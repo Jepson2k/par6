@@ -26,6 +26,23 @@ pub enum ClientError {
     /// own checks so a bad call fails fast and offline).
     #[error("invalid parameter: {0}")]
     Invalid(String),
+    /// The runtime restarted while a command was awaited: its queue
+    /// indexes started over, so the one awaited names nothing now.
+    #[error("the runtime restarted while command {index} was awaited")]
+    SessionChanged {
+        /// The index that was being awaited.
+        index: u64,
+    },
+    /// The runtime speaks another protocol version than this client was
+    /// built for; STATUS from it cannot be read, so no wait on it can end
+    /// any other way.
+    #[error("the runtime speaks protocol v{daemon}, this client v{client}")]
+    ProtocolMismatch {
+        /// The runtime's version.
+        daemon: u8,
+        /// This client's version.
+        client: u8,
+    },
 }
 
 impl ClientError {

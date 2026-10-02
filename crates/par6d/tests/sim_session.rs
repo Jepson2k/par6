@@ -15,7 +15,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    EnterFlashing, JogJ, MoveC, MoveJ, SaveConfig, SelectProfile, SelectTool, SetCanId,
+    EnterFlashing, JogJ, MoveJ, SaveConfig, SelectProfile, SelectTool, SetCanId,
     SetCompletionPolicy, Stop, Teleport, ToolAction, ToolParam,
 };
 use par6_proto::{
@@ -669,6 +669,52 @@ fn stop_then_move_completes_without_losing_samples() {
     rig.shutdown();
 }
 
+/// `stop()` promises an arm HELD where it stopped: braked along its path
+/// and then kept under position control — enabled, and not
+/// back-driveable. IDLE would be the gravity float on a homed arm: no
+/// velocity authority to brake with, and nothing holding the pose once
+/// stopped.
+#[test]
+fn a_stop_brakes_the_arm_and_then_holds_it() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let park = park_deg();
+    teleport_home(&rig, &mut c, park);
+
+    let i = c.ok_index(&move_j(3101, with_j0(park, 60.0), 2.0));
+    rig.wait_status("J0 is under way", |s| {
+        s.executing_index == i as i64 && s.speeds[0].abs() > 0.2
+    });
+    c.ok(&Command::Stop(Stop { clear_queue: true }));
+    let (ok, _) = c.wait_complete(i);
+    assert!(!ok, "the stopped move reports its cancellation");
+
+    let rest = rig.wait_status("the arm at rest after the stop", |s| {
+        s.speeds.iter().all(|v| v.abs() < 1e-3)
+    });
+    let floating = |s: &Status| s.mode == ControllerMode::Idle && s.homed && s.gravity_comp;
+    assert!(rest.enabled, "a stop leaves the controller enabled");
+    assert!(
+        !floating(&rest),
+        "a stopped arm must be held, not handed to the gravity float: {:?}",
+        rest.mode
+    );
+    let window = rig.collect_status(Duration::from_secs(1));
+    for s in &window {
+        assert!(!floating(s), "the hold must not lapse into the float");
+        assert!(
+            max_deg_error(&s.angles, &rest.angles) < 0.06,
+            "a held arm stays put: {:?} drifted from {:?}",
+            s.angles,
+            rest.angles
+        );
+    }
+
+    rig.shutdown();
+}
+
 /// Move size for the profile probe: short enough that the whole move is
 /// ramping, where a jerk limit costs the most against a profile without
 /// one (long moves are cruise-dominated and converge).
@@ -714,9 +760,11 @@ fn flashing_window_over_protocol_v2() {
     assert_eq!(err.code, ErrorCode::CommValidationError as u16);
     c.ok(&Command::Stop(Stop { clear_queue: true }));
     c.drain();
-    rig.wait_status("idle after the stop", |s| s.mode == ControllerMode::Idle);
+    rig.wait_status("at rest after the stop", |s| {
+        s.executing_index < 0 && s.speeds.iter().all(|v| v.abs() < 1e-3)
+    });
 
-    // From IDLE with the assertion: acked once the mode is FLASHING, and
+    // From rest with the assertion: acked once the mode is FLASHING, and
     // the silent bus reads as a stale link — the wire really is handed
     // to the flasher.
     c.ok(&enter);
@@ -835,27 +883,9 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     let park = park_deg();
     teleport_home(&rig, &mut c, park);
 
-    // ---- parameters that cannot be honoured are refused, never ignored.
-    // A corner radius on an ARC is one of them: par6d rounds corners
-    // between straight cartesian moves and between joint moves, but an
-    // arc ends at its end pose, and a radius that quietly did nothing
-    // would be the silent alteration this surface exists to prevent.
-    let err = c.expect_error(&Command::MoveC(MoveC {
-        key: 5001,
-        via: [0.0; 6],
-        end: [0.0; 6],
-        frame: Frame::Wrf,
-        duration: Some(0.5),
-        speed: None,
-        accel: None,
-        blend_radius: Some(5.0),
-        rel: false,
-    }));
-    assert_eq!(
-        err.code,
-        ErrorCode::CommValidationError as u16,
-        "a blend radius par6d cannot honour must be refused, got {err:?}"
-    );
+    // ---- parameters that cannot be honoured are refused, never ignored:
+    // a jaw position on a tool with no jaws would quietly do nothing,
+    // which is the silent alteration this surface exists to prevent.
     let err = c.expect_error(&Command::Teleport(Teleport {
         angles: park,
         tool_positions: Some(vec![0.5, 0.5]),
@@ -966,7 +996,7 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     // ---- a move before calibration is refused: the RT send gate never
     // streams to an uncalibrated gripper (the firmware's own gate drops
     // it), so admitting the move could only pretend.
-    let i = c.ok_index(&tool_action(6003, &tool, "move", &[1.0, 0.5, 500.0]));
+    let i = c.ok_index(&tool_action(6003, &tool, "move", &[1.0, 0.5, 0.3]));
     let (ok, detail) = c.wait_complete(i);
     assert!(!ok, "an uncalibrated gripper must refuse a move");
     assert_eq!(
@@ -985,7 +1015,7 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     // position with nothing between the jaws (detection: reached, no
     // object), opening runs it back.
     let before = jaw(&s);
-    let i = c.ok_index(&tool_action(6008, &tool, "move", &[1.0, 0.5, 500.0]));
+    let i = c.ok_index(&tool_action(6008, &tool, "move", &[1.0, 0.5, 0.3]));
     let (ok, detail, verdict) = c.wait_complete_full(i);
     assert!(ok, "gripper close must complete, got {detail:?}");
     assert_eq!(
@@ -1013,7 +1043,7 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         "a settled move leaves the jaws holding, not released"
     );
 
-    let i = c.ok_index(&tool_action(6004, &tool, "move", &[0.0, 0.5, 500.0]));
+    let i = c.ok_index(&tool_action(6004, &tool, "move", &[0.0, 0.5, 0.3]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "gripper open must complete, got {detail:?}");
     rig.wait_status("the jaw reaches the open command", |s| jaw(s) < 0.05);
@@ -1037,7 +1067,7 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         ErrorCode::CommValidationError as u16
     );
     // …and out-of-range move parameters are refused the same way.
-    let i = c.ok_index(&tool_action(6007, &tool, "move", &[2.0, 0.5, 500.0]));
+    let i = c.ok_index(&tool_action(6007, &tool, "move", &[2.0, 0.5, 0.3]));
     assert!(!c.wait_complete(i).0, "position 2.0 must fail");
 
     // ---- teleport places the tool as well as the arm.
@@ -1062,6 +1092,109 @@ fn tool_actions_profiles_and_unsupported_parameters() {
             "teleport did not place the tool within budget"
         );
     }
+
+    rig.shutdown();
+}
+
+/// A tool action runs in queue order between moves.
+///
+/// `move_j(A); close; move_j(B)` is a pick. The jaws must not start
+/// closing while the arm is still travelling to the part, and the arm
+/// must not leave with it before they have closed — so the close starts
+/// when A has finished, B starts when the close has, and A does not round
+/// a corner into B across the close even though it asks to blend. A stop
+/// that lands while the jaws travel halts them where they are: the grip
+/// is kept, neither released nor carried on.
+#[test]
+fn a_tool_action_runs_in_queue_order_between_moves() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let park = park_deg();
+    teleport_home(&rig, &mut c, park);
+    let tool = fitted_tool();
+    let i = c.ok_index(&tool_action(8001, &tool, "calibrate", &[]));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "gripper calibrate must complete, got {detail:?}");
+    rig.wait_status("calibration leaves the jaws open", |s| jaw(s) < 0.05);
+
+    let a = with_j0(park, 10.0);
+    rig.drain_status();
+    let ids = c.ok_indices(&[
+        Command::MoveJ(MoveJ {
+            key: 8002,
+            angles: a,
+            duration: Some(0.8),
+            speed: None,
+            accel: None,
+            blend_radius: Some(10.0),
+            rel: false,
+        }),
+        tool_action(8003, &tool, "move", &[1.0, 0.5, 0.3]),
+        move_j(8004, park, 0.8),
+    ]);
+    let (reach, close, leave) = (ids[0], ids[1], ids[2]);
+    let frames = rig.collect_through(leave, BUDGET);
+    for index in ids {
+        let (ok, detail) = c.wait_complete(index);
+        assert!(ok, "command {index} must complete, got {detail:?}");
+    }
+    let done = |s: &Status, index: u64| s.completed_index >= index as i64;
+
+    // Until A has arrived, the jaws stay open.
+    let approaching: Vec<f64> = frames.iter().filter(|s| !done(s, reach)).map(jaw).collect();
+    assert!(!approaching.is_empty(), "no frame caught the approach");
+    assert!(
+        approaching.iter().all(|&j| j < 0.05),
+        "the jaws closed before the arm reached the part: {approaching:?}"
+    );
+    // From A's arrival until the close completes, the arm holds at A.
+    let closing: Vec<&Status> = frames
+        .iter()
+        .filter(|s| done(s, reach) && !done(s, close))
+        .collect();
+    assert!(!closing.is_empty(), "no frame caught the jaws closing");
+    assert!(
+        closing.iter().all(|s| (s.angles[0] - a[0]).abs() < 1.0),
+        "the arm left A before the jaws had closed: J0 {:?}, A at {}",
+        closing.iter().map(|s| s.angles[0]).collect::<Vec<_>>(),
+        a[0]
+    );
+    let closed = frames
+        .iter()
+        .find(|s| done(s, close))
+        .expect("a frame reports the close complete");
+    assert!(
+        jaw(closed) > 0.95,
+        "the close completed with the jaws at {}",
+        jaw(closed)
+    );
+
+    // A stop while the jaws travel halts them where they are.
+    let opening = c.ok_index(&tool_action(8005, &tool, "move", &[0.0, 0.1, 0.3]));
+    rig.wait_status("the jaws start opening", |s| jaw(s) < 0.85);
+    c.ok(&Command::Stop(Stop { clear_queue: false }));
+    let (ok, detail) = c.wait_complete(opening);
+    assert!(
+        !ok && detail
+            .as_ref()
+            .is_some_and(|e| e.code == ErrorCode::MotnCancelled as u16),
+        "a stopped jaw move must report its cancellation: ok={ok} {detail:?}"
+    );
+    let caught = jaw(&rig.wait_status("a frame after the stop", |_| true));
+    let after = rig.collect_status(Duration::from_millis(600));
+    let last = after.last().expect("the broadcast carries on");
+    assert!(
+        (jaw(last) - caught).abs() < 0.1,
+        "the stop did not hold the jaws: caught at {caught}, carried on to {}",
+        jaw(last)
+    );
+    assert_eq!(
+        tool_status(last).state,
+        ToolState::Active,
+        "a stop must halt the jaws, not release the grip"
+    );
 
     rig.shutdown();
 }
@@ -1280,9 +1413,11 @@ fn queue_eta_counts_speed_parameterised_moves() {
         })
     };
 
-    // One move in flight: the ETA is that move's planned duration.
-    let index = c.ok_index(&sweep(7411, 20.0, 0.10));
+    // One move in flight: the ETA is that move's planned duration. The
+    // clock starts before the send: the move runs from its acceptance,
+    // before the reply that carries its index reaches the client.
     let started = Instant::now();
+    let index = c.ok_index(&sweep(7411, 20.0, 0.10));
     let fast = priced_duration(&mut c);
     let (ok, detail) = c.wait_complete(index);
     assert!(ok, "the move must complete, got {detail:?}");
@@ -1878,7 +2013,7 @@ fn bus_scan_and_a_commissioning_rename_on_the_simulator() {
         new_id: free_id,
         force: false,
     }));
-    assert!(err.cause.contains("idle arm"), "{}", err.cause);
+    assert!(err.cause.contains("arm at rest"), "{}", err.cause);
     c.ok(&Command::Stop(Stop { clear_queue: true }));
 
     // Under e-stop the arm cannot move: the rename goes through.
@@ -2012,6 +2147,70 @@ fn a_backend_swap_that_cannot_open_its_bus_is_refused_and_changes_nothing() {
         "a refused swap moved the arm: {:?} -> {:?}",
         before.angles,
         after.angles
+    );
+    rig.shutdown();
+}
+
+/// A program's physics shapes are in the live simulator's world, not
+/// only in the collision gate's: a block declared with a mass is
+/// something the jaws close ON, so a grip runs against it here the way
+/// it does in a preview run and on the arm.
+#[test]
+fn a_program_shape_with_physics_is_something_the_live_jaws_close_on() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    teleport_home(&rig, &mut c, park_deg());
+    let tool = fitted_tool();
+    let i = c.ok_index(&tool_action(7101, &tool, "calibrate", &[]));
+    let (ok, detail, _) = c.wait_complete_full(i);
+    assert!(ok, "gripper calibrate must complete, got {detail:?}");
+    rig.wait_status("calibration leaves the jaws open", |s| jaw(s) < 0.05);
+
+    // The reach-down pose over the stand, and the stand and block under
+    // it, as the preview run grasps them.
+    let grasp_rad: [f64; NUM_JOINTS] = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
+    let grasp: [f64; NUM_JOINTS] = std::array::from_fn(|i| grasp_rad[i].to_degrees());
+    c.ok(&teleport(grasp));
+    rig.wait_status("the arm is over the stand", |s| {
+        max_deg_error(&s.angles, &grasp) < 0.5
+    });
+    let block = |name: &str, params: [f64; 3], z: f64, mass: Option<f64>| par6_proto::Shape {
+        attachment: None,
+        kind: "box".into(),
+        params: params.to_vec(),
+        pose: vec![0.3713, 0.0, z, 0.0, 0.0, 0.0],
+        collision: true,
+        margin: None,
+        name: name.into(),
+        physics: Some(par6_proto::Physical {
+            mass,
+            friction: [1.0, 0.005, 0.0001],
+        }),
+    };
+    c.ok(&Command::SetShapes(par6_proto::command::SetShapes {
+        shapes: vec![
+            block("stand", [0.04, 0.04, 0.01], 0.005, None),
+            block("block", [0.036, 0.036, 0.06], 0.04, Some(0.05)),
+        ],
+    }));
+
+    // Closing meets the block: the jaws stop on it, and the settle
+    // verdict says an object was found while closing.
+    let i = c.ok_index(&tool_action(7102, &tool, "move", &[1.0, 0.5, 0.3]));
+    let (ok, detail, verdict) = c.wait_complete_full(i);
+    assert!(ok, "the grip must complete, got {detail:?}");
+    assert_eq!(
+        verdict,
+        Some(1),
+        "closing on the block must report an object while closing"
+    );
+    let s = rig.wait_status("the jaws rest on the block", |_| true);
+    assert!(
+        jaw(&s) < 0.9,
+        "the jaws closed through the block: {} — the program world never reached the simulator",
+        jaw(&s)
     );
     rig.shutdown();
 }

@@ -244,6 +244,9 @@ wire_enum! {
         SetTcpTransform = 111,
         /// Applied tool-local TCP transform readback.
         TcpTransform = 112,
+        /// How a queued command finished, by index: the COMPLETE push's
+        /// content, kept for a client whose push went missing.
+        CommandCompletion = 113,
     }
 }
 
@@ -300,6 +303,8 @@ wire_enum! {
         TcpTransform = 24,
         /// Requested, applied, and retained positive execution scales.
         ExecutionSpeed = 25,
+        /// See [`CmdType::CommandCompletion`].
+        CommandCompletion = 26,
     }
 }
 
@@ -447,7 +452,6 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SetGravityComp
         | C::Pause
         | C::Stop
-        | C::WriteIo
         | C::Simulator
         | C::SelectProfile
         | C::ResetState
@@ -461,7 +465,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SetCanId
         | C::SaveConfig
         | C::SetExecutionSpeed
-        | C::SetStatusRate => CommandClass::System,
+        | C::SetStatusRate
+        | C::Teleport => CommandClass::System,
 
         C::Ping
         | C::Status
@@ -487,15 +492,12 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::Payload
         | C::ConfigBundle
         | C::BusScan
-        | C::StatusRate => CommandClass::Query,
+        | C::StatusRate
+        | C::CommandCompletion => CommandClass::Query,
 
-        C::ServoJ
-        | C::ServoJPose
-        | C::ServoL
-        | C::JogJ
-        | C::JogL
-        | C::Teleport
-        | C::ResetLoopStats => CommandClass::FireAndForget,
+        C::ServoJ | C::ServoJPose | C::ServoL | C::JogJ | C::JogL | C::ResetLoopStats => {
+            CommandClass::FireAndForget
+        }
 
         C::Home
         | C::MoveJ
@@ -509,6 +511,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::Checkpoint
         | C::ToolAction
         | C::SetTcpOffset
-        | C::SetTcpTransform => CommandClass::Queued,
+        | C::SetTcpTransform
+        | C::WriteIo => CommandClass::Queued,
     }
 }

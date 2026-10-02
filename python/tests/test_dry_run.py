@@ -42,6 +42,24 @@ def park_deg() -> list[float]:
     return np.degrees(_cfg.homing_ready_pose_rad()).tolist()
 
 
+#: The record's row period: a config ticked at it records every tick. Its
+#: STATUS rate must divide the tick rate, which the suite's 20 Hz does not.
+_ROW_DT_S = 0.02
+_ROW_STATUS_HZ = 25
+
+
+def _row_rate_tick(toml: str) -> str:
+    """Re-tick the CI config at the record's row rate."""
+    for old, new in (
+        (f"tick_dt_s = {TICK_DT_S}", f"tick_dt_s = {_ROW_DT_S}"),
+        (f"status_rate_hz = {STATUS_RATE_HZ}", f"status_rate_hz = {_ROW_STATUS_HZ}"),
+    ):
+        if old not in toml:
+            raise RuntimeError(f"PAR6.toml patch point {old!r} missing")
+        toml = toml.replace(old, new)
+    return toml
+
+
 class _Block:
     """One command's motion, read off the commanded record.
 
@@ -227,16 +245,19 @@ class TestPlannedMotion:
         cfg = _cfg.config()
         velocity = np.array(cfg.limits("exec")["velocity"])
         start = _cfg.homing_ready_pose_rad()
-        target = start + np.radians([25.0, -10.0, 15.0, 0.0, 20.0, 0.0])
-        # The CI tick is slower than the record's row rate, so every tick is
-        # a row and the velocity check reads per-tick steps rather than a
-        # stride's average, which would smear a fast tick across several.
+        # Long enough that speed, not the default half accel, bounds it.
+        target = start + np.radians([60.0, -20.0, 30.0, 0.0, 40.0, 0.0])
+        # Ticked at the record's row rate, so every tick is a row and the
+        # velocity check reads per-tick steps rather than a stride's
+        # average, which would smear a fast tick across several.
         client = Robot().create_dry_run_client(
             initial_joints_deg=np.degrees(start).tolist(),
-            config_path=str(sim_config(tmp_path / "config")),
+            config_path=str(
+                sim_config(tmp_path / "config", config_patch=_row_rate_tick)
+            ),
         )
         dt = client._dt
-        assert dt == pytest.approx(TICK_DT_S)
+        assert dt == pytest.approx(_ROW_DT_S)
 
         for profile in DryRunProfiles.profiles():
             client.select_profile(profile)
@@ -273,6 +294,29 @@ class TestPlannedMotion:
         assert slow.duration == pytest.approx(4.0, abs=2 * dry_run.plan().row_dt_s)
         np.testing.assert_allclose(slow.end_joints_rad, np.radians(target), atol=1e-6)
 
+    def test_an_untimed_move_runs_at_half_speed_and_a_duration_sets_the_timing(
+        self, dry_run
+    ) -> None:
+        """A planned move that names no timing runs at ``speed=0.5`` — not at
+        full speed, and not refused — and a positive ``duration`` times the
+        move even beside an explicit ``speed``."""
+        dry_run.teleport(park_deg())
+        target = np.asarray(dry_run.pose())
+        # Long enough that speed, not the default half accel, bounds it.
+        target[1] += 100.0
+        target[2] += 60.0
+
+        def line(**timing: float) -> _Block:
+            dry_run.teleport(park_deg())
+            return _planned(dry_run, dry_run.move_l(target.tolist(), **timing))
+
+        row = dry_run.plan().row_dt_s
+        half, full, untimed = line(speed=0.5), line(speed=1.0), line()
+        assert half.duration > full.duration + 2 * row, "speed must bind on this line"
+        assert untimed.duration == pytest.approx(half.duration, abs=row)
+        timed = line(duration=3.0, speed=1.0)
+        assert timed.duration == pytest.approx(3.0, abs=2 * row)
+
 
 class TestCartesianMotion:
     def test_move_l_previews_a_straight_line_and_reports_where_it_fails(
@@ -306,7 +350,9 @@ class TestCartesianMotion:
         # The arm must not have moved: the runtime rejects the whole command.
         np.testing.assert_allclose(dry_run.angles(), before, atol=1e-9)
 
-    @pytest.mark.parametrize("profile", ["RUCKIG", "TRAPEZOID", "QUINTIC", "TOPPRA"])
+    @pytest.mark.parametrize(
+        "profile", ["RUCKIG", "TRAPEZOID", "QUINTIC", "TOPPRA", "LINEAR"]
+    )
     def test_move_l_is_straight_under_every_profile(self, dry_run, profile) -> None:
         """The profile decides how a linear move is timed, not where it goes:
         every profile must keep the TCP on the start->end line. A profile
@@ -432,7 +478,16 @@ class TestCartesianMotion:
         assert at_the_corner < cruising, (
             "the un-blended pair is supposed to stop at the corner"
         )
-        assert np.allclose(dry_run.angles(), np.degrees(blended.end_joints_rad))
+        # The record keeps every stride-th tick, so the motion's last
+        # ticks can fall between its final row and the end: the arm stands
+        # within one decelerating row of it.
+        last_row = np.degrees(
+            np.abs(np.diff(blended.joint_trajectory_rad[-2:], axis=0)[0])
+        )
+        stood = np.abs(
+            np.asarray(dry_run.angles()) - np.degrees(blended.end_joints_rad)
+        )
+        assert np.all(stood <= last_row + 1e-6), f"{stood} vs a last row of {last_row}"
 
         # A chain the program never closes is planned by flush(), which is
         # where the runtime's blend hold expires.
@@ -518,13 +573,6 @@ class TestCartesianMotion:
         """Parameters and commands ``par6d`` rejects must be rejected here with
         the same code, so a preview never promises motion the arm will refuse."""
         dry_run.teleport(park_deg())
-        # An arc ends where its end pose is: par6d rounds corners between
-        # straight moves and between joint moves, but has no arc-to-successor
-        # blend, so a radius on move_c is refused rather than ignored.
-        with pytest.raises(RobotError) as arc_blend:
-            dry_run.move_c(dry_run.pose(), dry_run.pose(), r=5.0)
-        assert arc_blend.value.code == ErrorCode.COMM_VALIDATION_ERROR
-
         # Geometry the runtime cannot turn into a path is a validation error,
         # never silently straightened into a line.
         base = np.asarray(dry_run.pose())
@@ -532,10 +580,11 @@ class TestCartesianMotion:
             dry_run.move_c(
                 _offset(base, (20.0, 0.0, 0.0)).tolist(),
                 _offset(base, (40.0, 0.0, 0.0)).tolist(),
+                speed=1.0,
             )
         assert collinear.value.code == ErrorCode.COMM_VALIDATION_ERROR
         with pytest.raises(RobotError) as empty:
-            dry_run.move_s([])
+            dry_run.move_s([], speed=1.0)
         assert empty.value.code == ErrorCode.COMM_VALIDATION_ERROR
 
         with pytest.raises(RobotError) as tool:
@@ -551,12 +600,22 @@ class TestCartesianMotion:
         # planned the absolute move would validate a program the arm
         # then refuses with this very ValueError.
         with pytest.raises(ValueError, match="rel=True"):
-            dry_run.move_j(pose=dry_run.pose(), rel=True)
+            dry_run.move_j(pose=dry_run.pose(), rel=True, speed=1.0)
+        # ``rel`` belongs to move_j/move_l, and a move takes only the
+        # keywords its wait does: the live client refuses the rest with a
+        # TypeError, and so must the preview of the same program.
+        here = dry_run.pose()
+        with pytest.raises(TypeError, match="rel"):
+            dry_run.move_c(here, here, rel=True, speed=0.5)
+        with pytest.raises(TypeError, match="rel"):
+            dry_run.move_p([here, here], rel=True, speed=0.5)
+        with pytest.raises(TypeError, match="bogus"):
+            dry_run.move_l(here, speed=0.5, bogus=1)
 
         far = list(dry_run.angles())
         far[1] = math.degrees(_cfg.soft_limits_rad()[1, 1]) + 20.0
         with pytest.raises(RobotError) as outside:
-            dry_run.move_j(far)
+            dry_run.move_j(far, speed=1.0)
         # A target outside the soft window is invalid input to the planner
         # (``planning_error``), the same class the runtime answers with.
         assert outside.value.code == ErrorCode.COMM_VALIDATION_ERROR
@@ -565,7 +624,7 @@ class TestCartesianMotion:
             initial_joints_deg=park_deg(), initial_homed=False
         )
         with pytest.raises(RobotError) as gate:
-            unhomed.move_j(park_deg())
+            unhomed.move_j(park_deg(), speed=1.0)
         assert gate.value.code == ErrorCode.MOTN_NOT_HOMED
         # Jogging stays available while un-homed, as it does on the runtime.
         unhomed.jog_j(0, 0.2, 0.2)
@@ -611,7 +670,14 @@ class TestCartesianMotion:
         # A wrong-length list is refused by the live client itself, before
         # any datagram, with ValueError — the preview raises the same.
         with pytest.raises(ValueError, match="requires"):
-            dry_run.move_j([0.0, 0.0, 0.0])
+            dry_run.move_j([0.0, 0.0, 0.0], speed=1.0)
+        # Timing out of range is refused as the live client refuses it, and
+        # nothing is submitted.
+        submitted = dry_run.program_length
+        for timing in ({"speed": 0.0}, {"accel": 1.5}, {"duration": -1.0}):
+            with pytest.raises(ValueError, match=next(iter(timing))):
+                dry_run.move_j(dry_run.angles(), **timing)
+        assert dry_run.program_length == submitted
         with pytest.raises(ValueError, match="requires"):
             dry_run.teleport([0.0, 0.0, 0.0])
 
@@ -646,22 +712,23 @@ class TestCartesianMotion:
         """HOME is two commands wearing one name, and the preview has to know
         which one it is drawing.
 
-        Un-referenced it is the seek, which ends wherever the configured
-        sequence's ``move_to`` steps leave the arm and reports no duration.
-        Referenced it is an ordinary planned move to the park pose — which is
-        what makes a Home button cost seconds rather than a full seek.
+        Un-referenced it is the seek, whose own time is the arm's: the
+        record shows it landing wherever the configured sequence's
+        ``move_to`` steps leave the arm, then the planned return to the park
+        pose the runtime runs once the references are established.
+        Referenced it is only that return — which is what makes a Home
+        button cost seconds rather than a full seek.
         """
         robot = Robot()
         cold = robot.create_dry_run_client(
             initial_joints_deg=park_deg(), initial_homed=False
         )
         seek = _planned(cold, cold.home())
-        assert seek.rows == 1, (
-            "a seek's time is the arm's; the record shows the landing"
+        assert seek.rows > 1, "the seek's landing, then the return to park"
+        np.testing.assert_allclose(
+            seek.joint_trajectory_rad[0], _cfg.homing_ready_pose_rad(), atol=1e-6
         )
-        assert seek.end_joints_rad == pytest.approx(
-            _cfg.homing_ready_pose_rad(), abs=1e-6
-        )
+        assert seek.end_joints_rad == pytest.approx(robot.joints.home.rad, abs=1e-3)
 
         warm = robot.create_dry_run_client(
             initial_joints_deg=np.degrees(_cfg.homing_ready_pose_rad()).tolist()
@@ -680,10 +747,9 @@ class TestCartesianMotion:
         assert client.queue() == []
         # The mirror must report what the ENGINE plans with from the
         # first preview: the runtime's own startup profile
-        # (par6d::planner::DEFAULT_PROFILE). A mirror that said TOPPRA
-        # while the engine ran RUCKIG timed every pre-sync preview with
-        # the wrong profile.
-        assert client.profile() == "RUCKIG"
+        # (par6d::planner::DEFAULT_PROFILE). A mirror that disagreed with
+        # the engine timed every pre-sync preview with the wrong profile.
+        assert client.profile() == "TOPPRA"
 
         # STATUS builds its pose from the 4x4 the engine returns; pose()
         # reads the engine's own xyzrpy. The two must describe one arm.
@@ -797,10 +863,26 @@ class TestLiveParity:
         assert client.tool.is_open(), "a refused move leaves the jaws where they were"
 
         assert _planned(client, client.tool.calibrate()).duration >= 2.0
-        assert _planned(client, client.tool.close()).duration > 0.0, (
+        close = client.tool.close()
+        assert _planned(client, close).duration > 0.0, (
             "a jaw move holds the arm for the jaws' travel"
         )
         assert not client.tool.is_open()
+        # The wire carries current as a fraction of the tool's range, like
+        # speed; a move that names none grips at half the range.
+        assert client._program[close]["params"] == [1.0, 0.5, 0.5]
+        firm = client.tool.set_position(0.3, speed=0.8, current=0.25)
+        assert client._program[firm]["params"] == [0.3, 0.8, 0.25]
+        # The wire refuses a non-finite float before any field reads it.
+        for current, reason in (
+            (-0.1, "current"),
+            (1.5, "current"),
+            (math.nan, "finite"),
+            (math.inf, "finite"),
+        ):
+            with pytest.raises(RobotError, match=reason) as bad_current:
+                client.tool.close(current=current)
+            assert bad_current.value.code == ErrorCode.COMM_VALIDATION_ERROR
         assert _planned(client, client.tool.stop()).duration == 0.0
         assert _planned(client, client.tool.release()).duration == 0.0
         with pytest.raises(RobotError) as past_stroke:
@@ -908,7 +990,7 @@ class TestProgramWorkflow:
     def test_a_program_previews_as_one_continuous_timeline(self) -> None:
         """Drive a whole program the way the editor does and check the results
         chain: every segment starts where the previous one ended, the tool
-        action holds position, and home lands on the configured ready pose.
+        action holds position, and home ends at the park pose.
 
         Un-referenced to start with, because that is the state an editor
         opens on and it is why a program's first line is ``home()``. Seeding
@@ -921,8 +1003,8 @@ class TestProgramWorkflow:
         program = [client.home()]
         np.testing.assert_allclose(
             _planned(client, program[-1]).end_joints_rad,
-            _cfg.homing_ready_pose_rad(),
-            atol=1e-9,
+            _cfg.config().park_pose_rad(),
+            atol=1e-4,
         )
 
         above = np.asarray(client.pose())
@@ -948,7 +1030,12 @@ class TestProgramWorkflow:
             np.testing.assert_allclose(
                 held.end_joints_rad, results[1].end_joints_rad, atol=1e-3
             )
-        assert client.angles() == pytest.approx(np.degrees(results[-1].end_joints_rad))
+        # The record keeps every stride-th sample, so its last row is up to
+        # one row short of the landing the virtual arm is placed on — a
+        # profile's last stride, at rest by then.
+        assert client.angles() == pytest.approx(
+            np.degrees(results[-1].end_joints_rad), abs=0.05
+        )
         assert sum(r.duration for r in results) > 0.0
 
 
@@ -973,8 +1060,8 @@ _CHAIN_R_MM = 15.0
 _CASE_SPEED = 0.05
 
 #: The RT tick and STATUS rate this capture runs at.  The rest of the suite
-#: ticks at 20 Hz to keep CI light, which samples one of these paths a dozen
-#: times — too coarse for a millimetre comparison, since the polyline
+#: broadcasts at 20 Hz to keep CI light, which samples one of these paths a
+#: dozen times — too coarse for a millimetre comparison, since the polyline
 #: through those samples cuts every corner it spans.  The packaged config
 #: documents ``status_rate_hz`` as the knob to raise for capture work, so
 #: this test raises the tick and the broadcast together and reads one frame
@@ -1202,7 +1289,7 @@ async def test_curved_and_blended_previews_match_the_runtime(tmp_path) -> None:
                 # in, so the shapes are anchored on the same place.
                 await teleport_to(client, _OPEN_POSE_DEG)
                 assert await client.wait_status(
-                    lambda s: float(np.abs(np.asarray(s.speeds)).max()) < 0.02,
+                    lambda s: float(np.abs(np.asarray(s.speeds)).max()) < 1.0,
                     timeout=20.0,
                 )
                 live_start = await client.angles()
@@ -1385,7 +1472,7 @@ def test_plan_and_simulate_describe_the_same_program() -> None:
     far = park_deg()
     far[1] = math.degrees(_cfg.soft_limits_rad()[1, 1]) + 20.0
     with pytest.raises(RobotError):
-        client.move_j(far)
+        client.move_j(far, speed=1.0)
     assert client.wait_command(5) is False
     failed = client.plan()
     assert failed.stop == "failed" and failed.blocks[5].error is not None
@@ -1426,7 +1513,7 @@ _TABLE_ARGS: dict[str, tuple] = {
     "set_execution_speed": (0.5,),
 }
 _TABLE_KWARGS: dict[str, dict] = {
-    n: {"speed": 0.3} for n in ("move_l", "move_c", "move_s", "move_p")
+    n: {"speed": 0.3} for n in ("move_j", "move_l", "move_c", "move_s", "move_p")
 }
 
 
@@ -1505,3 +1592,20 @@ def test_every_table_command_answers_with_the_kind_it_declares() -> None:
                 )
     assert not problems, "\n".join(problems)
     assert exercised >= 20
+
+
+def test_reset_state_keeps_a_latched_estop_and_reset_clears_it() -> None:
+    """``reset_state`` resets the program, not the controller: a latched
+    e-stop still refuses motion after it, and only ``reset`` re-enables."""
+    client = Robot().create_dry_run_client(initial_joints_deg=park_deg())
+    target = park_deg()
+    target[0] += 10.0
+    assert client.estop() == 1
+    assert client.reset_state() == 1
+    with pytest.raises(RobotError) as refused:
+        client.move_j(target, speed=0.5)
+    assert refused.value.code == ErrorCode.SYS_ESTOP_ACTIVE
+    assert client.angles() == pytest.approx(park_deg())
+    assert client.reset() == 1
+    assert client.move_j(target, speed=0.5) >= 0
+    assert client.angles() == pytest.approx(target, abs=1e-6)

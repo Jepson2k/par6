@@ -35,20 +35,33 @@ use par6_rt::{
 use par6_server::{
     attachment_error, attachments_fresh, check_gate, cmd_name, decode_error_to_wire,
     next_attachment_epoch, pid_gains_fault, session, tcp_transform_effect, tcp_transform_values,
-    validate_registries, validate_supported, write_io_fault, GateContext, PayloadSpec, PlanContext,
-    Planner, QueuedCommand, ServerConfig, ShapeLayer,
+    validate_registries, validate_supported, GateContext, PayloadSpec, PlanContext, Planner,
+    QueuedCommand, ServerConfig, ShapeLayer,
 };
 
 use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{
-    housekeeping_period, project_cart_jog, step_cart_jog, CartJogProbe, CartJogState, CoreLink,
-    CoreOp, StreamGate,
+    housekeeping_period, project_cart_jog, step_cart_jog, step_cart_servo, CartJogProbe,
+    CartJogState, CartServoState, CoreLink, CoreOp, StreamGate,
 };
 use crate::daemon::{load_preview_kin, DaemonError};
 use crate::kin::{matrix_to_xyzrpy, CartKin};
 use crate::options::{resolve_config_path, Options};
 use crate::planner::{profile_names, Par6Planner, PlannedMotion, PlannerKin};
 use plan::PlanRecorder;
+
+/// Braking time a stream preview allows beyond the motion itself before it
+/// calls the stream ended: the jog ramp and the servo brake run inside it.
+const PREVIEW_BRAKE_ALLOWANCE_S: f64 = 4.0;
+
+/// The runtime's answer to input it cannot act on.
+fn validation_error(detail: &str) -> WireError {
+    make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[("detail", detail)],
+    )
+}
 
 /// One submitted command's outcome: where the runtime would leave the
 /// arm and the rows it owns in the commanded record, the exact refusal
@@ -745,6 +758,11 @@ impl Preview {
         crate::calibrate::Protocol::default().speed
     }
 
+    /// The motion profile the estimation protocol swings on.
+    pub fn estimation_profile() -> &'static str {
+        crate::calibrate::MEASUREMENT_PROFILE
+    }
+
     /// The refusal the runtime would leave standing, or `None`.
     pub fn error(&self) -> Option<&WireError> {
         self.latches.standing_error.as_ref()
@@ -865,23 +883,6 @@ impl Preview {
         // A streamable preempts planned motion, pending queue included.
         self.held.clear();
         match command {
-            Command::Teleport(p) => {
-                // The travel check already ran: `validate_supported` calls
-                // `teleport_angle_fault` above.
-                let mut q = self.snap.q;
-                for (out, deg) in q.iter_mut().zip(p.angles.iter()) {
-                    *out = deg.to_radians();
-                }
-                self.snap.q = q;
-                self.snap.homed = true;
-                if let Some(pos) = p.tool_positions.as_ref().and_then(|v| v.first()) {
-                    self.tool_position = *pos;
-                }
-                self.publish();
-                let mut result = self.standing();
-                (result.start_row, result.rows) = self.mark();
-                result
-            }
             Command::JogJ(p) => self.preview_jog(p.speeds, p.duration, p.accel),
             Command::JogL(p) => self.preview_jog_l(p.velocities, p.frame, p.duration, p.accel),
             // A streamed target is tracked by the RT's own OTG at the
@@ -897,17 +898,99 @@ impl Preview {
                 rel: false,
             })),
             Command::ServoJPose(p) => self.settle_on_pose(p.pose, p.speed, p.accel),
-            Command::ServoL(p) => self.settle_on_pose(p.pose, p.speed, p.accel),
-            other => self.refuse(make_error(
-                ErrorCode::CommValidationError,
-                UNATTRIBUTED,
-                &[("detail", &format!("{:?} cannot be previewed", other.tag()))],
-            )),
+            Command::ServoL(p) => self.preview_servo_l(p.pose, p.speed, p.accel),
+            other => self.refuse(validation_error(&format!(
+                "{:?} cannot be previewed",
+                other.tag()
+            ))),
         }
     }
 
+    /// A `servo_l` target: the housekeeping loop's own cartesian limiter
+    /// (`step_cart_servo`) at its own period, each step gated as
+    /// housekeeping gates it, until the tool lands — so the preview draws
+    /// the straight line the runtime drives, not a joint-interpolated
+    /// move onto the same pose.
+    fn preview_servo_l(
+        &mut self,
+        pose: [f64; 6],
+        speed: Option<f64>,
+        accel: Option<f64>,
+    ) -> PreviewResult {
+        let at = match self.cart.fk(&self.snap.q) {
+            Ok(pose) => pose,
+            Err(e) => return self.refuse(validation_error(&e.to_string())),
+        };
+        let target = crate::kin::wire_pose_to_matrix(&pose);
+        let speed = speed.unwrap_or(1.0);
+        let mut state = match CartServoState::new(
+            self.dt,
+            par6_motion::CartLimits::from_motion(&self.motion),
+            &at,
+            &self.snap.q,
+            target,
+            speed,
+            accel.unwrap_or(1.0),
+        ) {
+            Ok(st) => st,
+            Err(e) => return self.refuse(validation_error(&e)),
+        };
+        let period = housekeeping_period(self.dt).as_secs_f64();
+        let ticks_per_step = (period / self.dt).round().max(1.0) as usize;
+        // A reachable target lands in about its distance over the
+        // limiter's ceiling; an unreachable one brakes and holds forever,
+        // so the preview stops at twice that plus the braking allowance
+        // the jog preview gives a ramp.
+        let line = par6_motion::cart::LineSegment::new(&at, &target);
+        let scale = speed.max(1e-3);
+        let travel_s = (line.length_m() / (self.motion.jog_l_linear_max_m_s * scale))
+            .max(line.angle_rad() / (self.motion.jog_l_angular_max_rad_s * scale));
+        let cap = ((2.0 * travel_s + PREVIEW_BRAKE_ALLOWANCE_S) / period).round() as usize;
+        self.cart_streaming = true;
+        let mut trajectory = Vec::new();
+        let q_meas = self.snap.q;
+        for _ in 0..cap.max(1) {
+            let before = state.commanded();
+            let (target, landed) = match step_cart_servo(
+                &mut self.cart,
+                &mut state,
+                &self.stream_limits,
+                period,
+                &q_meas,
+            ) {
+                Ok(step) => step,
+                Err(_) => (before, true),
+            };
+            let mut la = target;
+            for (j, v) in la.iter_mut().enumerate() {
+                let qd = (target[j] - before[j]) / period;
+                *v = (*v + self.gate.stopping_travel(j, qd)).clamp(
+                    self.stream_limits.soft_min[j],
+                    self.stream_limits.soft_max[j],
+                );
+            }
+            match self.gate.blocked(&before, &la) {
+                Ok(None) => {}
+                Ok(Some(pairs)) => {
+                    let error = self.gate.refuse(pairs);
+                    return self.refuse(error);
+                }
+                Err(e) => return self.refuse(e),
+            }
+            for _ in 0..ticks_per_step {
+                trajectory.push(target);
+            }
+            if landed {
+                break;
+            }
+        }
+        let ticks = trajectory.len();
+        self.finish_stream(trajectory, trajectory_duration(ticks, self.dt))
+    }
+
     /// A streamed cartesian target settles as the planner's joint move
-    /// onto it — the same rule for every servo family.
+    /// onto it — joint-space, which is right for `servo_j_pose` and only
+    /// for it.
     fn settle_on_pose(
         &mut self,
         pose: [f64; 6],
@@ -925,14 +1008,31 @@ impl Preview {
     }
 
     fn submit_system(&mut self, command: Command) -> PreviewResult {
-        let detail = |d: String| {
-            make_error(
-                ErrorCode::CommValidationError,
-                UNATTRIBUTED,
-                &[("detail", &d)],
-            )
-        };
         match command {
+            // Acked like the system command it is, and gated like the
+            // motion it is: the travel window (`teleport_angle_fault`,
+            // through `validate_supported`) and the arm's state.
+            Command::Teleport(ref p) => {
+                if let Some(error) = self
+                    .check_gate(&command)
+                    .or_else(|| validate_supported(&self.cfg, &command))
+                {
+                    return self.refuse(error);
+                }
+                // A jump preempts planned motion, pending queue included.
+                self.held.clear();
+                for (out, deg) in self.snap.q.iter_mut().zip(&p.angles) {
+                    *out = deg.to_radians();
+                }
+                self.snap.homed = true;
+                if let Some(pos) = p.tool_positions.as_ref().and_then(|v| v.first()) {
+                    self.tool_position = *pos;
+                }
+                self.publish();
+                let mut result = self.standing();
+                (result.start_row, result.rows) = self.mark();
+                return result;
+            }
             Command::Stop(p) => {
                 let cleared = p.clear_queue && !self.held.is_empty();
                 if p.clear_queue {
@@ -981,7 +1081,10 @@ impl Preview {
                 self.invalidate_attachments();
                 self.held.clear();
                 self.unpause();
-                self.latches.reset();
+                // The program-level state only: a latched e-stop is the
+                // controller's, and `reset` alone clears it — as the
+                // runtime's `reset_state` leaves its latch standing.
+                self.latches.standing_error = None;
                 self.tool.clone_from(&self.cfg.fitted_tool);
                 self.tool_variant = None;
                 self.tcp_offset_mm = [0.0; 3];
@@ -993,10 +1096,6 @@ impl Preview {
                     return self.refuse(e);
                 }
             }
-            Command::WriteIo(p) => match write_io_fault(p.port, &self.cfg) {
-                None => self.io_levels[usize::from(p.port)] = p.value,
-                Some(e) => return self.refuse(e),
-            },
             // A bus swap cancels every motion in flight (`Server`'s
             // `cancel_all_motion`), the held blend chain included — and
             // decides the references: the simulator is born referenced
@@ -1068,14 +1167,19 @@ impl Preview {
             // never does, so the reference survives the window.
             Command::ExitFlashing => {
                 if !self.flashing {
-                    return self.refuse(detail(format!(
+                    return self.refuse(validation_error(&format!(
                         "exit_flashing while the controller mode is {:?}, not FLASHING",
                         self.snap.mode
                     )));
                 }
                 self.flashing = false;
             }
-            other => return self.refuse(detail(format!("{:?} cannot be previewed", other.tag()))),
+            other => {
+                return self.refuse(validation_error(&format!(
+                    "{:?} cannot be previewed",
+                    other.tag()
+                )))
+            }
         }
         self.standing()
     }
@@ -1192,13 +1296,7 @@ impl Preview {
         }
         let at = match self.cart.fk(&self.snap.q) {
             Ok(pose) => pose,
-            Err(e) => {
-                return self.refuse(make_error(
-                    ErrorCode::CommValidationError,
-                    UNATTRIBUTED,
-                    &[("detail", &e.to_string())],
-                ))
-            }
+            Err(e) => return self.refuse(validation_error(&e.to_string())),
         };
         let mut state = match CartJogState::new(
             self.dt,
@@ -1212,13 +1310,7 @@ impl Preview {
             self.soft_max,
         ) {
             Ok(st) => st,
-            Err(e) => {
-                return self.refuse(make_error(
-                    ErrorCode::CommValidationError,
-                    UNATTRIBUTED,
-                    &[("detail", &e.to_string())],
-                ))
-            }
+            Err(e) => return self.refuse(validation_error(&e.to_string())),
         };
         // Housekeeping emits a setpoint every period; a cartesian jog's
         // setpoints arrive shaped, so the RT clamps and commands them
@@ -1253,7 +1345,7 @@ impl Preview {
         // under-predict where the runtime leaves the arm.
         state.release();
         let mut braking = 0usize;
-        let cap = (4.0 / period).round() as usize;
+        let cap = (PREVIEW_BRAKE_ALLOWANCE_S / period).round() as usize;
         for _ in 0..cap {
             let (target, at_rest) = match step_cart_jog(
                 &mut self.cart,
@@ -1422,14 +1514,20 @@ impl Preview {
                 rest = &rest[1..];
                 continue;
             }
-            // A tool action never enters the motion queue — it runs on
-            // the planner's own side channel — so it is offered there
-            // instead of to the batch, and it never joins a blend chain.
+            // A tool action is planned alone — no blend chain reaches
+            // across one — and the jaws' travel is drawn here, not planned.
             if let Command::ToolAction(action) = &rest[0] {
                 let action = action.clone();
-                results.push(self.preview_tool_action(&action));
+                let result = self.preview_tool_action(&action);
+                let refused = result.error.is_some() && action.action != "stop";
+                results.push(result);
                 self.next_index += 1;
                 rest = &rest[1..];
+                if refused {
+                    // A failed tool action fails the queue behind it, as a
+                    // refused move does below.
+                    break;
+                }
                 continue;
             }
             // Only offer the leading run of wire-valid commands: a later
@@ -1499,7 +1597,7 @@ impl Preview {
                 PlannedMotion::Hold(ticks) => (Vec::new(), ticks as f64 * self.dt),
                 PlannedMotion::Still => (Vec::new(), 0.0),
             };
-        self.planner.cancel();
+        self.planner.cancel(false);
         self.note_effects(head);
         let moved = !trajectory.is_empty();
         let mut result = self.advance(trajectory, duration_s);
@@ -1507,6 +1605,23 @@ impl Preview {
             // The seek's own ticks belong to the physical arm; the record
             // shows where it lands.
             (result.start_row, result.rows) = self.mark();
+            // Then the return the runtime plans once the references are
+            // established: the command ends at the home pose, held, as
+            // it does on the already-referenced fast path.
+            let park = Command::Home(par6_proto::command::Home {
+                key: 0,
+                calibrate: false,
+            });
+            let batch = [QueuedCommand {
+                index: self.next_index,
+                cmd: &park,
+            }];
+            if self.planner.start(&batch).is_ok() {
+                let tail = self.collect_plan(&park);
+                result.rows += tail.rows;
+                result.duration_s += tail.duration_s;
+                result.end_joints_rad = tail.end_joints_rad;
+            }
         }
         if !moved {
             result = PreviewResult {
@@ -1519,20 +1634,33 @@ impl Preview {
         result
     }
 
-    /// One tool action through the planner's tool lane — the same
-    /// admission the live daemon runs, so an unsupported verb, a missing
-    /// driver or an uncalibrated jaw move previews as the refusal the
-    /// arm would answer with. The arm holds still for as long as the
-    /// runtime waits on the jaws: a calibration's minimum wait, or a
-    /// move's travel at the firmware's constant byte rate, never less
-    /// than the grace the runtime gives a reply — with the jaws drawn on
-    /// their way.
+    /// One tool action through the planner — the same admission the live
+    /// daemon runs, a `stop` on the lane that runs ahead of the queue, so
+    /// an unsupported verb, a missing driver or an uncalibrated jaw move
+    /// previews as the refusal the arm would answer with. The arm holds
+    /// still for as long as the runtime waits on the jaws: a
+    /// calibration's minimum wait, or a move's travel at the firmware's
+    /// constant byte rate, never less than the grace the runtime gives a
+    /// reply — with the jaws drawn on their way.
     fn preview_tool_action(&mut self, action: &par6_proto::command::ToolAction) -> PreviewResult {
         self.publish();
-        if let Err(error) = self.planner.start_tool(self.next_index, action) {
+        let admitted = if action.action == "stop" {
+            self.planner
+                .start_tool(self.next_index, action)
+                .map(|()| self.planner.cancel_tool())
+        } else {
+            let cmd = Command::ToolAction(action.clone());
+            let batch = [QueuedCommand {
+                index: self.next_index,
+                cmd: &cmd,
+            }];
+            self.planner
+                .start(&batch)
+                .map(|_| self.planner.cancel(false))
+        };
+        if let Err(error) = admitted {
             return self.refuse(error);
         }
-        self.planner.cancel_tool(false);
         let from = self.tool_position;
         self.note_effects(&Command::ToolAction(action.clone()));
         let to = self.tool_position;
@@ -1592,6 +1720,9 @@ impl Preview {
             return;
         }
         match head {
+            // Validated at admission (`validate_supported`); at its turn
+            // the line changes, as the runtime's post-effect drives it.
+            Command::WriteIo(p) => self.io_levels[usize::from(p.port)] = p.value,
             Command::SelectTool(p) => {
                 // A variant carries its own TCP frame: a real change clears
                 // the offset, a re-selection leaves it alone.

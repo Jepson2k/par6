@@ -207,6 +207,16 @@ pub enum RotationPitch {
 }
 
 impl CartSampling {
+    /// Metres a radian of rotation counts as when translation and
+    /// rotation share one sample schedule: under the independent pitch,
+    /// one rotation pitch per translation pitch.
+    fn rotation_weight(&self) -> f64 {
+        match self.rotation {
+            RotationPitch::Independent(step_rad) => self.step_m / step_rad,
+            RotationPitch::Weighted(w) => w,
+        }
+    }
+
     /// Intervals a piece of `len_m` translation and `angle_rad` rotation
     /// wants, at least one.
     fn intervals(&self, len_m: f64, angle_rad: f64) -> usize {
@@ -273,6 +283,11 @@ impl LineSegment {
     /// Pose at normalized position `t` in \[0, 1\].
     pub fn sample(&self, t: f64) -> Pose {
         pose_of(self.q0.slerp(self.q1, t), self.p0.lerp(self.p1, t))
+    }
+
+    /// Unit direction of travel, the same everywhere on a line.
+    pub fn direction(&self) -> DVec3 {
+        (self.p1 - self.p0).normalize_or_zero()
     }
 }
 
@@ -387,39 +402,125 @@ pub fn arc(
     end: &Pose,
     s: CartSampling,
 ) -> Result<Vec<Pose>, MotionError> {
-    let (p_start, p_via, p_end) = (position(start), position(via), position(end));
-    let circle = circle_through(p_start, p_via, p_end)?;
-    let r1 = p_start - circle.center;
-    let r2 = p_end - circle.center;
-    let (n1, n2) = (r1.length(), r2.length());
-    if n1 < LEN_EPS || n2 < LEN_EPS {
-        return Err(MotionError::InvalidInput {
-            what: "via",
-            reason: "the arc has no radius".into(),
-        });
-    }
-    let (u1, u2) = (r1 / n1, r2 / n2);
-    let mut sweep = u1.dot(u2).clamp(-1.0, 1.0).acos();
-    if circle.full_circle {
-        sweep = std::f64::consts::TAU;
-    } else if u1.cross(u2).dot(circle.normal) < 0.0 {
-        sweep = std::f64::consts::TAU - sweep;
+    let seg = ArcSegment::new(start, via, end)?;
+    let n = s
+        .intervals(seg.length_m(), seg.angle_rad())
+        .min(s.max_points.saturating_sub(1).max(1));
+    Ok((0..=n).map(|k| seg.sample(k as f64 / n as f64)).collect())
+}
+
+/// A circular arc as a segment: position sweeps the circle through the
+/// via point from `start` to `end`, orientation slerps between the two.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArcSegment {
+    circle: Circle,
+    /// The start point, relative to the centre.
+    r1: DVec3,
+    /// Sweep about the plane normal \[rad\], always in the positive
+    /// sense; a whole lap for a full circle.
+    sweep: f64,
+    q0: DQuat,
+    q1: DQuat,
+}
+
+impl ArcSegment {
+    /// The arc through `via` from `start` to `end`; see [`circle_through`]
+    /// for the circle it lies on and what is refused.
+    pub fn new(start: &Pose, via: &Pose, end: &Pose) -> Result<Self, MotionError> {
+        let (p_start, p_via, p_end) = (position(start), position(via), position(end));
+        let circle = circle_through(p_start, p_via, p_end)?;
+        let r1 = p_start - circle.center;
+        let r2 = p_end - circle.center;
+        let (n1, n2) = (r1.length(), r2.length());
+        if n1 < LEN_EPS || n2 < LEN_EPS {
+            return Err(MotionError::InvalidInput {
+                what: "via",
+                reason: "the arc has no radius".into(),
+            });
+        }
+        let (u1, u2) = (r1 / n1, r2 / n2);
+        let mut sweep = u1.dot(u2).clamp(-1.0, 1.0).acos();
+        if circle.full_circle {
+            sweep = std::f64::consts::TAU;
+        } else if u1.cross(u2).dot(circle.normal) < 0.0 {
+            sweep = std::f64::consts::TAU - sweep;
+        }
+        Ok(Self {
+            circle,
+            r1,
+            sweep,
+            q0: rotation(start),
+            q1: rotation(end),
+        })
     }
 
-    let (q0, q1) = (rotation(start), rotation(end));
-    let arc_len = circle.radius * sweep;
-    let n = s
-        .intervals(arc_len, q0.angle_between(q1))
-        .min(s.max_points.saturating_sub(1).max(1));
-    Ok((0..=n)
-        .map(|k| {
-            let t = k as f64 / n as f64;
-            pose_of(
-                q0.slerp(q1, t),
-                circle.center + DQuat::from_axis_angle(circle.normal, t * sweep) * r1,
-            )
-        })
-        .collect())
+    /// Arc length \[m\].
+    pub fn length_m(&self) -> f64 {
+        self.circle.radius * self.sweep
+    }
+
+    /// Rotation angle between the endpoint orientations \[rad\].
+    pub fn angle_rad(&self) -> f64 {
+        self.q0.angle_between(self.q1)
+    }
+
+    /// Pose at normalized arc length `t` in \[0, 1\].
+    pub fn sample(&self, t: f64) -> Pose {
+        pose_of(
+            self.q0.slerp(self.q1, t),
+            self.circle.center
+                + DQuat::from_axis_angle(self.circle.normal, t * self.sweep) * self.r1,
+        )
+    }
+
+    /// Unit direction of travel at normalized arc length `t`.
+    pub fn tangent(&self, t: f64) -> DVec3 {
+        let r = DQuat::from_axis_angle(self.circle.normal, t * self.sweep) * self.r1;
+        self.circle.normal.cross(r).normalize_or_zero()
+    }
+}
+
+/// One piece of a cartesian path, straight or circular.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CartSegment {
+    /// A straight run.
+    Line(LineSegment),
+    /// A circular arc.
+    Arc(ArcSegment),
+}
+
+impl CartSegment {
+    /// Translation length \[m\].
+    pub fn length_m(&self) -> f64 {
+        match self {
+            Self::Line(l) => l.length_m(),
+            Self::Arc(a) => a.length_m(),
+        }
+    }
+
+    /// Rotation angle between the endpoint orientations \[rad\].
+    pub fn angle_rad(&self) -> f64 {
+        match self {
+            Self::Line(l) => l.angle_rad(),
+            Self::Arc(a) => a.angle_rad(),
+        }
+    }
+
+    /// Pose at normalized length `t` in \[0, 1\].
+    pub fn sample(&self, t: f64) -> Pose {
+        match self {
+            Self::Line(l) => l.sample(t),
+            Self::Arc(a) => a.sample(t),
+        }
+    }
+
+    /// Unit direction of travel at normalized length `t`.
+    pub fn tangent(&self, t: f64) -> DVec3 {
+        match self {
+            Self::Line(l) => l.direction(),
+            Self::Arc(a) => a.tangent(t),
+        }
+    }
 }
 
 // ----------------------------------------------------------------- spline
@@ -428,7 +529,10 @@ pub fn arc(
 /// start pose, and every one of them is passed through).
 ///
 /// Position is a natural cubic spline per axis over chord-length knots;
-/// orientation is a piecewise slerp on the same knots.
+/// orientation is a piecewise slerp between the waypoints. The samples
+/// are spread over the path metric, translation and rotation together:
+/// a waypoint that only turns the tool has no chord, and spread by chord
+/// alone the whole turn would land between two samples.
 ///
 /// Two deliberate divergences from parol6's spline
 /// (`motion/geometry.py`, `SplineMotion.generate_spline`), which builds
@@ -468,11 +572,18 @@ pub fn spline(waypoints: &[Pose], s: CartSampling) -> Result<Vec<Pose>, MotionEr
         let d = (points[i] - points[i - 1]).length().max(LEN_EPS);
         knots.push(knots[i - 1] + d);
     }
-    let total = knots[n - 1];
+    let w = s.rotation_weight();
+    let measure: Vec<f64> = (1..n)
+        .map(|i| {
+            let len = (points[i] - points[i - 1]).length();
+            len.hypot(w * quats[i - 1].angle_between(quats[i]))
+        })
+        .collect();
+    let total: f64 = measure.iter().sum();
     if total < LEN_EPS {
         return Err(MotionError::InvalidInput {
             what: "waypoints",
-            reason: "every spline waypoint is the same point".into(),
+            reason: "every spline waypoint is the same pose".into(),
         });
     }
 
@@ -484,21 +595,28 @@ pub fn spline(waypoints: &[Pose], s: CartSampling) -> Result<Vec<Pose>, MotionEr
         })
         .collect();
 
-    // Sample density from the polyline length and the total rotation:
-    // the spline is longer than its polyline, never shorter, so this is
-    // a floor on the density, and the budget bounds the ceiling.
-    let turn: f64 = (1..n).map(|i| quats[i - 1].angle_between(quats[i])).sum();
-    let steps = s.intervals(total, turn).min(s.max_points.max(2) - 1);
+    // The metric runs along the polyline, and the spline is longer than
+    // its polyline, never shorter, so this is a floor on the density; the
+    // budget bounds the ceiling.
+    let steps = ((total / s.step_m).ceil() as usize)
+        .max(1)
+        .min(s.max_points.max(2) - 1);
 
     let mut out = Vec::with_capacity(steps + 1);
-    let mut seg = 0usize;
+    let (mut seg, mut seg_start) = (0usize, 0.0);
     for k in 0..=steps {
-        let u = total * k as f64 / steps as f64;
-        while seg + 2 < n && u > knots[seg + 1] {
+        let at = total * k as f64 / steps as f64;
+        while seg + 2 < n && at > seg_start + measure[seg] {
+            seg_start += measure[seg];
             seg += 1;
         }
-        let (h, local) = (knots[seg + 1] - knots[seg], u - knots[seg]);
-        let t = (local / h).clamp(0.0, 1.0);
+        let t = if measure[seg] > 0.0 {
+            ((at - seg_start) / measure[seg]).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let h = knots[seg + 1] - knots[seg];
+        let local = t * h;
         let mut p = DVec3::ZERO;
         for (axis, c) in coeffs.iter().enumerate() {
             let (y, m) = (&c[0], &c[1]);
@@ -613,55 +731,77 @@ pub fn corner_trims(
 }
 
 /// Waypoints along a polyline whose interior corners are rounded by
-/// quadratic Bézier zones of the given radii \[m\].
-///
-/// `waypoints[0]` is the start pose; `radii` has one entry per interior
-/// waypoint, and `0` there means "stop at this corner" (the path still
-/// passes exactly through it). Each rounded corner is tangent to the
-/// incoming segment where the zone starts and to the outgoing one where
-/// it ends, so position is C1 across the corner: the arm never has to
-/// come to rest to change direction.
+/// Bézier zones of the given radii \[m\] — [`blended_path`] over
+/// straight segments.
 pub fn blended_polyline(
     waypoints: &[Pose],
     radii: &[f64],
     s: CartSampling,
 ) -> Result<Vec<Pose>, MotionError> {
-    let n = waypoints.len();
-    if n < 2 {
+    if waypoints.len() < 2 {
         return Err(MotionError::InvalidInput {
             what: "waypoints",
-            reason: format!("a path needs at least 2 waypoints, got {n}"),
+            reason: format!("a path needs at least 2 waypoints, got {}", waypoints.len()),
         });
     }
-    if n == 2 {
-        return Ok(line(&waypoints[0], &waypoints[1], s));
-    }
-    let segments: Vec<LineSegment> = (0..n - 1)
-        .map(|i| LineSegment::new(&waypoints[i], &waypoints[i + 1]))
+    let segments: Vec<CartSegment> = waypoints
+        .windows(2)
+        .map(|w| CartSegment::Line(LineSegment::new(&w[0], &w[1])))
         .collect();
-    let lengths: Vec<f64> = segments.iter().map(LineSegment::length_m).collect();
+    blended_path(&segments, radii, s)
+}
+
+/// Waypoints along a chain of segments whose junctions are rounded by
+/// zones of the given radii \[m\].
+///
+/// `radii` has one entry per junction (`segments.len() - 1`), and `0`
+/// there means "stop at this junction" (the path still passes exactly
+/// through it). A zone trims each adjoining segment by the radius,
+/// measured along the segment — arc length on an arc — and joins the
+/// two trim points with a cubic Bézier whose handles lie along the
+/// segments' directions of travel there, two thirds of the trim long.
+/// The zone is therefore tangent to the incoming segment where it
+/// starts and to the outgoing one where it ends, so position is C1
+/// across the corner: the arm never has to come to rest to change
+/// direction. Between two lines the cubic is exactly the degree-raised
+/// quadratic through the corner point; an arc's zone follows its
+/// curvature into and out of the corner.
+pub fn blended_path(
+    segments: &[CartSegment],
+    radii: &[f64],
+    s: CartSampling,
+) -> Result<Vec<Pose>, MotionError> {
+    let n = segments.len();
+    if n == 0 {
+        return Err(MotionError::InvalidInput {
+            what: "segments",
+            reason: "a path needs at least one segment".into(),
+        });
+    }
+    let lengths: Vec<f64> = segments.iter().map(CartSegment::length_m).collect();
     let (trims, clamped) = corner_trims(&lengths, radii)?;
 
     // Two passes: size every piece first so the density budget is spread
     // over the whole path, then emit.
     enum Piece {
-        /// Straight run of segment `i` from `a` to `b` in its own
-        /// normalized coordinate.
-        Line { i: usize, a: f64, b: f64 },
-        /// Bézier corner rounding waypoint `i + 1`.
+        /// Run of segment `i` from `a` to `b` in its own normalized
+        /// coordinate.
+        Run { i: usize, a: f64, b: f64 },
+        /// Bézier corner rounding the junction after segment `i`.
         Corner { i: usize },
     }
     let mut pieces = Vec::with_capacity(2 * n);
     let mut counts = Vec::with_capacity(2 * n);
-    for i in 0..n - 1 {
+    for i in 0..n {
         let (a, b) = (trims[i].entry, 1.0 - trims[i].exit);
         if b > a + 1e-12 {
             let seg = &segments[i];
             counts.push(s.intervals((b - a) * lengths[i], (b - a) * seg.angle_rad()));
-            pieces.push(Piece::Line { i, a, b });
+            pieces.push(Piece::Run { i, a, b });
         }
-        if i + 1 < n - 1 && clamped[i] > 0.0 {
-            // The corner's control polygon is 2r long; its arc is shorter.
+        if i + 1 < n && clamped[i] > 0.0 {
+            // The corner's control polygon is about 2r long; its arc is
+            // shorter.
             let entry = segments[i].sample(1.0 - trims[i].exit);
             let exit = segments[i + 1].sample(trims[i + 1].entry);
             counts.push(s.intervals(
@@ -682,7 +822,7 @@ pub fn blended_polyline(
     let mut out: Vec<Pose> = Vec::with_capacity(counts.iter().sum::<usize>() + 1);
     for (piece, steps) in pieces.iter().zip(counts.iter()) {
         match piece {
-            Piece::Line { i, a, b } => {
+            Piece::Run { i, a, b } => {
                 let seg = &segments[*i];
                 for k in 0..=*steps {
                     let t = a + (b - a) * k as f64 / *steps as f64;
@@ -690,15 +830,21 @@ pub fn blended_polyline(
                 }
             }
             Piece::Corner { i } => {
-                let entry = segments[*i].sample(1.0 - trims[*i].exit);
-                let exit = segments[*i + 1].sample(trims[*i + 1].entry);
-                let corner = position(&waypoints[*i + 1]);
+                let (t_in, t_out) = (1.0 - trims[*i].exit, trims[*i + 1].entry);
+                let entry = segments[*i].sample(t_in);
+                let exit = segments[*i + 1].sample(t_out);
                 let (pe, px) = (position(&entry), position(&exit));
                 let (qe, qx) = (rotation(&entry), rotation(&exit));
+                let handle = 2.0 / 3.0 * clamped[*i];
+                let p1 = pe + segments[*i].tangent(t_in) * handle;
+                let p2 = px - segments[*i + 1].tangent(t_out) * handle;
                 for k in 0..=*steps {
                     let t = k as f64 / *steps as f64;
                     let omt = 1.0 - t;
-                    let p = pe * (omt * omt) + corner * (2.0 * omt * t) + px * (t * t);
+                    let p = pe * (omt * omt * omt)
+                        + p1 * (3.0 * omt * omt * t)
+                        + p2 * (3.0 * omt * t * t)
+                        + px * (t * t * t);
                     push_distinct(&mut out, pose_of(qe.slerp(qx, t), p));
                 }
             }
@@ -1070,6 +1216,68 @@ mod tests {
         }
     }
 
+    /// A waypoint that only turns the tool in place is a segment like any
+    /// other. The turn is spread over samples at the path's pitch — on the
+    /// weighted metric, `step / w` radians a sample — and is made AT the
+    /// pivot: the tool stands there while it turns. Priced by its chord
+    /// alone, the turn costs nothing and lands between two samples, and
+    /// the IK has to swing the wrist through all of it in one step.
+    #[test]
+    fn a_spline_waypoint_that_only_turns_is_sampled_through_the_turn_at_the_pivot() {
+        let w = 0.15;
+        let s = CartSampling {
+            step_m: 0.002,
+            rotation: RotationPitch::Weighted(w),
+            max_points: 4000,
+        };
+        let turn = std::f64::consts::FRAC_PI_2;
+        let wps = [
+            pose(0.00, 0.35, 0.25, 0.0, 0.0, 0.0),
+            pose(0.05, 0.35, 0.25, 0.0, 0.0, 0.0),
+            pose(0.05, 0.35, 0.25, 0.0, 0.0, turn),
+            pose(0.10, 0.35, 0.25, 0.0, 0.0, turn),
+        ];
+        let path = spline(&wps, s).expect("spline");
+
+        let pitch = s.step_m / w;
+        let worst = path
+            .windows(2)
+            .map(|p| rotation(&p[0]).angle_between(rotation(&p[1])))
+            .fold(0.0f64, f64::max);
+        assert!(
+            worst <= pitch * (1.0 + 1e-6),
+            "one sample turns the tool {worst} rad; the pitch allows {pitch}"
+        );
+
+        let pivot = position(&wps[1]);
+        let (before, after) = (rotation(&wps[1]), rotation(&wps[2]));
+        let turning: Vec<&Pose> = path
+            .iter()
+            .filter(|m| {
+                let q = rotation(m);
+                q.angle_between(before) > 1e-6 && q.angle_between(after) > 1e-6
+            })
+            .collect();
+        assert!(
+            !turning.is_empty(),
+            "no sample is part-way through the turn"
+        );
+        let strayed = turning
+            .iter()
+            .map(|m| position(m).distance(pivot))
+            .fold(0.0f64, f64::max);
+        assert!(
+            strayed < 1e-4,
+            "the tool left the pivot by {strayed} m while it turned"
+        );
+        assert!(
+            path.iter().any(|m| {
+                position(m).distance(pivot) < 1e-4 && rotation(m).angle_between(after) <= pitch
+            }),
+            "no sample stands at the pivot with the turn complete"
+        );
+    }
+
     #[test]
     fn blend_rounds_the_corner_inside_its_radius_and_zero_radius_keeps_it_sharp() {
         let corner = DVec3::new(0.1, 0.35, 0.25);
@@ -1330,5 +1538,52 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max);
         assert!(worst < 1e-12, "screw misses its endpoint by {worst}");
+    }
+
+    /// Between two straight segments the cubic corner is the quadratic
+    /// through the corner point, degree-raised: a chain of `move_l`s
+    /// rounds on the quadratic through the corner point.
+    #[test]
+    fn a_line_line_corner_is_the_quadratic_bezier_through_the_corner() {
+        let a = pose(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let corner = pose(0.1, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let b = pose(0.1, 0.1, 0.0, 0.0, 0.0, 0.0);
+        let s = CartSampling {
+            step_m: 0.002,
+            rotation: RotationPitch::Weighted(0.15),
+            max_points: 4096,
+        };
+        let r = 0.02;
+        let path = blended_polyline(&[a, corner, b], &[r], s).expect("a rounded corner");
+        let (pc, pa, pb) = (position(&corner), position(&a), position(&b));
+        let entry = pc + (pa - pc).normalize() * r;
+        let exit = pc + (pb - pc).normalize() * r;
+        // Every sample inside the zone lies on the quadratic Bézier
+        // (entry, corner, exit): the closest point of that curve is within
+        // sampling noise of it.
+        let mut in_zone = 0;
+        for pose in &path {
+            let p = position(pose);
+            if (p - pc).length() > r {
+                continue;
+            }
+            in_zone += 1;
+            let miss = (0..=2000)
+                .map(|k| {
+                    let t = k as f64 / 2000.0;
+                    let omt = 1.0 - t;
+                    let q = entry * (omt * omt) + pc * (2.0 * omt * t) + exit * (t * t);
+                    (q - p).length()
+                })
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                miss < 1e-6,
+                "a zone sample left the quadratic by {miss:e} m"
+            );
+        }
+        assert!(
+            in_zone > 10,
+            "expected a sampled zone, got {in_zone} samples"
+        );
     }
 }

@@ -70,7 +70,12 @@ pub fn gate(cmd: CmdType) -> Gate {
         // here. Written out rather than left to the `_` arm so the choice
         // is visible instead of accidental.
         C::Pause | C::SetExecutionSpeed => {}
-        C::Teleport => g.needs_simulator = true,
+        // A teleport moves the arm, so it is gated the way arm motion is,
+        // acked like the system command it is.
+        C::Teleport => {
+            g.needs_simulator = true;
+            g.needs_enabled = true;
+        }
         // SetPayload is deliberately ungated beyond the SYSTEM default:
         // a payload change while motion runs is legal (the model updates
         // mid-move, exactly like a TCP-offset change), and clearing a

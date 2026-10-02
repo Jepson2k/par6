@@ -962,6 +962,11 @@ pub(crate) struct CartServoState {
     seed: [f64; NQ],
     /// The stream is braking because IK stopped solving.
     ik_stopping: bool,
+    /// The stream is braking because the client went silent.
+    releasing: bool,
+    /// The target the running brake gave up on: while braking, the
+    /// limiter is re-aimed only at a target that differs from it.
+    brake_target: Option<Pose>,
     /// The fractions the client asked for, before any ratio slowdown.
     speed: f64,
     accel: f64,
@@ -1022,6 +1027,10 @@ struct ActiveStream {
     /// The tick `still` last counted, so housekeeping running faster than
     /// the RT publishes cannot count one frame eight times.
     still_tick: u64,
+    /// The RT tick a cartesian stream's limiter was last stepped up to,
+    /// so a pass steps it once per tick the RT has taken — not once per
+    /// sleep, which straddles two ticks or none as the scheduler pleases.
+    stepped_tick: u64,
     /// The stream's `(speed, accel)` fractions, carried so housekeeping's
     /// keep-alive refeeds the setpoint the client asked for rather than
     /// silently restoring full-speed limits between datagrams.
@@ -1127,17 +1136,21 @@ impl CartServoState {
             q_commanded: *q,
             seed: *q,
             ik_stopping: false,
+            releasing: false,
+            brake_target: None,
             speed,
             accel,
         })
     }
 
     /// Point the stream at a new pose, keeping the limiter's state so
-    /// the retarget re-plans from the motion already underway.
+    /// the retarget re-plans from the motion already underway — which is
+    /// also what ends a silence brake: the client is back.
     pub(crate) fn retarget(&mut self, target: Pose, speed: f64, accel: f64) {
         self.target = target;
         self.speed = speed;
         self.accel = accel;
+        self.releasing = false;
     }
 
     /// The joint target last commanded.
@@ -1148,6 +1161,8 @@ impl CartServoState {
     /// Brake the tool to rest along its own line.
     pub(crate) fn release(&mut self) {
         self.exec.release();
+        self.releasing = true;
+        self.brake_target = Some(self.target);
     }
 }
 
@@ -1298,6 +1313,10 @@ pub(crate) struct SharedState {
     flashing: Option<FlashingRequest>,
     /// Resolved FLASHING outcome, waiting to be collected by the server.
     flashing_outcome: Option<Result<(), WireError>>,
+    /// Resolved backend-swap outcome (`simulator` / `connect_hardware`),
+    /// waiting to be collected by the server: the install runs on the RT
+    /// thread, and the reply waits for it.
+    bus_outcome: Option<Result<(), WireError>>,
 }
 
 /// The bridge's kinematics kit (feature `ffi`): its own model instance,
@@ -1319,12 +1338,24 @@ pub(crate) struct RtBridge {
     /// Bound for the EXEC flushes `halt` queues (see [`RtBridge::halt`]).
     flush: FlushMarker,
     bundle: Arc<ConfigBundle>,
+    /// The backend the RT runs on, as of the last swap it confirmed.
     sim: bool,
+    /// The CAN interface hardware runs on: the configured one until a
+    /// `connect_hardware` the RT confirmed names another, which
+    /// `simulator(false)` then returns to.
+    hardware_interface: String,
     /// The scene a simulator swap boots on.
     scene: Scene,
     /// Where the running simulator takes world layers from; `None` on
     /// hardware.
     sim_world: Option<WorldMailbox>,
+    /// A swap handed to the RT and not yet answered. What it would make
+    /// true is applied only once the RT reports it installed, so a swap
+    /// the RT refuses leaves this side describing the bus that still runs.
+    pending_swap: Option<PendingSwap>,
+    /// The accepted world, installation then program layer: what the
+    /// simulator is given, and given again when a swap boots a new one.
+    world_layers: [Vec<par6_proto::Shape>; 2],
     cart: CartStream,
 }
 
@@ -1341,6 +1372,7 @@ impl RtBridge {
         sim_world: Option<WorldMailbox>,
         cart: CartStream,
     ) -> Self {
+        let hardware_interface = bundle.robot.bus.interface.clone();
         Self {
             link,
             stream_input,
@@ -1348,10 +1380,38 @@ impl RtBridge {
             flush,
             bundle,
             sim,
+            hardware_interface,
             scene,
             sim_world,
+            pending_swap: None,
+            world_layers: [Vec::new(), Vec::new()],
             cart,
         }
+    }
+
+    /// A cartesian stream's limiter runs in housekeeping; the RT tracker
+    /// under it only clamps, so releasing the RT side would stop the tool
+    /// dead. A stop hands the limiter the brake instead, as a stream that
+    /// outlives its deadline does, and housekeeping ends the session with
+    /// the hold once the tool is at rest on its line. Returns whether a
+    /// cartesian stream took the stop; a standoff placement keeps its own
+    /// brake and is ended like any other stream.
+    fn brake_cart_stream(&mut self) -> bool {
+        let accel_time_s = self.bundle.robot.jog.accel_time_s;
+        let mut sh = self.shared.lock().unwrap();
+        let Some(a) = sh.stream.as_mut().filter(|a| a.standoff.is_none()) else {
+            return false;
+        };
+        match (a.kind, &mut a.cart, &mut a.servo) {
+            (StreamKind::CartJog, Some(st), _) => st.release(),
+            (StreamKind::CartServo, _, Some(st)) => st.release(),
+            _ => return false,
+        }
+        if !a.releasing {
+            a.releasing = true;
+            a.deadline = Instant::now() + ramp_cap(accel_time_s, a.scale.1);
+        }
+        true
     }
 
     /// Client silence after which a servo stream ends itself; housekeeping
@@ -1368,8 +1428,22 @@ impl RtBridge {
         self.link.send(RtCommand::SetMode(target));
     }
 
-    fn stop_stream_commands(&self) {
+    /// End the session by braking it: both releases ramp to rest, and the
+    /// core then holds the rest pose on its own. Nothing here cuts to
+    /// IDLE — landing a moment after the release, that would stop the arm
+    /// dead from speed and then hand it to the gravity float. A session
+    /// housekeeping owns (a standoff placement) has no stream record on
+    /// the server either, and the release is what keeps the RT watchdog
+    /// from latching RTI_LINK_LOST once nothing feeds STREAM.
+    fn release_stream_commands(&self) {
         self.link.send(RtCommand::JogRelease);
+        self.link.send(RtCommand::StreamRelease);
+    }
+
+    /// End the session and drop the mode to IDLE at once — for a teleport,
+    /// which re-seeds the whole arm and must not have a stream running
+    /// under it.
+    fn stop_stream_commands(&self) {
         // Say the stream is over before asking for the mode. The RT
         // latches RTI_LINK_LOST when STREAM goes quiet without a
         // release, and it drains one command per tick, so between this
@@ -1377,7 +1451,7 @@ impl RtBridge {
         // window the watchdog can expire in — which drops the arm on a
         // stream the daemon itself stopped. `StreamRelease` sets the
         // exemption on the tick it lands.
-        self.link.send(RtCommand::StreamRelease);
+        self.release_stream_commands();
         self.link.send(RtCommand::SetMode(Mode::Idle));
     }
 }
@@ -1458,6 +1532,7 @@ impl RtCommands for RtBridge {
                     parked: false,
                     still: 0,
                     still_tick: 0,
+                    stepped_tick: 0,
                     // JOG runs on the RT jog engine, not the streaming
                     // executor; its accel rides `RtCommand::Jog`. Kept
                     // here so a change of accel alone still resends.
@@ -1601,6 +1676,7 @@ impl RtCommands for RtBridge {
                         parked: false,
                         still: 0,
                         still_tick: 0,
+                        stepped_tick: 0,
                         scale,
                     });
                     // Reported, not swallowed. A command the server
@@ -1638,6 +1714,7 @@ impl RtCommands for RtBridge {
                     parked: false,
                     still: 0,
                     still_tick: 0,
+                    stepped_tick: 0,
                     scale,
                 });
             }
@@ -1657,11 +1734,16 @@ impl RtCommands for RtBridge {
                 // needs the pose the arm is at right now.
                 let q = self.cart.snapshots.latest().q;
                 let mut sh = self.shared.lock().unwrap();
+                // A stream braking on silence resumes in place too: the
+                // limiter still carries the velocity the brake is shedding,
+                // and a rebuilt one would restart the tool from rest while
+                // the arm is still moving.
                 if let Some(a) = &mut sh.stream {
-                    if a.kind == StreamKind::CartServo && !a.releasing {
+                    if a.kind == StreamKind::CartServo {
                         if let Some(st) = &mut a.servo {
                             st.retarget(target, speed, accel);
                         }
+                        a.releasing = false;
                         a.deadline = deadline;
                         a.scale = (speed, accel);
                         return Ok(());
@@ -1670,10 +1752,7 @@ impl RtCommands for RtBridge {
                 drop(sh);
                 let at = match self.cart.kin.fk(&q) {
                     Ok(p) => p,
-                    Err(e) => {
-                        log::warn!("SERVO_L: FK failed ({e}); dropped");
-                        return Ok(());
-                    }
+                    Err(e) => return Err(servo_refused("SERVO_L", &format!("FK failed ({e})"))),
                 };
                 let state = match CartServoState::new(
                     self.bundle.robot.robot.tick_dt_s,
@@ -1685,10 +1764,7 @@ impl RtCommands for RtBridge {
                     accel,
                 ) {
                     Ok(st) => st,
-                    Err(e) => {
-                        log::warn!("SERVO_L: {e}; dropped");
-                        return Ok(());
-                    }
+                    Err(e) => return Err(servo_refused("SERVO_L", &e)),
                 };
                 let mut sh = self.shared.lock().unwrap();
                 self.enter_stream_mode(Mode::Stream);
@@ -1708,6 +1784,7 @@ impl RtCommands for RtBridge {
                     parked: false,
                     still: 0,
                     still_tick: 0,
+                    stepped_tick: 0,
                     scale: (speed, accel),
                 });
             }
@@ -1724,20 +1801,33 @@ impl RtCommands for RtBridge {
                     _ => self.cart.snapshots.latest().q,
                 };
                 let target_pose = crate::kin::wire_pose_to_matrix(pose);
-                let mut target = match self.cart.kin.ik(&seed, &target_pose) {
-                    crate::kin::IkResult::Solved(q) => q,
+                // A target nothing can reach is REFUSED, never dropped as if
+                // accepted: an accepted datagram wipes the standing error and
+                // collision verdict. One outside the soft window is
+                // unreachable too, as parol6's solver has it; clamping would
+                // move the arm somewhere else.
+                let target = match self.cart.kin.ik(&seed, &target_pose) {
+                    crate::kin::IkResult::Solved(q)
+                        if within(&q, &self.cart.soft_min, &self.cart.soft_max) =>
+                    {
+                        q
+                    }
+                    crate::kin::IkResult::Solved(_) => {
+                        return Err(servo_refused(
+                            "SERVO_J_POSE",
+                            "the target is past a joint's soft limit",
+                        ));
+                    }
                     crate::kin::IkResult::Unreachable => {
-                        log::warn!("{:?}: target pose unreachable; dropped", cmd.tag());
-                        return Ok(());
+                        return Err(servo_refused(
+                            "SERVO_J_POSE",
+                            "no solution reaches the target",
+                        ));
                     }
                     crate::kin::IkResult::Failed(e) => {
-                        log::warn!("{:?}: IK failed ({e}); dropped", cmd.tag());
-                        return Ok(());
+                        return Err(servo_refused("SERVO_J_POSE", &format!("IK failed ({e})")));
                     }
                 };
-                for (j, v) in target.iter_mut().enumerate() {
-                    *v = v.clamp(self.cart.soft_min[j], self.cart.soft_max[j]);
-                }
                 return self.stream(&Command::ServoJ(par6_proto::command::ServoJ {
                     angles: std::array::from_fn(|j| target[j].to_degrees()),
                     speed: *speed,
@@ -1757,6 +1847,7 @@ impl RtCommands for RtBridge {
                         parked: false,
                         still: 0,
                         still_tick: 0,
+                        stepped_tick: 0,
                         ..
                     }) => state.commanded(),
                     _ => self.cart.snapshots.latest().q,
@@ -1798,11 +1889,16 @@ impl RtCommands for RtBridge {
                 // A jog already running keeps its limiter: the ramp it
                 // is on is the state that makes the next twist smooth,
                 // and rebuilding it would restart from rest.
+                // Also while the ramp from an elapsed duration is running
+                // down: a rebuilt limiter would restart the tool from rest
+                // while the arm is still moving, where parol6 resumes from
+                // the velocity it still carries.
                 if let Some(a) = &mut sh.stream {
-                    if a.kind == StreamKind::CartJog && !a.releasing {
+                    if a.kind == StreamKind::CartJog {
                         if let Some(state) = &mut a.cart {
                             state.retwist(twist, p.frame);
                         }
+                        a.releasing = false;
                         a.deadline = jog_deadline(p.duration);
                         a.scale = (1.0, p.accel.unwrap_or(1.0));
                         return Ok(());
@@ -1846,6 +1942,7 @@ impl RtCommands for RtBridge {
                     parked: false,
                     still: 0,
                     still_tick: 0,
+                    stepped_tick: 0,
                     cart: Some(state),
                     servo: None,
                     // A cartesian jog is integrated into joint targets and
@@ -1860,8 +1957,11 @@ impl RtCommands for RtBridge {
     }
 
     fn cancel_stream(&mut self) {
+        if self.brake_cart_stream() {
+            return;
+        }
         self.shared.lock().unwrap().stream = None;
-        self.stop_stream_commands();
+        self.release_stream_commands();
     }
 
     fn stop_refused_stream(&mut self) -> bool {
@@ -1882,24 +1982,18 @@ impl RtCommands for RtBridge {
     }
 
     fn discard_exec(&mut self) {
-        // Marked before it is queued, for the reason `halt` gives: the
-        // mark is pinned to what is in the ring now, so a move accepted
-        // behind this keeps its own fill.
+        // Marked before it is queued, so the flush is pinned to the samples
+        // in the ring right now: a move accepted while this is still
+        // working its way through the RT command queue keeps its own fill.
         self.flush.mark();
-        self.link.send(RtCommand::ExecFlush);
-        self.link.send(RtCommand::SetMode(Mode::Idle));
+        self.link.send(RtCommand::ExecStop);
     }
 
+    /// The stop brakes along the path and then holds; the server starts
+    /// nothing new until it has.
     fn halt(&mut self) {
-        self.shared.lock().unwrap().stream = None;
-        self.link.send(RtCommand::JogRelease);
-        // Marked before it is queued, so the flush is pinned to the
-        // samples in the ring right now: a move accepted while this
-        // stop is still working its way through the RT command queue
-        // keeps its own fill.
-        self.flush.mark();
-        self.link.send(RtCommand::ExecFlush);
-        self.link.send(RtCommand::SetMode(Mode::Idle));
+        self.cancel_stream();
+        self.discard_exec();
     }
 
     fn set_gravity_comp(&mut self, on: bool) {
@@ -1958,9 +2052,13 @@ impl RtCommands for RtBridge {
 
     fn enter_flashing(&mut self) {
         let mut sh = self.shared.lock().unwrap();
-        // The assertion rides the same queue as the mode request, so the
-        // core consumes them in order; any transition in between drops
-        // the one-shot assertion, which is the safety property intended.
+        // FLASHING opens only from IDLE, and an arm at rest is holding in
+        // EXEC; the server admits this only with nothing moving. The drop
+        // goes FIRST: the assertion rides the same queue as the mode
+        // requests, so the core consumes them in order, and any transition
+        // after it drops the one-shot assertion — the safety property
+        // intended.
+        self.link.send(RtCommand::SetMode(Mode::Idle));
         self.link.send(RtCommand::AssertParked);
         self.link.send(RtCommand::SetMode(Mode::Flashing));
         sh.flashing_outcome = None;
@@ -2004,11 +2102,17 @@ impl RtCommands for RtBridge {
         });
     }
 
+    // Rewriting a drive runs from IDLE, never under the EXEC hold an arm
+    // at rest is in: the hold is a position loop addressed to the very
+    // node being renamed or rebooted. The server admits these only with
+    // nothing moving.
     fn set_can_id(&mut self, node: u8, new_id: u8) {
+        self.link.send(RtCommand::SetMode(Mode::Idle));
         self.link.send(RtCommand::SetCanId { node, new_id });
     }
 
     fn save_config(&mut self, node: u8) {
+        self.link.send(RtCommand::SetMode(Mode::Idle));
         self.link.send(RtCommand::SaveConfig { node });
     }
 
@@ -2103,18 +2207,35 @@ impl RtCommands for RtBridge {
     }
 
     fn set_simulator(&mut self, on: bool) -> Result<(), WireError> {
+        self.refuse_while_swapping()?;
         if on == self.sim {
+            // Nothing to install; the server's waiter is answered at once.
+            self.shared.lock().unwrap().bus_outcome = Some(Ok(()));
             return Ok(());
         }
         if on {
             self.swap_to_sim()
         } else {
-            self.swap_to_hardware(&self.bundle.robot.bus.interface.clone())
+            let interface = self.hardware_interface.clone();
+            self.swap_to_hardware(&interface)
         }
     }
 
     fn connect_hardware(&mut self, port: &str) -> Result<(), WireError> {
+        self.refuse_while_swapping()?;
         self.swap_to_hardware(port)
+    }
+
+    fn take_bus_outcome(&mut self) -> Option<Result<(), WireError>> {
+        let outcome = self.shared.lock().unwrap().bus_outcome.take()?;
+        if let (Some(swap), Ok(())) = (self.pending_swap.take(), &outcome) {
+            self.sim = swap.sim;
+            self.sim_world = swap.world;
+            if let Some(interface) = swap.interface {
+                self.hardware_interface = interface;
+            }
+        }
+        Some(outcome)
     }
 
     fn reset_state(&mut self) {
@@ -2133,7 +2254,24 @@ impl RtCommands for RtBridge {
         layer: ShapeLayer,
         shapes: &[par6_proto::Shape],
     ) -> Result<(), WireError> {
-        self.cart.gate.lock().unwrap().set_layer(layer, shapes)
+        self.cart.gate.lock().unwrap().set_layer(layer, shapes)?;
+        // The world the gate keeps the arm out of is the world the
+        // simulator rests things on: a physics box a program declares
+        // has to be there for the jaws to close on, on the live sim as
+        // in a preview run. Hardware needs no copy — the real world
+        // provides the contact.
+        let (index, posted) = match layer {
+            ShapeLayer::Installation => (0, par6_proto::Layer::Installation),
+            ShapeLayer::Program => (1, par6_proto::Layer::Program),
+        };
+        self.world_layers[index] = shapes.to_vec();
+        // A simulator still being installed was seeded with the layers as
+        // they stood; it takes this change too, whichever bus ends up running.
+        let pending = self.pending_swap.as_ref().and_then(|s| s.world.as_ref());
+        for world in self.sim_world.iter().chain(pending) {
+            world.post(posted, shapes.to_vec());
+        }
+        Ok(())
     }
 
     fn collision(&mut self) -> Option<CollisionState> {
@@ -2162,24 +2300,44 @@ impl RtBridge {
     /// (`bus.watchdog_action`), so on hardware this is a way to stop
     /// LOOKING at the arm, not a way to park it.
     fn swap_to_sim(&mut self) -> Result<(), WireError> {
+        self.end_stream_for_swap();
         let sim = SimBus::new(self.scene.clone());
-        self.sim_world = Some(sim.mailbox());
+        let world = sim.mailbox();
+        // A fresh simulator knows nothing of the world the last one was
+        // given; the accepted layers are posted again before it boots.
+        world.post(
+            par6_proto::Layer::Installation,
+            self.world_layers[0].clone(),
+        );
+        world.post(par6_proto::Layer::Program, self.world_layers[1].clone());
+        self.pending_swap = Some(PendingSwap {
+            sim: true,
+            world: Some(world),
+            interface: None,
+        });
         let bundle = self.bundle.clone();
-        self.sim = true;
+        let shared = self.shared.clone();
+        shared.lock().unwrap().bus_outcome = None;
         self.link.op(Box::new(move |core| {
             let q = core.measured_q();
             if let Err(e) = core.replace_bus(RuntimeBus::from(sim)) {
-                log::error!("simulator swap refused: {e}");
+                swap_failed(&shared, format!("simulator swap refused: {e}"));
                 return;
             }
             let robot = &bundle.robot;
             let n = robot.joints.len();
             let Some(bus) = core.bus_mut().sim_mut() else {
-                log::error!("the simulator swap did not install a simulator");
+                swap_failed(
+                    &shared,
+                    "the simulator swap did not install a simulator".to_owned(),
+                );
                 return;
             };
             if let Err(e) = bus.teleport_joint_rad(&q[..n]) {
-                log::error!("simulator swap: plant re-seed failed: {e}");
+                swap_failed(
+                    &shared,
+                    format!("simulator swap: plant re-seed failed: {e}"),
+                );
                 return;
             }
             for (i, joint) in robot.joints.iter().enumerate() {
@@ -2195,6 +2353,7 @@ impl RtBridge {
             core.reseed_motion_targets();
             core.set_homed(true);
             log::info!("bus backend: simulator, seeded at {q:?} rad");
+            shared.lock().unwrap().bus_outcome = Some(Ok(()));
         }));
         Ok(())
     }
@@ -2229,17 +2388,89 @@ impl RtBridge {
                 &[("detail", &format!("cannot open '{}': {e}", cfg.interface))],
             )
         })?;
-        self.sim = false;
+        self.end_stream_for_swap();
+        self.pending_swap = Some(PendingSwap {
+            sim: false,
+            world: None,
+            interface: Some(cfg.interface.clone()),
+        });
         let name = cfg.interface.clone();
+        let shared = self.shared.clone();
+        shared.lock().unwrap().bus_outcome = None;
         self.link.op(Box::new(move |core| {
             if let Err(e) = core.replace_bus(RuntimeBus::from(hw)) {
-                log::error!("hardware swap refused: {e}");
+                swap_failed(&shared, format!("hardware swap refused: {e}"));
                 return;
             }
             log::info!("bus backend: SocketCAN on '{name}' (un-homed)");
+            shared.lock().unwrap().bus_outcome = Some(Ok(()));
         }));
         Ok(())
     }
+}
+
+/// End a stream housekeeping was driving and hold where it stopped. The
+/// release goes first: it tells the RT the stream is over, or its watchdog
+/// can latch RTI_LINK_LOST in the ticks before the hold lands.
+fn end_cart_stream(link: &CoreLink) {
+    link.send(RtCommand::StreamRelease);
+    link.send(RtCommand::Hold);
+}
+
+/// How long a released stream may take to report rest: longer than any
+/// ramp the stream can ask for — its acceleration fraction stretches the
+/// configured ramp, and the s-curve profile adds jerk phases to the linear
+/// time — so it is only reached if the brake never finishes.
+fn ramp_cap(jog_accel_time_s: f64, accel_frac: f64) -> Duration {
+    Duration::from_secs_f64(4.0 * jog_accel_time_s / accel_frac.clamp(0.01, 1.0))
+}
+
+/// What a swap in flight makes true once the RT confirms it.
+struct PendingSwap {
+    sim: bool,
+    /// The new simulator's world mailbox; `None` for hardware.
+    world: Option<WorldMailbox>,
+    /// The interface a hardware swap opened.
+    interface: Option<String>,
+}
+
+impl RtBridge {
+    /// The bus under a stream is about to become a different arm: a brake
+    /// still running would go on stepping from the old one's pose, and a
+    /// stream datagram after the swap would resume from it. The core drops
+    /// to BOOTING with the new bus, so the brake has nothing to finish.
+    fn end_stream_for_swap(&self) {
+        if self.shared.lock().unwrap().stream.take().is_some() {
+            self.release_stream_commands();
+        }
+    }
+
+    /// One swap at a time: a second would overwrite the outcome the first
+    /// one's caller is waiting on.
+    fn refuse_while_swapping(&self) -> Result<(), WireError> {
+        if self.pending_swap.is_none() {
+            return Ok(());
+        }
+        Err(make_error(
+            ErrorCode::CommValidationError,
+            UNATTRIBUTED,
+            &[(
+                "detail",
+                "a bus swap is still being installed; retry once it answers",
+            )],
+        ))
+    }
+}
+
+/// A backend swap the RT could not complete: logged where it happened,
+/// and left for the server to answer the client with.
+fn swap_failed(shared: &Arc<Mutex<SharedState>>, detail: String) {
+    log::error!("{detail}");
+    shared.lock().unwrap().bus_outcome = Some(Err(make_error(
+        ErrorCode::MotnSetupFailed,
+        UNATTRIBUTED,
+        &[("detail", &detail)],
+    )));
 }
 
 /// Timed follow-throughs that the datagram-driven bridge cannot run
@@ -2260,8 +2491,8 @@ pub(crate) fn housekeeping_loop(
     stream_limits: MotionLimits,
 ) {
     // Stops the live stream because its next step is collision-blocked:
-    // latch the verdict for STATUS and put the RT back to IDLE. The
-    // abrupt stop is deliberate — the alternative is driving on toward
+    // latch the verdict for STATUS and brake the RT to rest. The
+    // stop is deliberate — the alternative is driving on toward
     // contact (parol6 halts its joint jog on the same prediction).
     let collision_stop = |link: &CoreLink,
                           gate: &Arc<Mutex<StreamGate>>,
@@ -2281,8 +2512,8 @@ pub(crate) fn housekeeping_loop(
         gate.lock().unwrap().refuse(pairs);
         // Both releases, because either mode may be the one running and
         // each ignores the release that is not its own. They ramp the
-        // arm to rest under its limits and hand the mode to IDLE
-        // themselves once it is there.
+        // arm to rest under its limits, and the core then holds the rest
+        // pose (see `RtCommand::Hold`).
         //
         // Not `SetMode(Idle)`: IDLE holds against gravity and has no
         // velocity authority, so a moving arm dropped into it keeps its
@@ -2292,10 +2523,6 @@ pub(crate) fn housekeeping_loop(
         link.send(RtCommand::JogRelease);
         link.send(RtCommand::StreamRelease);
     };
-    // Longer than any ramp the config can ask for (the s-curve profile
-    // adds jerk phases to the linear time); only reached if the RT never
-    // reports rest.
-    let jog_ramp_cap = Duration::from_secs_f64(4.0 * jog_accel_time_s);
     let mut profile_logged = Instant::now();
     'housekeeping: while !shutdown.load(Ordering::SeqCst) {
         // One pass per RT tick, paced at the TOP because the arms below
@@ -2571,16 +2798,20 @@ pub(crate) fn housekeeping_loop(
                                 link.send(RtCommand::JogRelease);
                                 a.releasing = true;
                                 a.jog = [0.0; MAX_JOINTS];
-                                a.deadline = now + jog_ramp_cap;
+                                a.deadline = now + ramp_cap(jog_accel_time_s, a.scale.1);
                                 continue 'housekeeping;
                             }
                             StreamKind::Jog => {
-                                log::warn!("jog ramp never reported rest; idling");
-                                link.send(RtCommand::SetMode(Mode::Idle));
+                                log::warn!("jog ramp never reported rest; holding where it is");
+                                link.send(RtCommand::Hold);
                             }
+                            // Braked like every other stream end: the joint
+                            // limiter ramps to rest and the core holds there;
+                            // IDLE would stop the arm dead from speed and then
+                            // let it float.
                             StreamKind::Servo => {
-                                log::debug!("servo stream went silent; stopping");
-                                link.send(RtCommand::SetMode(Mode::Idle));
+                                log::debug!("servo stream went silent; braking to a hold");
+                                link.send(RtCommand::StreamRelease);
                             }
                             // The tool ramps down along the axis it is
                             // travelling. The clamp-only tracker does no
@@ -2592,16 +2823,12 @@ pub(crate) fn housekeeping_loop(
                                     st.release();
                                 }
                                 a.releasing = true;
-                                a.deadline = now + jog_ramp_cap;
+                                a.deadline = now + ramp_cap(jog_accel_time_s, a.scale.1);
                                 continue 'housekeeping;
                             }
                             StreamKind::CartJog => {
-                                log::warn!("jog_l ramp never reported rest; idling");
-                                // The stream is over: say so before asking for the
-                                // mode, or the RT's watchdog can latch
-                                // RTI_LINK_LOST in the ticks before IDLE lands.
-                                link.send(RtCommand::StreamRelease);
-                                link.send(RtCommand::SetMode(Mode::Idle));
+                                log::warn!("jog_l ramp never reported rest; holding where it is");
+                                end_cart_stream(&link);
                             }
                             // The tool brakes ALONG its line rather than
                             // the RT cutting to IDLE under it: the
@@ -2613,16 +2840,14 @@ pub(crate) fn housekeeping_loop(
                                     st.release();
                                 }
                                 a.releasing = true;
-                                a.deadline = now + jog_ramp_cap;
+                                a.deadline = now + ramp_cap(jog_accel_time_s, a.scale.1);
                                 continue 'housekeeping;
                             }
                             StreamKind::CartServo => {
-                                log::warn!("servo_l brake never reported rest; idling");
-                                // The stream is over: say so before asking for the
-                                // mode, or the RT's watchdog can latch
-                                // RTI_LINK_LOST in the ticks before IDLE lands.
-                                link.send(RtCommand::StreamRelease);
-                                link.send(RtCommand::SetMode(Mode::Idle));
+                                log::warn!(
+                                    "servo_l brake never reported rest; holding where it is"
+                                );
+                                end_cart_stream(&link);
                             }
                         }
                         sh.stream = None;
@@ -2651,7 +2876,7 @@ pub(crate) fn housekeeping_loop(
                                 drop(g);
                                 log::error!("jog_j gate check failed: {}", e.cause);
                                 link.send(RtCommand::JogRelease);
-                                link.send(RtCommand::SetMode(Mode::Idle));
+                                link.send(RtCommand::Hold);
                                 sh.stream = None;
                             }
                         }
@@ -2699,7 +2924,7 @@ pub(crate) fn housekeeping_loop(
                             Err(e) => {
                                 drop(g);
                                 log::error!("servo gate check failed: {}", e.cause);
-                                link.send(RtCommand::SetMode(Mode::Idle));
+                                link.send(RtCommand::Hold);
                                 sh.stream = None;
                                 continue 'housekeeping;
                             }
@@ -2732,7 +2957,7 @@ pub(crate) fn housekeeping_loop(
                                         // model failure) rather than stream
                                         // unchecked.
                                         log::error!("servo gate check failed: {}", e.cause);
-                                        link.send(RtCommand::SetMode(Mode::Idle));
+                                        link.send(RtCommand::Hold);
                                         sh.stream = None;
                                         continue 'housekeeping;
                                     }
@@ -2751,12 +2976,19 @@ pub(crate) fn housekeeping_loop(
                         }
                     }
                     Some(a) if a.kind == StreamKind::CartJog => {
+                        let owed = steps_owed(a, snap.tick);
+                        if owed == 0 {
+                            continue 'housekeeping;
+                        }
                         if let Some(st) = &mut a.cart {
                             let before = st.commanded();
-                            match step_cart_jog(&mut kin, st, &stream_limits, dt, &snap.q) {
+                            match step_up_to(owed, || {
+                                step_cart_jog(&mut kin, st, &stream_limits, dt, &snap.q)
+                            }) {
                                 Ok((target, at_rest)) => {
+                                    let span = dt * owed as f64;
                                     let qd: [f64; NQ] =
-                                        std::array::from_fn(|j| (target[j] - before[j]) / dt);
+                                        std::array::from_fn(|j| (target[j] - before[j]) / span);
                                     // Where the arm comes to rest if this
                                     // step turns out to be the last one
                                     // admitted.
@@ -2784,11 +3016,7 @@ pub(crate) fn housekeeping_loop(
                                             // The ramp has run out and the
                                             // tool is stopped.
                                             if a.releasing && at_rest {
-                                                // The stream is over: say so before asking for the
-                                                // mode, or the RT's watchdog can latch
-                                                // RTI_LINK_LOST in the ticks before IDLE lands.
-                                                link.send(RtCommand::StreamRelease);
-                                                link.send(RtCommand::SetMode(Mode::Idle));
+                                                end_cart_stream(&link);
                                                 sh.stream = None;
                                                 continue 'housekeeping;
                                             }
@@ -2803,11 +3031,7 @@ pub(crate) fn housekeeping_loop(
                                             // this is a model failure, not a
                                             // predicted contact.
                                             log::error!("jog_l gate check failed: {}", e.cause);
-                                            // The stream is over: say so before asking for the
-                                            // mode, or the RT's watchdog can latch
-                                            // RTI_LINK_LOST in the ticks before IDLE lands.
-                                            link.send(RtCommand::StreamRelease);
-                                            link.send(RtCommand::SetMode(Mode::Idle));
+                                            end_cart_stream(&link);
                                             sh.stream = None;
                                             continue 'housekeeping;
                                         }
@@ -2829,12 +3053,19 @@ pub(crate) fn housekeeping_loop(
                         }
                     }
                     Some(a) if a.kind == StreamKind::CartServo => {
+                        let owed = steps_owed(a, snap.tick);
+                        if owed == 0 {
+                            continue 'housekeeping;
+                        }
                         if let Some(st) = &mut a.servo {
                             let before = st.commanded();
-                            match step_cart_servo(&mut kin, st, &stream_limits, dt, &snap.q) {
+                            match step_up_to(owed, || {
+                                step_cart_servo(&mut kin, st, &stream_limits, dt, &snap.q)
+                            }) {
                                 Ok((target, finished)) => {
+                                    let span = dt * owed as f64;
                                     let qd: [f64; NQ] =
-                                        std::array::from_fn(|j| (target[j] - before[j]) / dt);
+                                        std::array::from_fn(|j| (target[j] - before[j]) / span);
                                     let mut la = target;
                                     let verdict = {
                                         let mut g = gate.lock().unwrap();
@@ -2861,11 +3092,7 @@ pub(crate) fn housekeeping_loop(
                                             // The brake has run out; the
                                             // tool is at rest on its line.
                                             if a.releasing && finished {
-                                                // The stream is over: say so before asking for the
-                                                // mode, or the RT's watchdog can latch
-                                                // RTI_LINK_LOST in the ticks before IDLE lands.
-                                                link.send(RtCommand::StreamRelease);
-                                                link.send(RtCommand::SetMode(Mode::Idle));
+                                                end_cart_stream(&link);
                                                 sh.stream = None;
                                                 continue 'housekeeping;
                                             }
@@ -2877,11 +3104,7 @@ pub(crate) fn housekeeping_loop(
                                         }
                                         Err(e) => {
                                             log::error!("servo_l gate check failed: {}", e.cause);
-                                            // The stream is over: say so before asking for the
-                                            // mode, or the RT's watchdog can latch
-                                            // RTI_LINK_LOST in the ticks before IDLE lands.
-                                            link.send(RtCommand::StreamRelease);
-                                            link.send(RtCommand::SetMode(Mode::Idle));
+                                            end_cart_stream(&link);
                                             sh.stream = None;
                                             continue 'housekeeping;
                                         }
@@ -2967,6 +3190,21 @@ pub(crate) fn housekeeping_loop(
     }
 }
 
+/// The refusal a streamed setpoint gets when there is nothing to stream.
+fn servo_refused(what: &str, detail: &str) -> WireError {
+    log::warn!("{what}: {detail}; refused");
+    make_error(
+        ErrorCode::IkTargetUnreachable,
+        UNATTRIBUTED,
+        &[("detail", &format!("{what}: {detail}"))],
+    )
+}
+
+/// Whether every joint of `q` lies inside the soft window.
+fn within(q: &[f64; NQ], lo: &[f64; NQ], hi: &[f64; NQ]) -> bool {
+    (0..NQ).all(|j| q[j] >= lo[j] && q[j] <= hi[j])
+}
+
 /// One cartesian-jog step: ramp the tool's twist under the cartesian
 /// envelope, solve the smoothed pose to joints, and hold the result to
 /// the joints' per-tick budget without bending the tool off its axis.
@@ -3019,7 +3257,12 @@ pub(crate) fn step_cart_jog(
     }
     let step = st.exec.step().map_err(|e| format!("cartesian step: {e}"))?;
 
-    match kin.ik(&st.seed, &step.pose) {
+    // A solution outside the soft window is a limit reached, and it brakes
+    // the tool along its axis like any other unreachable pose; a per-joint
+    // clamp would pin that joint while the rest went on, bending the tool
+    // off the axis it was jogging.
+    let solved = ik_in_window(kin, &st.seed, &step.pose, &st.soft_min, &st.soft_max);
+    match solved {
         IkResult::Solved(q) => {
             if st.ik_stopping {
                 let pose = kin.fk(q_meas)?;
@@ -3043,23 +3286,83 @@ pub(crate) fn step_cart_jog(
                 st.q_commanded = q;
                 st.vel_ratio = 1.0;
             }
-            for (j, out) in st.q_commanded.iter_mut().enumerate() {
-                *out = out.clamp(st.soft_min[j], st.soft_max[j]);
-            }
             Ok((st.q_commanded, step.finished))
         }
         unreachable => {
             if !st.ik_stopping {
                 match &unreachable {
-                    IkResult::Unreachable => log::warn!("jog_l: pose unreachable; braking"),
+                    IkResult::Unreachable => {
+                        log::warn!("jog_l: pose unreachable or past a joint limit; braking")
+                    }
                     IkResult::Failed(e) => log::warn!("jog_l: IK failed ({e}); braking"),
                     IkResult::Solved(_) => unreachable!(),
                 }
                 st.exec.release();
                 st.ik_stopping = true;
+            } else if step.finished {
+                // The brake has run out with the pose still unreachable:
+                // start over from where the arm is, as parol6 ends the jog
+                // here and lets the next datagram start a fresh one. The
+                // twist is then re-commanded, so a jog turned away from
+                // the limit drives off it, and one still pressing into it
+                // is braked again before the arm moves.
+                let pose = kin.fk(q_meas)?;
+                st.exec.activate(&pose);
+                st.q_commanded = *q_meas;
+                st.seed = *q_meas;
+                st.vel_ratio = 1.0;
+                st.ik_stopping = false;
             }
             Ok((st.q_commanded, step.finished))
         }
+    }
+}
+
+/// A stalled RT (a bus swap, a blocked core) must not turn into a lurch
+/// when it resumes: more ticks than this are stepped as this many.
+const MAX_CATCHUP_STEPS: u64 = 4;
+
+/// How many limiter steps a cartesian stream is owed this pass: one per
+/// RT tick since the last pass, the first pass one.
+fn steps_owed(a: &mut ActiveStream, tick: u64) -> usize {
+    let owed = if a.stepped_tick == 0 {
+        1
+    } else {
+        tick.saturating_sub(a.stepped_tick).min(MAX_CATCHUP_STEPS)
+    };
+    a.stepped_tick = tick;
+    owed as usize
+}
+
+/// A cartesian step run up to `n` times over one measured pose, at least
+/// once, stopping early when it reports done; the last step's result.
+fn step_up_to(
+    n: usize,
+    mut step: impl FnMut() -> Result<([f64; NQ], bool), String>,
+) -> Result<([f64; NQ], bool), String> {
+    let mut out = step()?;
+    for _ in 1..n {
+        if out.1 {
+            break;
+        }
+        out = step()?;
+    }
+    Ok(out)
+}
+
+/// The IK solution for `pose`, or `Unreachable` when it lies outside the
+/// soft window: parol6's solver rejects such a solution outright, and a
+/// per-joint clamp would move the arm some other way than the tool's line.
+fn ik_in_window(
+    kin: &mut crate::kin::CartKin,
+    seed: &[f64; NQ],
+    pose: &Pose,
+    lo: &[f64; NQ],
+    hi: &[f64; NQ],
+) -> IkResult {
+    match kin.ik(seed, pose) {
+        IkResult::Solved(q) if !within(&q, lo, hi) => IkResult::Unreachable,
+        other => other,
     }
 }
 
@@ -3085,12 +3388,26 @@ pub(crate) fn step_cart_servo(
     dt: f64,
     q_meas: &[f64; NQ],
 ) -> Result<([f64; NQ], bool), String> {
-    st.exec
-        .set_target(&st.target)
-        .map_err(|e| format!("cartesian retarget: {e}"))?;
+    // A brake owns the limiter until the client names somewhere new: the
+    // release put it on the velocity interface, and re-aiming it at the
+    // very target it was braking away from would put it straight back on
+    // course for that target — the brake undone on the step after it began.
+    let braking = st.releasing || st.ik_stopping;
+    if !braking || st.brake_target != Some(st.target) {
+        st.exec
+            .set_target(&st.target)
+            .map_err(|e| format!("cartesian retarget: {e}"))?;
+    }
     let step = st.exec.step().map_err(|e| format!("cartesian step: {e}"))?;
 
-    match kin.ik(&st.seed, &step.pose) {
+    let solved = ik_in_window(
+        kin,
+        &st.seed,
+        &step.pose,
+        &limits.soft_min,
+        &limits.soft_max,
+    );
+    match solved {
         IkResult::Solved(q) => {
             if st.ik_stopping {
                 // Solving again: restart the line from where the arm
@@ -3130,6 +3447,7 @@ pub(crate) fn step_cart_servo(
                 }
                 st.exec.release();
                 st.ik_stopping = true;
+                st.brake_target = Some(st.target);
             }
             // Keep commanding the last good target while the limiter
             // sheds its velocity: the arm holds rather than jumping to a

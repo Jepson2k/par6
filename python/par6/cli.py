@@ -87,7 +87,7 @@ def _cmd_status(client: RobotClient, args: argparse.Namespace) -> int:
     _emit(
         {
             "angles_deg": [round(v, 4) for v in status.angles],
-            "speeds_rad_s": [round(v, 4) for v in status.speeds],
+            "speeds_deg_s": [round(v, 4) for v in status.speeds],
             # The e-stop is always the LAST slot; the ones before it are the
             # configured inputs then outputs, so the width follows config.
             "io": list(status.io),

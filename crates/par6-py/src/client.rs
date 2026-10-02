@@ -84,6 +84,15 @@ where
     })
 }
 
+/// A wait that ended under a latched protocol mismatch did not time out:
+/// it could never have been answered.
+fn mismatch_check(client: &Client) -> PyResult<()> {
+    match client.protocol_mismatch() {
+        Some((daemon, client)) => Err(client_err(ClientError::ProtocolMismatch { daemon, client })),
+        None => Ok(()),
+    }
+}
+
 fn fire_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Bound<'py, PyAny>> {
     future_into_py(py, async move {
         client.fire(c).await.map_err(client_err)?;
@@ -350,7 +359,15 @@ impl CoreClient {
         )
     }
 
-    /// Await the checkpoint `label`; False on timeout.
+    /// The protocol skew the status stream has latched, as `(daemon,
+    /// client)` versions, or None.
+    fn protocol_mismatch(&self) -> Option<(u8, u8)> {
+        self.rt().protocol_mismatch()
+    }
+
+    /// Await the checkpoint `label`; False on timeout. Raises
+    /// ConnectionError under a latched protocol mismatch: no frame from
+    /// that runtime will ever be read.
     fn wait_checkpoint<'py>(
         &self,
         py: Python<'py>,
@@ -359,9 +376,11 @@ impl CoreClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
         future_into_py(py, async move {
-            Ok(client
+            let hit = client
                 .wait_checkpoint(&label, Duration::from_secs_f64(timeout))
-                .await)
+                .await;
+            mismatch_check(&client)?;
+            Ok(hit)
         })
     }
 
@@ -385,7 +404,11 @@ impl CoreClient {
             angle_threshold,
             motion_start_timeout: Duration::from_secs_f64(motion_start_timeout),
         };
-        future_into_py(py, async move { Ok(client.wait_motion(wait).await) })
+        future_into_py(py, async move {
+            let settled = client.wait_motion(wait).await;
+            mismatch_check(&client)?;
+            Ok(settled)
+        })
     }
 
     /// Whether the e-stop line reads pressed; False when unreachable.
@@ -688,10 +711,15 @@ impl CoreClient {
     }
 
     fn write_io<'py>(&self, py: Python<'py>, port: u8, value: u8) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(
+        let client = self.rt();
+        queued_future(
             py,
-            self.rt(),
-            Command::WriteIo(cmd::WriteIo { port, value }),
+            client.clone(),
+            Command::WriteIo(cmd::WriteIo {
+                key: client.fresh_key(),
+                port,
+                value,
+            }),
         )
     }
 
@@ -1159,7 +1187,7 @@ impl CoreClient {
         angles: [f64; NUM_JOINTS],
         tool_positions: Option<Vec<f64>>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        fire_future(
+        sys_future(
             py,
             self.rt(),
             Command::Teleport(cmd::Teleport {

@@ -230,8 +230,8 @@ class RobotClient:
         *,
         pose: list[float] | None = None,
         duration: float = 0.0,
-        speed: float = 0.0,
-        accel: float = 1.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         r: float = 0.0,
         rel: bool = False,
         wait: bool = True,
@@ -258,8 +258,8 @@ class RobotClient:
         *,
         frame: Frame = "WRF",
         duration: float = 0.0,
-        speed: float = 0.0,
-        accel: float = 1.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         r: float = 0.0,
         rel: bool = False,
         wait: bool = True,
@@ -286,11 +286,10 @@ class RobotClient:
         end: list[float],
         *,
         frame: Frame = "WRF",
-        duration: float | None = None,
-        speed: float | None = None,
-        accel: float = 1.0,
+        duration: float = 0.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         r: float = 0.0,
-        rel: bool = False,
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
@@ -304,7 +303,6 @@ class RobotClient:
                 speed=speed,
                 accel=accel,
                 r=r,
-                rel=rel,
                 wait=wait,
                 timeout=timeout,
             )
@@ -315,10 +313,9 @@ class RobotClient:
         waypoints: list[list[float]],
         *,
         frame: Frame = "WRF",
-        duration: float | None = None,
-        speed: float | None = None,
-        accel: float = 1.0,
-        rel: bool = False,
+        duration: float = 0.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
@@ -330,7 +327,6 @@ class RobotClient:
                 duration=duration,
                 speed=speed,
                 accel=accel,
-                rel=rel,
                 wait=wait,
                 timeout=timeout,
             )
@@ -341,10 +337,9 @@ class RobotClient:
         waypoints: list[list[float]],
         *,
         frame: Frame = "WRF",
-        duration: float | None = None,
-        speed: float | None = None,
-        accel: float = 1.0,
-        rel: bool = False,
+        duration: float = 0.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
@@ -356,7 +351,6 @@ class RobotClient:
                 duration=duration,
                 speed=speed,
                 accel=accel,
-                rel=rel,
                 wait=wait,
                 timeout=timeout,
             )
@@ -369,14 +363,14 @@ class RobotClient:
         angles: list[float] | None = None,
         *,
         pose: list[float] | None = None,
-        speed: float = 1.0,
-        accel: float = 1.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
     ) -> int:
         """Streaming joint position target (fire-and-forget)."""
         return _run(self._inner.servo_j(angles, pose=pose, speed=speed, accel=accel))
 
     def servo_l(
-        self, pose: list[float], *, speed: float = 1.0, accel: float = 1.0
+        self, pose: list[float], *, speed: float = 0.5, accel: float = 0.5
     ) -> int:
         """Streaming linear Cartesian target (fire-and-forget)."""
         return _run(self._inner.servo_l(pose, speed=speed, accel=accel))
@@ -389,7 +383,7 @@ class RobotClient:
         *,
         joints: list[int] | None = None,
         speeds: list[float] | None = None,
-        accel: float = 1.0,
+        accel: float = 0.5,
     ) -> int:
         """Joint velocity jog (duration-watchdogged, fire-and-forget)."""
         return _run(
@@ -407,7 +401,7 @@ class RobotClient:
         *,
         axes: list[Axis] | None = None,
         speeds_list: list[float] | None = None,
-        accel: float = 1.0,
+        accel: float = 0.5,
     ) -> int:
         """Cartesian velocity jog (duration-watchdogged, fire-and-forget)."""
         return _run(
@@ -607,7 +601,9 @@ class RobotClient:
         return _run(self._inner.set_completion_policy(policy))
 
     def write_io(self, index: int, value: int) -> int:
-        """Set digital output by logical index (0 = first output pin)."""
+        """Queue a digital output level by logical index (0 = first output
+        pin); it lands at its turn between the commands around it, and
+        the returned index completes when it does."""
         return _run(self._inner.write_io(index, value))
 
     def tool_action(
@@ -616,10 +612,10 @@ class RobotClient:
         action: str,
         params: list[Any] | None = None,
         *,
-        wait: bool = True,
+        wait: bool = False,
         timeout: float = 10.0,
     ) -> int:
-        """Invoke a tool-specific action by key (blocking by default)."""
+        """Invoke a tool-specific action by key."""
         return _run(
             self._inner.tool_action(
                 tool_key, action, params, wait=wait, timeout=timeout
@@ -657,7 +653,7 @@ class RobotClient:
         return _run(self._inner.io())
 
     def joint_speeds(self) -> list[float] | None:
-        """Current joint velocities in rad/s."""
+        """Current joint velocities in deg/s."""
         return _run(self._inner.joint_speeds())
 
     def status(self) -> StatusResult | None:
@@ -700,8 +696,8 @@ class RobotClient:
         """Whether the e-stop is engaged."""
         return _run(self._inner.is_estop_pressed())
 
-    def is_robot_stopped(self, threshold_speed: float = 0.01) -> bool:
-        """Whether every joint is below *threshold_speed* (rad/s)."""
+    def is_robot_stopped(self, threshold_speed: float = 0.5) -> bool:
+        """Whether every joint is below *threshold_speed* (deg/s)."""
         return _run(self._inner.is_robot_stopped(threshold_speed))
 
     def tcp_transform(self) -> list[float]:
@@ -772,7 +768,7 @@ class RobotClient:
         self,
         timeout: float = 10.0,
         settle_window: float = 0.25,
-        speed_threshold: float = 0.01,
+        speed_threshold: float = 0.5,
         angle_threshold: float = 0.5,
         motion_start_timeout: float = 1.0,
     ) -> bool:

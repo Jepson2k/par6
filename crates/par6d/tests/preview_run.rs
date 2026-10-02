@@ -294,6 +294,50 @@ fn execution_controls_reach_the_simulated_runtime() {
         .unwrap();
     assert_eq!(held.stop, StopReason::BudgetExhausted);
     assert_eq!(held.commands[1].rows, 0);
+
+    // A tool action is queued like the move, so the pause holds it too:
+    // the jaws do not close under a paused program.
+    preview.set_gripper_calibrated(true);
+    let tool = par6_config::RobotConfig::load(&config)
+        .expect("config")
+        .robot
+        .active_gripper;
+    let held_tool = preview
+        .run(
+            &[
+                Command::Pause(Pause { on: true }),
+                Command::ToolAction(ToolAction {
+                    key: 9904,
+                    tool_key: tool,
+                    action: "move".into(),
+                    params: vec![
+                        ToolParam::Float(1.0),
+                        ToolParam::Float(0.5),
+                        ToolParam::Float(0.3),
+                    ],
+                }),
+            ],
+            RunLimits { max_seconds: 0.5 },
+        )
+        .unwrap();
+    assert_eq!(
+        held_tool.stop,
+        StopReason::BudgetExhausted,
+        "{:?}",
+        held_tool.commands
+    );
+    assert_eq!(held_tool.commands[1].rows, 0);
+    let jaw: Vec<f32> = held_tool
+        .tool_closed
+        .iter()
+        .copied()
+        .filter(|j| j.is_finite())
+        .collect();
+    assert!(!jaw.is_empty(), "the run never heard from the gripper");
+    assert!(
+        jaw.iter().all(|&j| j < 0.05),
+        "a paused program closed the jaws: {jaw:?}"
+    );
 }
 
 /// The simulated run against the planner it replaces.
@@ -381,8 +425,11 @@ fn the_simulated_run_lands_where_the_plan_says_and_shows_the_tracking_error() {
         worst > 1e-5,
         "q and q_commanded are the same column: the plant is not being simulated"
     );
+    // TOPPRA, the startup profile, runs the joints at their acceleration
+    // limit with no jerk limit, which the plant follows a little less
+    // closely than a jerk-limited profile.
     assert!(
-        worst < 0.05,
+        worst < 0.06,
         "the arm is not following its commands: worst tracking error {worst} rad"
     );
 }
@@ -440,7 +487,7 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
             params: vec![
                 ToolParam::Float(closed),
                 ToolParam::Float(0.5),
-                ToolParam::Float(500.0),
+                ToolParam::Float(0.3),
             ],
         })
     };
@@ -523,7 +570,11 @@ fn physics_replays_io_writes_and_runs_on_after_a_stop() {
     let mut target = park_deg();
     target[0] += 5.0;
     let commands = [
-        Command::WriteIo(WriteIo { port: 0, value: 1 }),
+        Command::WriteIo(WriteIo {
+            key: 0,
+            port: 0,
+            value: 1,
+        }),
         move_j_cmd(target, 9960, 0.2),
         Command::Stop(Stop { clear_queue: true }),
         move_j_cmd(park_deg(), 9961, 0.2),

@@ -83,6 +83,20 @@ impl Client {
         unwrap_query!(self, Command::LoopStats, QueryResult::LoopStats(stats) => stats)
     }
 
+    /// How queued command `index` finished, as the runtime recorded it:
+    /// `(finished, ok, detail, verdict)` — what its COMPLETE push carried,
+    /// or `finished == false` when the runtime has no record of it.
+    pub async fn command_completion(
+        &self,
+        index: u64,
+    ) -> Result<(bool, bool, Option<WireError>, Option<u8>), ClientError> {
+        unwrap_query!(
+            self,
+            Command::CommandCompletion { index },
+            QueryResult::CommandCompletion { finished, ok, detail, verdict, .. } => (finished, ok, detail, verdict)
+        )
+    }
+
     /// Active motion profile name.
     pub async fn profile(&self) -> Result<String, ClientError> {
         unwrap_query!(self, Command::Profile, QueryResult::Profile { profile } => profile)
@@ -272,10 +286,16 @@ impl Client {
         self.system(Command::Stop(cmd::Stop { clear_queue })).await
     }
 
-    /// Drive one declared digital output.
-    pub async fn write_io(&self, port: u8, value: u8) -> Result<Ack, ClientError> {
-        self.system(Command::WriteIo(cmd::WriteIo { port, value }))
-            .await
+    /// Queue a level on one declared digital output. Applied at its turn
+    /// in the queue, so an output written after a move changes when that
+    /// move has finished; the returned index completes when it lands.
+    pub async fn write_io(&self, port: u8, value: u8) -> Result<Option<u64>, ClientError> {
+        self.queued(Command::WriteIo(cmd::WriteIo {
+            key: self.fresh_key(),
+            port,
+            value,
+        }))
+        .await
     }
 
     /// Switch the simulator backend on/off (live bus swap).
@@ -719,8 +739,8 @@ impl Client {
         &self,
         angles: [f64; NUM_JOINTS],
         tool_positions: Option<Vec<f64>>,
-    ) -> Result<(), ClientError> {
-        self.fire(Command::Teleport(cmd::Teleport {
+    ) -> Result<Ack, ClientError> {
+        self.system(Command::Teleport(cmd::Teleport {
             angles,
             tool_positions,
         }))

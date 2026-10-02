@@ -23,6 +23,11 @@ use par6_proto::CompletionPolicy;
 /// stay small.
 pub const WRIST_JOINTS: [usize; 3] = [3, 4, 5];
 
+/// The profile the swings between poses run on: jerk-limited, so every
+/// arrival is monotonic and the two-sided approach can cancel friction
+/// (see [`measure`]).
+pub const MEASUREMENT_PROFILE: &str = "RUCKIG";
+
 /// How a run rests and reads the arm.
 #[derive(Debug, Clone, Copy)]
 pub struct Protocol {
@@ -288,8 +293,9 @@ pub async fn measure(
     // The readings are the torques the arm holds a FINISHED move with, so
     // the runtime has to be the one that decides a move is finished and
     // settled — the policy is stated here rather than assumed. It is the
-    // caller's session, though, so whatever they had is put back after:
-    // what they set, or the server's boot default if they never did.
+    // caller's session, though, so whatever they had is put back after,
+    // on every exit: what they set, or the server's boot default if they
+    // never did.
     let previous = client
         .completion_policy()
         .unwrap_or(CompletionPolicy::Settled);
@@ -297,6 +303,35 @@ pub async fn measure(
         .set_completion_policy(CompletionPolicy::Settled)
         .await
         .map_err(|e| format!("set_completion_policy: {e}"))?;
+    let result = measure_on_the_measurement_profile(client, poses, protocol).await;
+    let restored = client
+        .set_completion_policy(previous)
+        .await
+        .map_err(|e| format!("restoring the completion policy: {e}"));
+    let samples = result?;
+    restored?;
+    Ok(samples)
+}
+
+/// The two-sided approach cancels friction only when each arrival is
+/// monotonic: a move that overshoots its pose and comes back has entered
+/// it from the OTHER side, and the readings then add the friction band
+/// instead of cancelling it. So the swings run on the jerk-limited
+/// profile, whatever the session has selected, and the session's own
+/// choice is put back on every exit.
+async fn measure_on_the_measurement_profile(
+    client: &Client,
+    poses: &[[f64; NQ]],
+    protocol: &Protocol,
+) -> Result<Vec<GravitySample>, String> {
+    let previous_profile = client
+        .profile()
+        .await
+        .map_err(|e| format!("profile: {e}"))?;
+    client
+        .select_profile(MEASUREMENT_PROFILE)
+        .await
+        .map_err(|e| format!("select_profile: {e}"))?;
     let run = async {
         let mut samples = Vec::with_capacity(poses.len());
         for (i, q) in poses.iter().enumerate() {
@@ -306,11 +341,13 @@ pub async fn measure(
         Ok::<_, String>(samples)
     };
     let result = run.await;
-    client
-        .set_completion_policy(previous)
+    let restored = client
+        .select_profile(&previous_profile)
         .await
-        .map_err(|e| format!("restoring the completion policy: {e}"))?;
-    result
+        .map_err(|e| format!("restoring the motion profile: {e}"));
+    let samples = result?;
+    restored?;
+    Ok(samples)
 }
 
 /// The whole run: swing the wrist through `poses` on the arm behind

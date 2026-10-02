@@ -402,6 +402,12 @@ impl Preview {
         EnginePreview::estimation_speed()
     }
 
+    /// The motion profile the estimation protocol swings on.
+    #[staticmethod]
+    fn estimation_profile() -> &'static str {
+        EnginePreview::estimation_profile()
+    }
+
     /// Where the configured homing seek leaves the arm \[rad\].
     fn homing_ready_pose_rad(&self) -> Vec<f64> {
         self.inner.lock().unwrap().homing_ready_pose_rad().to_vec()

@@ -1,9 +1,11 @@
 """Argument adaptation shared by the live client and the dry run: the
 waldoctl call conventions (mm/deg, duration-or-speed, axis names) mapped
-onto the wire's fields.  No numerics — only shapes and names."""
+onto the wire's fields.  No planning numerics — only shapes, names,
+ranges and units."""
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from typing import Any, cast
 
@@ -34,18 +36,46 @@ def f6(values: Sequence[float], name: str) -> list[float]:
     return [float(v) for v in values]
 
 
+def fraction(value: float, name: str) -> float:
+    """*value* as a float in ``(0, 1]``; ValueError otherwise, NaN included."""
+    v = float(value)
+    if not 0.0 < v <= 1.0:
+        raise ValueError(f"{name} must be in (0, 1], got {value!r}")
+    return v
+
+
 def timing(
-    duration: float | None, speed: float | None
-) -> tuple[float | None, float | None]:
-    """Map the waldoctl duration/speed pair (0/None = unset) onto the wire's
-    exactly-one-of convention.  Neither set means full profile speed."""
-    d = float(duration) if duration else None
-    s = float(speed) if speed else None
-    if d is not None and s is not None:
-        raise ValueError("duration and speed are mutually exclusive")
-    if d is None and s is None:
-        s = 1.0
-    return d, s
+    duration: float, speed: float, accel: float
+) -> tuple[float | None, float | None, float]:
+    """Map a planned move's timing onto the wire's exactly-one-of
+    duration/speed, the unused one as None: a positive *duration* sets the
+    timing, otherwise *speed* does."""
+    d = float(duration)
+    if not math.isfinite(d) or d < 0.0:
+        raise ValueError(f"duration must be finite and >= 0, got {duration!r}")
+    a = fraction(accel, "accel")
+    if d > 0.0:
+        return d, None, a
+    return None, fraction(speed, "speed"), a
+
+
+def deg_per_s(rad_s: Sequence[float]) -> list[float]:
+    """A joint-speed query's answer (rad/s on the wire) in deg/s."""
+    return [math.degrees(v) for v in rad_s]
+
+
+def refuse_unknown_keywords(
+    kwargs: dict[str, Any], accepted: frozenset[str] = frozenset()
+) -> None:
+    """A planned move's ``**wait_kwargs`` exist for keywords its wait takes,
+    and ``wait_command`` takes none beyond ``timeout``: anything else —
+    ``rel`` on a move that declares none, a misspelled keyword — is a
+    TypeError, as parol6's client has it, never planned as if unwritten.
+    *accepted* names keywords the caller's signature takes through
+    ``**kwargs`` itself."""
+    unknown = sorted(k for k in kwargs if k not in accepted)
+    if unknown:
+        raise TypeError(f"unexpected keyword argument(s): {', '.join(unknown)}")
 
 
 def blend(r: float | None) -> float | None:
@@ -132,9 +162,11 @@ def shape_to_wire(shape: Shape) -> dict[str, Any]:
     }
 
 
-def tool_status_from_dict(raw: dict | None) -> ToolStatus | None:
+def tool_status_from_dict(raw: dict | None) -> ToolStatus:
+    """The runtime's tool status; with no tool fitted, a ``ToolStatus``
+    whose key is ``"NONE"`` rather than nothing."""
     if raw is None:
-        return None
+        return ToolStatus()
     return ToolStatus(
         key=canonical_tool_key(raw["key"]),
         variant_key=raw["variant_key"],

@@ -75,6 +75,16 @@ where
     run_with(daemon, cfg, body);
 }
 
+/// Park with the wrist turned off its singularity: at park J5 sits at
+/// zero, where the pose's roll/pitch/yaw form degenerates and a target
+/// built by round-tripping through it carries a rotation nobody asked for.
+fn clear_of_the_wrist_deg() -> [f64; NUM_JOINTS] {
+    let mut q = common::park_deg();
+    q[3] += 25.0;
+    q[4] += 35.0;
+    q
+}
+
 fn close_deg(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS], tol: f64) -> bool {
     a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < tol)
 }
@@ -85,7 +95,8 @@ fn close_deg(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS], tol: f64) -> bool {
 async fn settle_at(client: &Client, target: [f64; NUM_JOINTS]) {
     let deadline = tokio::time::Instant::now() + BUDGET;
     loop {
-        client.teleport(target, None).await.expect("teleport sends");
+        // Refused until the boot enable lands; the loop re-sends.
+        let _ = client.teleport(target, None).await;
         let landed = client
             .wait_status(
                 move |s| s.homed && close_deg(&s.angles, &target, 1.0),
@@ -100,6 +111,60 @@ async fn settle_at(client: &Client, target: [f64; NUM_JOINTS]) {
             "teleport did not take effect within budget"
         );
     }
+}
+
+/// A COMPLETE push that never arrives does not leave the wait guessing:
+/// STATUS shows the command finished, and the runtime is asked what it
+/// finished as — a landing as much as a cancellation.
+#[test]
+fn a_missing_complete_push_is_recovered_from_the_runtime() {
+    run_session("recover", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        let park = common::park_deg();
+        settle_at(&client, park).await;
+        client.drop_complete_pushes_for_test(true);
+
+        let mut target = park;
+        target[0] += 8.0;
+        let landed = client
+            .move_j(target, None, Some(1.0), None, None, false)
+            .await
+            .expect("move_j accepted")
+            .expect("move_j acked with an index");
+        assert!(
+            client
+                .wait_command(landed, BUDGET)
+                .await
+                .expect("recovered"),
+            "the landing must be recovered without its push"
+        );
+        assert_eq!(
+            client.command_completion(landed).await.expect("query"),
+            (true, true, None, None)
+        );
+
+        let mut far = park;
+        far[0] -= 30.0;
+        let cancelled = client
+            .move_j(far, Some(6.0), None, None, None, false)
+            .await
+            .expect("move_j accepted")
+            .expect("move_j acked with an index");
+        assert!(
+            client
+                .wait_status(|s| s.speeds.iter().any(|v| v.abs() > 0.02), BUDGET)
+                .await,
+            "the long move never started"
+        );
+        client.stop(true).await.expect("stop");
+        match client.wait_command(cancelled, BUDGET).await {
+            Err(ClientError::Robot(e)) => {
+                assert_eq!(e.code, ErrorCode::MotnCancelled as u16, "{e:?}")
+            }
+            other => panic!("the cancellation must be recovered without its push: {other:?}"),
+        }
+        client.drop_complete_pushes_for_test(false);
+    });
 }
 
 #[test]
@@ -153,20 +218,26 @@ fn a_full_session_over_the_rust_client() {
             "the arm never came to rest after stop"
         );
 
-        // A refused fire-and-forget surfaces through the standing error
-        // (issue #23): out-of-range teleport, then acceptance clears it.
+        // A teleport is acked: an out-of-range one is refused in the
+        // reply, and the arm stays where the stop left it.
+        let resting = client.angles().await.expect("angles");
         let mut bad = park;
         bad[0] = 1.0e5;
-        client.teleport(bad, None).await.expect("send succeeds");
+        let refused = client
+            .teleport(bad, None)
+            .await
+            .expect_err("an out-of-range teleport is refused");
         assert!(
-            client.wait_status(|s| s.error.is_some(), BUDGET).await,
-            "the refused teleport never latched a standing error"
+            matches!(&refused, ClientError::Robot(e) if e.code == ErrorCode::CommValidationError as u16),
+            "{refused:?}"
+        );
+        assert!(
+            client
+                .wait_status(move |s| close_deg(&s.angles, &resting, 0.5), BUDGET)
+                .await,
+            "the refused teleport moved the arm"
         );
         settle_at(&client, park).await;
-        assert!(
-            client.wait_status(|s| s.error.is_none(), BUDGET).await,
-            "acceptance must clear the refusal"
-        );
 
         // Chunked transfer: a shape world too large for one datagram.
         let shapes: Vec<Shape> = (0..64)
@@ -643,9 +714,7 @@ fn servo_l_holds_the_line_where_servo_j_pose_does_not() {
         // form degenerates — roll and yaw stop being separable, so a
         // target built by round-tripping through it carries a rotation
         // nobody asked for and the move is a screw, not a line.
-        let mut from = common::park_deg();
-        from[3] += 25.0;
-        from[4] += 35.0;
+        let from = clear_of_the_wrist_deg();
 
         // A diagonal in all three axes: a move along one axis alone
         // cannot tell a straight path from a bowed one.
@@ -727,9 +796,7 @@ fn jog_l_drives_the_tool_along_the_axis_it_was_given() {
     run_session("jog-l-axis", |client| async move {
         assert!(client.wait_ready(Duration::from_secs(15)).await);
         // Off the wrist singularity, as the servo_l line test is.
-        let mut from = common::park_deg();
-        from[3] += 25.0;
-        from[4] += 35.0;
+        let from = clear_of_the_wrist_deg();
         settle_at(&client, from).await;
         let start = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at start"));
 
@@ -784,6 +851,334 @@ fn jog_l_drives_the_tool_along_the_axis_it_was_given() {
         assert!(
             worst_off < 2.0,
             "the tool wandered {worst_off:.2} mm off the axis it was jogged along"
+        );
+    })
+}
+
+fn distance_mm(a: &[f64; 6], b: &[f64; 6]) -> f64 {
+    ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+}
+
+/// Poll the WRF pose until it holds still for ten readings in a row.
+async fn pose_at_rest(client: &Client) -> [f64; 6] {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+    let mut last = wire_pose(&client.pose(Frame::Wrf).await.expect("pose"));
+    let mut still = 0;
+    while still < 10 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the tool never came to rest"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let here = wire_pose(&client.pose(Frame::Wrf).await.expect("pose"));
+        still = if distance_mm(&here, &last) < 0.05 {
+            still + 1
+        } else {
+            0
+        };
+        last = here;
+    }
+    last
+}
+
+/// A STATUS in another protocol version that still decodes — a newer
+/// daemon's frame, or a second daemon on a shared group — does not stop
+/// the waits: the client warns and goes on reading the runtime it talks
+/// to. Only a frame that cannot be read at all latches the mismatch.
+#[test]
+fn a_readable_status_in_another_version_does_not_stop_the_waits() {
+    let (daemon, cfg) = boot_daemon("skew", Ipv4Addr::LOCALHOST);
+    let status_port = cfg.status_port;
+    run_with(daemon, cfg, |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        assert!(
+            client.wait_status(|_| true, BUDGET).await,
+            "no STATUS arrived"
+        );
+        let mut foreign = (*client.latest_status().expect("status")).clone();
+        foreign.proto_version = foreign.proto_version.wrapping_add(1);
+        let mut frame = Vec::new();
+        par6_proto::encode_status_into(&foreign, &mut frame);
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender socket");
+        sender
+            .send_to(&frame, ("127.0.0.1", status_port))
+            .expect("the foreign frame is sent");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(client.protocol_mismatch(), None);
+        let seen = client.latest_status().expect("status").seq;
+        assert!(
+            client.wait_status(|s| s.seq > seen, BUDGET).await,
+            "one readable foreign frame stopped every wait"
+        );
+    });
+}
+
+/// A runtime that restarts while a command is awaited numbers its queue
+/// from the start again, so the index waited on names nothing: the wait
+/// says the session changed, every time, never a plain `false` that reads
+/// as a timeout. Several restarts, because which of the two signals the
+/// client sees first is a race it must win whichever way it goes.
+#[test]
+fn a_restart_mid_wait_is_reported_as_the_session_changing() {
+    let (first, cfg) = boot_daemon("restart", Ipv4Addr::LOCALHOST);
+    let status_port = cfg.status_port;
+    let command_port = cfg.port;
+    let rt = tokio::runtime::Runtime::new().expect("client runtime");
+    let client = rt.block_on(Client::connect(cfg)).expect("client connects");
+    let mut daemon = first;
+    for round in 0..5 {
+        let index = rt.block_on(async {
+            assert!(client.wait_ready(Duration::from_secs(15)).await);
+            let park = common::park_deg();
+            settle_at(&client, park).await;
+            let mut far = park;
+            far[0] -= 30.0;
+            client
+                .move_j(far, Some(6.0), None, None, None, false)
+                .await
+                .expect("move_j accepted")
+                .expect("move_j acked with an index")
+        });
+        let waiting = {
+            let client = client.clone();
+            rt.spawn(async move { client.wait_command(index, BUDGET).await })
+        };
+        daemon.shutdown();
+        let mut opts =
+            common::sim_options(common::retimed_config("client-restart", 0.02), status_port);
+        opts.command_port = Some(command_port);
+        daemon = Daemon::start(&opts).expect("the daemon restarts");
+        match rt.block_on(waiting).expect("the wait ran") {
+            Err(ClientError::SessionChanged { index: i }) => assert_eq!(i, index),
+            other => panic!("round {round}: a restart mid-wait must read as one: {other:?}"),
+        }
+    }
+    client.close();
+    drop(rt);
+    daemon.shutdown();
+}
+
+/// A `servo_l` stream that goes silent brakes the tool ALONG its line and
+/// stops it well short of the pose it was last sent. The brake owns the
+/// limiter until a new target arrives, so the tool never drives on toward
+/// the goal of a stream nobody is sending.
+#[test]
+fn a_servo_l_stream_that_goes_silent_brakes_short_of_its_target() {
+    run_session("servo-l-silence", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        let from = clear_of_the_wrist_deg();
+        settle_at(&client, from).await;
+        let start = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at start"));
+        let mut target = start;
+        for (axis, d) in [60.0, -45.0, 30.0].iter().enumerate() {
+            target[axis] += d;
+        }
+        let length = distance_mm(&start, &target);
+
+        // Under way, then silent.
+        for _ in 0..15 {
+            client
+                .servo_l(target, Some(0.6), Some(1.0))
+                .await
+                .expect("fire-and-forget sends");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let rest = pose_at_rest(&client).await;
+        let remaining = distance_mm(&rest, &target);
+        assert!(
+            remaining > 0.4 * length,
+            "the silent stream drove on toward its target: {remaining:.1} mm left of {length:.1}"
+        );
+        assert!(
+            distance_mm(&rest, &start) > 2.0,
+            "the stream never got under way"
+        );
+        assert!(
+            off_line(&start, &target, &rest) < 2.0,
+            "the brake left the line by {:.2} mm",
+            off_line(&start, &target, &rest)
+        );
+    })
+}
+
+/// A servo target nothing can reach is REFUSED — a standing error the
+/// client can read — never dropped as if it had been accepted. An
+/// accepted datagram wipes the standing error and the collision verdict,
+/// so a dropped target would read as a stream running normally while the
+/// arm sat still.
+#[test]
+fn an_unreachable_servo_target_is_refused_not_dropped() {
+    run_session("servo-unreachable", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        let park = common::park_deg();
+        settle_at(&client, park).await;
+        let rest = client.angles().await.expect("angles at rest");
+        // Two metres out: past any reach of this arm.
+        client
+            .servo_j_pose([2000.0, 0.0, 300.0, 180.0, 0.0, 180.0], Some(0.2), None)
+            .await
+            .expect("fire-and-forget sends");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        let error = loop {
+            if let Some(e) = client.error().await.expect("error query") {
+                break e;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "an unreachable servo target left no standing error"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(
+            error.code,
+            par6_proto::ErrorCode::IkTargetUnreachable as u16
+        );
+        let moved = client
+            .wait_status(
+                move |s| !close_deg(&s.angles, &rest, 0.3),
+                Duration::from_millis(1000),
+            )
+            .await;
+        assert!(!moved, "the arm moved on a refused target");
+    })
+}
+
+/// The fastest joint's speed \[rad/s\] as the runtime measures it, averaged
+/// over the last `SMOOTH` readings. The runtime's own velocities need no
+/// wall-clock timing; the average rides over the one tick a housekeeping
+/// pass that wakes late leaves without a fresh setpoint.
+struct JointSpeedTrace {
+    recent: std::collections::VecDeque<f64>,
+}
+
+impl JointSpeedTrace {
+    const SMOOTH: usize = 6;
+
+    fn new() -> Self {
+        Self {
+            recent: std::collections::VecDeque::with_capacity(Self::SMOOTH + 1),
+        }
+    }
+
+    async fn sample(&mut self, client: &Client) -> f64 {
+        let fastest = client
+            .joint_speeds()
+            .await
+            .expect("joint speeds")
+            .iter()
+            .fold(0.0_f64, |m, v| m.max(v.abs()));
+        self.recent.push_back(fastest);
+        if self.recent.len() > Self::SMOOTH {
+            self.recent.pop_front();
+        }
+        self.recent.iter().sum::<f64>() / self.recent.len() as f64
+    }
+}
+
+/// `stop()` during a `jog_l` brakes the tool ALONG the axis it was
+/// travelling and then holds it, as a stop does for every other motion:
+/// the cartesian limiter ramps it down, instead of the arm stopping dead
+/// from jog speed wherever the stream was cut.
+#[test]
+fn a_stop_mid_jog_l_brakes_along_the_axis_and_then_holds() {
+    run_session("jog-l-stop", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        let from = clear_of_the_wrist_deg();
+        settle_at(&client, from).await;
+        let start = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at start"));
+        // A quarter of the acceleration: a ramp of a few tenths of a
+        // second, long against the 20 ms between samples.
+        let press = || client.jog_l([0.3, -0.4, 0.0, 0.0, 0.0, 0.0], 0.3, Frame::Wrf, Some(0.25));
+        let mut trace = JointSpeedTrace::new();
+        let mut cruise = 0.0;
+        for _ in 0..50 {
+            press().await.expect("fire-and-forget sends");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cruise = trace.sample(&client).await;
+        }
+        assert!(
+            cruise > 0.01,
+            "the jog never got up to speed: {cruise:.4} rad/s"
+        );
+        let at_stop = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at the stop"));
+
+        client.stop(true).await.expect("the stop is acked");
+        // Stopped dead, the plant is at rest well inside 100 ms of the
+        // stop; braked at a quarter of the acceleration it is still
+        // travelling at most of its cruise speed at 150 ms.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let braking = client
+            .joint_speeds()
+            .await
+            .expect("joint speeds")
+            .iter()
+            .fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            braking > 0.3 * cruise,
+            "the stop cut the jog dead: {braking:.4} rad/s 150 ms in, against a \
+             {cruise:.4} rad/s cruise"
+        );
+
+        let rest = pose_at_rest(&client).await;
+        assert!(
+            distance_mm(&at_stop, &rest) > 1.0,
+            "the brake covered no ground past the stop"
+        );
+        let off = off_line(&start, &at_stop, &rest);
+        assert!(off < 2.0, "the brake left the jog axis by {off:.2} mm");
+    })
+}
+
+/// A `jog_l` pressed again while the ramp from the previous press is still
+/// running resumes from the speed the tool still carries, as parol6's
+/// does.
+#[test]
+fn a_jog_l_pressed_again_mid_ramp_carries_on_without_stopping() {
+    run_session("jog-l-repress", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        // The pose and diagonal the axis test jogs along: clear of the
+        // wrist singularity, and short enough that the joint speeds a
+        // given tool speed needs stay put.
+        let from = clear_of_the_wrist_deg();
+        settle_at(&client, from).await;
+        // A quarter of the rates: a ramp long enough to press into, with
+        // ticks to spare either side of the moment the ramp begins.
+        let press = || {
+            client.jog_l(
+                [0.15, -0.2, 0.0, 0.0, 0.0, 0.0],
+                0.1,
+                Frame::Wrf,
+                Some(0.25),
+            )
+        };
+        let mut trace = JointSpeedTrace::new();
+
+        let mut cruise = 0.0;
+        let mut last_press = tokio::time::Instant::now();
+        for _ in 0..50 {
+            press().await.expect("fire-and-forget sends");
+            last_press = tokio::time::Instant::now();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cruise = trace.sample(&client).await;
+        }
+        assert!(
+            cruise > 0.01,
+            "the jog never got up to speed: {cruise:.4} rad/s"
+        );
+        // The ramp down starts 0.1 s (the press's duration) after the last
+        // press lands and runs ~0.36 s at this acceleration: re-press a
+        // quarter of the way into it.
+        tokio::time::sleep_until(last_press + Duration::from_millis(200)).await;
+        let mut slowest = f64::MAX;
+        for _ in 0..25 {
+            press().await.expect("fire-and-forget sends");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            slowest = slowest.min(trace.sample(&client).await);
+        }
+        assert!(
+            slowest > 0.3 * cruise,
+            "the re-press stopped the arm: {slowest:.4} rad/s against a {cruise:.4} rad/s cruise"
         );
     })
 }

@@ -78,6 +78,7 @@ class StatusBuffer:
     speeds: np.ndarray = field(
         default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64)
     )
+    """Joint speeds [deg/s]."""
     io: np.ndarray = field(default_factory=lambda: np.zeros(IO_SLOTS, dtype=np.int32))
     action_current: str = ""
     action_state: ActionState = ActionState.IDLE
@@ -191,6 +192,8 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
     buf.pose[:] = d["pose"]
     buf.angles[:] = d["angles"]
     buf.speeds[:] = d["speeds"]
+    # The wire carries rad/s; the API speaks degrees, like `angles`.
+    np.rad2deg(buf.speeds, out=buf.speeds)
     buf.io = _int_array(buf.io, d["io"])
     buf.action_current = d["action_current"]
     buf.action_state = _enum(buf.action_state, ActionState, d["action_state"])
