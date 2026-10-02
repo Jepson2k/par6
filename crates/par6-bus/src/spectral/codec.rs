@@ -152,14 +152,17 @@ pub enum CommandId {
     /// 41 — Velocity_Window (DLC 1: the speed filter's moving-average length in
     /// control loops, 4..64, the vendor's 20; par6 firmware).
     VelocityWindow = 41,
-    /// 42 — Inject (DLC 5: i16 amplitude \[mA\], u16 seed, u8 control loops
-    /// per bit; par6 firmware). Arms the next capture only: while it records,
-    /// the velocity and position loops add a pseudo-random ±amplitude to
-    /// their current setpoint and channel 2 records that setpoint instead of
-    /// the electrical phase.
-    Inject = 42,
-    /// 43 — periodic injection configuration (DLC 8), RTR status/capability.
-    PeriodicInject = 43,
+    /// 42 — Capture_Stream (DLC 0; par6 firmware). The drive sends every
+    /// recorded pair of every capture channel as cmd 39 replies, channel 0
+    /// then 1 then 2 in pair order, one frame every 320 µs from its main
+    /// loop, so a 1024-sample capture arrives in about half a second instead
+    /// of one pair per host tick.
+    CaptureStream = 42,
+    /// 43 — the stream's frames (D→H DLC 7, the cmd 39 reply laid out the
+    /// same way). Their own id, so a streamed frame never shares an
+    /// arbitration id with a host cmd 39 request: two frames with one id
+    /// and different lengths both win arbitration and collide.
+    CaptureStreamData = 43,
     /// 60 — Respond_Gripper_data (D→H DLC 4).
     RespondGripperData = 60,
     /// 61 — Gripper_data_pack (DLC 5, or DLC 0 = empty watchdog poll).
@@ -215,8 +218,8 @@ impl CommandId {
             39 => CaptureRead,
             40 => Ripple,
             41 => VelocityWindow,
-            42 => Inject,
-            43 => PeriodicInject,
+            42 => CaptureStream,
+            43 => CaptureStreamData,
             60 => RespondGripperData,
             61 => GripperDataPack,
             62 => GripperCalibrate,
@@ -616,14 +619,21 @@ pub fn encode_capture(node: NodeId, divisor: u8, wanted: u16) -> CanFrame {
 }
 
 /// Capture_Read (cmd 39): ask for pair `chunk` of `channel` (0 velocity,
-/// 1 Iq, 2 electrical phase, or the current setpoint when the capture
-/// was armed with an injection), or the capture's status with [`CAPTURE_STATUS_CHANNEL`].
+/// 1 Iq, 2 electrical phase), or the capture's status with
+/// [`CAPTURE_STATUS_CHANNEL`].
 pub fn encode_capture_read(node: NodeId, channel: u8, chunk: u16) -> CanFrame {
     let c = chunk.to_be_bytes();
     CanFrame::data_frame(
         pack_can_id(node, CommandId::CaptureRead, false),
         &[channel, c[0], c[1]],
     )
+}
+
+/// Capture_Stream (cmd 42): have `node` send its whole capture as cmd 39
+/// replies, paced by the drive. Pairs the bus drops are read back one at a
+/// time with [`encode_capture_read`].
+pub fn encode_capture_stream(node: NodeId) -> CanFrame {
+    CanFrame::data_frame(pack_can_id(node, CommandId::CaptureStream, false), &[])
 }
 
 /// Ripple feedforward slots a drive has (cmd 40).
@@ -647,39 +657,6 @@ pub fn encode_velocity_window(node: NodeId, window: u8) -> CanFrame {
         pack_can_id(node, CommandId::VelocityWindow, false),
         &[window],
     )
-}
-
-/// Inject (cmd 42): arm the next capture with a pseudo-random ±`amplitude_ma`
-/// on the loops' current setpoint, the sign the low bit of a 16-bit Galois
-/// LFSR (taps [`INJECT_TAPS`]) seeded with `seed` and stepped every `hold`
-/// control loops; see [`inject_sequence`]. Amplitude 0 disarms.
-pub fn encode_inject(node: NodeId, amplitude_ma: i16, seed: u16, hold: u8) -> CanFrame {
-    let (a, s) = (amplitude_ma.to_be_bytes(), seed.to_be_bytes());
-    CanFrame::data_frame(
-        pack_can_id(node, CommandId::Inject, false),
-        &[a[0], a[1], s[0], s[1], hold],
-    )
-}
-
-/// The injection's LFSR taps (x^16 + x^14 + x^13 + x^11 + 1, maximal).
-pub const INJECT_TAPS: u16 = 0xB400;
-
-/// The signs an injection armed with `seed` and `hold` applies over the
-/// first `loops` control loops of its capture, as the drive steps them: +1
-/// while the LFSR's low bit is set. A seed of 0 runs as 1, and so does a
-/// hold of 0.
-pub fn inject_sequence(seed: u16, hold: u8, loops: usize) -> Vec<f64> {
-    let hold = usize::from(hold.max(1));
-    let mut lfsr = seed.max(1);
-    (0..loops)
-        .map(|k| {
-            let sign = if lfsr & 1 == 1 { 1.0 } else { -1.0 };
-            if (k + 1) % hold == 0 {
-                lfsr = (lfsr >> 1) ^ ((0u16.wrapping_sub(lfsr & 1)) & INJECT_TAPS);
-            }
-            sign
-        })
-        .collect()
 }
 
 /// Impedance PD gains (cmd 16): f32 KP + f32 KD.
@@ -916,8 +893,6 @@ pub enum Payload {
         /// The pair.
         samples: [i16; 2],
     },
-    /// cmd 43: periodic protocol version and the last experiment state.
-    PeriodicStatus(super::periodic::Status),
     /// cmd 39 reply to a status request: how far the capture got.
     CaptureStatus {
         /// Samples recorded so far.
@@ -1082,18 +1057,7 @@ pub fn decode_frame(frame: &CanFrame) -> Result<DecodedFrame, DecodeError> {
                 ma: unpack_i16([d[6], d[7]]),
             }
         }
-        CommandId::PeriodicInject => {
-            expect_dlc(frame, node, raw_cmd, err_bit, 8)?;
-            Payload::PeriodicStatus(super::periodic::Status {
-                version: d[0],
-                profile: d[1],
-                divisor: d[2],
-                flags: d[3],
-                token: u16::from_be_bytes([d[4], d[5]]),
-                peak_ma: u16::from_be_bytes([d[6], d[7]]),
-            })
-        }
-        CommandId::CaptureRead => {
+        CommandId::CaptureRead | CommandId::CaptureStreamData => {
             expect_dlc(frame, node, raw_cmd, err_bit, 7)?;
             let word = |i: usize| u16::from_be_bytes([d[i], d[i + 1]]);
             if d[0] == CAPTURE_STATUS_CHANNEL {
@@ -1222,7 +1186,7 @@ pub fn decode_frame(frame: &CanFrame) -> Result<DecodedFrame, DecodeError> {
         | CommandId::Capture
         | CommandId::Ripple
         | CommandId::VelocityWindow
-        | CommandId::Inject
+        | CommandId::CaptureStream
         | CommandId::GripperDataPack
         | CommandId::GripperCalibrate => {
             return Err(DecodeError::NotAReply {
@@ -1624,31 +1588,5 @@ mod tests {
         // data[0] slot, data[1] harmonic, data[2..3] and data[4..5] big-endian.
         assert_eq!(f.payload(), &[2, 4, 0xFE, 0xD4, 0x04, 0xD2]);
         assert!(decode_frame(&f).is_err(), "cmd 40 is host-to-drive only");
-    }
-
-    #[test]
-    fn inject_frame_and_sequence_match_what_the_drive_runs() {
-        let f = encode_inject(3, -200, 0xACE1, 4);
-        assert_eq!(unpack_can_id(f.id), (3, 42, false));
-        // data[0..1] amplitude and data[2..3] seed big-endian, data[4] hold.
-        assert_eq!(f.payload(), &[0xFF, 0x38, 0xAC, 0xE1, 4]);
-        assert!(decode_frame(&f).is_err(), "cmd 42 is host-to-drive only");
-
-        // Maximal length: the signs repeat only after 65535 bits, balanced to
-        // one, so no capture sees a short cycle or a bias.
-        let period = usize::from(u16::MAX);
-        let bits = inject_sequence(0xACE1, 1, 2 * period);
-        assert_eq!(bits[..period], bits[period..]);
-        assert_eq!(bits[..period].iter().sum::<f64>(), 1.0);
-        let shortest = (1..period).find(|p| bits[..period] == bits[*p..*p + period]);
-        assert_eq!(shortest, None);
-
-        // A hold of 3 holds each of those signs for three loops.
-        let held = inject_sequence(0xACE1, 3, 300);
-        for (k, sign) in held.iter().enumerate() {
-            assert_eq!(*sign, bits[k / 3]);
-        }
-        // The drive runs seed 0 and hold 0 as 1.
-        assert_eq!(inject_sequence(0, 0, 64), inject_sequence(1, 1, 64));
     }
 }

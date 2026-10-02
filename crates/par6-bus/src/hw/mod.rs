@@ -49,7 +49,7 @@ use crate::spectral::codec::{
     unpack_can_id, CanFrame, CommandId, DecodedFrame, Payload, CAN_MAX_DATA,
 };
 use crate::spectral::codec::{
-    encode_capture, encode_capture_read, encode_inject, encode_readback_request,
+    encode_capture, encode_capture_read, encode_capture_stream, encode_readback_request,
 };
 use crate::types::CaptureBuffer;
 use crate::types::{
@@ -278,9 +278,6 @@ impl SocketCanBus {
         let node = match decode_frame(frame) {
             Ok(d) => {
                 match d.payload {
-                    Payload::PeriodicStatus(status) => {
-                        self.captures[usize::from(d.node)].periodic = Some(status)
-                    }
                     Payload::Capture {
                         channel,
                         chunk,
@@ -577,7 +574,7 @@ fn apply_payload(decoded: &DecodedFrame, state: &mut BusState) {
         }
         // Kept by the backend, not the shared state: see `SocketCanBus::captures`.
         Payload::Readback(r) => state.nodes[n].readback[r.kind().index()] = Some(r),
-        Payload::Capture { .. } | Payload::CaptureStatus { .. } | Payload::PeriodicStatus(_) => {}
+        Payload::Capture { .. } | Payload::CaptureStatus { .. } => {}
         Payload::DeviceInfo(info) => state.nodes[n].device_info = Some(info),
         Payload::Kt { nm_per_a } => state.nodes[n].kt_nm_a = Some(nm_per_a),
         Payload::Gripper(reply) => {
@@ -893,34 +890,9 @@ impl DriverBus for SocketCanBus {
         ))
     }
 
-    fn arm_injection(
-        &mut self,
-        node: NodeId,
-        amplitude_ma: i16,
-        seed: u16,
-        hold: u8,
-    ) -> Result<(), BusError> {
+    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
         self.ensure_ready()?;
-        self.send(&encode_inject(node, amplitude_ma, seed, hold))
-    }
-
-    fn arm_periodic(
-        &mut self,
-        node: NodeId,
-        spec: crate::spectral::periodic::Spec,
-    ) -> Result<(), BusError> {
-        self.ensure_ready()?;
-        if !spec.valid() {
-            return Err(BusError::InvalidCommand {
-                reason: "invalid periodic injection",
-            });
-        }
-        self.send(&crate::spectral::periodic::encode(node, spec))
-    }
-
-    fn read_periodic_status(&mut self, node: NodeId) -> Result<(), BusError> {
-        self.ensure_ready()?;
-        self.send(&crate::spectral::periodic::request(node))
+        self.send(&encode_capture_stream(node))
     }
 
     fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {

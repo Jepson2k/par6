@@ -281,14 +281,11 @@ pub struct CaptureBuffer {
     pub wanted: u16,
     /// Control loops per sample (status reply).
     pub divisor: u16,
-    /// Versioned experiment identity; cleared with every new capture.
-    pub periodic: Option<crate::spectral::periodic::Status>,
     /// Channel 0 \[ticks/s / `CAPTURE_VEL_SCALE`\], indexed by sample.
     pub velocity: Vec<i16>,
     /// Channel 1 \[mA\], indexed by sample.
     pub current: Vec<i16>,
-    /// Channel 2: the rotor's electrical phase, 0..16383 per cycle, or the
-    /// current setpoint \[mA\] when the capture ran an injection (cmd 42).
+    /// Channel 2: the rotor's electrical phase, 0..16383 per cycle.
     pub phase: Vec<i16>,
     /// Which pairs of each channel have been answered.
     received: [Vec<bool>; 3],
@@ -305,7 +302,6 @@ impl CaptureBuffer {
     pub fn new() -> Self {
         let len = usize::from(crate::spectral::codec::CAPTURE_LEN);
         Self {
-            periodic: None,
             recorded: 0,
             wanted: 0,
             divisor: 0,
@@ -322,7 +318,6 @@ impl CaptureBuffer {
 
     /// Forget the previous capture: a new one is starting.
     pub fn clear(&mut self) {
-        self.periodic = None;
         self.recorded = 0;
         self.wanted = 0;
         self.divisor = 0;

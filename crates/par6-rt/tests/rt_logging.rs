@@ -142,14 +142,8 @@ impl DriverBus for FailingBus {
         self.inner.set_velocity_window(node, window)
     }
 
-    fn arm_injection(
-        &mut self,
-        node: NodeId,
-        amplitude_ma: i16,
-        seed: u16,
-        hold: u8,
-    ) -> Result<(), BusError> {
-        self.inner.arm_injection(node, amplitude_ma, seed, hold)
+    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
+        self.inner.capture_stream(node)
     }
 
     fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {

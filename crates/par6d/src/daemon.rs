@@ -712,19 +712,62 @@ struct ConfigFiles {
     tools: Vec<(String, String)>,
 }
 
-fn read_config_files(robot_toml: &std::path::Path) -> std::io::Result<ConfigFiles> {
+/// sha256 hex over the robot TOML and each gripper file, each hashed as its
+/// file name, a newline, then its content bytes.
+fn config_fingerprint(
+    robot_filename: &str,
+    robot_toml: &str,
+    tools: &[(String, String)],
+) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    let mut read = |path: &std::path::Path| -> std::io::Result<(String, String)> {
+    for (name, content) in std::iter::once((robot_filename, robot_toml))
+        .chain(tools.iter().map(|(n, c)| (n.as_str(), c.as_str())))
+    {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(content.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// The files as the daemon runs them: when the gripper drive identified a
+/// tool other than the file's `active_tool`, the served TOML names that
+/// tool and the fingerprint follows, so a client that materializes this
+/// bundle (payload estimation does) fits what the arm is wearing.
+fn fitted_files(mut files: ConfigFiles, active_tool: &str) -> ConfigFiles {
+    let fitted = format!("active_tool = \"{active_tool}\"");
+    let mut changed = false;
+    let text: Vec<String> = files
+        .robot_toml
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            let is_key =
+                trimmed.starts_with("active_tool") && trimmed[11..].trim_start().starts_with('=');
+            if is_key && trimmed != fitted {
+                changed = true;
+                return fitted.clone();
+            }
+            line.to_owned()
+        })
+        .collect();
+    if changed {
+        files.robot_toml = text.join("\n") + "\n";
+        files.fingerprint =
+            config_fingerprint(&files.robot_filename, &files.robot_toml, &files.tools);
+    }
+    files
+}
+
+fn read_config_files(robot_toml: &std::path::Path) -> std::io::Result<ConfigFiles> {
+    let read = |path: &std::path::Path| -> std::io::Result<(String, String)> {
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_owned();
         let content = std::fs::read_to_string(path)?;
-        hasher.update(name.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(content.as_bytes());
         Ok((name, content))
     };
     let (robot_filename, robot_content) = read(robot_toml)?;
@@ -745,7 +788,7 @@ fn read_config_files(robot_toml: &std::path::Path) -> std::io::Result<ConfigFile
         .map(|g| read(g))
         .collect::<std::io::Result<Vec<_>>>()?;
     Ok(ConfigFiles {
-        fingerprint: format!("{:x}", hasher.finalize()),
+        fingerprint: config_fingerprint(&robot_filename, &robot_content, &tools),
         robot_filename,
         robot_toml: robot_content,
         tools,
@@ -754,15 +797,17 @@ fn read_config_files(robot_toml: &std::path::Path) -> std::io::Result<ConfigFile
 
 fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) -> ConfigInfoData {
     let m = robot.motion;
-    let files = read_config_files(config_path).unwrap_or_else(|e| {
-        log::warn!("config file readback failed: {e}");
-        ConfigFiles {
-            fingerprint: String::new(),
-            robot_filename: String::new(),
-            robot_toml: String::new(),
-            tools: Vec::new(),
-        }
-    });
+    let files = read_config_files(config_path)
+        .map(|files| fitted_files(files, &robot.robot.active_tool))
+        .unwrap_or_else(|e| {
+            log::warn!("config file readback failed: {e}");
+            ConfigFiles {
+                fingerprint: String::new(),
+                robot_filename: String::new(),
+                robot_toml: String::new(),
+                tools: Vec::new(),
+            }
+        });
     ConfigInfoData {
         path: config_path.display().to_string(),
         fingerprint: files.fingerprint,

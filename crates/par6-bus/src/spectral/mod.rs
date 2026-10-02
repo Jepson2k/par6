@@ -18,7 +18,6 @@
 
 pub mod codec;
 pub mod convert;
-pub mod periodic;
 
 pub use codec::{
     decode_frame, encode_clear_error, encode_current_gains, encode_estop, encode_gripper_command,

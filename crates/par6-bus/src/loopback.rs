@@ -533,17 +533,6 @@ impl DriverBus for LoopbackBus {
         self.ensure_ready()
     }
 
-    /// Nothing on the loopback records; the request is accepted.
-    fn arm_injection(
-        &mut self,
-        _node: NodeId,
-        _amplitude_ma: i16,
-        _seed: u16,
-        _hold: u8,
-    ) -> Result<(), BusError> {
-        self.ensure_ready()
-    }
-
     /// Nothing on the loopback applies it; the request is accepted.
     fn set_ripple(
         &mut self,
@@ -555,6 +544,12 @@ impl DriverBus for LoopbackBus {
 
     /// The loopback has no drive to record anything; the request is
     /// accepted and nothing is ever read back.
+    /// Nothing on the loopback records, so nothing streams; the request is
+    /// accepted.
+    fn capture_stream(&mut self, _node: NodeId) -> Result<(), BusError> {
+        self.ensure_ready()
+    }
+
     fn capture_start(&mut self, _node: NodeId, _divisor: u8, _wanted: u16) -> Result<(), BusError> {
         self.ensure_ready()
     }

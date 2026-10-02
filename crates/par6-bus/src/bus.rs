@@ -145,37 +145,11 @@ pub trait DriverBus {
     /// node's reconnect resend.
     fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError>;
 
-    /// Arm `node`'s next capture with an injection (cmd 42): while it
-    /// records, the drive adds a pseudo-random ±`amplitude_ma` to its loops'
-    /// current setpoint, the signs
-    /// [`inject_sequence`](crate::spectral::codec::inject_sequence) of `seed`
-    /// and `hold`, and capture channel 2 records that setpoint instead of the
-    /// electrical phase. One capture only; amplitude 0 disarms.
-    fn arm_injection(
-        &mut self,
-        node: NodeId,
-        amplitude_ma: i16,
-        seed: u16,
-        hold: u8,
-    ) -> Result<(), BusError>;
-
-    /// Arm/cancel a finite periodic experiment. Unsupported backends refuse it.
-    fn arm_periodic(
-        &mut self,
-        _node: NodeId,
-        _spec: crate::spectral::periodic::Spec,
-    ) -> Result<(), BusError> {
-        Err(BusError::InvalidCommand {
-            reason: "periodic injection requires STEPFOC hardware",
-        })
-    }
-
-    /// Query capability/state without enabling motion or injection.
-    fn read_periodic_status(&mut self, _node: NodeId) -> Result<(), BusError> {
-        Err(BusError::InvalidCommand {
-            reason: "periodic injection requires STEPFOC hardware",
-        })
-    }
+    /// Have `node` send its whole capture (cmd 42) as the same replies a
+    /// [`PollAction::CaptureRead`] gets, paced by the drive; they land in
+    /// [`DriverBus::capture`] as they arrive. Pairs the bus drops are read
+    /// back one at a time afterwards.
+    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError>;
 
     /// Start a loop-rate capture on `node` (cmd 38): `wanted` samples of the
     /// velocity its loop acts on and Iq, one every `divisor` control loops,

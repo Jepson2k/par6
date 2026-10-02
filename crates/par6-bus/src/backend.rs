@@ -129,26 +129,8 @@ impl DriverBus for RuntimeBus {
         dispatch!(self, set_velocity_window(node, window))
     }
 
-    fn arm_injection(
-        &mut self,
-        node: NodeId,
-        amplitude_ma: i16,
-        seed: u16,
-        hold: u8,
-    ) -> Result<(), BusError> {
-        dispatch!(self, arm_injection(node, amplitude_ma, seed, hold))
-    }
-
-    fn arm_periodic(
-        &mut self,
-        node: NodeId,
-        spec: crate::spectral::periodic::Spec,
-    ) -> Result<(), BusError> {
-        dispatch!(self, arm_periodic(node, spec))
-    }
-
-    fn read_periodic_status(&mut self, node: NodeId) -> Result<(), BusError> {
-        dispatch!(self, read_periodic_status(node))
+    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
+        dispatch!(self, capture_stream(node))
     }
 
     fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {

@@ -54,7 +54,7 @@ use crate::spectral::codec::{
     CanFrame, CommandId, Payload,
 };
 use crate::spectral::codec::{
-    encode_capture, encode_capture_read, encode_inject, encode_readback_request,
+    encode_capture, encode_capture_read, encode_capture_stream, encode_readback_request,
 };
 use crate::spectral::convert::JointConversion;
 use crate::types::CaptureBuffer;
@@ -71,6 +71,8 @@ use map::JointMap;
 /// RX queue capacity \[frames\]. Replies past it are dropped, mirroring
 /// the silent kernel-queue drop of a saturated real interface.
 const RX_QUEUE_CAP: usize = 512;
+/// A streaming drive's frames per 4 ms host tick: one every 320 µs.
+const STREAM_FRAMES_PER_TICK: usize = 12;
 
 /// Where the runtime posts world layers for the simulator: one slot per
 /// layer, latest wins, taken by the bus on its own tick. Posting allocates
@@ -126,6 +128,10 @@ pub struct SimBus {
     node_to_joint: [Option<usize>; MAX_NODES],
     gripper_node: NodeId,
     captures: Vec<CaptureBuffer>,
+    /// Per node, a capture stream in progress: the channel being sent and
+    /// its next pair. Paced like the firmware's loop: one frame every
+    /// 320 µs, so `STREAM_FRAMES_PER_TICK` a tick.
+    streams: Vec<Option<(u8, u16)>>,
     timing_dummy_node: NodeId,
     rx_cap: usize,
     fresh: FreshnessClock,
@@ -193,6 +199,7 @@ impl SimBus {
             node_to_joint: [None; MAX_NODES],
             gripper_node: 0,
             captures: (0..MAX_NODES).map(|_| CaptureBuffer::new()).collect(),
+            streams: vec![None; MAX_NODES],
             timing_dummy_node: 0,
             rx_cap: 32,
             fresh: FreshnessClock::default(),
@@ -509,6 +516,41 @@ impl SimBus {
         Ok(())
     }
 
+    /// The frames each streaming node's loop would have sent since the last
+    /// tick: channels 0, 1, 2 in pair order up to the last pair recorded.
+    fn pump_streams(&mut self) {
+        for node in 0..MAX_NODES {
+            let Some((mut channel, mut chunk)) = self.streams[node] else {
+                continue;
+            };
+            let Some(j) = self.node_to_joint[node] else {
+                self.streams[node] = None;
+                continue;
+            };
+            let pairs = self.drivers[j].capture_pairs();
+            for _ in 0..STREAM_FRAMES_PER_TICK {
+                while chunk >= pairs {
+                    channel += 1;
+                    chunk = 0;
+                    if channel > 2 {
+                        break;
+                    }
+                }
+                if channel > 2 {
+                    break;
+                }
+                let err = self.drivers[j].err_bit();
+                let p = self.drivers[j].capture_reply(channel, chunk);
+                self.enqueue(CanFrame::data_frame(
+                    pack_can_id(node as NodeId, CommandId::CaptureStreamData, err),
+                    &p,
+                ));
+                chunk += 1;
+            }
+            self.streams[node] = (channel <= 2).then_some((channel, chunk));
+        }
+    }
+
     fn enqueue(&mut self, frame: CanFrame) {
         if self.rx.len() >= RX_QUEUE_CAP {
             self.dropped_rx += 1;
@@ -816,6 +858,10 @@ impl SimBus {
                 self.drivers[j].capture_start(d[0], u16::from_be_bytes([d[1], d[2]]));
                 return;
             }
+            (CommandId::CaptureStream, 0) => {
+                self.streams[usize::from(node)] = Some((0, 0));
+                return;
+            }
             (CommandId::CaptureRead, 3) => {
                 let err = self.drivers[j].err_bit();
                 let p = self.drivers[j].capture_reply(d[0], u16::from_be_bytes([d[1], d[2]]));
@@ -1025,9 +1071,7 @@ impl SimBus {
             }
             // Kept by the backend, not the shared state: see `SimBus::captures`.
             Payload::Readback(r) => state.nodes[n].readback[r.kind().index()] = Some(r),
-            Payload::Capture { .. }
-            | Payload::CaptureStatus { .. }
-            | Payload::PeriodicStatus(_) => {}
+            Payload::Capture { .. } | Payload::CaptureStatus { .. } => {}
             Payload::DeviceInfo(info) => state.nodes[n].device_info = Some(info),
             Payload::Kt { nm_per_a } => state.nodes[n].kt_nm_a = Some(nm_per_a),
             Payload::Gripper(reply) => {
@@ -1049,6 +1093,7 @@ impl DriverBus for SimBus {
             }
         }
         self.tick = tick;
+        self.pump_streams();
         self.joints_sent_this_tick = false;
         self.tx_frames_this_tick = 0;
         if !self.silent {
@@ -1462,20 +1507,15 @@ impl DriverBus for SimBus {
         Ok(())
     }
 
-    fn arm_injection(
-        &mut self,
-        node: NodeId,
-        amplitude_ma: i16,
-        seed: u16,
-        hold: u8,
-    ) -> Result<(), BusError> {
+    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
         self.ensure_ready()?;
-        self.deliver_frame(&encode_inject(node, amplitude_ma, seed, hold));
+        self.deliver_frame(&encode_capture_stream(node));
         Ok(())
     }
 
     fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {
         self.ensure_ready()?;
+        self.streams[usize::from(node)] = None;
         self.captures[usize::from(node)].clear();
         self.deliver_frame(&encode_capture(node, divisor, wanted));
         Ok(())

@@ -7,7 +7,7 @@
 
 use crate::spectral::codec::{
     unpack_f32, unpack_i16, unpack_i24, unpack_u32, CommandId, CAPTURE_LEN, CAPTURE_STATUS_CHANNEL,
-    CAPTURE_VEL_SCALE, INJECT_TAPS, RIPPLE_SLOTS,
+    CAPTURE_VEL_SCALE, RIPPLE_SLOTS,
 };
 use crate::types::{DeviceInfo, ErrorFlags, NodeId};
 
@@ -133,12 +133,6 @@ pub(crate) struct VirtualDriver {
     capture_phase: Vec<i16>,
     /// Ripple feedforward slots (cmd 40): (harmonic, cosine mA, sine mA).
     ripple: [(u8, i16, i16); RIPPLE_SLOTS as usize],
-    /// The injection cmd 42 armed for the next capture: amplitude \[mA\],
-    /// seed, loops per bit.
-    inject_next: (i16, u16, u8),
-    /// The injection the capture recording now runs: amplitude \[mA\] (0 =
-    /// none), LFSR state, loops per bit, loops since the last step.
-    inject: (i16, u16, u8, u8),
     /// The rotor's electrical phase this loop, 0..16383 per cycle, as the
     /// firmware derives it from the raw count.
     phase: u32,
@@ -197,8 +191,6 @@ impl VirtualDriver {
             capture_iq: vec![0; usize::from(CAPTURE_LEN)],
             capture_phase: vec![0; usize::from(CAPTURE_LEN)],
             ripple: [(0, 0, 0); RIPPLE_SLOTS as usize],
-            inject_next: (0, 1, 1),
-            inject: (0, 1, 1, 0),
             phase: 0,
             written: [None; 7],
             flags: ErrorFlags {
@@ -231,10 +223,6 @@ impl VirtualDriver {
         self.capture_div = u16::from(divisor.max(1));
         self.capture_tick = 0;
         self.capture_pos = 0;
-        // An armed injection belongs to this capture alone.
-        let (amplitude, seed, hold) = self.inject_next;
-        self.inject = (amplitude, seed, hold, 0);
-        self.inject_next.0 = 0;
     }
 
     /// A read request on a configuration frame: what was last written, the
@@ -245,6 +233,11 @@ impl VirtualDriver {
 
     /// cmd 39 reply payload: pair `chunk` of `channel`, zero past what
     /// was recorded; the status for `CAPTURE_STATUS_CHANNEL`.
+    /// Pairs recorded so far: what a stream sends per channel.
+    pub fn capture_pairs(&self) -> u16 {
+        self.capture_pos.div_ceil(2)
+    }
+
     pub fn capture_reply(&self, channel: u8, chunk: u16) -> [u8; 7] {
         let mut p = [0u8; 7];
         p[0] = channel;
@@ -309,11 +302,6 @@ impl VirtualDriver {
                     self.velocity_window = window;
                     self.velocity_samples = 0;
                 }
-                ReplyKind::None
-            }
-            (Inject, 5) => {
-                let seed = u16::from_be_bytes([d[2], d[3]]);
-                self.inject_next = (i16::from_be_bytes([d[0], d[1]]), seed.max(1), d[4].max(1));
                 ReplyKind::None
             }
             (Ripple, 6) if d[0] < RIPPLE_SLOTS => {
@@ -531,8 +519,7 @@ impl VirtualDriver {
 
     /// Loop-rate capture (cmd 38), after the loop the way the firmware takes
     /// it: this loop's filtered velocity, the current the last loop drove,
-    /// and the electrical phase, or with an injection the current this loop
-    /// just commanded.
+    /// and the electrical phase.
     fn record_capture(&mut self, vel_ticks_s: f64, driven: f64) {
         if self.capture_pos >= self.capture_wanted {
             return;
@@ -543,33 +530,8 @@ impl VirtualDriver {
             let i = usize::from(self.capture_pos);
             self.capture_vel[i] = (vel_ticks_s / f64::from(CAPTURE_VEL_SCALE)) as i16;
             self.capture_iq[i] = driven as i16;
-            self.capture_phase[i] = if self.inject.0 != 0 {
-                self.cur_out_ma as i16
-            } else {
-                self.phase as i16
-            };
+            self.capture_phase[i] = self.phase as i16;
             self.capture_pos += 1;
-        }
-        let (amplitude, lfsr, hold, count) = &mut self.inject;
-        if *amplitude != 0 {
-            *count += 1;
-            if *count >= *hold {
-                *count = 0;
-                *lfsr = (*lfsr >> 1) ^ (0u16.wrapping_sub(*lfsr & 1) & INJECT_TAPS);
-            }
-        }
-    }
-
-    /// The injection's current this loop \[mA\]: ±amplitude while the capture
-    /// it was armed for records.
-    fn inject_ma(&self) -> f64 {
-        let (amplitude, lfsr, ..) = self.inject;
-        if amplitude == 0 || self.capture_pos >= self.capture_wanted {
-            0.0
-        } else if lfsr & 1 == 1 {
-            f64::from(amplitude)
-        } else {
-            -f64::from(amplitude)
         }
     }
 
@@ -710,7 +672,7 @@ impl VirtualDriver {
         let err = vel_target - vel_meas;
         self.integral_ma =
             (self.integral_ma + self.kiv * err * fw_steps).clamp(-self.ilim_ma, self.ilim_ma);
-        self.kpv * err + self.integral_ma + cur_ff + self.ripple_ff() + self.inject_ma()
+        self.kpv * err + self.integral_ma + cur_ff + self.ripple_ff()
     }
 
     /// The firmware's ripple feedforward at this loop's phase \[mA\].

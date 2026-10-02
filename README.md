@@ -688,8 +688,9 @@ outside selfcal — the anti-resonance/resonance pair it showed is what
 `[sim] arm_lateral_stiffness_nm_rad` carries. `--only <stage>` (repeatable) runs
 homing and just those stages, for development, and `--joint N` narrows the
 ripple and gains stages to some joints. Hardware runs need `sudo`; the ripple and gains stages need the par6
-STEPFOC firmware. The earlier injected and periodic identification methods are
-kept only as [development notes](docs/development/2026-09-28-periodic-tuning.md).
+STEPFOC firmware. The earlier injected and periodic identification methods were
+removed; the [development notes](docs/development/2026-09-28-periodic-tuning.md)
+record why.
 
 **The tool: `estimate_payload()`.** With the tool fitted and `par6d` running,
 the client call holds a few wrist poses and fits the mass and centre of mass it
