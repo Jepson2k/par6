@@ -5542,6 +5542,229 @@ fn patch_array(text: &mut String, key: &str, values: &[f64]) -> Result<()> {
 
 /// Patch the measured values into the file as written, so its comments and
 /// layout survive; a full re-serialisation would discard them.
+/// Earlier runs the end-of-run history shows beside this one.
+const HISTORY_RUNS: usize = 3;
+
+/// How the calibration is moving: this run's values beside those of the most
+/// recent earlier runs in the same output directory, newest first, with the
+/// change against the newest. The console gets the rows that moved and a
+/// count of those that did not; the whole table is left as `history.tsv` in
+/// the run directory. An earlier run whose `calibrated.toml` is missing or no
+/// longer loads is skipped. `None` when there is no earlier run to compare.
+fn history(
+    directory: &Path,
+    current: &par6_config::RobotConfig,
+) -> Result<Option<(String, String)>> {
+    let Some(parent) = directory.parent() else {
+        return Ok(None);
+    };
+    let mut runs: Vec<PathBuf> = fs::read_dir(parent)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path != directory
+                && path.is_dir()
+                && path
+                    .file_name()
+                    .is_some_and(|name| name.to_string_lossy().starts_with("selfcal-"))
+        })
+        .collect();
+    runs.sort();
+    let mut earlier: Vec<(String, par6_config::RobotConfig)> = Vec::new();
+    for path in runs.iter().rev() {
+        let Ok(text) = fs::read_to_string(path.join("calibrated.toml")) else {
+            continue;
+        };
+        let Ok(config) = par6_config::RobotConfig::from_toml_str(&text) else {
+            continue;
+        };
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let label = name[name.len().saturating_sub(8)..].to_owned();
+        earlier.push((label, config));
+        if earlier.len() == HISTORY_RUNS {
+            break;
+        }
+    }
+    if earlier.is_empty() {
+        return Ok(None);
+    }
+    let columns: Vec<&par6_config::RobotConfig> = std::iter::once(current)
+        .chain(earlier.iter().map(|(_, config)| config))
+        .collect();
+    let joints = columns
+        .iter()
+        .map(|config| config.joints.len())
+        .min()
+        .unwrap_or(0);
+    let mut rows: Vec<(String, Vec<f64>)> = Vec::new();
+    for j in 0..joints {
+        for name in ["kpv", "kiv", "kpp"] {
+            rows.push((
+                format!("J{} {name}", j + 1),
+                columns
+                    .iter()
+                    .map(|config| {
+                        let gains = &config.joints[j].gains;
+                        match name {
+                            "kpv" => gains.kpv,
+                            "kiv" => gains.kiv,
+                            _ => gains.kpp,
+                        }
+                    })
+                    .collect(),
+            ));
+        }
+    }
+    for j in 0..joints {
+        let at = |values: &[f64]| values.get(j).copied().unwrap_or(f64::NAN);
+        rows.push((
+            format!("J{} viscous Nm.s/rad", j + 1),
+            columns
+                .iter()
+                .map(|config| at(&config.sim.viscous_nm_s))
+                .collect(),
+        ));
+        rows.push((
+            format!("J{} coulomb Nm", j + 1),
+            columns
+                .iter()
+                .map(|config| at(&config.sim.coulomb_nm))
+                .collect(),
+        ));
+    }
+    for j in 0..joints {
+        rows.push((
+            format!("J{} ripple mA", j + 1),
+            columns
+                .iter()
+                .map(|config| ripple_amplitude(&config.joints[j].ripple))
+                .collect(),
+        ));
+    }
+    let gravity: Vec<f64> = columns
+        .iter()
+        .map(|config| {
+            config
+                .gravity_correction
+                .iter()
+                .fold(0.0_f64, |max, term| max.max(term.abs()))
+        })
+        .collect();
+    let gravity_change = {
+        let (now, before) = (
+            &current.gravity_correction,
+            &earlier[0].1.gravity_correction,
+        );
+        if now.is_empty() || now.len() != before.len() {
+            "n/a".to_owned()
+        } else {
+            let delta = now
+                .iter()
+                .zip(before)
+                .fold(0.0_f64, |max, (a, b)| max.max((a - b).abs()));
+            if delta == 0.0 {
+                "same".to_owned()
+            } else {
+                format!("max |diff| {delta:.4}")
+            }
+        }
+    };
+
+    let header: Vec<String> = std::iter::once("this run".to_owned())
+        .chain(earlier.iter().map(|(label, _)| label.clone()))
+        .collect();
+    let mut cells: Vec<HistoryRow> = rows
+        .iter()
+        .map(|(name, values)| HistoryRow {
+            name: name.clone(),
+            values: values.iter().map(|value| compact(*value)).collect(),
+            change: relative_change(values[0], values[1]),
+        })
+        .collect();
+    cells.push(HistoryRow {
+        name: "gravity max |term|".to_owned(),
+        values: gravity.iter().map(|value| compact(*value)).collect(),
+        change: gravity_change,
+    });
+    let aligned = |name: &str, values: &[String], change: &str| {
+        let mut text = format!("{name:<22}");
+        for value in values {
+            let _ = write!(text, "{value:>14}");
+        }
+        let _ = writeln!(text, "{change:>18}");
+        text
+    };
+    let tabbed = |name: &str, values: &[String], change: &str| {
+        format!("{name}\t{}\t{change}\n", values.join("\t"))
+    };
+    let mut table = tabbed("quantity", &header, "change vs newest");
+    let mut console = aligned("quantity", &header, "change vs newest");
+    let mut unchanged = 0usize;
+    for row in &cells {
+        table.push_str(&tabbed(&row.name, &row.values, &row.change));
+        if row.change == "same" {
+            unchanged += 1;
+        } else {
+            console.push_str(&aligned(&row.name, &row.values, &row.change));
+        }
+    }
+    let console = format!(
+        "history: {} earlier run{} in {} (newest first); {unchanged} of {} values unchanged since {}\n{console}",
+        earlier.len(),
+        if earlier.len() == 1 { "" } else { "s" },
+        parent.display(),
+        cells.len(),
+        earlier[0].0,
+    );
+    Ok(Some((console, table)))
+}
+
+/// One line of the history table: the quantity, its value in each run shown,
+/// and how this run's compares with the newest earlier one.
+struct HistoryRow {
+    name: String,
+    values: Vec<String>,
+    change: String,
+}
+
+/// The ripple feedforward's size: the root sum of squares of its harmonic
+/// amplitudes \[mA\], one number a run can be compared on.
+fn ripple_amplitude(terms: &[RippleHarmonic]) -> f64 {
+    terms
+        .iter()
+        .map(|h| f64::from(h.a_ma).hypot(f64::from(h.b_ma)).powi(2))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// `now` against `before` as a share of the larger magnitude, or `same`.
+fn relative_change(now: f64, before: f64) -> String {
+    if now.is_nan() || before.is_nan() {
+        return "n/a".to_owned();
+    }
+    let scale = now.abs().max(before.abs());
+    if now == before || scale == 0.0 {
+        return "same".to_owned();
+    }
+    format!("{:+.1}%", 100.0 * (now - before) / scale)
+}
+
+/// Six decimals with the trailing zeros dropped; `-` for a value a run lacks.
+fn compact(value: f64) -> String {
+    if value.is_nan() {
+        return "-".to_owned();
+    }
+    let text = format!("{value:.6}");
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    if trimmed.is_empty() || trimmed == "-" {
+        "0".to_owned()
+    } else {
+        trimmed.to_owned()
+    }
+}
+
 fn patch_config(
     original: &str,
     correction: Option<&[f64]>,
@@ -6468,8 +6691,17 @@ fn run(args: Args) -> Result<()> {
         limits.as_ref(),
     )?;
     // Refuse to write something that will not load.
-    par6_config::RobotConfig::from_toml_str(&patched)?.validate()?;
+    let calibrated = par6_config::RobotConfig::from_toml_str(&patched)?;
+    calibrated.validate()?;
     fs::write(directory.join("calibrated.toml"), &patched)?;
+    match history(&directory, &calibrated) {
+        Ok(Some((console, table))) => {
+            print!("{console}");
+            fs::write(directory.join("history.tsv"), table)?;
+        }
+        Ok(None) => {}
+        Err(error) => println!("history: unavailable: {error}"),
+    }
     if !complete {
         return Err(format!(
             "calibration incomplete; see {}/stages.tsv; candidate saved but not applied",
