@@ -671,8 +671,13 @@ for that quantity and the report says why, which counts as complete for
 `--apply`. The arm may not stand still for more than a second anywhere in a
 run; every longer stop is printed as it ends, with what the run was doing,
 and totalled at the end. Shutdown retraces the checked legs back to the ready
-pose before parking joint by joint. `--apply` writes the results into the
-config, keeping a backup. Stages other than ripple and gains can use `--sim`,
+pose before parking joint by joint. Every run leaves a directory
+`selfcal-<nanoseconds>` under `--output-dir` (default `calibration-runs`) with
+its candidate `calibrated.toml`, `stages.tsv`, the per-tick `samples.csv` and
+`history.tsv`: the candidate's values beside the three most recent earlier runs
+in the same directory that measured them, with the change against the newest,
+printed at the end of the run and on demand with `--history <run-dir>` (no arm
+needed). `--apply` writes the results into the config, keeping a backup. Stages other than ripple and gains can use `--sim`,
 which refuses `--apply`; nothing about tuning is developed or tested in the
 simulator.
 `--limits` (off by default) also finds each joint's velocity,

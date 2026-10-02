@@ -187,6 +187,11 @@ const GAINS_CAPTURE_DIVISOR: u8 = 3;
 const GAINS_STATUS_TRIES: u32 = 3;
 /// Read passes over the chunks a lossy bus did not answer.
 const GAINS_READ_PASSES: u32 = 3;
+/// How close to an endstop a sample stops counting as tracking. User
+/// requirement, 2026-09-21: within this much of a stop a joint is nudging
+/// into, or breaking away from, a mechanical limit, and what it does there
+/// says nothing about its gains.
+const ENDSTOP_EXCLUSION_RAD: f64 = 5.0 * std::f64::consts::PI / 180.0;
 /// How long a streamed capture is given to land: 1536 frames at the drive's
 /// 320 µs pace is half a second, and the host's own traffic shares the bus.
 /// Pairs still missing after it are read one at a time.
@@ -411,7 +416,7 @@ const POSE_ATTEMPTS: usize = 8;
 /// How long the CAN transmit queue may stay full before the bus is given up.
 const TX_FULL_S: f64 = 1.0;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GainAxis {
     Kpv,
     Kiv,
@@ -670,6 +675,11 @@ struct Args {
     config: PathBuf,
     #[arg(long, default_value = "calibration-runs")]
     output_dir: PathBuf,
+    /// Print the history table for this existing run directory -- its
+    /// candidate beside the earlier runs in the same output directory -- and
+    /// exit. No arm, no bus.
+    #[arg(long, value_name = "RUN_DIR")]
+    history: Option<PathBuf>,
     /// Run against the simulator instead of the arm.
     #[arg(long)]
     sim: bool,
@@ -1243,6 +1253,10 @@ struct Arm {
     friction: [(f64, f64); N],
     /// Positive point estimates can still be dominated by fit uncertainty.
     friction_fit_uncertain: [bool; N],
+    /// The endstop this joint last touched: the one homing referenced it
+    /// against, or the one a move stopped on. Samples within
+    /// `ENDSTOP_EXCLUSION_RAD` of it are not scored.
+    endstop_guard: [Option<i32>; N],
     /// While the gains stage trials a joint: the last gains that tracked,
     /// restored within a tick if the trial runs away.
     sane_gains: [Option<Gains>; N],
@@ -1351,6 +1365,7 @@ impl Arm {
             position_rx_ns: [0; N],
             friction,
             friction_fit_uncertain: [false; N],
+            endstop_guard: [None; N],
             sane_gains: [None; N],
             gain_used: [0; N],
             gain_watch: false,
@@ -2002,13 +2017,37 @@ impl Arm {
         let mut sums = [(0.0_f64, 0.0_f64, 0u32); N];
         let mut generation = self.generation;
         let window = self.ticks(SPEED_WINDOW_S);
-        for _ in 0..self.ticks(HOLD_OBSERVATION_S) {
+        // A joint holding on trial gains has no guard but this one: the
+        // shared guard stands aside for it and the motion's own guard ended
+        // with the motion. A runaway here ends the hold at once as a failed
+        // hold, and the trial's own backoff takes it from there.
+        let trial = self.gain_joint.filter(|&j| self.sane_gains[j].is_some());
+        let mut loud = 0u32;
+        let mut ran_away = None;
+        'hold: for _ in 0..self.ticks(HOLD_OBSERVATION_S) {
             self.frame(velocity_joint.map(|j| (j, JointCommand::velocity(0, 0))))?;
             for j in 0..N {
                 if generation[j] == self.generation[j] {
                     continue;
                 }
                 generation[j] = self.generation[j];
+                if trial == Some(j) {
+                    let reported = self.state.nodes[self.node(j)].speed_ticks_s.unwrap_or(0);
+                    loud = if (f64::from(reported) * self.per_tick(j)).abs() > RUNAWAY_RAD_S {
+                        loud + 1
+                    } else {
+                        0
+                    };
+                    if loud >= RUNAWAY_TICKS {
+                        self.emit(Event::GainsNote(
+                            self.tick,
+                            j,
+                            "ran away while holding on trial gains; the hold is failed",
+                        ));
+                        ran_away = Some(j);
+                        break 'hold;
+                    }
+                }
                 let p = self.pos(j)?;
                 let per_tick = self.per_tick(j);
                 let offset = (f64::from(p) - f64::from(self.hold[j])) * per_tick;
@@ -2021,11 +2060,18 @@ impl Arm {
                 sums[j].2 += 1;
             }
         }
-        if let Some(j) = sums.iter().position(|(_, _, n)| *n == 0) {
-            return Err(format!("J{} supplied no complete encoder window at {why}", j + 1).into());
+        if ran_away.is_none() {
+            if let Some(j) = sums.iter().position(|(_, _, n)| *n == 0) {
+                return Err(
+                    format!("J{} supplied no complete encoder window at {why}", j + 1).into(),
+                );
+            }
         }
         let out: [(f64, f64); N] = std::array::from_fn(|j| {
-            let n = f64::from(sums[j].2);
+            if ran_away == Some(j) {
+                return (f64::INFINITY, f64::INFINITY);
+            }
+            let n = f64::from(sums[j].2.max(1));
             ((sums[j].0 / n).sqrt(), (sums[j].1 / n).sqrt())
         });
         for (j, (offset, speed)) in out.iter().enumerate() {
@@ -2213,10 +2259,15 @@ impl Arm {
                     break;
                 }
             }
-            // The guard drops the ramp and the drive's velocity integral
-            // unwinding from the previous command from the scoring window --
-            // a spike there used to fail a gain that tracked.
-            if t >= guard {
+            // Two exclusions on the scoring window. The guard drops the ramp
+            // and the drive's velocity integral unwinding from the previous
+            // command -- a spike there used to fail a gain that tracked. The
+            // endstop band drops samples within ENDSTOP_EXCLUSION_RAD of the
+            // stop this joint last touched.
+            let near_stop = self.endstop_guard[j].is_some_and(|contact| {
+                ((f64::from(p) - f64::from(contact)) * per_tick).abs() < ENDSTOP_EXCLUSION_RAD
+            });
+            if t >= guard && !near_stop {
                 out.peak_error_rad = out.peak_error_rad.max(error.abs());
                 out.samples += 1;
                 out.position_sq += error * error;
@@ -2264,6 +2315,7 @@ impl Arm {
                     contact.loaded,
                 ));
                 if contact.blocked {
+                    self.endstop_guard[j] = Some(p);
                     out.outcome = Outcome::Blocked;
                     break;
                 }
@@ -2393,10 +2445,10 @@ impl Arm {
                     let j = usize::from(j);
                     self.emit(Event::Phase("home", j));
                     // Reference, limits and the post-home move are the FSM's;
-                    // this only records that the joint is referenced. The
-                    // contact it just left is no longer where it is, so
-                    // nothing after this may be excluded by it.
-                    self.home_joint(j)?;
+                    // this records that the joint is referenced and where the
+                    // stop it was referenced against sits.
+                    let contact = self.home_joint(j)?;
+                    self.endstop_guard[j] = Some(contact);
                     self.homed[j] = true;
                 }
             }
@@ -5565,254 +5617,387 @@ fn patch_array(text: &mut String, key: &str, values: &[f64]) -> Result<()> {
     Ok(())
 }
 
-/// Patch the measured values into the file as written, so its comments and
-/// layout survive; a full re-serialisation would discard them.
-/// Earlier runs the end-of-run history shows beside this one.
+/// Earlier runs the end-of-run history shows beside this one: the two that
+/// must agree for repeatability, and one more for the trend.
 const HISTORY_RUNS: usize = 3;
 
-/// How the calibration is moving: this run's values beside those of the most
-/// recent earlier runs in the same output directory, newest first, with the
-/// change against the newest. The console gets the rows that moved and a
-/// count of those that did not; the whole table is left as `history.tsv` in
-/// the run directory. An earlier run whose `calibrated.toml` is missing or no
-/// longer loads is skipped. `None` when there is no earlier run to compare.
-fn history(
-    directory: &Path,
-    current: &par6_config::RobotConfig,
-) -> Result<Option<(String, String)>> {
-    let Some(parent) = directory.parent() else {
-        return Ok(None);
-    };
-    let mut runs: Vec<PathBuf> = fs::read_dir(parent)?
-        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
-        .filter(|path| {
-            path != directory
-                && path.is_dir()
-                && path
-                    .file_name()
-                    .is_some_and(|name| name.to_string_lossy().starts_with("selfcal-"))
-        })
-        .collect();
-    runs.sort();
-    let mut earlier: Vec<(String, par6_config::RobotConfig)> = Vec::new();
-    for path in runs.iter().rev() {
-        let Ok(text) = fs::read_to_string(path.join("calibrated.toml")) else {
-            continue;
-        };
-        let Ok(config) = par6_config::RobotConfig::from_toml_str(&text) else {
-            continue;
-        };
-        let name = path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        let label = name[name.len().saturating_sub(8)..].to_owned();
-        earlier.push((label, config));
-        if earlier.len() == HISTORY_RUNS {
-            break;
-        }
-    }
-    if earlier.is_empty() {
-        return Ok(None);
-    }
-    let columns: Vec<&par6_config::RobotConfig> = std::iter::once(current)
-        .chain(earlier.iter().map(|(_, config)| config))
-        .collect();
-    let joints = columns
-        .iter()
-        .map(|config| config.joints.len())
-        .min()
-        .unwrap_or(0);
-    let mut rows: Vec<(String, Vec<f64>)> = Vec::new();
-    for j in 0..joints {
-        for name in ["kpv", "kiv", "kpp"] {
-            rows.push((
-                format!("J{} {name}", j + 1),
-                columns
-                    .iter()
-                    .map(|config| {
-                        let gains = &config.joints[j].gains;
-                        match name {
-                            "kpv" => gains.kpv,
-                            "kiv" => gains.kiv,
-                            _ => gains.kpp,
-                        }
-                    })
-                    .collect(),
-            ));
-        }
-    }
-    for j in 0..joints {
-        let at = |values: &[f64]| values.get(j).copied().unwrap_or(f64::NAN);
-        rows.push((
-            format!("J{} viscous Nm.s/rad", j + 1),
-            columns
-                .iter()
-                .map(|config| at(&config.sim.viscous_nm_s))
-                .collect(),
-        ));
-        rows.push((
-            format!("J{} coulomb Nm", j + 1),
-            columns
-                .iter()
-                .map(|config| at(&config.sim.coulomb_nm))
-                .collect(),
-        ));
-    }
-    for j in 0..joints {
-        rows.push((
-            format!("J{} ripple mA", j + 1),
-            columns
-                .iter()
-                .map(|config| ripple_amplitude(&config.joints[j].ripple))
-                .collect(),
-        ));
-    }
-    let gravity: Vec<f64> = columns
-        .iter()
-        .map(|config| {
-            config
-                .gravity_correction
-                .iter()
-                .fold(0.0_f64, |max, term| max.max(term.abs()))
-        })
-        .collect();
-    let gravity_change = {
-        let (now, before) = (
-            &current.gravity_correction,
-            &earlier[0].1.gravity_correction,
-        );
-        if now.is_empty() || now.len() != before.len() {
-            "n/a".to_owned()
-        } else {
-            let delta = now
-                .iter()
-                .zip(before)
-                .fold(0.0_f64, |max, (a, b)| max.max((a - b).abs()));
-            if delta == 0.0 {
-                "same".to_owned()
-            } else {
-                format!("max |diff| {delta:.4}")
-            }
-        }
-    };
-
-    let header: Vec<String> = std::iter::once("this run".to_owned())
-        .chain(earlier.iter().map(|(label, _)| label.clone()))
-        .collect();
-    let mut cells: Vec<HistoryRow> = rows
-        .iter()
-        .map(|(name, values)| HistoryRow {
-            name: name.clone(),
-            values: values.iter().map(|value| compact(*value)).collect(),
-            change: relative_change(values[0], values[1]),
-        })
-        .collect();
-    // The ripple's size can stay while its coefficients move (a harmonic
-    // changing sign, or amplitude moving between harmonics), so "same" is
-    // the coefficients' call, keyed by harmonic.
-    for j in 0..joints {
-        let terms = |config: &par6_config::RobotConfig| {
-            let mut terms: Vec<(u8, i16, i16)> = config.joints[j]
-                .ripple
-                .iter()
-                .map(|h| (h.harmonic, h.a_ma, h.b_ma))
-                .collect();
-            terms.sort_unstable();
-            terms
-        };
-        let same = terms(current) == terms(&earlier[0].1);
-        let name = format!("J{} ripple mA", j + 1);
-        if let Some(cell) = cells.iter_mut().find(|cell| cell.name == name) {
-            if same {
-                cell.change = "same".to_owned();
-            } else if cell.change == "same" {
-                cell.change = "coefficients moved".to_owned();
-            }
-        }
-    }
-    cells.push(HistoryRow {
-        name: "gravity max |term|".to_owned(),
-        values: gravity.iter().map(|value| compact(*value)).collect(),
-        change: gravity_change,
-    });
-    let aligned = |name: &str, values: &[String], change: &str| {
-        let mut text = format!("{name:<22}");
-        for value in values {
-            let _ = write!(text, "{value:>14}");
-        }
-        let _ = writeln!(text, "{change:>18}");
-        text
-    };
-    let tabbed = |name: &str, values: &[String], change: &str| {
-        format!("{name}\t{}\t{change}\n", values.join("\t"))
-    };
-    let mut table = tabbed("quantity", &header, "change vs newest");
-    let mut console = aligned("quantity", &header, "change vs newest");
-    let mut unchanged = 0usize;
-    for row in &cells {
-        table.push_str(&tabbed(&row.name, &row.values, &row.change));
-        if row.change == "same" {
-            unchanged += 1;
-        } else {
-            console.push_str(&aligned(&row.name, &row.values, &row.change));
-        }
-    }
-    let console = format!(
-        "history: {} earlier run{} in {} (newest first); {unchanged} of {} values unchanged since {}\n{console}",
-        earlier.len(),
-        if earlier.len() == 1 { "" } else { "s" },
-        parent.display(),
-        cells.len(),
-        earlier[0].0,
-    );
-    Ok(Some((console, table)))
+/// One run as its directory records it: the candidate it wrote, which stages
+/// passed for which joint (`stages.tsv`), and whether it ran in the
+/// simulator (`run.toml`).
+struct Run {
+    label: String,
+    config: par6_config::RobotConfig,
+    passed: Vec<(String, Option<usize>)>,
+    sim: bool,
 }
 
-/// One line of the history table: the quantity, its value in each run shown,
-/// and how this run's compares with the newest earlier one.
+impl Run {
+    const FILES: [&'static str; 3] = ["calibrated.toml", "stages.tsv", "run.toml"];
+
+    fn recorded(dir: &Path) -> bool {
+        Self::FILES.iter().all(|file| dir.join(file).exists())
+    }
+
+    fn load(dir: &Path) -> Result<Self> {
+        let config = par6_config::RobotConfig::load(&dir.join("calibrated.toml"))?;
+        let passed = fs::read_to_string(dir.join("stages.tsv"))?
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let mut cells = line.split('\t');
+                let (stage, joint, status) = (cells.next()?, cells.next()?, cells.next()?);
+                status.starts_with("passed").then(|| {
+                    (
+                        stage.to_owned(),
+                        joint.parse::<usize>().ok().map(|j| j.saturating_sub(1)),
+                    )
+                })
+            })
+            .collect();
+        let sim = fs::read_to_string(dir.join("run.toml"))?
+            .lines()
+            .any(|line| line.trim() == "sim = true");
+        Ok(Self {
+            label: run_label(dir),
+            config,
+            passed,
+            sim,
+        })
+    }
+
+    /// Whether this run measured `stage` for `joint` (`None`: the arm).
+    fn measured(&self, stage: &str, joint: Option<usize>) -> bool {
+        self.passed.iter().any(|(s, j)| s == stage && *j == joint)
+    }
+
+    fn joint<T>(
+        &self,
+        stage: &str,
+        j: usize,
+        pick: impl Fn(&par6_config::JointConfig) -> T,
+    ) -> Option<T> {
+        self.measured(stage, Some(j))
+            .then(|| self.config.joints.get(j).map(pick))
+            .flatten()
+    }
+}
+
+/// The run directory's name carries nanoseconds since the epoch, which
+/// nobody reads by eye: the label is its minute, `MM-DD HH:MMZ`.
+fn run_label(dir: &Path) -> String {
+    let name = dir
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    match run_stamp(dir) {
+        Some(nanos) => utc_minute((nanos / 1_000_000_000) as u64),
+        None => name,
+    }
+}
+
+/// The nanosecond stamp in a `selfcal-<nanos>` directory name.
+fn run_stamp(dir: &Path) -> Option<u128> {
+    dir.file_name()?
+        .to_str()?
+        .strip_prefix("selfcal-")?
+        .parse()
+        .ok()
+}
+
+/// `MM-DD HH:MMZ` of a Unix time (Hinnant's civil-from-days).
+fn utc_minute(secs: u64) -> String {
+    let z = (secs / 86_400) as i64 + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let rem = secs % 86_400;
+    format!(
+        "{month:02}-{day:02} {:02}:{:02}Z",
+        rem / 3600,
+        (rem % 3600) / 60
+    )
+}
+
+/// One line of the history table: the quantity, its value in each run shown
+/// (`-` where that run did not measure it), and how this run's compares with
+/// the newest earlier one.
 struct HistoryRow {
     name: String,
     values: Vec<String>,
     change: String,
 }
 
-/// The ripple feedforward's size: the root sum of squares of its harmonic
-/// amplitudes \[mA\], one number a run can be compared on.
-fn ripple_amplitude(terms: &[RippleHarmonic]) -> f64 {
-    terms
+impl HistoryRow {
+    /// `same` when the two displayed values agree, otherwise the change as a
+    /// share of the earlier value; `n/a` when either run did not measure it.
+    fn numeric(name: String, values: &[Option<f64>], decimals: usize) -> Self {
+        let text =
+            |value: Option<f64>| value.map_or_else(|| "-".to_owned(), |v| compact(v, decimals));
+        let change = match (values[0], values[1]) {
+            (Some(now), Some(before)) if text(Some(now)) == text(Some(before)) => "same".to_owned(),
+            (Some(now), Some(before)) if before != 0.0 => {
+                format!("{:+.1}%", 100.0 * (now - before) / before)
+            }
+            (Some(_), Some(_)) => "from zero".to_owned(),
+            _ => "n/a".to_owned(),
+        };
+        Self {
+            name,
+            values: values.iter().map(|value| text(*value)).collect(),
+            change,
+        }
+    }
+}
+
+/// A per-joint friction value out of the simulator section.
+type SimPick = fn(&par6_config::SimConfig, usize) -> Option<f64>;
+/// One of a joint's EXEC limits.
+type LimitPick = fn(&par6_config::ResolvedLimits) -> Option<f64>;
+
+/// How the calibration is moving: this run's candidate beside the most
+/// recent earlier runs in the same output directory with the same simulator
+/// flag, newest first, one row per quantity and joint. A value a run did not
+/// measure shows as `-` and is not compared. The console gets the rows that
+/// moved; the whole table is left as `history.tsv`. `None` when no earlier
+/// run can be compared; what was skipped is said.
+fn history(directory: &Path) -> Result<Option<(String, String)>> {
+    let current = Run::load(directory)?;
+    let Some(parent) = directory.parent() else {
+        return Ok(None);
+    };
+    let mut siblings: Vec<(u128, PathBuf)> = fs::read_dir(parent)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path != directory && path.is_dir())
+        .filter_map(|path| run_stamp(&path).map(|stamp| (stamp, path)))
+        .collect();
+    siblings.sort_by_key(|(stamp, _)| std::cmp::Reverse(*stamp));
+    let mut earlier: Vec<Run> = Vec::new();
+    let mut skipped = 0usize;
+    for (_, path) in siblings {
+        if !Run::recorded(&path) {
+            skipped += 1;
+            continue;
+        }
+        match Run::load(&path) {
+            Ok(run) if run.sim == current.sim => {
+                earlier.push(run);
+                if earlier.len() == HISTORY_RUNS {
+                    break;
+                }
+            }
+            Ok(_) => skipped += 1,
+            Err(error) => {
+                println!("history: {}: {error}", path.display());
+                skipped += 1;
+            }
+        }
+    }
+    if earlier.is_empty() {
+        if skipped > 0 {
+            println!(
+                "history: no comparable earlier run in {} ({skipped} skipped: no record, \
+                 other simulator flag, or unreadable)",
+                parent.display()
+            );
+        }
+        return Ok(None);
+    }
+    let runs: Vec<&Run> = std::iter::once(&current).chain(earlier.iter()).collect();
+    let joints = runs
         .iter()
-        .map(|h| f64::from(h.a_ma).hypot(f64::from(h.b_ma)).powi(2))
-        .sum::<f64>()
-        .sqrt()
-}
+        .map(|run| run.config.joints.len())
+        .min()
+        .unwrap_or(0);
+    let mut cells: Vec<HistoryRow> = Vec::new();
+    for j in 0..joints {
+        for axis in [GainAxis::Kpv, GainAxis::Kiv, GainAxis::Kpp] {
+            let values: Vec<Option<f64>> = runs
+                .iter()
+                .map(|run| run.joint("gains", j, |joint| axis.value(joint.gains)))
+                .collect();
+            let decimals = if axis == GainAxis::Kiv { 8 } else { 6 };
+            cells.push(HistoryRow::numeric(
+                format!("J{} {}", j + 1, axis.label()),
+                &values,
+                decimals,
+            ));
+        }
+    }
+    for j in 0..joints {
+        let picks: [(&str, SimPick); 2] = [
+            ("viscous Nm.s/rad", |sim, j| {
+                sim.viscous_nm_s.get(j).copied()
+            }),
+            ("coulomb Nm", |sim, j| sim.coulomb_nm.get(j).copied()),
+        ];
+        for (name, pick) in picks {
+            let values: Vec<Option<f64>> = runs
+                .iter()
+                .map(|run| {
+                    run.measured("friction", Some(j))
+                        .then(|| pick(&run.config.sim, j))
+                        .flatten()
+                })
+                .collect();
+            cells.push(HistoryRow::numeric(
+                format!("J{} {name}", j + 1),
+                &values,
+                6,
+            ));
+        }
+    }
+    for j in 0..joints {
+        let terms = |run: &Run| {
+            run.joint("ripple", j, |joint| {
+                let mut terms: Vec<(u8, i16, i16)> = joint
+                    .ripple
+                    .iter()
+                    .map(|h| (h.harmonic, h.a_ma, h.b_ma))
+                    .collect();
+                terms.sort_unstable();
+                terms
+            })
+        };
+        let size = |terms: &[(u8, i16, i16)]| {
+            ripple::total(
+                &terms
+                    .iter()
+                    .map(|&(harmonic, a, b)| ripple::Harmonic {
+                        harmonic,
+                        a: f64::from(a),
+                        b: f64::from(b),
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let totals: Vec<Option<f64>> = runs
+            .iter()
+            .map(|run| terms(run).map(|terms| size(&terms)))
+            .collect();
+        let mut row = HistoryRow::numeric(format!("J{} ripple mA", j + 1), &totals, 1);
+        // The size can stay while the coefficients move (a harmonic changing
+        // sign, amplitude moving between harmonics): "same" is their call.
+        if let (Some(now), Some(before)) = (terms(runs[0]), terms(runs[1])) {
+            if now == before {
+                row.change = "same".to_owned();
+            } else if row.change == "same" {
+                row.change = "coefficients moved".to_owned();
+            }
+        }
+        cells.push(row);
+    }
+    for j in 0..joints {
+        let exec = |run: &Run, pick: LimitPick| {
+            run.joint("limits", j, |joint| {
+                pick(&joint.limits.for_mode(LimitMode::Exec))
+            })
+            .flatten()
+        };
+        let picks: [(&str, LimitPick); 3] = [
+            ("exec velocity rad/s", |l| Some(l.velocity_rad_s)),
+            ("exec acceleration rad/s2", |l| Some(l.acceleration_rad_s2)),
+            ("exec jerk rad/s3", |l| l.jerk_rad_s3),
+        ];
+        for (name, pick) in picks {
+            let values: Vec<Option<f64>> = runs.iter().map(|run| exec(run, pick)).collect();
+            cells.push(HistoryRow::numeric(
+                format!("J{} {name}", j + 1),
+                &values,
+                4,
+            ));
+        }
+    }
+    let gravity = |run: &Run| {
+        run.measured("gravity", None)
+            .then(|| run.config.gravity_correction.clone())
+    };
+    let peaks: Vec<Option<f64>> = runs
+        .iter()
+        .map(|run| gravity(run).map(|terms| terms.iter().fold(0.0_f64, |max, t| max.max(t.abs()))))
+        .collect();
+    let mut row = HistoryRow::numeric("gravity max |term|".to_owned(), &peaks, 5);
+    if let (Some(now), Some(before)) = (gravity(runs[0]), gravity(runs[1])) {
+        row.change = if now == before {
+            "same".to_owned()
+        } else if now.len() == before.len() {
+            let delta = now
+                .iter()
+                .zip(&before)
+                .fold(0.0_f64, |max, (a, b)| max.max((a - b).abs()));
+            format!("max |diff| {delta:.2e}")
+        } else {
+            "terms differ".to_owned()
+        };
+    }
+    cells.push(row);
 
-/// `now` against `before` as a share of the larger magnitude, or `same`.
-fn relative_change(now: f64, before: f64) -> String {
-    if now.is_nan() || before.is_nan() {
-        return "n/a".to_owned();
+    let header: Vec<String> = runs.iter().map(|run| run.label.clone()).collect();
+    let aligned = |name: &str, values: &[String], change: &str| {
+        let mut text = format!("{name:<26}");
+        for value in values {
+            let _ = write!(text, "{value:>14}");
+        }
+        let _ = writeln!(text, "{change:>20}");
+        text
+    };
+    let tabbed = |name: &str, values: &[String], change: &str| {
+        format!("{name}\t{}\t{change}\n", values.join("\t"))
+    };
+    let header_labels: Vec<String> = std::iter::once("this run".to_owned())
+        .chain(header.iter().skip(1).cloned())
+        .collect();
+    let mut table = tabbed("quantity", &header_labels, "change vs newest");
+    let mut moved = String::new();
+    let (mut unchanged, mut compared) = (0usize, 0usize);
+    for row in &cells {
+        table.push_str(&tabbed(&row.name, &row.values, &row.change));
+        if row.change == "n/a" {
+            continue;
+        }
+        compared += 1;
+        if row.change == "same" {
+            unchanged += 1;
+        } else {
+            moved.push_str(&aligned(&row.name, &row.values, &row.change));
+        }
     }
-    let scale = now.abs().max(before.abs());
-    if now == before || scale == 0.0 {
-        return "same".to_owned();
-    }
-    format!("{:+.1}%", 100.0 * (now - before) / scale)
-}
-
-/// Six decimals with the trailing zeros dropped; `-` for a value a run lacks.
-fn compact(value: f64) -> String {
-    if value.is_nan() {
-        return "-".to_owned();
-    }
-    let text = format!("{value:.6}");
-    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
-    if trimmed.is_empty() || trimmed == "-" {
-        "0".to_owned()
+    let mut console = format!(
+        "history: {} earlier run{} in {} (newest first); {unchanged} of {compared} compared values unchanged since {}{}\n",
+        earlier.len(),
+        if earlier.len() == 1 { "" } else { "s" },
+        parent.display(),
+        earlier[0].label,
+        if skipped > 0 {
+            format!("; {skipped} run director{} skipped", if skipped == 1 { "y" } else { "ies" })
+        } else {
+            String::new()
+        },
+    );
+    if moved.is_empty() {
+        console.push_str("history: no compared value moved\n");
     } else {
-        trimmed.to_owned()
+        console.push_str(&aligned("quantity", &header_labels, "change vs newest"));
+        console.push_str(&moved);
     }
+    Ok(Some((console, table)))
 }
 
+/// `decimals` places with the trailing zeros dropped; a zero of either sign
+/// is `0`.
+fn compact(value: f64, decimals: usize) -> String {
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    let text = format!("{value:.decimals$}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// Patch the measured values into the file as written, so its comments and
+/// layout survive; a full re-serialisation would discard them.
 fn patch_config(
     original: &str,
     correction: Option<&[f64]>,
@@ -6002,6 +6187,16 @@ fn stage_status(
 }
 
 fn run(args: Args) -> Result<()> {
+    if let Some(dir) = &args.history {
+        match history(dir)? {
+            Some((console, _)) => print!("{console}"),
+            None => println!(
+                "history: no comparable earlier run beside {}",
+                dir.display()
+            ),
+        }
+        return Ok(());
+    }
     let runs = |stage: Stage| args.only.is_empty() || args.only.contains(&stage);
     if args.verify_gains.is_some() && args.only != [Stage::Gains] {
         return Err("--verify-gains requires --only gains".into());
@@ -6192,6 +6387,7 @@ fn run(args: Args) -> Result<()> {
                 .collect::<String>(),
         )?;
     }
+    let active_tool = bundle.robot.robot.active_tool.clone();
     let mut arm = Arm::open(bundle, &assets, args.sim, tx)?;
     if (gains_stage || mechanics_stage) && !args.sim {
         arm.encoder_clock = Some(EncoderClock::open(&arm.bundle.robot)?);
@@ -6614,6 +6810,42 @@ fn run(args: Args) -> Result<()> {
             },
         ),
     )?;
+    // What was measured is the record, whatever ended the run: the candidate
+    // and the run's marker are written here, and the history read from them,
+    // before the verdict can return. `--apply` stays gated below on both.
+    let candidate = patch_config(
+        &original,
+        correction.as_deref(),
+        friction.as_ref(),
+        &sim,
+        ripples.as_ref(),
+        tuned.as_ref(),
+        limits.as_ref(),
+    )
+    .and_then(|patched| {
+        par6_config::RobotConfig::from_toml_str(&patched)?;
+        Ok(patched)
+    });
+    match &candidate {
+        Ok(patched) => {
+            fs::write(directory.join("calibrated.toml"), patched)?;
+            fs::write(
+                directory.join("run.toml"),
+                format!("sim = {}\ntool = {active_tool:?}\n", args.sim),
+            )?;
+            match history(&directory) {
+                Ok(Some((console, table))) => {
+                    print!("{console}");
+                    if let Err(error) = fs::write(directory.join("history.tsv"), table) {
+                        println!("history: not saved: {error}");
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => println!("history: unavailable: {error}"),
+            }
+        }
+        Err(error) => println!("candidate: not written: {error}"),
+    }
     result?;
 
     if let Some(fit) = &fit {
@@ -6735,27 +6967,7 @@ fn run(args: Args) -> Result<()> {
             }
         }
     }
-    let patched = patch_config(
-        &original,
-        correction.as_deref(),
-        friction.as_ref(),
-        &sim,
-        ripples.as_ref(),
-        tuned.as_ref(),
-        limits.as_ref(),
-    )?;
-    // Refuse to write something that will not load.
-    let calibrated = par6_config::RobotConfig::from_toml_str(&patched)?;
-    calibrated.validate()?;
-    fs::write(directory.join("calibrated.toml"), &patched)?;
-    match history(&directory, &calibrated) {
-        Ok(Some((console, table))) => {
-            print!("{console}");
-            fs::write(directory.join("history.tsv"), table)?;
-        }
-        Ok(None) => {}
-        Err(error) => println!("history: unavailable: {error}"),
-    }
+    let patched = candidate?;
     if !complete {
         return Err(format!(
             "calibration incomplete; see {}/stages.tsv; candidate saved but not applied",
