@@ -15,7 +15,6 @@ rust-version.workspace = true
 # The shim is built by par6-kin's build script; build under `pixi run`.
 
 [dependencies]
-clap = { version = "4.5", features = ["derive"] }
 par6-config = { workspace = true }
 par6-proto = { workspace = true }
 par6-motion = { workspace = true }
@@ -26,9 +25,12 @@ par6-kin = { workspace = true }
 # `calibrate` drives a live client through the estimation protocol.
 par6-client = { workspace = true }
 tokio = { workspace = true }
+clap = { workspace = true }
 thiserror = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
+file-rotate = "0.8"
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 sha2 = { workspace = true }
 libc = "0.2"
 socketcan = { workspace = true }

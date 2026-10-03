@@ -29,10 +29,56 @@ const VELOCITY_WINDOW: usize = 20;
 /// The longest speed filter the firmware takes (cmd 41).
 const VELOCITY_WINDOW_MAX: usize = 64;
 
+/// Bridge MOSFET on-resistance \[ohm\] (STEPFOC `Rdson`). Two of them
+/// sit in the winding's current path.
+const RDSON_OHM: f64 = 0.2;
+/// Current-sense resistor \[ohm\] (STEPFOC `SENSE_RESISTOR`).
+const SENSE_OHM: f64 = 0.025;
+/// Back-EMF constant per unit torque constant.
+///
+/// The firmware's calibration derives `Kt = 8.2747 / KV` with KV in
+/// RPM/V, while the back-EMF constant in V.s/rad is `9.5493 / KV`. The
+/// ratio between them is the line-to-line against phase convention the
+/// two are quoted in.
+const KE_PER_KT: f64 = 9.5493 / 8.2747;
+/// Bus voltage \[V\] the bridge switches, and the ceiling a configured
+/// voltage limit is taken against (the firmware caps to whichever is
+/// smaller).
+const VBUS_V: f64 = 24.0;
+
+/// A motor's electrical constants, without which a driver has no
+/// current dynamics to model.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Electrical {
+    /// Total circuit resistance \[ohm\]: the winding plus the bridge's
+    /// own pair of [`RDSON_OHM`] and [`SENSE_OHM`], which is what the
+    /// firmware keeps as its TOTAL_RESISTANCE beside the phase value.
+    pub r_ohm: f64,
+    /// Winding inductance \[H\].
+    pub l_h: f64,
+    /// Back-EMF constant at the motor shaft \[V.s/rad\].
+    pub ke_v_s_rad: f64,
+    /// Encoder counts per motor revolution.
+    pub ticks_per_rev: f64,
+}
+
+impl Electrical {
+    /// From a joint's datasheet phase values.
+    pub(crate) fn new(phase_r_ohm: f64, phase_l_mh: f64, kt_nm_a: f64, encoder_bits: u8) -> Self {
+        Self {
+            r_ohm: phase_r_ohm + 2.0 * RDSON_OHM + SENSE_OHM,
+            l_h: phase_l_mh * 1e-3,
+            ke_v_s_rad: kt_nm_a * KE_PER_KT,
+            ticks_per_rev: f64::from(1u32 << encoder_bits),
+        }
+    }
+}
+
 /// A per-type driver fault a test can inject ([`super::SimBus::inject_fault`]).
 /// Maps 1:1 onto the cmd-26 flag bits; every injected fault also raises the
 /// aggregate `error` flag and the per-frame live err bit until Clear_Error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FaultKind {
     /// Over-temperature (byte 0 b6).
     Temperature,
@@ -106,6 +152,12 @@ pub(crate) struct VirtualDriver {
     kiv: f64,
     kp_pd: f64,
     kd_pd: f64,
+    /// Current-loop PI (cmd 17), in volts per amp of Iq error and volts
+    /// per amp per firmware iteration.
+    kpiq: f64,
+    kiiq: f64,
+    /// Configured inverter voltage ceiling \[V\] (cmd 34); 0 = VBUS.
+    v_limit_v: f64,
     pub vel_limit: f64,
     pub ilim_ma: f64,
     watchdog_ticks: u64,
@@ -121,6 +173,14 @@ pub(crate) struct VirtualDriver {
     velocity_samples: usize,
     previous_encoder: Option<f64>,
     pub measured_velocity: f64,
+    /// The motor's electrical model; `None` leaves the driver with the
+    /// commanded current applied instantly, which is a drive that can
+    /// change its torque infinitely fast.
+    electrical: Option<Electrical>,
+    /// Current actually flowing \[mA\], and the current loop's integral
+    /// \[V\].
+    iq_ma: f64,
+    iq_err_sum: f64,
     armed: bool,
     ticks_since_data: u64,
     pub cur_out_ma: f64,
@@ -154,7 +214,14 @@ pub(crate) struct VirtualDriver {
 }
 
 impl VirtualDriver {
-    pub fn new(dt: f64, node: NodeId, vel_limit: f64, ilim_ma: f64, kt_nm_a: f64) -> Self {
+    pub fn new(
+        dt: f64,
+        node: NodeId,
+        vel_limit: f64,
+        ilim_ma: f64,
+        kt_nm_a: f64,
+        electrical: Option<Electrical>,
+    ) -> Self {
         Self {
             dt,
             kpp: 0.0,
@@ -162,6 +229,9 @@ impl VirtualDriver {
             kiv: 0.0,
             kp_pd: 0.0,
             kd_pd: 0.0,
+            kpiq: 0.0,
+            kiiq: 0.0,
+            v_limit_v: 0.0,
             vel_limit,
             ilim_ma,
             watchdog_ticks: u64::MAX,
@@ -180,6 +250,9 @@ impl VirtualDriver {
             velocity_samples: 0,
             previous_encoder: None,
             measured_velocity: 0.0,
+            electrical,
+            iq_ma: 0.0,
+            iq_err_sum: 0.0,
             armed: false,
             ticks_since_data: 0,
             cur_out_ma: 0.0,
@@ -383,12 +456,16 @@ impl VirtualDriver {
                 self.kpp = f64::from(unpack_f32([d[0], d[1], d[2], d[3]]));
                 ReplyKind::None
             }
-            // Current-loop gains and the voltage limit shape the inner
-            // current loop / bus voltage, which the plant abstracts away —
-            // accepted (they feed the watchdog) but numerically unused.
-            (CurrentGains, 8) | (VoltageLimit, 4) | (HeartbeatSetup, 4) | (SaveConfig, 0) => {
+            (CurrentGains, 8) => {
+                self.kpiq = f64::from(unpack_f32([d[0], d[1], d[2], d[3]]));
+                self.kiiq = f64::from(unpack_f32([d[4], d[5], d[6], d[7]]));
                 ReplyKind::None
             }
+            (VoltageLimit, 4) => {
+                self.v_limit_v = f64::from(unpack_u32([d[0], d[1], d[2], d[3]])) * 1e-3;
+                ReplyKind::None
+            }
+            (HeartbeatSetup, 4) | (SaveConfig, 0) => ReplyKind::None,
             (Kt, 4) => {
                 self.kt_nm_a = unpack_f32([d[0], d[1], d[2], d[3]]);
                 ReplyKind::None
@@ -494,6 +571,8 @@ impl VirtualDriver {
     }
 
     fn control_iteration(&mut self, pos_ticks: f64, vel_ticks_s: f64) -> PlantCmd {
+        // The shaft's true speed, which only the winding sees.
+        let shaft_ticks_s = vel_ticks_s;
         let pos_ticks = pos_ticks.round();
         self.phase = ((pos_ticks.rem_euclid(ENCODER_COUNTS) as u32) * POLE_PAIRS) & 16383;
         let vel_ticks_s = self
@@ -512,7 +591,7 @@ impl VirtualDriver {
             .trunc();
         self.measured_velocity = vel_ticks_s;
         let driven = self.cur_out_ma;
-        let out = self.control_law(pos_ticks, vel_ticks_s);
+        let out = self.control_law(pos_ticks, vel_ticks_s, shaft_ticks_s);
         self.record_capture(vel_ticks_s, driven);
         out
     }
@@ -535,12 +614,15 @@ impl VirtualDriver {
         }
     }
 
-    fn control_law(&mut self, pos_ticks: f64, vel_ticks_s: f64) -> PlantCmd {
+    fn control_law(&mut self, pos_ticks: f64, vel_ticks_s: f64, shaft_ticks_s: f64) -> PlantCmd {
         let fw_steps = 1.0;
         // Without this a test could fault a joint, keep commanding it, and
         // pass — against hardware where the arm simply freewheels.
         if self.flags.error {
             self.mode = Mode::Idle;
+            self.integral_ma = 0.0;
+            self.iq_ma = 0.0;
+            self.iq_err_sum = 0.0;
             self.cur_out_ma = 0.0;
             return PlantCmd {
                 current_ma: 0.0,
@@ -558,6 +640,8 @@ impl VirtualDriver {
         };
         let cur = match self.mode {
             Mode::Idle => {
+                self.iq_ma = 0.0;
+                self.iq_err_sum = 0.0;
                 self.cur_out_ma = 0.0;
                 return PlantCmd {
                     current_ma: 0.0,
@@ -597,7 +681,8 @@ impl VirtualDriver {
                 self.kp_pd * (pos - pos_ticks) + self.kd_pd * (vel - vel_ticks_s) + cur_ff
             }
         };
-        self.cur_out_ma = cur.clamp(-ilim, ilim);
+        let setpoint = cur.clamp(-ilim, ilim);
+        self.cur_out_ma = self.current_loop(setpoint, shaft_ticks_s, fw_steps);
         PlantCmd {
             current_ma: self.cur_out_ma,
             ff_ma: ff.clamp(-ilim, ilim),
@@ -632,6 +717,9 @@ impl VirtualDriver {
         self.previous_encoder = None;
         self.measured_velocity = 0.0;
         self.integral_ma = 0.0;
+        self.iq_ma = 0.0;
+        self.iq_err_sum = 0.0;
+        self.reset_velocity_filter();
         self.cur_out_ma = 0.0;
         self.mode = Mode::Position {
             pos: pos_ticks,
@@ -666,6 +754,48 @@ impl VirtualDriver {
     /// firmware gripper to halt jaw motion on command silence).
     pub fn watchdog_fired(&self) -> bool {
         self.armed && self.ticks_since_data >= self.watchdog_ticks
+    }
+
+    fn reset_velocity_filter(&mut self) {
+        self.velocity_history.fill(0.0);
+        self.velocity_samples = 0;
+        self.previous_encoder = None;
+    }
+
+    /// The firmware's `Torque_mode()` current loop and the winding it
+    /// drives: PI on the Iq error into a voltage, capped by the
+    /// configured limit, integrated through `L di/dt = U - R.i - Ke.w`.
+    ///
+    /// Without it the commanded current appears in the winding instantly,
+    /// which is a drive with unlimited voltage — the one assumption that
+    /// makes a position loop stiffer in the simulator than it can be on
+    /// the bench. Slewing this motor's full current through its winding
+    /// in one firmware iteration would want tens of volts; the bridge has
+    /// six.
+    fn current_loop(&mut self, iq_set_ma: f64, vel_ticks_s: f64, fw_steps: f64) -> f64 {
+        let Some(e) = self.electrical else {
+            return iq_set_ma;
+        };
+        let ceiling = if self.v_limit_v > 0.0 {
+            self.v_limit_v.min(VBUS_V)
+        } else {
+            VBUS_V
+        };
+        // The back-EMF the winding sees, from the shaft speed this step.
+        let omega = vel_ticks_s / e.ticks_per_rev * std::f64::consts::TAU;
+        let bemf = e.ke_v_s_rad * omega;
+        // The loop runs at the firmware's own iteration rate, and the
+        // substep this call stands for is `fw_steps` of them.
+        let n = fw_steps.round().max(1.0);
+        let dt_e = fw_steps * FW_LOOP_DT / n;
+        for _ in 0..n as u32 {
+            let err_a = (iq_set_ma - self.iq_ma) * 1e-3;
+            self.iq_err_sum = (self.iq_err_sum + self.kiiq * err_a).clamp(-ceiling, ceiling);
+            let uq = (self.kpiq * err_a + self.iq_err_sum).clamp(-ceiling, ceiling);
+            let di_a_s = (uq - e.r_ohm * self.iq_ma * 1e-3 - bemf) / e.l_h;
+            self.iq_ma += di_a_s * dt_e * 1e3;
+        }
+        self.iq_ma
     }
 
     fn velocity_pi(&mut self, vel_target: f64, vel_meas: f64, cur_ff: f64, fw_steps: f64) -> f64 {

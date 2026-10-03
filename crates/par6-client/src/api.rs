@@ -83,6 +83,20 @@ impl Client {
         unwrap_query!(self, Command::LoopStats, QueryResult::LoopStats(stats) => stats)
     }
 
+    /// How queued command `index` finished, as the runtime recorded it:
+    /// `(finished, ok, detail, verdict)` — what its COMPLETE push carried,
+    /// or `finished == false` when the runtime has no record of it.
+    pub async fn command_completion(
+        &self,
+        index: u64,
+    ) -> Result<(bool, bool, Option<WireError>, Option<u8>), ClientError> {
+        unwrap_query!(
+            self,
+            Command::CommandCompletion { index },
+            QueryResult::CommandCompletion { finished, ok, detail, verdict, .. } => (finished, ok, detail, verdict)
+        )
+    }
+
     /// Active motion profile name.
     pub async fn profile(&self) -> Result<String, ClientError> {
         unwrap_query!(self, Command::Profile, QueryResult::Profile { profile } => profile)
@@ -106,6 +120,11 @@ impl Client {
     /// Applied TCP offset \[mm\], tool-local.
     pub async fn tcp_offset(&self) -> Result<[f64; 3], ClientError> {
         unwrap_query!(self, Command::TcpOffset, QueryResult::TcpOffset { x, y, z } => [x, y, z])
+    }
+
+    /// Applied TCP transform (mm, intrinsic XYZ degrees).
+    pub async fn tcp_transform(&self) -> Result<[f64; 6], ClientError> {
+        unwrap_query!(self, Command::TcpTransform, QueryResult::TcpTransform { values } => values)
     }
 
     /// Selected tool's live status.
@@ -267,10 +286,16 @@ impl Client {
         self.system(Command::Stop(cmd::Stop { clear_queue })).await
     }
 
-    /// Drive one declared digital output.
-    pub async fn write_io(&self, port: u8, value: u8) -> Result<Ack, ClientError> {
-        self.system(Command::WriteIo(cmd::WriteIo { port, value }))
-            .await
+    /// Queue a level on one declared digital output. Applied at its turn
+    /// in the queue, so an output written after a move changes when that
+    /// move has finished; the returned index completes when it lands.
+    pub async fn write_io(&self, port: u8, value: u8) -> Result<Option<u64>, ClientError> {
+        self.queued(Command::WriteIo(cmd::WriteIo {
+            key: self.fresh_key(),
+            port,
+            value,
+        }))
+        .await
     }
 
     /// Switch the simulator backend on/off (live bus swap).
@@ -295,6 +320,21 @@ impl Client {
     pub async fn connect_hardware(&self, port: &str) -> Result<Ack, ClientError> {
         self.system(Command::ConnectHardware(cmd::ConnectHardware {
             port: port.to_string(),
+        }))
+        .await
+    }
+
+    /// Queue a tool-local TCP transform (mm, intrinsic XYZ degrees).
+    pub async fn set_tcp_transform(&self, values: [f64; 6]) -> Result<Option<u64>, ClientError> {
+        let [x, y, z, roll, pitch, yaw] = values;
+        self.queued(Command::SetTcpTransform(cmd::SetTcpTransform {
+            key: self.fresh_key(),
+            x,
+            y,
+            z,
+            roll,
+            pitch,
+            yaw,
         }))
         .await
     }
@@ -716,8 +756,8 @@ impl Client {
         &self,
         angles: [f64; NUM_JOINTS],
         tool_positions: Option<Vec<f64>>,
-    ) -> Result<(), ClientError> {
-        self.fire(Command::Teleport(cmd::Teleport {
+    ) -> Result<Ack, ClientError> {
+        self.system(Command::Teleport(cmd::Teleport {
             angles,
             tool_positions,
         }))

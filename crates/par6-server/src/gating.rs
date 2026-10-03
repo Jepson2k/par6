@@ -69,8 +69,13 @@ pub fn gate(cmd: CmdType) -> Gate {
         // longer legal is refused by the RT's own mode table rather than
         // here. Written out rather than left to the `_` arm so the choice
         // is visible instead of accidental.
-        C::Pause => {}
-        C::Teleport => g.needs_simulator = true,
+        C::Pause | C::SetExecutionSpeed => {}
+        // A teleport moves the arm, so it is gated the way arm motion is,
+        // acked like the system command it is.
+        C::Teleport => {
+            g.needs_simulator = true;
+            g.needs_enabled = true;
+        }
         // SetPayload is deliberately ungated beyond the SYSTEM default:
         // a payload change while motion runs is legal (the model updates
         // mid-move, exactly like a TCP-offset change), and clearing a
@@ -79,7 +84,7 @@ pub fn gate(cmd: CmdType) -> Gate {
         // SetTcpOffset is queued so it lands in order between moves, but
         // it is configuration, not motion: measuring a tool on a disabled
         // arm must work, exactly as it did when the command was immediate.
-        C::SetTcpOffset => g.needs_enabled = false,
+        C::SetTcpOffset | C::SetTcpTransform => g.needs_enabled = false,
         C::ResetLoopStats => g.needs_enabled = false,
         _ => {}
     }

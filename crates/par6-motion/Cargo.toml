@@ -9,6 +9,7 @@ rust-version.workspace = true
 
 [dependencies]
 par6-config = { workspace = true }
+glam = { workspace = true }
 rsruckig = { workspace = true }
 thiserror = { workspace = true }
 

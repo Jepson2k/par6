@@ -78,8 +78,28 @@ struct BootConfig {
 /// equality test there leaves STREAM open forever on an arm that has
 /// visibly stopped.
 const STREAM_REST_RAD_S: f64 = 1e-9;
-/// Encoder stability window before releasing velocity authority [s].
-const STREAM_BRAKE_SETTLE_S: f64 = 0.1;
+/// How far a joint may wander and still count as stopped for a released
+/// JOG or STREAM to hand over to IDLE \[rad\], and how long it must stay
+/// inside that band \[s\].
+///
+/// Displacement, not speed. The ramp reaching zero says nothing about
+/// the plant, which lags it by whatever its velocity loop still carries,
+/// and IDLE drives nothing — so an arm handed over while it is still
+/// travelling freewheels on its momentum, when the position law holding
+/// the ramp's rest point was what should have braked it. But a drive
+/// holding a position rings around it without going anywhere, and a
+/// speed threshold reads that ring as motion for as long as it lasts:
+/// traced on the sim rig, a held setpoint sustains a 1.8 degree swing at
+/// 5 Hz and ±0.38 rad/s that never decays, and a mode waiting for slow
+/// joints waits for good while whatever was waiting on the arm times
+/// out. Whether the arm is still TRAVELLING is a question about where it
+/// has been, not how fast it is going this instant. The band is wider
+/// than that ring and narrower than the ground a coasting arm covers in
+/// the window, and the window restarts the moment a joint leaves it —
+/// the same displacement plateau the homing detector reads a stall
+/// from.
+const RELEASE_REST_BAND_RAD: f64 = 0.05;
+const RELEASE_REST_WINDOW_S: f64 = 0.2;
 
 const BOOT_SELFCHECK_S: f64 = 0.032;
 /// Settling time between a boot-time link cycle and the re-scan that
@@ -353,8 +373,12 @@ pub struct RtHooks {
     pub gravity: Box<dyn GravityModel>,
     /// Jog ramp engine.
     pub jog: Box<dyn JogEngine>,
-    /// Streaming target tracker (rate limiter).
+    /// Streaming target tracker (rate limiter) for joint-space targets.
     pub stream: Box<dyn StreamTracker>,
+    /// Tracker for targets that arrive already rate-limited
+    /// ([`StreamSetpoint::shaped`]) — clamps to the soft limits and
+    /// commands what it was given, without re-planning it.
+    pub stream_shaped: Box<dyn StreamTracker>,
     /// EXEC completion policy.
     pub settle: Box<dyn SettlePolicy>,
     /// ESTOP_1 GPIO line.
@@ -407,6 +431,18 @@ pub struct StreamSetpoint {
     pub speed: f64,
     /// Acceleration fraction of the STREAM limits, in `(0, 1]`.
     pub accel: f64,
+    /// Whether this target already sits on a rate-limited profile and
+    /// must be tracked as given rather than re-planned.
+    ///
+    /// A cartesian stream is limited in CARTESIAN space, upstream: the
+    /// tool path is the thing being held to, and joint limits are met by
+    /// slowing the whole move along it. Re-planning those targets here
+    /// would give each joint its own time-optimal route to its own
+    /// target-at-rest, which is precisely the joint-space interpolation
+    /// the cartesian limiter exists to avoid — the tool would leave the
+    /// line. Such a setpoint goes to a clamp-only tracker instead, so
+    /// the soft limits still bind and nothing reshapes the path.
+    pub shaped: bool,
 }
 
 impl Default for StreamSetpoint {
@@ -415,6 +451,7 @@ impl Default for StreamSetpoint {
             q: [0.0; MAX_JOINTS],
             speed: 1.0,
             accel: 1.0,
+            shaped: false,
         }
     }
 }
@@ -483,6 +520,7 @@ pub struct RtCore<B: DriverBus> {
     gravity_scale: [f64; MAX_JOINTS],
     jog: Box<dyn JogEngine>,
     stream: Box<dyn StreamTracker>,
+    stream_shaped: Box<dyn StreamTracker>,
     exec: ExecPlayback,
     estop: EstopMonitor,
     io: Box<dyn DigitalIo>,
@@ -603,12 +641,17 @@ pub struct RtCore<B: DriverBus> {
     /// A `StreamRelease` is braking to rest. STREAM outlives it the same
     /// way JOG outlives a release.
     stream_released: bool,
-    stream_brake_min: [f64; MAX_JOINTS],
-    stream_brake_max: [f64; MAX_JOINTS],
-    stream_brake_since: Option<u64>,
-    stream_brake_generation: [u64; MAX_JOINTS],
-    stream_brake_ticks: u64,
-    stream_brake_resolution: [f64; MAX_JOINTS],
+    /// The pose the stillness window is measured from, re-seeded
+    /// whenever a joint leaves [`RELEASE_REST_BAND_RAD`] of it.
+    release_rest_ref: Option<[f64; MAX_JOINTS]>,
+    /// Consecutive ticks with every joint inside that band, against
+    /// `release_rest_needed` ([`RELEASE_REST_WINDOW_S`] in ticks).
+    release_rest_streak: u32,
+    /// Each joint's position generation at the last rest check: a tick
+    /// without a new encoder reading on every joint restarts the rest
+    /// window, since a cached position does not move whatever the arm does.
+    release_rest_generation: [u64; MAX_JOINTS],
+    release_rest_needed: u32,
     jog_joints: u8,
     jog_blocked: u16,
 
@@ -619,6 +662,12 @@ pub struct RtCore<B: DriverBus> {
 
     // Streaming.
     stream_rx: SnapshotReader<StreamSetpoint>,
+    /// Which tracker is live: the clamp-only one while shaped setpoints
+    /// are arriving, the rate limiter otherwise.
+    stream_is_shaped: bool,
+    /// The joint target the live tracker last commanded, so a handover
+    /// between the two starts where the arm was actually sent.
+    stream_commanded: [f64; MAX_JOINTS],
     /// Fractions currently applied to the streaming executor's limits.
     stream_scale: (f64, f64),
     /// Acceleration fraction currently applied to the jog engine.
@@ -749,7 +798,21 @@ impl<B: DriverBus> RtCore<B> {
             gravity_scale: robot.gravity_scale,
             jog: hooks.jog,
             stream: hooks.stream,
-            exec: ExecPlayback::new(hooks.samples, hooks.settle),
+            stream_shaped: hooks.stream_shaped,
+            stream_is_shaped: false,
+            stream_commanded: [0.0; MAX_JOINTS],
+            exec: ExecPlayback::new(
+                hooks.samples,
+                hooks.settle,
+                dt,
+                robot.motion.execution_override_transition_s,
+                std::array::from_fn(|i| {
+                    robot.joints[i]
+                        .limits
+                        .for_mode(LimitMode::Exec)
+                        .acceleration_rad_s2
+                }),
+            ),
             estop: EstopMonitor::new(hooks.estop),
             io: hooks.io,
             io_lines: [0; MAX_IO_LINES],
@@ -829,15 +892,10 @@ impl<B: DriverBus> RtCore<B> {
             jog_active: false,
             jog_released: false,
             stream_released: false,
-            stream_brake_min: [0.0; MAX_JOINTS],
-            stream_brake_max: [0.0; MAX_JOINTS],
-            stream_brake_since: None,
-            stream_brake_generation: [0; MAX_JOINTS],
-            stream_brake_ticks: u64::from(robot.ticks(STREAM_BRAKE_SETTLE_S).max(1)),
-            stream_brake_resolution: std::array::from_fn(|i| {
-                let j = &robot.joints[i];
-                2.0 * std::f64::consts::TAU / f64::from(1i32 << j.encoder_bits) / j.gear_ratio
-            }),
+            release_rest_ref: None,
+            release_rest_streak: 0,
+            release_rest_generation: [0; MAX_JOINTS],
+            release_rest_needed: robot.ticks(RELEASE_REST_WINDOW_S).max(1),
             jog_joints: 0,
             jog_blocked: 0,
             heartbeat: heartbeat.clone(),
@@ -941,6 +999,13 @@ impl<B: DriverBus> RtCore<B> {
                 log::error!("select_tool: the gripper node refused its new limits: {e}");
             }
         }
+    }
+
+    /// Whether the arm has stopped travelling: every joint inside
+    /// [`RELEASE_REST_BAND_RAD`] of where it was for
+    /// [`RELEASE_REST_WINDOW_S`].
+    fn at_measured_rest(&self) -> bool {
+        self.release_rest_streak >= self.release_rest_needed
     }
 
     /// Measured joint positions \[rad\] — what a backend swap seeds the
@@ -1054,9 +1119,17 @@ impl<B: DriverBus> RtCore<B> {
     /// channel is only a feedforward, so a hold left aimed at the
     /// pre-teleport pose would actively drag the arm back to it.
     pub fn reseed_motion_targets(&mut self) {
+        // Whatever is waiting in the streaming slot was computed for the
+        // pose the arm has just stopped being in. The slot is
+        // latest-wins, so leaving it would apply that stale target on the
+        // very next tick — and a shaped setpoint is commanded through a
+        // clamp, which moves the arm the whole way there in one tick.
+        let _ = self.stream_rx.take();
         let q = self.q;
         self.exec.reseed_hold(&q);
         self.stream.activate(&q);
+        self.stream_shaped.activate(&q);
+        self.stream_commanded = q;
         self.jog.activate(&q);
         self.q_target = q;
     }
@@ -1185,6 +1258,13 @@ impl<B: DriverBus> RtCore<B> {
             return false;
         }
         self.park.saved_scale = self.stream_scale;
+        // The retreat is a joint-space move to a fixed pose, so it runs
+        // on the rate limiter even if a cartesian stream was live: the
+        // mode request above is a no-op when STREAM is already the mode,
+        // and would leave the clamp-only tracker holding the path.
+        self.stream_is_shaped = false;
+        self.stream.activate(&self.q);
+        self.stream_commanded = self.q;
         let f = self.park.speed_fractions;
         self.stream.set_scale_per_joint(&f, 1.0);
         self.stream_scale = (f.iter().copied().fold(1.0, f64::min), 1.0);
@@ -1291,6 +1371,7 @@ impl<B: DriverBus> RtCore<B> {
         if let Some(cmd) = self.commands.poll() {
             self.apply_command(cmd);
         }
+        self.exec.clock_tick();
 
         // Phase 5b: a level this tick's command changed reaches the pins
         // in the same tick, so a client that writes and then reads the
@@ -1584,15 +1665,45 @@ impl<B: DriverBus> RtCore<B> {
             }
             RtCommand::StreamRelease => {
                 if self.mode == Mode::Stream {
-                    self.stream.release();
+                    if self.stream_is_shaped {
+                        self.stream_shaped.release();
+                    } else {
+                        self.stream.release();
+                    }
                     self.stream_released = true;
                 }
             }
             RtCommand::ExecSetPaused(paused) => self.exec.set_paused(paused),
+            RtCommand::ExecSetSpeedScale(scale) => {
+                if !self.exec.set_speed_scale(scale) {
+                    log::warn!("invalid queued execution scale: {scale}");
+                }
+            }
             RtCommand::ExecFlush => {
                 let n = self.exec.flush();
                 log::info!("EXEC flush discarded {n} samples");
             }
+            RtCommand::ExecStop => match self.mode {
+                Mode::Exec => self.exec.begin_stop(),
+                // A referencing seek has no path to brake along, and it
+                // leaves the arm unreferenced: a stop aborts it to IDLE,
+                // whose law is zero-velocity on an unhomed arm.
+                Mode::Homing => {
+                    if let Err(e) = self.request_mode(Mode::Idle) {
+                        log::warn!("stop: HOMING → IDLE refused: {e:?}");
+                    }
+                    self.exec.flush();
+                }
+                _ => {
+                    let n = self.exec.flush();
+                    log::info!("EXEC stop outside EXEC discarded {n} samples");
+                }
+            },
+            RtCommand::Hold => match self.mode {
+                Mode::Jog => self.rest_into_hold(self.q_target),
+                Mode::Stream => self.rest_into_hold(self.stream_commanded),
+                _ => {}
+            },
             RtCommand::Gripper(fw) => {
                 if self.has_can_gripper {
                     let at = self.bus_state.gripper.reply.map_or(0, |r| r.position);
@@ -1738,6 +1849,18 @@ impl<B: DriverBus> RtCore<B> {
     /// reachability, then enabled ∧ no-errors ∧ homed-if-motion.
     fn request_mode(&mut self, target: Mode) -> Result<(), GateRefusal> {
         if target == self.mode {
+            // A STREAM request while STREAM is braking to rest resumes
+            // the session where the tracker is, rather than bouncing
+            // through IDLE and re-seeding the tracker at the measured
+            // pose: the measurement trails what the drive is holding by
+            // its settle, and a re-seed there is a position step the
+            // drive rings on — measured on the sim rig, that ring is
+            // what kept a standoff placement from ever reading as
+            // arrived.
+            if target == Mode::Stream && self.stream_released {
+                self.stream_released = false;
+                self.stream_last_rx_tick = self.tick;
+            }
             return Ok(());
         }
         // Never request targets: BOOTING is boot-only, ACTIVE_ERROR is a
@@ -1795,6 +1918,26 @@ impl<B: DriverBus> RtCore<B> {
         Ok(())
     }
 
+    /// Where a jog or stream session ends: holding `at` — the pose the
+    /// session last commanded, which is what the drive is already holding
+    /// (re-seeding at the measurement instead is a position step the drive
+    /// rings on) — under EXEC's position loop, the same hold a finished
+    /// program rests in. IDLE instead when the arm may not be held: its
+    /// law is zero-velocity there, because the gravity float needs homed ∧
+    /// enabled. A deliberate float is `SetGravityComp(true)`, which lets a
+    /// resting EXEC go.
+    fn rest_into_hold(&mut self, at: [f64; MAX_JOINTS]) {
+        let may_hold = self.homed && self.state == ArmState::Enabled && !self.errors.any_hard();
+        if !may_hold {
+            self.enter_mode(Mode::Idle);
+            return;
+        }
+        self.leave_mode(Mode::Exec);
+        self.exec.activate(&at);
+        self.hb_silence = 0;
+        self.mode = Mode::Exec;
+    }
+
     fn enter_mode(&mut self, target: Mode) {
         self.leave_mode(target);
         match target {
@@ -1817,11 +1960,12 @@ impl<B: DriverBus> RtCore<B> {
             }
             Mode::Stream => {
                 self.stream.activate(&self.q);
+                self.stream_shaped.activate(&self.q);
+                self.stream_commanded = self.q;
+                // Until a setpoint says otherwise, a stream is
+                // joint-space and gets the rate limiter.
+                self.stream_is_shaped = false;
                 self.stream_released = false;
-                self.stream_brake_since = None;
-                self.stream_brake_generation = std::array::from_fn(|i| {
-                    self.bus_state.nodes[usize::from(self.node_of[i])].position_generation
-                });
                 self.stream_last_rx_tick = self.tick;
                 self.stream_window_pos = 0;
                 self.stream_window_applied = 0;
@@ -1881,6 +2025,10 @@ impl<B: DriverBus> RtCore<B> {
                     self.gripper_settle.disarm();
                 }
             }
+            // A stop cut short still owes its flush: the samples it was
+            // braking out of belong to a cancelled program, which the next
+            // EXEC entry — the hold a jog or stream ends in — would play.
+            Mode::Exec if self.exec.is_stopping() => self.exec.finish_stop(),
             Mode::Stream => {
                 // Only the Stream arm drains the latest-wins slot, so a
                 // setpoint published in the tick this session ended would
@@ -1983,6 +2131,28 @@ impl<B: DriverBus> RtCore<B> {
                 self.qd_filt[i] += MEAS_FILTER_ALPHA * (self.qd[i] - self.qd_filt[i]);
                 self.tau_filt[i] += MEAS_FILTER_ALPHA * (self.tau[i] - self.tau_filt[i]);
             }
+        }
+        let held = self.release_rest_ref.is_some_and(|reference| {
+            self.q
+                .iter()
+                .zip(reference.iter())
+                .all(|(q, r)| (q - r).abs() <= RELEASE_REST_BAND_RAD)
+        });
+        let mut fresh = true;
+        for i in 0..MAX_JOINTS {
+            let node = &self.bus_state.nodes[usize::from(self.node_of[i])];
+            fresh &= node.position_ticks.is_some()
+                && node.position_generation != self.release_rest_generation[i];
+            self.release_rest_generation[i] = node.position_generation;
+        }
+        if held && fresh {
+            self.release_rest_streak = self.release_rest_streak.saturating_add(1);
+        } else if held {
+            // Rest is evidence about now: a joint that went quiet voids it.
+            self.release_rest_streak = 0;
+        } else {
+            self.release_rest_ref = Some(self.q);
+            self.release_rest_streak = 0;
         }
     }
 
@@ -2167,14 +2337,21 @@ impl<B: DriverBus> RtCore<B> {
             }
         }
 
-        // EXEC link watchdog: heartbeat silence while samples pending.
+        // EXEC link watchdog: heartbeat silence while samples pending. Not
+        // while a stop brakes: the planner stopped feeding a program it
+        // cancelled, and the samples still in the ring are the ones the
+        // brake is about to discard — a link fault there would drop the
+        // arm on a stop the daemon itself asked for.
         if self.mode == Mode::Exec {
             if self.heartbeat.swap(false, Ordering::Relaxed) {
                 self.hb_silence = 0;
             } else {
                 self.hb_silence = self.hb_silence.saturating_add(1);
             }
-            if self.exec.samples_remaining() > 0 && self.hb_silence >= self.hb_timeout_ticks {
+            if self.exec.samples_remaining() > 0
+                && !self.exec.is_stopping()
+                && self.hb_silence >= self.hb_timeout_ticks
+            {
                 self.errors.latch(ErrorCode::ExecLinkLost, None);
             }
         }
@@ -2308,6 +2485,9 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     fn dispatch_and_send(&mut self) {
+        if self.mode != Mode::Exec {
+            self.exec.at_rest();
+        }
         if self.mode != Mode::Idle {
             self.drift.reset();
         }
@@ -2431,9 +2611,15 @@ impl<B: DriverBus> RtCore<B> {
                 );
                 // A released jog ramps down instead of stopping dead,
                 // and JOG is the only mode that ticks the engine, so the
-                // mode outlives the release until the ramp is at rest.
-                if self.jog_released && self.scratch_qd.iter().all(|v| *v == 0.0) {
-                    self.mode = Mode::Idle;
+                // mode outlives the release until the ramp AND the arm
+                // are at rest: the ramp's rest point is a position hold,
+                // and the hold is what brakes an arm still carrying the
+                // ramp's velocity (see [`RELEASE_REST_BAND_RAD`]).
+                if self.jog_released
+                    && self.scratch_qd.iter().all(|v| *v == 0.0)
+                    && self.at_measured_rest()
+                {
+                    self.rest_into_hold(self.scratch_q);
                 }
             }
             Mode::Exec => {
@@ -2474,24 +2660,54 @@ impl<B: DriverBus> RtCore<B> {
                 if self.stream_released {
                     let _ = self.stream_rx.take();
                 } else if let Some(sp) = self.stream_rx.take() {
+                    if sp.shaped != self.stream_is_shaped {
+                        // Handover: the incoming tracker starts from the
+                        // target the outgoing one last commanded, so the
+                        // switch does not step the arm.
+                        let from = self.stream_commanded;
+                        if sp.shaped {
+                            self.stream_shaped.activate(&from);
+                        } else {
+                            self.stream.activate(&from);
+                        }
+                        self.stream_is_shaped = sp.shaped;
+                        // The fractions belong to the tracker, so the
+                        // new one has to be told them again.
+                        self.stream_scale = (f64::NAN, f64::NAN);
+                    }
                     // Scale first: the limits have to be in force for
                     // the tick that consumes this target, not the one
                     // after. Only on a change — `set_limits` rewrites
                     // the OTG's whole input block and most streams
                     // never move the sliders at all.
                     if self.stream_scale != (sp.speed, sp.accel) {
-                        self.stream.set_scale(sp.speed, sp.accel);
+                        if self.stream_is_shaped {
+                            self.stream_shaped.set_scale(sp.speed, sp.accel);
+                        } else {
+                            self.stream.set_scale(sp.speed, sp.accel);
+                        }
                         self.stream_scale = (sp.speed, sp.accel);
                     }
                     // `q_target` carries the raw request; the filter
                     // sits between it and the executor, so the pair
                     // makes the smoothing visible.
                     self.q_target = sp.q;
-                    let target = self.filtered_target(&sp.q);
-                    self.stream.set_target(&target);
+                    // A shaped target is already on its profile: the
+                    // low-pass would lag it off the path it was computed
+                    // to follow, so it goes through untouched.
+                    let target = if sp.shaped {
+                        sp.q
+                    } else {
+                        self.filtered_target(&sp.q)
+                    };
+                    if self.stream_is_shaped {
+                        self.stream_shaped.set_target(&target);
+                    } else {
+                        self.stream.set_target(&target);
+                    }
                     self.stream_last_rx_tick = self.tick;
                     applied = true;
-                } else if self.stream_lp_alpha != 0.0 {
+                } else if self.stream_lp_alpha != 0.0 && !self.stream_is_shaped {
                     // The filter is a per-tick coefficient: it keeps
                     // converging on the latest request between setpoints,
                     // so the realized cutoff does not scale with the
@@ -2501,8 +2717,14 @@ impl<B: DriverBus> RtCore<B> {
                     self.stream.set_target(&target);
                 }
                 self.stream_window(applied);
-                self.stream.step(&mut self.scratch_q, &mut self.scratch_qd);
-                if self.stream.faulted() {
+                let live: &mut dyn StreamTracker = if self.stream_is_shaped {
+                    self.stream_shaped.as_mut()
+                } else {
+                    self.stream.as_mut()
+                };
+                live.step(&mut self.scratch_q, &mut self.scratch_qd);
+                self.stream_commanded = self.scratch_q;
+                if self.stream_faulted() {
                     // The limiter is holding in place instead of
                     // tracking; a stream that silently stops following
                     // its setpoints must become a visible hard error.
@@ -2515,46 +2737,19 @@ impl<B: DriverBus> RtCore<B> {
                     &self.g,
                     &mut self.setpoints,
                 );
-                // The planned ramp can finish before the plant stops.
-                // Keep velocity authority until encoder positions settle;
-                // one zero quantized velocity sample cannot establish rest.
+                // A released stream brakes instead of stopping dead, and
+                // STREAM is the only mode that ticks this executor, so
+                // the mode outlives the release until the ramp AND the
+                // arm are at rest — the same contract JOG has. Handing
+                // the arm to IDLE while it still carries velocity is what
+                // let a refused stream coast on past the keep-out that
+                // refused it, and the ramp's rest is not the arm's (see
+                // [`RELEASE_REST_BAND_RAD`]).
                 if self.stream_released
                     && self.scratch_qd.iter().all(|v| v.abs() <= STREAM_REST_RAD_S)
+                    && self.at_measured_rest()
                 {
-                    let gravity = self.gravity_applied();
-                    for i in 0..MAX_JOINTS {
-                        self.setpoints[i] = dispatch::JointSetpoint::zero_velocity();
-                        self.setpoints[i].torque_nm = Some(if gravity { self.g[i] } else { 0.0 });
-                    }
-                    let mut positions_fresh = true;
-                    for i in 0..MAX_JOINTS {
-                        let node = &self.bus_state.nodes[usize::from(self.node_of[i])];
-                        positions_fresh &= node.position_ticks.is_some()
-                            && node.position_generation != self.stream_brake_generation[i];
-                        self.stream_brake_generation[i] = node.position_generation;
-                        self.stream_brake_min[i] = self.stream_brake_min[i].min(self.q[i]);
-                        self.stream_brake_max[i] = self.stream_brake_max[i].max(self.q[i]);
-                    }
-                    let moved = (0..MAX_JOINTS).any(|i| {
-                        self.stream_brake_max[i] - self.stream_brake_min[i]
-                            > self.stream_brake_resolution[i]
-                    });
-                    match self.stream_brake_since {
-                        Some(since) if positions_fresh && !moved => {
-                            if self.tick - since >= self.stream_brake_ticks {
-                                self.mode = Mode::Idle;
-                            }
-                        }
-                        _ => {
-                            self.stream_brake_min = self.q;
-                            self.stream_brake_max = self.q;
-                            // Cached encoder values cannot establish rest even
-                            // while voltage or fault replies keep the node live.
-                            self.stream_brake_since = positions_fresh.then_some(self.tick);
-                        }
-                    }
-                } else {
-                    self.stream_brake_since = None;
+                    self.rest_into_hold(self.scratch_q);
                 }
             }
             // HAND_GUIDING/IMPEDANCE are refused at the gate; HOMING and
@@ -2647,6 +2842,15 @@ impl<B: DriverBus> RtCore<B> {
             *y += self.stream_lp_alpha * (x - *y);
         }
         self.stream_filt
+    }
+
+    /// Whether the live stream tracker is failing to track.
+    fn stream_faulted(&self) -> bool {
+        if self.stream_is_shaped {
+            self.stream_shaped.faulted()
+        } else {
+            self.stream.faulted()
+        }
     }
 
     fn stream_window(&mut self, applied: bool) {

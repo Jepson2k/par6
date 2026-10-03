@@ -42,7 +42,8 @@ pub use chunk::{
     Reassembler,
 };
 pub use command::{
-    decode_command, encode_command, validate_shape, Command, Layer, Physical, Shape, ToolParam,
+    decode_command, encode_command, validate_shape, Attachment, Command, Layer, Physical, Shape,
+    ToolParam,
 };
 pub use enums::{
     command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode,
@@ -59,7 +60,7 @@ pub use status::{
 };
 
 /// Protocol version carried in the STATUS header.
-pub const PROTO_VERSION: u8 = 5;
+pub const PROTO_VERSION: u8 = 6;
 /// Number of arm joints.
 pub const NUM_JOINTS: usize = 6;
 /// Elements in a flattened 4×4 row-major pose.
@@ -86,6 +87,13 @@ pub const IO_SLOTS: usize = 11;
 pub const MAX_IO_SLOTS: usize = 64;
 /// Enablement flag slots (6 joints/axes × 2 directions).
 pub const EN_SLOTS: usize = 12;
+/// Finished commands whose outcome the runtime keeps for COMMAND_COMPLETION
+/// and the client keeps for late `wait_command` callers: one window on both
+/// sides, so whatever the client may still ask about the runtime can answer.
+pub const COMPLETIONS_KEPT: usize = 1024;
+/// `[motion]` config keys, in the order CONFIG_INFO carries them
+/// (`MotionConfig::KEYS` in par6-config names them).
+pub const MOTION_KEYS: usize = 19;
 
 /// A flattened row-major 4×4 from a translation and an intrinsic-XYZ
 /// rotation `[rx, ry, rz]` in radians: `R = Rx(rx)·Ry(ry)·Rz(rz)`.

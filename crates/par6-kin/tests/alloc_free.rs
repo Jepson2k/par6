@@ -88,6 +88,7 @@ fn collision_checks_are_allocation_free_after_the_world_is_applied() {
     col.set_layer(
         Layer::Installation,
         &[Shape {
+            attachment: None,
             name: "table".to_owned(),
             kind: ShapeKind::Box,
             params: [2.0, 2.0, 0.1],
@@ -100,6 +101,7 @@ fn collision_checks_are_allocation_free_after_the_world_is_applied() {
     col.set_layer(
         Layer::Program,
         &[Shape {
+            attachment: None,
             name: "keepout".to_owned(),
             kind: ShapeKind::Sphere,
             params: [0.08, 0.0, 0.0],

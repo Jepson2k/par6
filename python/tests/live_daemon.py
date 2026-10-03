@@ -28,7 +28,8 @@ import pytest
 
 from par6 import _daemon
 from par6 import config as _cfg
-from par6.client import AsyncRobotClient
+from par6.client import AsyncRobotClient, RobotError
+from par6.protocol import ErrorCode
 
 #: Boot budget for the daemon's ``PAR6D_READY`` line.
 READY_TIMEOUT_S = 30.0
@@ -36,13 +37,15 @@ READY_TIMEOUT_S = 30.0
 #: The sim tick the e2e rig runs at. Every RT time constant derives from
 #: config SECONDS (``round(s/dt)``), so the runtime is rate-agnostic by
 #: contract and the wiring under test is identical to the shipped 250 Hz —
-#: but a shared CI box cannot hold a 4 ms deadline. 50 ms leaves the jitter
-#: headroom. The generated config deliberately declares no ``[timing]``
+#: but a shared CI box cannot hold a 4 ms deadline. 10 ms leaves it jitter
+#: headroom while every per-tick effect (read-back latency, the travel a
+#: check covers) stays near the scale the arm runs at. The generated config
+#: deliberately declares no ``[timing]``
 #: section, so ``par6d --sim`` applies its relaxed loop-degradation bands
 #: and host load raises the self-clearing LOOP_DEGRADED warning instead of
 #: latching LOOP_CRITICAL. ``status_rate_hz`` must integer-divide the tick
 #: rate.
-TICK_DT_S = 0.05
+TICK_DT_S = 0.01
 STATUS_RATE_HZ = 20
 
 
@@ -202,7 +205,6 @@ class LiveDaemon:
         cls,
         workdir: Path,
         status_transport: str = "unicast",
-        sim_dynamics: bool = False,
         config_patch: Callable[[str], str] | None = None,
     ) -> "LiveDaemon":
         binary = par6d_binary()
@@ -234,7 +236,6 @@ class LiveDaemon:
                 # leave a daemon holding its ports and grant.
                 "--parent-pid",
                 str(os.getpid()),
-                *(["--sim-dynamics"] if sim_dynamics else []),
             ],
             stdout=subprocess.PIPE,
             stderr=log,
@@ -334,13 +335,18 @@ async def teleport_to(
 ) -> None:
     """Leave the sim arm standing at *angles_deg*.
 
-    Teleport is unacked and gated on ENABLED, so it is re-sent until the
-    broadcast shows the arm there — the same loop a UI runs. Raises when
-    the arm never arrives within *budget_s*.
+    Teleport is gated on ENABLED, which the boot's clear sequence reaches
+    on its own time, so a refusal for a DISABLED controller is re-sent
+    until the broadcast shows the arm there — the same loop a UI runs.
+    Raises when the arm never arrives within *budget_s*.
     """
     deadline = time.monotonic() + budget_s
     while time.monotonic() < deadline:
-        await client.teleport(angles_deg)
+        try:
+            await client.teleport(angles_deg)
+        except RobotError as refused:
+            if refused.code != ErrorCode.SYS_CONTROLLER_DISABLED:
+                raise
         arrived = await client.wait_status(
             lambda s: (
                 s.homed

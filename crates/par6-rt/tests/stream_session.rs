@@ -254,16 +254,16 @@ fn telemetry_without_encoder_updates_cannot_complete_a_stream_release() {
             );
         }
         rig.skip_nodes = 0;
-        for _ in 0..(0.2_f64 / dt).round() as u32 {
+        for _ in 0..(0.4_f64 / dt).round() as u32 {
             rig.tick();
-            if rig.snap().mode == Mode::Idle {
+            if rig.snap().mode == Mode::Exec {
                 break;
             }
         }
         assert_eq!(
             rig.snap().mode,
-            Mode::Idle,
-            "fresh, stationary encoder replies must allow the release to complete"
+            Mode::Exec,
+            "fresh, stationary encoder replies must let the release complete into the hold"
         );
     }
 }

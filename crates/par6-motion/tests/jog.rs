@@ -209,6 +209,47 @@ fn trapezoid_ramp_runs_to_the_block() {
     assert!(plant.q[0] < cfg.joints[0].limits.soft_max_rad);
 }
 
+/// The runtime is rate-agnostic: every jog, at every tick the config may
+/// carry and every acceleration a jog may ask for, brakes its target to
+/// rest short of the soft limit — never onto it at speed, where only the
+/// never-cross clamp would stop it and the lagging arm would run past.
+#[test]
+fn the_lookahead_stops_the_target_short_at_any_tick_rate() {
+    for dt in [0.004, 0.008, 0.02, 0.05] {
+        let mut cfg = par6_config();
+        cfg.robot.tick_dt_s = dt;
+        let soft_max = cfg.joints[0].limits.soft_max_rad;
+        let mut start = HOME;
+        start[0] = soft_max - 40f64.to_radians();
+        for profile in [JogProfile::Scurve, JogProfile::Trapezoid] {
+            for accel in [1.0, 0.5, 0.25] {
+                for speed in [1.0, 0.5] {
+                    let mut engine = JogEngine::new(&cfg).unwrap();
+                    engine.set_profile(profile);
+                    engine
+                        .set_accel_time_s(cfg.jog.accel_time_s / accel)
+                        .unwrap();
+                    engine.activate(&start);
+                    let mut plant = LagPlant::new(&start, dt);
+                    engine.command(&one(0, speed)).unwrap();
+                    let case = format!("dt {dt} {profile:?} accel {accel} speed {speed}");
+                    for _ in 0..(10.0 / dt) as usize {
+                        let out = engine.tick(&plant.q);
+                        assert!(
+                            out.q[0] < soft_max,
+                            "{case}: the target ran onto the soft limit"
+                        );
+                        plant.step(&out.qd);
+                    }
+                    assert_eq!(engine.velocity(0), 0.0, "{case}: the jog must come to rest");
+                    assert_eq!(engine.blocked_direction(0), Some(JogDirection::Positive));
+                    assert!(plant.q[0] < soft_max, "{case}: the arm must rest short");
+                }
+            }
+        }
+    }
+}
+
 /// The measured-pose hard clamp, reached by physics instead of a
 /// hand-built overrun: jog activation inherits a plant still carrying
 /// velocity toward the limit (the state a jog leaves in when it preempts

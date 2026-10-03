@@ -17,7 +17,7 @@ par6-proto = { workspace = true }
 # load and checked against the Pinocchio FK, so IK needs no tuning and no
 # hand-entered constants.
 rs-opw-kinematics = { version = "2.0.3", default-features = false }
-glam = "=0.30.10"
+glam = { workspace = true }
 urdf-rs = "0.9"
 
 

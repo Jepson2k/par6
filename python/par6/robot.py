@@ -403,13 +403,16 @@ class Robot(_RobotABC):
 
     @property
     def motion_profiles(self) -> tuple[str, ...]:
-        """Profile names ``par6d`` plans queued moves with, read from the
-        runtime's own registry so the list cannot drift from it.
+        """Profile names ``par6d`` plans queued moves with — the planner's
+        own registry, so the advertisement cannot drift from what
+        ``select_profile`` accepts.
 
-        ``RUCKIG`` (the runtime's startup default) is jerk-limited
-        point-to-point, ``TRAPEZOID`` drops the jerk limit, ``QUINTIC``
-        starts and stops at rest in acceleration, ``SEPTIC`` in jerk too,
-        and ``TOPPRA`` time-optimally parameterizes the path.
+        ``TOPPRA`` (the runtime's startup default) time-optimally
+        parameterizes the path, ``RUCKIG`` is jerk-limited point-to-point,
+        ``TRAPEZOID`` and ``LINEAR`` run the path at constant velocity with
+        ramps at the acceleration limit, ``QUINTIC`` is a point-to-point
+        polynomial with zero end acceleration, and ``SEPTIC`` with zero end
+        jerk too.
         """
         return tuple(Preview.profiles())
 
@@ -453,6 +456,8 @@ class Robot(_RobotABC):
         tool_key: str,
         tcp_offset_m: tuple[float, float, float] | None = None,
         variant_key: str | None = None,
+        *,
+        tcp_rotation_rad: tuple[float, float, float] | None = None,
     ) -> None:
         """Point the local FK/IK model at a tool's TCP.
 
@@ -476,6 +481,9 @@ class Robot(_RobotABC):
             [float(v) for v in origin],
             [float(v) for v in rpy],
             [float(v) for v in offset],
+            [float(v) for v in tcp_rotation_rad]
+            if tcp_rotation_rad is not None
+            else None,
         )
         if all(abs(a - b) < 1e-15 for a, b in zip(frame, _IDENTITY)):
             frame = None
@@ -615,13 +623,6 @@ class Robot(_RobotABC):
     def has_collision_checking(self) -> bool:
         return self._world is not None
 
-    @property
-    def has_physics_simulation(self) -> bool:
-        """par6's dry run drives the same control loop and the same MuJoCo
-        plant the simulator does, so it reports what the arm did and not
-        only what it was told."""
-        return True
-
     def in_collision(self, q_rad: NDArray[np.float64]) -> bool:
         w = self._world
         if w is None:
@@ -753,19 +754,21 @@ class Robot(_RobotABC):
         kwargs.setdefault("host", self._host)
         kwargs.setdefault("port", self._port)
         kwargs.setdefault("timeout", 5.0)
+        kwargs.setdefault("robot", self)
         return AsyncRobotClient(tool_specs=self.tools.available, **kwargs)
 
     def create_sync_client(self, **kwargs: Any) -> SyncRobotClient:
         kwargs.setdefault("host", self._host)
         kwargs.setdefault("port", self._port)
         kwargs.setdefault("timeout", 5.0)
+        kwargs.setdefault("robot", self)
         return SyncRobotClient(tool_specs=self.tools.available, **kwargs)
 
     def create_dry_run_client(self, **kwargs: Any) -> DryRunRobotClient:
         """Offline preview client — the command stream without a runtime.
 
         Keyword args: ``initial_joints_deg`` (defaults to home),
-        ``initial_homed``, ``max_snapshot_points``, ``config_path``.
+        ``initial_homed``, ``config_path``.
 
         Always a client, never ``None``: par6 supports dry running, so a
         config the engine will not load raises and says which — the ABC's
@@ -786,6 +789,7 @@ class Robot(_RobotABC):
             kwargs["config_path"] = self._daemon_config_path() or str(
                 _cfg.data_root() / "config" / "PAR6.toml"
             )
+        kwargs.setdefault("robot", self)
         return DryRunRobotClient(**kwargs)
 
     def _daemon_config_path(self) -> str | None:

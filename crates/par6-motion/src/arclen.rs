@@ -14,11 +14,11 @@
 //! held to one by a ceiling on `ds/dt` alone.
 //!
 //! What this module does NOT do is time the path. The geometry is
-//! handed to TOPPRA as a degree-1 path — straight lines between the
-//! poses IK actually solved, so nothing is invented between them — and
-//! TOPPRA prices the turning at the knots itself. A scalar profile over
-//! the same coordinate cannot: it sees only `|dq/ds|`, which is the cost
-//! of going ALONG the path and says nothing about the cost of turning.
+//! handed to TOPPRA as a cubic spline whose knots are the poses IK
+//! actually solved, and TOPPRA prices the turning between them itself.
+//! A scalar profile over the same coordinate cannot: it sees only
+//! `|dq/ds|`, which is the cost of going ALONG the path and says nothing
+//! about the cost of turning.
 
 use crate::limits::MotionLimits;
 use crate::NUM_JOINTS;
@@ -42,6 +42,24 @@ pub fn tool_arc_lengths(steps: &[(f64, f64)], rot_weight_m_per_rad: f64) -> Vec<
         out.push(acc);
     }
     out
+}
+
+/// The largest share of any step's arc length that is translation, in
+/// `0..=1`: `0` for a path that only turns the tool. A linear speed limit
+/// on the tool bounds the rate along the arc length by the limit over this
+/// share, so the rotation-weighted part of the length is not held to it.
+pub fn max_translation_share(steps: &[(f64, f64)], rot_weight_m_per_rad: f64) -> f64 {
+    steps
+        .iter()
+        .map(|&(d_trans, d_rot)| {
+            let span = d_trans.hypot(rot_weight_m_per_rad * d_rot);
+            if span > MIN_SPAN {
+                d_trans / span
+            } else {
+                0.0
+            }
+        })
+        .fold(0.0, f64::max)
 }
 
 /// A joint chain keyed to the normalized tool distance at each waypoint.
@@ -101,9 +119,10 @@ impl ArcKnots {
     /// the per-joint magnitude a path-speed ceiling divides its limits
     /// by.
     ///
-    /// Exact rather than probed: the path is affine between knots, so
-    /// `dq/ds` is constant within a segment and the extremes are the
-    /// segment slopes themselves.
+    /// Taken from the chord slopes between knots: with knots a couple of
+    /// millimetres apart the spline's own slope stays within a hair of
+    /// the chord's, and a per-knot extreme is what a ceiling on `ds/dt`
+    /// needs to divide by.
     pub fn max_slope(&self) -> [f64; NUM_JOINTS] {
         let mut worst = [0.0f64; NUM_JOINTS];
         for i in 0..self.s.len() - 1 {

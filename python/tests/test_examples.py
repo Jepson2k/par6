@@ -29,6 +29,9 @@ EXPECTED = {
     "sync_quickstart": ("ping:", "angles:", "pose:", "after move:"),
     "async_quickstart": ("queued as command", "seq="),
     "keepout_preview": ("preview refused:", "runtime refused:", "cleared:"),
+    # `determined:` is the last line either branch prints, so it is what
+    # separates a completed fit from an early return.
+    "payload_estimate": ("mass", "com", "poses", "residual", "determined:"),
 }
 
 

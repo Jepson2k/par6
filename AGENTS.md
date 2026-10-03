@@ -99,6 +99,8 @@ resolving that enum everywhere it is used.
 
 ## Code style
 
+- **Use the ecosystem when appropriate.** There is no dependency budget in this repo.
+  Reach for a well-maintained crate or library before writing your own.
 - **Comments:** a short WHY is fine; never describe WHAT the code does, and describe the
   final implementation, not the change ("changed X to Y" is review noise).
 - **Never ship declared-but-unimplemented API surface.** No "reserved" fields or params,
@@ -113,5 +115,10 @@ resolving that enum everywhere it is used.
 - Use the SAME branch name across repos with coordinated changes; WC's CI installs
   `par6` from a same-named branch when one exists (`#subdirectory=python`), falling back
   to the `main` pin.
-- The python package versions with semver in `python/pyproject.toml`; pre-1.0 breaking
-  changes bump minor.
+- One semver version covers the crates and the python package, written only in
+  `[workspace.package]` in the root `Cargo.toml`; pre-1.0 breaking changes bump minor.
+  `cargo release` owns the bump and the tag (configured in
+  `[workspace.metadata.release]`): `cargo release version <x.y.z> --execute` edits
+  the manifests for a normal PR, then on main `cargo release tag --execute &&
+  cargo release push --execute` cuts `v<x.y.z>`, which `release.yml` builds and
+  publishes. Nothing goes to crates.io.

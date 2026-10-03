@@ -13,8 +13,8 @@ use par6d::preview::Preview;
 
 mod common;
 use common::{
-    max_deg_error, park_deg, rotation_angle_deg, teleport_cmd, teleport_home, to_deg, to_rad,
-    Client, Rig,
+    distance, max_deg_error, park_deg, rotation_angle_deg, span_joints, span_tcp, teleport_cmd,
+    teleport_home, to_deg, to_rad, wire_pose_at, Client, Rig,
 };
 
 /// The shipped config re-ticked to 50 Hz, shared verbatim by the daemon
@@ -58,6 +58,94 @@ fn jog_l_cmd(velocities: [f64; 6], duration: f64) -> Command {
 }
 
 #[test]
+fn held_geometry_requires_reference_and_reset_reconciliation() {
+    use par6_proto::Attachment;
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+    let mut part = Shape {
+        name: "part".into(),
+        kind: "sphere".into(),
+        params: vec![0.01],
+        pose: vec![0.0, 0.0, 0.3, 0.0, 0.0, 0.0],
+        collision: true,
+        margin: None,
+        physics: None,
+        attachment: Some(Attachment {
+            epoch: preview.shapes().3,
+            allowed_contacts: vec![],
+        }),
+    };
+    preview.set_homed(false);
+    assert!(preview
+        .set_shapes(ShapeLayer::Program, std::slice::from_ref(&part))
+        .is_err());
+    preview.set_homed(true);
+    part.attachment.as_mut().unwrap().epoch = preview.shapes().3;
+    preview
+        .set_shapes(ShapeLayer::Program, std::slice::from_ref(&part))
+        .unwrap();
+    assert!(preview.submit(Command::Reset).valid());
+    assert!(preview
+        .set_shapes(ShapeLayer::Program, std::slice::from_ref(&part))
+        .is_err());
+    let refused = preview.submit(move_j_cmd(to_deg(&preview.angles_rad()), None));
+    assert!(!refused.valid());
+    part.attachment.as_mut().unwrap().epoch = preview.shapes().3;
+    preview.set_shapes(ShapeLayer::Program, &[part]).unwrap();
+    preview.set_shapes(ShapeLayer::Program, &[]).unwrap();
+    assert!(preview
+        .submit(move_j_cmd(to_deg(&preview.angles_rad()), None))
+        .valid());
+}
+
+#[test]
+fn execution_override_retimes_the_plan_and_preserves_paused_commands() {
+    use par6_proto::command::{Pause, SetExecutionSpeed};
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+    let start = preview.angles_rad();
+    let mut target = to_deg(&start);
+    target[0] += 8.0;
+    let normal = preview.submit(move_j_cmd(target, None));
+    assert!(normal.valid());
+    preview.teleport_rad(start);
+    let result = preview.submit(Command::SetExecutionSpeed(SetExecutionSpeed { scale: 0.5 }));
+    assert!(result.valid(), "{result:?}");
+    let slow = preview.submit(move_j_cmd(target, None));
+    assert!(slow.valid());
+    assert!((slow.duration_s - 2.0 * normal.duration_s).abs() < 1e-9);
+    // The same plan, stretched: the slow span has twice the rows, and
+    // every other row of it is a row of the normal one.
+    let record = preview.plan_record(None);
+    let normal_q = span_joints(&record, normal.start_row, normal.rows);
+    let slow_q = span_joints(&record, slow.start_row, slow.rows);
+    assert!(
+        !normal_q.is_empty() && slow_q.len() == 2 * normal_q.len(),
+        "{} rows against {}",
+        normal_q.len(),
+        slow_q.len()
+    );
+    for (k, q) in normal_q.iter().enumerate() {
+        assert_eq!(
+            &slow_q[2 * k],
+            q,
+            "row {k} of the retimed plan is not the nominal one"
+        );
+    }
+    assert!(preview.submit(Command::Pause(Pause { on: true })).valid());
+    let held = preview.submit(move_j_cmd(to_deg(&start), None));
+    assert!(held.pending, "pause cannot claim motion completed");
+    assert_eq!(preview.angles_rad(), slow.end_joints_rad);
+    assert!(preview.flush().unwrap().pending);
+    // The resume runs what the pause held: its result is that motion, and
+    // nothing is left for a flush.
+    let resumed = preview.submit(Command::Pause(Pause { on: false }));
+    assert!(resumed.valid() && !resumed.pending, "{resumed:?}");
+    assert!(max_deg_error(&to_deg(&resumed.end_joints_rad), &to_deg(&start)) < 0.01);
+    assert!(preview.flush().is_none(), "the resume left motion held");
+}
+
+#[test]
 fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
     let config = test_config();
     let rig = Rig::boot(config.clone());
@@ -85,10 +173,14 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
         max_deg_error(&end_deg, &target) < 0.1,
         "the preview must land on the target: {end_deg:?} vs {target:?}"
     );
-    assert_eq!(
-        planned.joint_trajectory_rad.len(),
-        planned.tcp_poses.len(),
-        "every trajectory sample carries its FK pose"
+    // The record's rows are the plan: its last row is where the plan ends.
+    let record = preview.plan_record(None);
+    let rows = span_joints(&record, planned.start_row, planned.rows);
+    let last = rows.last().expect("a planned move owns rows");
+    assert!(
+        max_deg_error(&to_deg(last), &end_deg) < 0.01,
+        "the record's last row {:?} is not the plan's end {end_deg:?}",
+        to_deg(last)
     );
 
     let index = c.ok_index(&move_j_cmd(target, None));
@@ -111,7 +203,11 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
     beyond[0] += 400.0;
     for cmd in [
         teleport_cmd(beyond),
-        Command::WriteIo(WriteIo { port: 7, value: 1 }),
+        Command::WriteIo(WriteIo {
+            key: 0,
+            port: 7,
+            value: 1,
+        }),
         Command::SelectProfile(SelectProfile {
             profile: "BANG_BANG".into(),
         }),
@@ -140,6 +236,7 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
     let center_m = [pose[3], pose[7], pose[11]];
     preview.place_rad(to_rad(&target));
     let keepout = vec![Shape {
+        attachment: None,
         kind: "box".into(),
         params: vec![0.1, 0.1, 0.1],
         pose: vec![center_m[0], center_m[1], center_m[2], 0.0, 0.0, 0.0],
@@ -254,7 +351,7 @@ fn the_preview_runs_the_cartesian_pipeline() {
         dz * 1e3
     );
     assert!(
-        planned.joint_trajectory_rad.len() > 5,
+        planned.rows > 5,
         "a 30 mm cartesian move is many ticks long"
     );
 
@@ -323,7 +420,7 @@ fn blended_moves_hold_fold_and_flush_as_the_queue_does() {
 
     let held = preview.submit(move_j_cmd(a, Some(20.0)));
     assert!(held.pending && held.valid(), "{held:?}");
-    assert!(held.joint_trajectory_rad.is_empty());
+    assert_eq!(held.rows, 0);
     assert_eq!(preview.held_names(), vec!["move_j"]);
     assert_eq!(preview.angles_rad(), to_rad(&park), "nothing planned yet");
 
@@ -348,8 +445,8 @@ fn blended_moves_hold_fold_and_flush_as_the_queue_does() {
         alone
     );
     // The corner is cut: the chain never passes through A itself.
-    let nearest = chain
-        .joint_trajectory_rad
+    let record = preview.plan_record(None);
+    let nearest = span_joints(&record, chain.start_row, chain.rows)
         .iter()
         .map(|q| max_deg_error(&to_deg(q), &a))
         .fold(f64::INFINITY, f64::min);
@@ -417,10 +514,21 @@ fn home_previews_as_a_seek_until_referenced_and_a_return_afterwards() {
         calibrate: false,
     }));
     assert!(seek.valid(), "{seek:?}");
-    assert_eq!(seek.end_joints_rad, ready);
-    assert_eq!(seek.duration_s, 0.0);
+    // The seek lands at the ready pose — its own time is the arm's — and
+    // the return to park that follows it is planned and timed.
+    let record = preview.plan_record(None);
+    let rows = span_joints(&record, seek.start_row, seek.rows);
+    assert!(
+        max_deg_error(&to_deg(&rows[0]), &to_deg(&ready)) < 1e-4,
+        "the seek lands at the ready pose: {:?} vs {ready:?}",
+        rows[0]
+    );
+    assert!(max_deg_error(&to_deg(&seek.end_joints_rad), &park) < 0.1);
+    assert!(seek.duration_s > 0.1 && seek.rows > 1, "{seek:?}");
     assert!(preview.homed());
 
+    // Referenced and away from park, HOME is the planned return alone.
+    preview.place_rad(ready);
     let ret = preview.submit(Command::Home(Home {
         key: 2,
         calibrate: false,
@@ -431,7 +539,7 @@ fn home_previews_as_a_seek_until_referenced_and_a_return_afterwards() {
         "a referenced HOME is a planned move, not a jump"
     );
     assert!(max_deg_error(&to_deg(&ret.end_joints_rad), &park) < 0.1);
-    assert!(ret.tcp_poses.len() > 1, "a planned move draws a path");
+    assert!(ret.rows > 1, "a planned move draws a path");
 }
 
 /// The jog preview runs the runtime's own ramp: a diagonal jog moves
@@ -514,6 +622,21 @@ fn the_preview_latches_an_estop_and_streams_a_jog_the_way_the_runtime_does() {
         mine.end_joints_rad,
         to_rad(&park),
         "a refused move must not advance the virtual arm"
+    );
+
+    // reset_state is the program's reset, not the controller's: the
+    // e-stop latch stands through it, on the preview as on the runtime.
+    preview.submit(Command::ResetState);
+    c.ok(&Command::ResetState);
+    let still_mine = preview.submit(move_j_cmd(target, None));
+    let still_theirs = c.expect_error(&move_j_cmd(target, None));
+    let still = still_mine
+        .error
+        .as_ref()
+        .expect("reset_state must not clear a latched e-stop");
+    assert_eq!(
+        still.code, still_theirs.code,
+        "{still:?} vs {still_theirs:?}"
     );
 
     preview.submit(Command::Reset);
@@ -635,8 +758,10 @@ fn a_calibrating_home_seeks_even_when_the_arm_is_already_referenced() {
     }));
     assert!(plain.valid(), "{plain:?}");
 
-    // Referenced, but asked to calibrate: the seek runs instead, ending
-    // where the homing sequence leaves the arm rather than at park.
+    // Referenced, but asked to calibrate: the seek runs instead. The
+    // record shows it landing where the homing sequence leaves the arm,
+    // then the return to park the runtime plans once referenced — the
+    // only part of a calibrating home a plan can time.
     let mut off = park;
     off[0] += 20.0;
     preview.place_rad(to_rad(&off));
@@ -646,15 +771,22 @@ fn a_calibrating_home_seeks_even_when_the_arm_is_already_referenced() {
     }));
     assert!(seek.valid(), "{seek:?}");
     let ready = to_deg(&preview.homing_ready_pose_rad());
+    let record = preview.plan_record(None);
+    let rows = span_joints(&record, seek.start_row, seek.rows);
+    // The record stores single-precision rows.
     assert!(
-        max_deg_error(&to_deg(&seek.end_joints_rad), &ready) < 1e-6,
-        "a calibrating home must end where the seek ends: {:?} vs {ready:?}",
+        max_deg_error(&to_deg(&rows[0]), &ready) < 1e-4,
+        "a calibrating home seeks first: the record must land at the ready pose, got {:?} vs {ready:?}",
+        to_deg(&rows[0])
+    );
+    assert!(
+        max_deg_error(&to_deg(&seek.end_joints_rad), &park) < 0.1,
+        "home ends at the park pose whichever route it took: {:?}",
         to_deg(&seek.end_joints_rad)
     );
     assert!(
-        seek.duration_s == 0.0,
-        "the seek's duration belongs to the physical sequence, not to a plan: {}",
-        seek.duration_s
+        seek.duration_s > 0.1 && seek.rows > 1,
+        "the return from the ready pose is a planned move: {seek:?}"
     );
 }
 
@@ -827,8 +959,8 @@ fn the_preview_jogs_cartesian_through_the_runtime_kinematics() {
         None,
     );
     assert!(r.valid(), "a plain +x jog previews: {:?}", r.error);
-    assert_eq!(r.joint_trajectory_rad.len(), r.tcp_poses.len());
-    let (first, last) = (r.tcp_poses[0], r.tcp_poses[r.tcp_poses.len() - 1]);
+    let poses = span_tcp(&preview.plan_record(None), r.start_row, r.rows);
+    let (first, last) = (poses[0], poses[poses.len() - 1]);
     let dx = last[3] - first[3];
     let dy = (last[7] - first[7]).abs();
     let dz = (last[11] - first[11]).abs();
@@ -873,13 +1005,13 @@ fn a_pure_reorientation_first_waypoint_is_not_dropped() {
         "a rotate-then-translate path previews: {:?}",
         r.error
     );
-    let start = r.tcp_poses[0];
+    let poses = span_tcp(&preview.plan_record(None), r.start_row, r.rows);
+    let start = poses[0];
     let translation = |p: &[f64; 16]| {
         ((p[3] - start[3]).powi(2) + (p[7] - start[7]).powi(2) + (p[11] - start[11]).powi(2)).sqrt()
     };
     let rotation = |p: &[f64; 16]| rotation_angle_deg(&start, p);
-    let moving = r
-        .tcp_poses
+    let moving = poses
         .iter()
         .find(|p| translation(p) > 0.005)
         .expect("the path translates 50 mm");
@@ -900,18 +1032,10 @@ fn calibration_preview_includes_the_shoulder_and_elbow_approaches() {
     let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
     let start = to_rad(&park_deg());
     preview.teleport_rad(start);
-    let (_, planned) = preview
-        .preview_estimation(0.5)
-        .expect("calibration preview");
-    assert!(planned.valid(), "the calibration path must plan");
+    let visits = preview.estimation_poses(0.5).expect("calibration preview");
     for j in [1, 2] {
-        let lo = planned
-            .joint_trajectory_rad
-            .iter()
-            .map(|q| q[j])
-            .fold(f64::INFINITY, f64::min);
-        let hi = planned
-            .joint_trajectory_rad
+        let lo = visits.iter().map(|q| q[j]).fold(f64::INFINITY, f64::min);
+        let hi = visits
             .iter()
             .map(|q| q[j])
             .fold(f64::NEG_INFINITY, f64::max);
@@ -924,12 +1048,183 @@ fn calibration_preview_includes_the_shoulder_and_elbow_approaches() {
             start[j]
         );
     }
+    let end = visits.last().expect("at least the return");
     assert!(
-        planned
-            .end_joints_rad
-            .iter()
-            .zip(start)
-            .all(|(a, b)| (a - b).abs() < 1e-6),
-        "calibration must preview its return to the starting pose"
+        end.iter().zip(start).all(|(a, b)| (a - b).abs() < 1e-6),
+        "calibration must end on its starting pose"
+    );
+}
+
+/// Distance \[m\] from `p` to the line through `a` along the unit `dir`.
+fn off_axis(p: &[f64; 16], a: &[f64; 16], dir: [f64; 3]) -> f64 {
+    let rel = [p[3] - a[3], p[7] - a[7], p[11] - a[11]];
+    let along = rel[0] * dir[0] + rel[1] * dir[1] + rel[2] * dir[2];
+    let perp = [
+        rel[0] - along * dir[0],
+        rel[1] - along * dir[1],
+        rel[2] - along * dir[2],
+    ];
+    (perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]).sqrt()
+}
+
+/// A `jog_l` that drives a joint into its soft limit brakes the tool ON
+/// the axis it was jogging, as parol6's does — a solution past a limit
+/// is a pose out of reach.
+#[test]
+fn a_jog_l_into_a_joint_limit_brakes_on_its_axis() {
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
+    let soft_max = par6_config::ConfigBundle::load(&config)
+        .expect("config")
+        .robot
+        .joints[0]
+        .limits
+        .soft_max_rad;
+    let mut start = wrist_clear_deg();
+    start[0] = soft_max.to_degrees() - 4.0;
+    preview.teleport_rad(to_rad(&start));
+    let at = preview.pose().expect("pose at start");
+
+    // Tangential to the base rotation through the tool: the direction +J1
+    // carries it, so the jog walks J1 straight into its limit.
+    let norm = (at[3] * at[3] + at[7] * at[7]).sqrt();
+    let dir = [-at[7] / norm, at[3] / norm, 0.0];
+    let r = preview.preview_jog_l([dir[0], dir[1], 0.0, 0.0, 0.0, 0.0], Frame::Wrf, 1.5, None);
+    assert!(r.valid(), "the jog previews: {:?}", r.error);
+    let record = preview.plan_record(None);
+    let joints = span_joints(&record, r.start_row, r.rows);
+    let poses = span_tcp(&record, r.start_row, r.rows);
+
+    assert!(
+        joints.iter().all(|q| q[0] <= soft_max + 1e-6),
+        "J1 crossed its soft limit"
+    );
+    let reached = joints.iter().map(|q| q[0]).fold(f64::MIN, f64::max);
+    assert!(
+        soft_max - reached < 2f64.to_radians(),
+        "the jog must run up to the limit before braking: stopped {:.2} deg short",
+        (soft_max - reached).to_degrees()
+    );
+    let worst = poses
+        .iter()
+        .map(|p| off_axis(p, &at, dir))
+        .fold(0.0f64, f64::max);
+    assert!(
+        worst < 0.001,
+        "the tool left its axis by {:.2} mm at the limit",
+        worst * 1e3
+    );
+}
+
+/// The dry-run preview of `servo_l` draws the straight line the runtime
+/// drives, not a joint-interpolated move onto the same pose.
+#[test]
+fn the_servo_l_preview_draws_the_line_the_runtime_drives() {
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
+    let mut from = park_deg();
+    from[3] += 25.0;
+    from[4] += 35.0;
+    preview.teleport_rad(to_rad(&from));
+    let at = preview.pose().expect("pose at start");
+    let start = [at[3] * 1e3, at[7] * 1e3, at[11] * 1e3];
+    let target_mm = [start[0] + 60.0, start[1] - 45.0, start[2] + 30.0];
+
+    let r = preview.submit(Command::ServoL(par6_proto::command::ServoL {
+        pose: wire_pose_at(&at, target_mm),
+        speed: Some(0.3),
+        accel: Some(0.3),
+    }));
+    assert!(r.valid(), "a reachable servo_l previews: {:?}", r.error);
+    let poses = span_tcp(&preview.plan_record(None), r.start_row, r.rows);
+    let length = ((60.0f64).powi(2) + 45.0f64.powi(2) + 30.0f64.powi(2)).sqrt();
+    let dir = [60.0 / length, -45.0 / length, 30.0 / length];
+    let worst = poses
+        .iter()
+        .map(|p| off_axis(p, &at, dir))
+        .fold(0.0f64, f64::max);
+    let end = poses.last().expect("rows");
+    let landed = distance([end[3] * 1e3, end[7] * 1e3, end[11] * 1e3], target_mm);
+    assert!(
+        landed < 1.0,
+        "the preview ends {landed:.2} mm from the target"
+    );
+    assert!(
+        worst < 0.0005,
+        "the servo_l preview left the line by {:.2} mm",
+        worst * 1e3
+    );
+}
+
+/// `LINEAR` is a profile this runtime plans with, and it is what its
+/// name says: a constant-velocity joint path with ramps at the
+/// acceleration limit, so a script written for parol6's default profile
+/// runs here unchanged.
+#[test]
+fn the_linear_profile_cruises_at_one_speed_between_its_ramps() {
+    let mut preview =
+        Preview::new(Some(&test_config()), Some(&assets()), None).expect("the preview boots");
+    preview.set_homed(true);
+    preview.teleport_rad(to_rad(&wrist_clear_deg()));
+    let selected = preview.submit(Command::SelectProfile(SelectProfile {
+        profile: "LINEAR".into(),
+    }));
+    assert!(
+        selected.error.is_none(),
+        "LINEAR is refused: {:?}",
+        selected.error
+    );
+
+    // Far enough, and slow enough, to spend most of the move cruising:
+    // at 30% of the velocity limit the ramps to it are short.
+    let mut target = wrist_clear_deg();
+    target[0] += 90.0;
+    let r = preview.submit(Command::MoveJ(MoveJ {
+        key: 4343,
+        angles: target,
+        duration: None,
+        speed: Some(0.3),
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    }));
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let record = preview.plan_record(None);
+    let joints = span_joints(&record, r.start_row, r.rows);
+    let dt = record.row_dt_s;
+    let speeds: Vec<f64> = joints
+        .windows(2)
+        .map(|w| ((w[1][0] - w[0][0]) / dt).abs())
+        .collect();
+    let peak = speeds.iter().copied().fold(0.0f64, f64::max);
+    assert!(peak > 0.1, "J1 never got up to speed: {peak:.3} rad/s");
+    let cruising = speeds.iter().filter(|v| **v > peak * 0.98).count();
+    assert!(
+        cruising * 2 > speeds.len(),
+        "a LINEAR move cruises at one speed: only {cruising} of {} rows are within 2% of the \
+         {peak:.3} rad/s peak",
+        speeds.len()
+    );
+    // The ramps are ramps, not steps: no row changes speed by more than
+    // the configured acceleration limit allows.
+    let limit = par6_config::ConfigBundle::load(&test_config())
+        .expect("config")
+        .robot
+        .joints[0]
+        .limits
+        .for_mode(par6_config::LimitMode::Exec)
+        .acceleration_rad_s2;
+    let jump = speeds
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs() / dt)
+        .fold(0.0f64, f64::max);
+    assert!(
+        jump <= limit * 1.01,
+        "the profile steps its velocity: {jump:.2} rad/s² in one row against a {limit} limit"
+    );
+    assert!(
+        max_deg_error(&to_deg(&joints[joints.len() - 1]), &target) < 1e-3,
+        "the move lands on its target: {:?} vs {target:?}",
+        to_deg(&joints[joints.len() - 1])
     );
 }

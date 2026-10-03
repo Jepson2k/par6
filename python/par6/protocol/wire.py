@@ -63,6 +63,7 @@ class StatusBuffer:
     # v2 header
     proto_version: int = 0
     controller_id: int = 0
+    session_id: int = 0
     seq: int = 0
     mono_time_ns: int = 0
     link_ok: int = 0
@@ -77,6 +78,7 @@ class StatusBuffer:
     speeds: np.ndarray = field(
         default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64)
     )
+    """Joint speeds [deg/s]."""
     io: np.ndarray = field(default_factory=lambda: np.zeros(IO_SLOTS, dtype=np.int32))
     action_current: str = ""
     action_state: ActionState = ActionState.IDLE
@@ -182,6 +184,7 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
     """
     buf.proto_version = d["proto_version"]
     buf.controller_id = d["controller_id"]
+    buf.session_id = d["session_id"]
     buf.seq = d["seq"]
     buf.mono_time_ns = d["mono_time_ns"]
     buf.link_ok = int(d["link_ok"])
@@ -189,6 +192,8 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
     buf.pose[:] = d["pose"]
     buf.angles[:] = d["angles"]
     buf.speeds[:] = d["speeds"]
+    # The wire carries rad/s; the API speaks degrees, like `angles`.
+    np.rad2deg(buf.speeds, out=buf.speeds)
     buf.io = _int_array(buf.io, d["io"])
     buf.action_current = d["action_current"]
     buf.action_state = _enum(buf.action_state, ActionState, d["action_state"])

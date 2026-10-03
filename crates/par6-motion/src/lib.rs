@@ -18,6 +18,10 @@
 //!   jerk-aware soft-limit lookahead and direction-block latching.
 //! - [`StreamingExecutor`]: rsruckig online target tracker for
 //!   servo-style streaming targets, stepped at tick rate.
+//! - [`CartesianStreamingExecutor`]: the same tracker on the SE(3)
+//!   tangent, so `servo_l` setpoints are followed along the screw
+//!   geodesic (a straight TCP line for a pure translation) instead of
+//!   by joint interpolation that merely ends in the right place.
 //!
 //! # TOPPRA
 //!
@@ -53,4 +57,4 @@ pub use plan::{
     SEPTIC_PEAK_VEL,
 };
 pub use sample::{Sample, SampleMeta, NUM_JOINTS};
-pub use stream::{StreamStep, StreamingExecutor};
+pub use stream::{CartLimits, CartStep, CartesianStreamingExecutor, StreamStep, StreamingExecutor};

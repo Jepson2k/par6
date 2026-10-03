@@ -11,6 +11,9 @@
 use std::path::Path;
 
 fn main() {
+    let shim =
+        std::env::var("DEP_PAR6_SHIM_RPATH").expect("par6-kin publishes the linked shim path");
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{shim}");
     println!("cargo:rerun-if-env-changed=MUJOCO_DYNAMIC_LINK_DIR");
     let lib_dir = std::env::var("MUJOCO_DYNAMIC_LINK_DIR").unwrap_or_else(|_| {
         panic!(

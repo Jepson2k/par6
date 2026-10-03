@@ -20,6 +20,8 @@ fn push_cmd(rig: &mut Rig, index: u32, from: f64, step: f64, n: usize, blend: bo
             q,
             qd: [0.0; MAX_JOINTS],
             tau_ff: [0.0; MAX_JOINTS],
+            inertia_velocity: [0.0; MAX_JOINTS],
+            start: None,
             meta: SampleMeta {
                 command_index: index,
                 checkpoint_id: index,
@@ -181,6 +183,59 @@ fn settled_timeout_completes_without_error_strict_timeout_latches() {
     assert!(f.iter().all(|c| c.pos.is_none() && c.vel == Some(0)));
 }
 
+/// The settle timeout is "no progress for this long", not "this long
+/// since the ring ran out": a joint still closing on its target under
+/// `strict` is settling, not stuck, however long it takes — while one
+/// that only twitches by less than a tenth of the tolerance is.
+#[test]
+fn strict_settle_faults_on_stalled_progress_not_on_elapsed_time() {
+    let mut rig = Rig::with_policy(CompletionPolicy::Strict);
+    enter_exec(&mut rig);
+    let q0 = rig.pose[0];
+    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, false, true);
+    rig.tick_n(4);
+    assert!(rig.snap().exec.settling, "the ring has run out: settling");
+    // Closing by 0.002 rad every 300 ticks: every step clears the
+    // progress floor (0.001 rad) inside the 500-tick timeout, so the
+    // clock keeps restarting although the move takes 9000 ticks.
+    for k in 1..=30 {
+        rig.pose[0] = q0 + 0.002 * f64::from(k);
+        rig.tick_n(300);
+        let s = rig.snap();
+        assert!(
+            !s.error_active,
+            "faulted at step {k} while the joint was still closing"
+        );
+        assert_eq!(s.exec.completed_index, 0, "not within tolerance yet");
+    }
+    rig.pose[0] = q0 + 0.08;
+    rig.tick_n(10);
+    let s = rig.snap();
+    assert_eq!(s.exec.completed_index, 1, "the slow settle completes");
+    assert!(!s.error_active);
+
+    // Dithering by 0.0004 rad about the same spot never clears the floor:
+    // no progress, and the timeout latches.
+    let mut rig = Rig::with_policy(CompletionPolicy::Strict);
+    enter_exec(&mut rig);
+    let q0 = rig.pose[0];
+    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, false, true);
+    rig.tick_n(4);
+    for k in 1..=6 {
+        rig.pose[0] = q0 + 0.0004 * f64::from(k % 2);
+        rig.tick_n(100);
+    }
+    let s = rig.snap();
+    assert!(
+        s.errors
+            .as_slice()
+            .iter()
+            .any(|e| e.code == ErrorCode::ExecSettleTimeout),
+        "noise-level creep is not progress: the strict timeout must latch"
+    );
+    assert_eq!(s.exec.completed_index, 0);
+}
+
 #[test]
 fn blend_continues_bypasses_settling_across_the_boundary() {
     let mut rig = Rig::new(); // Settled policy — the bypass must win
@@ -215,12 +270,23 @@ fn pause_holds_in_place_with_the_ring_untouched() {
     let mut rig = Rig::new();
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0, 0.001, 100, false, false);
+    push_cmd(&mut rig, 1, q0, 0.0, 1000, false, false);
     rig.tick_n(10);
-    let before = rig.snap().exec.samples_remaining;
-    let held = rig.last_joints()[0].pos.unwrap();
 
     rig.cmd(RtCommand::ExecSetPaused(true));
+    for _ in 0..300 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+        if rig.snap().exec.paused {
+            break;
+        }
+    }
+    assert!(
+        rig.snap().exec.paused,
+        "bounded deceleration reaches a hold"
+    );
+    let before = rig.snap().exec.samples_remaining;
+    let held = rig.last_joints()[0].pos.unwrap();
     rig.tick_n(30);
     let s = rig.snap();
     assert!(s.exec.paused);
@@ -232,7 +298,10 @@ fn pause_holds_in_place_with_the_ring_untouched() {
     assert_eq!(rig.last_joints()[0].vel, Some(0), "zero velocity hold");
 
     rig.cmd(RtCommand::ExecSetPaused(false));
-    rig.tick_n(5);
+    for _ in 0..300 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+    }
     assert!(
         rig.snap().exec.samples_remaining < before,
         "playback resumed"
@@ -358,9 +427,180 @@ fn a_pause_requested_while_idle_holds_the_next_program() {
     );
 
     rig.cmd(RtCommand::ExecSetPaused(false));
-    rig.tick_n(5);
+    for _ in 0..300 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+        if rig.snap().exec.samples_remaining < before {
+            break;
+        }
+    }
     assert!(
         rig.snap().exec.samples_remaining < before,
         "un-pausing resumes playback"
     );
+}
+
+/// `stop()` on a moving program: the arm brakes ALONG the path — never
+/// reversing, never stepping — at no more than the joint acceleration
+/// limit, then holds where the brake ended with the rest of the program
+/// discarded. A flush alone stops the setpoint dead from full speed.
+#[test]
+fn a_stop_brakes_along_the_path_within_the_acceleration_limit_then_holds() {
+    let mut rig = Rig::new();
+    enter_exec(&mut rig);
+    let q0 = rig.pose[0];
+    let limits = common::bundle().robot.joints[0]
+        .limits
+        .for_mode(par6_config::LimitMode::Exec);
+    let ticks_per_rad = f64::from(rig.conv[0].motor_ticks(q0 + 1.0) - rig.conv[0].motor_ticks(q0));
+    // A cruise far from both ends of a long program, its samples carrying
+    // the velocity their spacing implies (as the planner's do: EXEC
+    // interpolates Hermite, so zero sample velocities would be a
+    // stop-start at every sample, not a cruise).
+    let step = 0.002;
+    let mut q = rig.pose;
+    for k in 0..2000 {
+        q[0] = q0 + step * (k + 1) as f64;
+        let mut qd = [0.0; MAX_JOINTS];
+        qd[0] = step / rig.dt;
+        let s = Sample {
+            q,
+            qd,
+            tau_ff: [0.0; MAX_JOINTS],
+            inertia_velocity: [0.0; MAX_JOINTS],
+            start: None,
+            meta: SampleMeta {
+                command_index: 1,
+                checkpoint_id: 1,
+                blend_continues: false,
+                is_last: k == 1999,
+            },
+        };
+        assert!(rig.producer.try_push(&s), "ring capacity");
+    }
+    for _ in 0..40 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+    }
+    let stop_tick = rig.snap().tick;
+    rig.producer.flush_marker().mark();
+    rig.send(RtCommand::ExecStop);
+    let mut ended = None;
+    for _ in 0..2000 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+        let s = rig.snap();
+        if s.tick > stop_tick + 1 && !s.exec.stopping {
+            ended = Some(s);
+            break;
+        }
+    }
+    let s = ended.expect("the stop brake finishes");
+    assert_eq!(
+        s.mode,
+        Mode::Exec,
+        "a stopped program rests in the EXEC hold"
+    );
+    assert_eq!(
+        s.exec.samples_remaining, 0,
+        "the rest of the program is gone"
+    );
+
+    let pos: Vec<f64> = j0_positions(&mut rig, stop_tick)
+        .into_iter()
+        .map(f64::from)
+        .collect();
+    let deltas: Vec<f64> = pos.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(
+        deltas.iter().all(|d| *d >= -1.0),
+        "the brake follows the path forward, never back: {deltas:?}"
+    );
+    let a_ticks = limits.acceleration_rad_s2 * ticks_per_rad * rig.dt * rig.dt;
+    for w in deltas.windows(2) {
+        // One motor tick of quantization on each of the two deltas.
+        assert!(
+            (w[1] - w[0]).abs() <= a_ticks * 1.05 + 2.0,
+            "deceleration {} ticks/tick² over the limit {a_ticks}",
+            (w[1] - w[0]).abs()
+        );
+    }
+    let v = step / rig.dt;
+    let travel = (pos[pos.len() - 1] - pos[0]) / ticks_per_rad;
+    let floor = v * v / (2.0 * limits.acceleration_rad_s2);
+    assert!(
+        travel >= 0.9 * floor,
+        "stopped in {travel} rad from {v} rad/s: faster than the limit allows ({floor} rad)"
+    );
+    assert!(
+        travel <= 4.0 * floor + 2.0 * step,
+        "braked far softer than the limit: {travel} rad against {floor} rad"
+    );
+
+    let held = rig.last_joints()[0];
+    rig.tick_n(30);
+    let f = rig.last_joints()[0];
+    assert_eq!(f.vel, Some(0), "held still");
+    assert_eq!(f.pos, held.pos, "held in place");
+}
+
+/// A jog that preempts a program takes the RT out of EXEC while the
+/// program's stop is still braking. The brake never reaches the flush it
+/// ends in, so the jog's own end — a hold in EXEC — must not find the
+/// cancelled program still queued and play it back.
+#[test]
+fn a_jog_cutting_a_stop_short_leaves_nothing_for_the_hold_to_play() {
+    let mut rig = Rig::new();
+    enter_exec(&mut rig);
+    let q0 = rig.pose[0];
+    let step = 0.002;
+    let mut q = rig.pose;
+    for k in 0..2000 {
+        q[0] = q0 + step * (k + 1) as f64;
+        let mut qd = [0.0; MAX_JOINTS];
+        qd[0] = step / rig.dt;
+        let s = Sample {
+            q,
+            qd,
+            tau_ff: [0.0; MAX_JOINTS],
+            inertia_velocity: [0.0; MAX_JOINTS],
+            start: None,
+            meta: SampleMeta {
+                command_index: 1,
+                checkpoint_id: 1,
+                blend_continues: false,
+                is_last: k == 1999,
+            },
+        };
+        assert!(rig.producer.try_push(&s), "ring capacity");
+    }
+    for _ in 0..40 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+    }
+    rig.producer.flush_marker().mark();
+    rig.send(RtCommand::ExecStop);
+    rig.handles.heartbeat.feed();
+    rig.tick();
+    assert!(rig.snap().exec.stopping, "the stop is braking");
+
+    // The jog's mode entry, as the daemon sends it, then its end.
+    rig.send(RtCommand::SetMode(Mode::Idle));
+    rig.send(RtCommand::SetMode(Mode::Jog));
+    rig.send(RtCommand::Hold);
+    for _ in 0..10 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+    }
+    let s = rig.snap();
+    assert_eq!(s.mode, Mode::Exec, "the jog ends in the EXEC hold");
+    assert_eq!(
+        s.exec.samples_remaining, 0,
+        "the cancelled program is gone, not waiting for the hold to play it"
+    );
+    let held = rig.last_joints()[0];
+    for _ in 0..30 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+    }
+    assert_eq!(rig.last_joints()[0].pos, held.pos, "the hold holds");
 }

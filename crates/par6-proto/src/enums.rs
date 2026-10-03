@@ -137,11 +137,13 @@ wire_enum! {
         /// every Nth tick, so only divisors of the tick rate can be served;
         /// anything else is refused rather than rounded to a neighbour.
         SetStatusRate = 31,
+        /// Select 10–100% of planned execution speed, preserving pause.
+        SetExecutionSpeed = 32,
         /// Commissioning: tell a gripper drive which tool it is built into
         /// (cmd 36 to `node`, carrying `tool_id`) and have it saved. Same gate
         /// and `force` rule as SET_CAN_ID. The drive reports the id in its
         /// device info from then on, and the runtime fits that tool at boot.
-        SetToolId = 32,
+        SetToolId = 33,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -196,6 +198,8 @@ wire_enum! {
         BusScan = 61,
         /// Current STATUS rate, and the tick rate it divides.
         StatusRate = 62,
+        /// Fresh queued-execution timing readback.
+        ExecutionSpeed = 63,
 
         // -- FIRE_AND_FORGET: no reply --
         /// Streaming joint position target (degrees).
@@ -241,6 +245,13 @@ wire_enum! {
         Checkpoint = 109,
         /// Generic tool action (open/close/move…), validated server-side.
         ToolAction = 110,
+        /// Queued tool-local TCP transform (mm, intrinsic XYZ degrees).
+        SetTcpTransform = 111,
+        /// Applied tool-local TCP transform readback.
+        TcpTransform = 112,
+        /// How a queued command finished, by index: the COMPLETE push's
+        /// content, kept for a client whose push went missing.
+        CommandCompletion = 113,
     }
 }
 
@@ -293,6 +304,12 @@ wire_enum! {
         BusScan = 22,
         /// See [`CmdType::StatusRate`].
         StatusRate = 23,
+        /// See [`CmdType::TcpTransform`].
+        TcpTransform = 24,
+        /// Requested, applied, and retained positive execution scales.
+        ExecutionSpeed = 25,
+        /// See [`CmdType::CommandCompletion`].
+        CommandCompletion = 26,
     }
 }
 
@@ -440,7 +457,6 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SetGravityComp
         | C::Pause
         | C::Stop
-        | C::WriteIo
         | C::Simulator
         | C::SelectProfile
         | C::ResetState
@@ -454,7 +470,9 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SetCanId
         | C::SaveConfig
         | C::SetToolId
-        | C::SetStatusRate => CommandClass::System,
+        | C::SetExecutionSpeed
+        | C::SetStatusRate
+        | C::Teleport => CommandClass::System,
 
         C::Ping
         | C::Status
@@ -471,6 +489,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::Error
         | C::TcpSpeed
         | C::TcpOffset
+        | C::ExecutionSpeed
+        | C::TcpTransform
         | C::ToolStatus
         | C::IsSimulator
         | C::Shapes
@@ -478,15 +498,12 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::Payload
         | C::ConfigBundle
         | C::BusScan
-        | C::StatusRate => CommandClass::Query,
+        | C::StatusRate
+        | C::CommandCompletion => CommandClass::Query,
 
-        C::ServoJ
-        | C::ServoJPose
-        | C::ServoL
-        | C::JogJ
-        | C::JogL
-        | C::Teleport
-        | C::ResetLoopStats => CommandClass::FireAndForget,
+        C::ServoJ | C::ServoJPose | C::ServoL | C::JogJ | C::JogL | C::ResetLoopStats => {
+            CommandClass::FireAndForget
+        }
 
         C::Home
         | C::MoveJ
@@ -499,6 +516,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::Delay
         | C::Checkpoint
         | C::ToolAction
-        | C::SetTcpOffset => CommandClass::Queued,
+        | C::SetTcpOffset
+        | C::SetTcpTransform
+        | C::WriteIo => CommandClass::Queued,
     }
 }

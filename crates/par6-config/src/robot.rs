@@ -207,6 +207,18 @@ pub struct JointConfig {
     /// Driver voltage limit \[mV\] (cmd 34); 0 = use VBUS. Old firmware
     /// ignores the frame.
     pub voltage_limit_mv: u32,
+    /// Motor phase resistance \[ohm\] and inductance \[mH\].
+    ///
+    /// The motor's own electrical constants, from its datasheet or from
+    /// the driver's `Cal` routine, which measures both and keeps them in
+    /// EEPROM. The simulator needs them to model the current loop
+    /// against `voltage_limit_mv`: without them it applies the commanded
+    /// current instantly, which is a drive with unlimited authority.
+    /// Omitted on a motor whose constants are not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_resistance_ohm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_inductance_mh: Option<f64>,
     /// Motor velocity limit \[encoder ticks/s\] (cmd 20).
     pub velocity_limit_ticks_s: f64,
     /// Driver watchdog timeout \[ms\] (cmd 15, wire unit is ms). Fires
@@ -493,11 +505,10 @@ pub struct SimConfig {
     pub viscous_nm_s: Vec<f64>,
     /// Coulomb friction per joint \[Nm, joint side\].
     pub coulomb_nm: Vec<f64>,
-    /// Gearbox holding friction per joint \[Nm, joint side\]: the load
-    /// the unpowered drivetrain holds without back-driving (stepper detent
-    /// through the reduction). An estimate until measured on the arm; it
-    /// shapes only what the sim does with an idled or released drive.
-    pub holding_friction_nm: Vec<f64>,
+    /// Assumed powered load support per joint \[Nm, joint side\]. This
+    /// empirical fit is not a measured passive-friction or brake parameter.
+    /// Supply-loss scenarios remove it when their supply envelope reaches zero.
+    pub powered_support_nm: Vec<f64>,
     /// Lateral stiffness of the arm's forks \[Nm/rad\]: passive hinges on
     /// the shoulder's and the elbow's driven bodies about the two axes
     /// their joints do not turn, so a base swing bends or twists each
@@ -527,7 +538,7 @@ impl Default for SimConfig {
             // Measured on the test arm by par6-selfcal, 2026-09-23.
             viscous_nm_s: vec![0.033145, 1.513348, 0.0, 0.0, 0.033714, 0.009957],
             coulomb_nm: vec![0.2314, 0.9030, 2.2047, 0.1279, 0.0521, 0.0854],
-            holding_friction_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
+            powered_support_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
             // From the base chirp of 2026-09-23 (par6-selfcal --belt-only,
             // Flange): K = I_forearm · (2π·23.3 Hz)² at the elbow, ζ ≈ 0.15;
             // the shoulder fork is given the same, unmeasured.
@@ -610,8 +621,25 @@ pub struct MotionConfig {
     /// Full-scale `jog_l` linear TCP speed \[m/s\] (a `velocities`
     /// fraction of ±1 maps to this).
     pub jog_l_linear_max_m_s: f64,
+    /// TCP linear speed ceiling of a planned cartesian move (`move_l`,
+    /// `move_c`, `move_s`, `move_p`) \[m/s\]: a move's `speed` fraction
+    /// scales this as well as the joint limits, so a full-speed `move_l`
+    /// never sweeps the tool faster than this however much room the
+    /// joints have (parol6's `CARTESIAN_LINEAR_VELOCITY_MAX`).
+    pub planned_linear_max_m_s: f64,
     /// Full-scale `jog_l` angular TCP speed \[rad/s\].
     pub jog_l_angular_max_rad_s: f64,
+    /// Linear TCP acceleration ceiling for the cartesian streaming
+    /// limiter \[m/s²\]. The two full-scale `jog_l` rates above are its
+    /// velocity ceiling, as parol6 does — `servo_l` and `jog_l` share
+    /// one executor, so they share one envelope.
+    pub cart_linear_accel_max_m_s2: f64,
+    /// Angular TCP acceleration ceiling for the same limiter \[rad/s²\].
+    pub cart_angular_accel_max_rad_s2: f64,
+    /// Linear TCP jerk ceiling for the same limiter \[m/s³\].
+    pub cart_linear_jerk_max_m_s3: f64,
+    /// Angular TCP jerk ceiling for the same limiter \[rad/s³\].
+    pub cart_angular_jerk_max_rad_s3: f64,
     /// MOVE_L sampling pitch: one IK waypoint per this much
     /// translation \[m\] …
     pub cart_step_m: f64,
@@ -640,6 +668,9 @@ pub struct MotionConfig {
     pub settle_tolerance_rad: f64,
     /// Settle timeout \[s\].
     pub settle_timeout_s: f64,
+    /// Minimum time for a unit change of queued execution scale [s].
+    /// Joint acceleration constraints may extend a transition.
+    pub execution_override_transition_s: f64,
     /// Rotation weight `w` in the multi-segment path metric
     /// √(t² + (w·θ)²) \[m/rad\] (vendor: 0.15).
     pub path_rot_weight_m_per_rad: f64,
@@ -653,9 +684,14 @@ pub struct MotionConfig {
 
 impl MotionConfig {
     /// Every key, in declaration order — the labels of [`Self::as_array`].
-    pub const KEYS: [&'static str; 13] = [
+    pub const KEYS: [&'static str; par6_proto::MOTION_KEYS] = [
         "jog_l_linear_max_m_s",
+        "planned_linear_max_m_s",
         "jog_l_angular_max_rad_s",
+        "cart_linear_accel_max_m_s2",
+        "cart_angular_accel_max_rad_s2",
+        "cart_linear_jerk_max_m_s3",
+        "cart_angular_jerk_max_rad_s3",
         "cart_step_m",
         "cart_step_rad",
         "path_step_m",
@@ -664,6 +700,7 @@ impl MotionConfig {
         "dls_lambda",
         "settle_tolerance_rad",
         "settle_timeout_s",
+        "execution_override_transition_s",
         "path_rot_weight_m_per_rad",
         "singularity_cond_max",
         "singularity_sigma_min",
@@ -671,10 +708,15 @@ impl MotionConfig {
 
     /// Every value in [`Self::KEYS`] order; an omitted `joint_step_rad`
     /// is NaN.
-    pub fn as_array(&self) -> [f64; 13] {
+    pub fn as_array(&self) -> [f64; par6_proto::MOTION_KEYS] {
         [
             self.jog_l_linear_max_m_s,
+            self.planned_linear_max_m_s,
             self.jog_l_angular_max_rad_s,
+            self.cart_linear_accel_max_m_s2,
+            self.cart_angular_accel_max_rad_s2,
+            self.cart_linear_jerk_max_m_s3,
+            self.cart_angular_jerk_max_rad_s3,
             self.cart_step_m,
             self.cart_step_rad,
             self.path_step_m,
@@ -683,6 +725,7 @@ impl MotionConfig {
             self.dls_lambda,
             self.settle_tolerance_rad,
             self.settle_timeout_s,
+            self.execution_override_transition_s,
             self.path_rot_weight_m_per_rad,
             self.singularity_cond_max,
             self.singularity_sigma_min,
@@ -694,7 +737,12 @@ impl Default for MotionConfig {
     fn default() -> Self {
         Self {
             jog_l_linear_max_m_s: 0.08,
+            planned_linear_max_m_s: 0.2,
             jog_l_angular_max_rad_s: 0.6,
+            cart_linear_accel_max_m_s2: 0.22,
+            cart_angular_accel_max_rad_s2: 1.65,
+            cart_linear_jerk_max_m_s3: 2.2,
+            cart_angular_jerk_max_rad_s3: 16.5,
             cart_step_m: 0.01,
             cart_step_rad: 0.034906585,
             path_step_m: 0.002,
@@ -703,6 +751,7 @@ impl Default for MotionConfig {
             dls_lambda: 0.05,
             settle_tolerance_rad: 0.01,
             settle_timeout_s: 2.0,
+            execution_override_transition_s: 1.0,
             path_rot_weight_m_per_rad: 0.15,
             singularity_cond_max: 1000.0,
             singularity_sigma_min: 1e-4,
@@ -1176,6 +1225,22 @@ impl RobotConfig {
         if j.dir > 1 {
             return Err(invalid(f("dir"), "must be 0 or 1"));
         }
+        for (name, v) in [
+            ("phase_resistance_ohm", j.phase_resistance_ohm),
+            ("phase_inductance_mh", j.phase_inductance_mh),
+        ] {
+            if let Some(v) = v {
+                if !(v.is_finite() && v > 0.0) {
+                    return Err(invalid(f(name), "must be finite and > 0"));
+                }
+            }
+        }
+        if j.phase_resistance_ohm.is_some() != j.phase_inductance_mh.is_some() {
+            return Err(invalid(
+                f("phase_resistance_ohm"),
+                "resistance and inductance are a pair: give both or neither",
+            ));
+        }
         if j.kt_nm_a <= 0.0 {
             return Err(invalid(f("kt_nm_a"), "must be > 0"));
         }
@@ -1422,21 +1487,9 @@ impl RobotConfig {
 
     fn validate_sim(&self) -> Result<(), ConfigError> {
         let sim = &self.sim;
-        if sim.motor_jm_kg_m2.len() != self.joints.len() {
-            return Err(invalid(
-                "sim.motor_jm_kg_m2",
-                "must carry one entry per joint",
-            ));
-        }
-        for (j, v) in sim.motor_jm_kg_m2.iter().enumerate() {
-            if !(v.is_finite() && *v >= 0.0) {
-                return Err(invalid(
-                    "sim.motor_jm_kg_m2",
-                    format!("entry {j} must be finite and >= 0"),
-                ));
-            }
-        }
         for (values, name) in [
+            (&sim.motor_jm_kg_m2, "sim.motor_jm_kg_m2"),
+            (&sim.powered_support_nm, "sim.powered_support_nm"),
             (&sim.viscous_nm_s, "sim.viscous_nm_s"),
             (&sim.coulomb_nm, "sim.coulomb_nm"),
         ] {
@@ -1587,7 +1640,24 @@ impl RobotConfig {
         let m = &self.motion;
         for (v, name) in [
             (m.jog_l_linear_max_m_s, "motion.jog_l_linear_max_m_s"),
+            (m.planned_linear_max_m_s, "motion.planned_linear_max_m_s"),
             (m.jog_l_angular_max_rad_s, "motion.jog_l_angular_max_rad_s"),
+            (
+                m.cart_linear_accel_max_m_s2,
+                "motion.cart_linear_accel_max_m_s2",
+            ),
+            (
+                m.cart_angular_accel_max_rad_s2,
+                "motion.cart_angular_accel_max_rad_s2",
+            ),
+            (
+                m.cart_linear_jerk_max_m_s3,
+                "motion.cart_linear_jerk_max_m_s3",
+            ),
+            (
+                m.cart_angular_jerk_max_rad_s3,
+                "motion.cart_angular_jerk_max_rad_s3",
+            ),
             (m.cart_step_m, "motion.cart_step_m"),
             (m.cart_step_rad, "motion.cart_step_rad"),
             (m.path_step_m, "motion.path_step_m"),
@@ -1599,6 +1669,10 @@ impl RobotConfig {
             (m.dls_lambda, "motion.dls_lambda"),
             (m.settle_tolerance_rad, "motion.settle_tolerance_rad"),
             (m.settle_timeout_s, "motion.settle_timeout_s"),
+            (
+                m.execution_override_transition_s,
+                "motion.execution_override_transition_s",
+            ),
             (
                 m.path_rot_weight_m_per_rad,
                 "motion.path_rot_weight_m_per_rad",

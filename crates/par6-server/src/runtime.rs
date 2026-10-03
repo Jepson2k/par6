@@ -99,6 +99,8 @@ pub struct PlanContext<'a> {
     pub tool_variant: Option<&'a str>,
     /// TCP offset in the tool-local frame (mm).
     pub tcp_offset_mm: [f64; 3],
+    /// Tool-local intrinsic XYZ orientation correction (degrees).
+    pub tcp_rotation_deg: [f64; 3],
     /// Controller-side completion policy for queued motion.
     pub completion_policy: CompletionPolicy,
     /// The runtime payload the torque feedforward must carry.
@@ -164,10 +166,12 @@ pub fn blend_radius_mm(cmd: &par6_proto::Command) -> Option<f64> {
 }
 
 /// Executes queued commands: plans them, feeds the RT sample ring, and
-/// reports completion. Exactly one MOTION is in flight at a time — the
-/// server serializes the queue and calls [`Planner::start`] only after
-/// the previous outcome arrived (or was cancelled) — but one motion may
-/// cover SEVERAL queued commands when they blend into one another.
+/// reports completion. Exactly one queued command is in flight at a
+/// time — the server serializes the queue and calls [`Planner::start`]
+/// only after the previous outcome arrived (or was cancelled) — but one
+/// motion may cover SEVERAL queued commands when they blend into one
+/// another. Tool actions are queued commands too; only a tool `stop`
+/// runs outside the queue ([`Planner::start_tool`]).
 pub trait Planner: Send {
     /// Begin executing `batch[0]` (wire units). The rest of `batch` is
     /// the queue standing behind it, in order, offered for blending: an
@@ -192,19 +196,20 @@ pub trait Planner: Send {
     fn poll(&mut self) -> Option<CommandOutcome>;
 
     /// Cancel the in-flight command (if any) and discard its planned
-    /// samples. Idempotent. No outcome is expected afterwards.
-    fn cancel(&mut self);
+    /// samples. A tool action in flight is halted where it is when
+    /// `halt_tool` is set — never released, so a cancellation keeps a
+    /// grip — and otherwise left to whoever re-aims the jaws next.
+    /// Idempotent. No outcome is expected afterwards.
+    fn cancel(&mut self, halt_tool: bool);
 
-    /// Begin a tool action on the side channel.
+    /// Halt the tool where it is, ahead of the queue: the `stop` verb.
     ///
-    /// Tool commands drive the tool's own actuator and never write the
-    /// arm's joint slots, so they cannot race motion and do not belong
-    /// in the motion lane. An implementation runs at most one at a
-    /// time; the server completes a superseded one before starting the
-    /// next.
+    /// The server has already cancelled any tool action in flight. One
+    /// stop is tracked at a time; a later one re-arms the wait, and only
+    /// its outcome is expected.
     ///
     /// `Err` means nothing started — the server fails that index alone
-    /// and leaves the motion queue untouched.
+    /// and leaves the queue untouched.
     fn start_tool(
         &mut self,
         _index: u64,
@@ -213,23 +218,22 @@ pub trait Planner: Send {
         Err(par6_proto::make_error(
             par6_proto::ErrorCode::CommValidationError,
             par6_proto::UNATTRIBUTED,
-            &[("detail", "this runtime has no tool channel")],
+            &[("detail", "this runtime has no tool to stop")],
         ))
     }
 
-    /// Poll the tool side channel; `None` while it is still running.
+    /// Poll the tool stop in flight; `None` until the jaws are still.
     ///
-    /// This must not touch the motion lane. A tool fault is a fault of
-    /// the tool: flushing the sample ring here would stop an arm move
+    /// This must not touch the queue's command. A tool fault is a fault
+    /// of the tool: flushing the sample ring here would stop an arm move
     /// that has nothing to do with it.
     fn poll_tool(&mut self) -> Option<CommandOutcome> {
         None
     }
 
-    /// Abandon the tool action in flight (if any). `halt` asks the tool
-    /// to stop where it is rather than release, so a stop never drops a
-    /// grasped part. Idempotent; no outcome is expected afterwards.
-    fn cancel_tool(&mut self, _halt: bool) {}
+    /// Stop waiting on the tool stop in flight (if any). Idempotent; no
+    /// outcome is expected afterwards.
+    fn cancel_tool(&mut self) {}
 
     /// The planning context changed (profile / tool / TCP offset /
     /// completion policy). Also called once at server startup with the
@@ -316,6 +320,14 @@ pub trait RtCommands: Send {
     /// Stop the active streaming session (hold in place). Idempotent.
     fn cancel_stream(&mut self);
 
+    /// Stop continuation of a stream whose update was refused. Return true
+    /// while the runtime owns a bounded stopping sequence, so a later stop
+    /// or preemption can still cancel that sequence.
+    fn stop_refused_stream(&mut self) -> bool {
+        self.cancel_stream();
+        false
+    }
+
     /// Halt all motion now (stop/estop scope). Idempotent.
     fn halt(&mut self);
 
@@ -346,6 +358,9 @@ pub trait RtCommands: Send {
     /// Hold or resume the executing trajectory, leaving the sample ring
     /// intact so a resume continues rather than restarts.
     fn set_exec_paused(&mut self, paused: bool);
+
+    /// Select queued execution speed without releasing a pause.
+    fn set_exec_speed(&mut self, scale: f64);
 
     /// Take the outcome of the last `set_enabled(true)` request, once the
     /// RT has actually answered it: `Some(Ok(()))` when the core came up
@@ -387,6 +402,13 @@ pub trait RtCommands: Send {
     /// window closed without it. Each outcome is delivered exactly once.
     fn take_flashing_outcome(&mut self) -> Option<Result<(), WireError>>;
 
+    /// Take the outcome of the last `set_simulator`/`connect_hardware`
+    /// once the RT has installed (or refused) the bus: the open is
+    /// synchronous and answers the request directly, the install is the
+    /// RT thread's, and the server holds the reply for it. Each outcome
+    /// is delivered exactly once.
+    fn take_bus_outcome(&mut self) -> Option<Result<(), WireError>>;
+
     /// Push one node's drive tuning through the stored boot-config path
     /// (`SET_PID_GAINS`). The server has already validated the values
     /// (codec) and the node id (config), so this only forwards.
@@ -422,15 +444,16 @@ pub trait RtCommands: Send {
     /// Reset loop timing statistics (truly unacked fire-and-forget).
     fn reset_loop_stats(&mut self);
 
-    /// Discard whatever planned motion the RT still holds: flush the
-    /// sample ring and put the loop back to IDLE.
+    /// Discard whatever planned motion the RT still holds: brake the
+    /// program along its path, then discard the ring and hold
+    /// (`RtCommand::ExecStop`).
     ///
     /// The SERVER owns this, not the planner, and the ordering is why.
     /// A jog that preempts a queued move drops the planned motion and
     /// then streams itself, both in one datagram handler; if the RT-side
     /// discard travelled with the planner's cancel it would arrive after
-    /// the jog had already entered JOG mode and put the loop straight
-    /// back to IDLE. parol6 splits it the same way — its main loop
+    /// the jog had already entered JOG mode and stop it under the jog.
+    /// parol6 splits it the same way — its main loop
     /// cancels the segment player itself and leaves the planner
     /// subprocess to its own buffers.
     ///

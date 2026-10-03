@@ -53,6 +53,7 @@ impl Rig {
                 limits,
                 robot.stream.fault_latch_s,
             )),
+            stream_shaped: Box::new(par6_rt::hooks::ClampStream::new(robot)),
             settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
             estop: Box::new(estop),
             io: Box::new(io),
@@ -91,11 +92,11 @@ impl Rig {
     }
 }
 
-/// A completed release must leave the measured arm stopped. A zero
-/// planned velocity cannot establish that: the drive can still carry
-/// momentum and a position-loop tracking error at that instant.
+/// A completed release must leave the measured arm stopped before the hold
+/// takes it. A zero planned velocity cannot establish that: the drive can
+/// still carry momentum and a position-loop tracking error at that instant.
 #[test]
-fn a_released_stream_stops_the_plant_before_relinquishing_velocity_control() {
+fn a_released_stream_stops_the_plant_before_the_hold_takes_it() {
     for (dt, direction) in [(0.004, 1.0), (0.004, -1.0), (0.02, 1.0), (0.02, -1.0)] {
         let start = [-40.0_f64, -20.0, 235.0, 0.0, 15.0, 180.0].map(f64::to_radians);
         let mut rig = Rig::boot(dt, start);
@@ -124,12 +125,16 @@ fn a_released_stream_stops_the_plant_before_relinquishing_velocity_control() {
                 q: late_target,
                 ..Default::default()
             });
-            if rig.tick().mode == Mode::Idle {
+            if rig.tick().mode == Mode::Exec {
                 break;
             }
         }
         let stopped = rig.handles.snapshots.latest();
-        assert_eq!(stopped.mode, Mode::Idle, "the release must complete");
+        assert_eq!(
+            stopped.mode,
+            Mode::Exec,
+            "the release must complete into the hold"
+        );
         assert!(
             (stopped.q[0] - moving.q[0]).abs() < 0.05,
             "a release must not follow the late target"
@@ -144,14 +149,16 @@ fn a_released_stream_stops_the_plant_before_relinquishing_velocity_control() {
                 hi[j] = hi[j].max(s.q[j]);
             }
         }
+        // The hold brakes what the ramp's rest left moving; it must keep the
+        // arm inside the band the runtime judged rest by (0.05 rad).
         for j in 0..MAX_JOINTS {
-            let joint = &rig.bundle.robot.joints[j];
-            let two_counts = 2.0 * std::f64::consts::TAU
-                / f64::from(1i32 << joint.encoder_bits)
-                / joint.gear_ratio;
-            assert!(hi[j] - lo[j] <= two_counts * (1.0 + 1e-9),
-                "dt {dt}: joint {j} coasted {:.6} rad after release completed (two counts {two_counts:.6}, reported exit speed {:.6} rad/s)",
-                hi[j] - lo[j], stopped.qd[j]);
+            assert!(
+                hi[j] - lo[j] <= 0.05,
+                "dt {dt}: joint {j} moved {:.6} rad under the hold after the release \
+                 (reported exit speed {:.6} rad/s)",
+                hi[j] - lo[j],
+                stopped.qd[j]
+            );
         }
     }
 }

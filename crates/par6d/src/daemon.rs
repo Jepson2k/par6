@@ -240,6 +240,9 @@ impl Daemon {
 
         let dt = robot.robot.tick_dt_s;
         let stream_limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
+        // MotionLimits is Copy; housekeeping needs the same STREAM
+        // envelope to hold a cartesian stream's joints to their budget.
+        let hk_stream_limits = stream_limits;
         let jog_limits = MotionLimits::from_config(robot, LimitMode::Jog)?;
         let jog = MotionJog::new(JogEngine::new(robot)?, robot.jog.accel_time_s);
         let stream = MotionStream::new(
@@ -288,6 +291,10 @@ impl Daemon {
             gravity: gravity_hook,
             jog: Box::new(jog),
             stream: Box::new(stream),
+            // A cartesian stream arrives already limited in cartesian
+            // space; this side clamps it to the soft window and
+            // commands it, and must not reshape it.
+            stream_shaped: Box::new(par6_rt::hooks::ClampStream::new(&bundle.robot)),
             settle: Box::new(SpecSettle::new(
                 CompletionPolicy::Settled,
                 dt,
@@ -482,6 +489,7 @@ impl Daemon {
                             kin_hk,
                             stream_gate,
                             tools.clone(),
+                            hk_stream_limits,
                         );
                     })?,
             );

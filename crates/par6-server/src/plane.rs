@@ -82,6 +82,8 @@ pub struct OwnedPlanContext {
     pub tool_variant: Option<String>,
     /// TCP offset in the tool-local frame (mm).
     pub tcp_offset_mm: [f64; 3],
+    /// Tool-local intrinsic XYZ orientation correction (degrees).
+    pub tcp_rotation_deg: [f64; 3],
     /// Controller-side completion policy for queued motion.
     pub completion_policy: CompletionPolicy,
     /// The runtime payload the torque feedforward must carry.
@@ -95,6 +97,7 @@ impl OwnedPlanContext {
             tool: &self.tool,
             tool_variant: self.tool_variant.as_deref(),
             tcp_offset_mm: self.tcp_offset_mm,
+            tcp_rotation_deg: self.tcp_rotation_deg,
             completion_policy: self.completion_policy,
             payload: self.payload,
         }
@@ -124,7 +127,7 @@ pub enum PlanRequest {
         /// The replacement set.
         shapes: Vec<Shape>,
     },
-    /// Begin a tool action on the side channel.
+    /// Begin a tool `stop`, ahead of the queue.
     StartTool {
         /// Who is waiting for the answer.
         tag: ReplyTag,
@@ -135,13 +138,13 @@ pub enum PlanRequest {
     },
     /// The planning context changed.
     Sync(OwnedPlanContext),
-    /// Cancel the motion in flight.
-    Cancel,
-    /// Abandon the tool action in flight.
-    CancelTool {
-        /// Ask the tool to stop where it is rather than release.
-        halt: bool,
+    /// Cancel the command in flight.
+    Cancel {
+        /// Halt a tool action in flight where it is.
+        halt_tool: bool,
     },
+    /// Abandon the tool stop in flight.
+    CancelTool,
     /// Drop the collision latch.
     ClearCollision,
 }
@@ -192,7 +195,7 @@ pub enum PlanEvent {
     },
     /// A queued command finished.
     Outcome(CommandOutcome),
-    /// A tool action finished.
+    /// A tool stop finished.
     ToolOutcome(CommandOutcome),
     /// `start_tool` answered.
     ToolStarted {
@@ -448,8 +451,8 @@ fn planner_loop<P: Planner>(
 /// The requests that cannot take long, applied wherever they are seen.
 fn apply_cheap<P: Planner>(p: &mut P, req: PlanRequest, emit: &impl Fn(PlanEvent)) {
     match req {
-        PlanRequest::Cancel => p.cancel(),
-        PlanRequest::CancelTool { halt } => p.cancel_tool(halt),
+        PlanRequest::Cancel { halt_tool } => p.cancel(halt_tool),
+        PlanRequest::CancelTool => p.cancel_tool(),
         PlanRequest::ClearCollision => p.clear_collision(),
         PlanRequest::Sync(ctx) => p.sync(ctx.as_ref()),
         // Cheap by nature: it puts one frame on the gripper's slot and

@@ -16,7 +16,8 @@ use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use par6d::options::USAGE;
+use clap::Parser;
+
 use par6d::{Daemon, Options};
 
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
@@ -26,20 +27,11 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 }
 
 fn main() {
-    let opts = match Options::parse(std::env::args().skip(1)) {
-        Ok(o) => o,
-        Err(e) => {
-            eprintln!("par6d: {e}");
-            std::process::exit(2);
-        }
-    };
+    par6d::options::clear_empty_env();
+    let opts = Options::parse();
     if let Err(e) = par6d::logging::install(opts.log_dir.as_deref()) {
         eprintln!("par6d: cannot open the activity logs: {e}");
         std::process::exit(1);
-    }
-    if opts.help {
-        print!("{USAGE}");
-        return;
     }
     if opts.check_config {
         let path = match par6d::options::resolve_config_path(opts.config.as_deref()) {

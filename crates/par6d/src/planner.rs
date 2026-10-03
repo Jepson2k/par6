@@ -130,10 +130,9 @@ pub(crate) const COLLISION_STEP_RAD: f64 = 0.02;
 /// upper-case spelling clients use on the wire. The server refuses any
 /// name outside [`profile_names`], so a stored profile is always one of
 /// these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Profile {
     /// Jerk-limited point-to-point (rsruckig).
-    #[default]
     Ruckig,
     /// Trapezoid on the path coordinate; no jerk limiting.
     Trapezoid,
@@ -144,38 +143,44 @@ pub(crate) enum Profile {
     /// jerk at both ends, jerk-limited, point-to-point only.
     Septic,
     /// Time-optimal path parameterization (toppra-cpp): the velocity and
-    /// acceleration limits bind, nothing else.
+    /// acceleration limits bind, nothing else. The default.
     Toppra,
+    /// Constant velocity along a degree-1 joint path, with ramps at the
+    /// acceleration limit at either end: parol6's LINEAR, which is the
+    /// trapezoid shape under the name a script written for it uses.
+    Linear,
 }
+
+/// Every profile by its wire name, the default first.
+const PROFILES: [(&str, Profile); 6] = [
+    ("TOPPRA", Profile::Toppra),
+    ("RUCKIG", Profile::Ruckig),
+    ("TRAPEZOID", Profile::Trapezoid),
+    ("QUINTIC", Profile::Quintic),
+    ("SEPTIC", Profile::Septic),
+    ("LINEAR", Profile::Linear),
+];
 
 impl Profile {
     fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "RUCKIG" => Some(Self::Ruckig),
-            "TRAPEZOID" => Some(Self::Trapezoid),
-            "QUINTIC" => Some(Self::Quintic),
-            "SEPTIC" => Some(Self::Septic),
-            "TOPPRA" => Some(Self::Toppra),
-            _ => None,
-        }
+        PROFILES.iter().find(|(n, _)| *n == name).map(|&(_, p)| p)
+    }
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        PROFILES[0].1
     }
 }
 
 /// The profile registry the command plane advertises and validates
 /// `select_profile` against.
 pub(crate) fn profile_names() -> Vec<String> {
-    let mut names = vec![
-        "RUCKIG".to_owned(),
-        "TRAPEZOID".to_owned(),
-        "QUINTIC".to_owned(),
-        "SEPTIC".to_owned(),
-    ];
-    names.push("TOPPRA".to_owned());
-    names
+    PROFILES.iter().map(|(n, _)| (*n).to_owned()).collect()
 }
 
 /// Name of the profile a fresh runtime plans with.
-pub(crate) const DEFAULT_PROFILE: &str = "RUCKIG";
+pub(crate) const DEFAULT_PROFILE: &str = PROFILES[0].0;
 
 /// What the planner needs to know about the fitted CAN gripper.
 struct ToolSpec {
@@ -183,7 +188,66 @@ struct ToolSpec {
     ilim_ma: f64,
 }
 
+/// One move of a cartesian blend chain: its geometry, and the parameters
+/// the chain has to reconcile.
+#[derive(Clone, Copy)]
+struct CartMove<'a> {
+    geometry: CartGeometry<'a>,
+    blend_radius: Option<f64>,
+    speed: Option<f64>,
+    accel: Option<f64>,
+    duration: Option<f64>,
+}
+
+/// A straight run or an arc.
+#[derive(Clone, Copy)]
+enum CartGeometry<'a> {
+    Line(&'a par6_proto::command::MoveL),
+    Arc(&'a par6_proto::command::MoveC),
+}
+
+impl<'a> CartMove<'a> {
+    fn of(cmd: &'a Command) -> Option<Self> {
+        match cmd {
+            Command::MoveL(p) => Some(Self {
+                geometry: CartGeometry::Line(p),
+                blend_radius: p.blend_radius,
+                speed: p.speed,
+                accel: p.accel,
+                duration: p.duration,
+            }),
+            Command::MoveC(p) => Some(Self {
+                geometry: CartGeometry::Arc(p),
+                blend_radius: p.blend_radius,
+                speed: p.speed,
+                accel: p.accel,
+                duration: p.duration,
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// A blend chain's timing: the slowest speed and acceleration fraction any
+/// move in it asks for, and the durations' sum when every move carries
+/// one (mixed with speed-parameterised moves there is no meaningful total).
+fn chain_timing(
+    mut moves: impl Iterator<Item = (Option<f64>, Option<f64>, Option<f64>)> + Clone,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let speed = moves.clone().filter_map(|(s, _, _)| s).reduce(f64::min);
+    let accel = moves.clone().filter_map(|(_, a, _)| a).reduce(f64::min);
+    let duration = moves.try_fold(0.0, |acc, (_, _, d)| d.map(|d| acc + d));
+    (speed, accel, duration)
+}
+
 enum InFlightKind {
+    /// A queued tool action: nothing in the ring, the jaws' own settle
+    /// decides when it is done.
+    Tool {
+        /// The settle epoch read before the command was sent (see
+        /// [`tool_settle`]).
+        epoch_at_send: u32,
+    },
     Exec {
         ring_index: u32,
         samples: Vec<RingSample>,
@@ -195,6 +259,7 @@ enum InFlightKind {
     },
     Delay {
         target_tick: u64,
+        paused_ticks_at_start: u64,
     },
     /// A tool swap, done when the RT core has applied it.
     ToolSwap {
@@ -209,24 +274,23 @@ struct InFlight {
     kind: InFlightKind,
 }
 
-/// The tool action on the side channel. It owns no ring samples and no
-/// planner state, which is what lets it run beside a motion.
-struct ToolInFlight {
+/// The tool `stop` in flight, outside the queue.
+struct ToolStopInFlight {
     server_index: u64,
-    /// The settle epoch read before the command was sent. The RT bumps
-    /// it when it arms, so a verdict still carrying this value belongs
-    /// to the PREVIOUS action, not to ours.
+    /// The settle epoch read before the stop was sent (see
+    /// [`tool_settle`]).
     epoch_at_send: u32,
 }
 
 /// Which coordinate a cartesian path is timed against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CartTiming {
-    /// As fast as the joint limits allow (TOPPRA). What `move_l`,
-    /// `move_c` and `move_s` promise.
+    /// As fast as the joint limits allow (TOPPRA), under the TCP speed
+    /// ceiling. What `move_l`, `move_c` and `move_s` promise.
     TimeOptimal,
-    /// At a constant tool speed along the path. What `move_p` promises,
-    /// and the reason it is a separate command.
+    /// At one constant tool speed along the whole path, under the same
+    /// ceiling. What `move_p` promises, and the reason it is a separate
+    /// command.
     ConstantToolSpeed,
 }
 
@@ -271,7 +335,7 @@ pub(crate) struct Par6Planner {
     profile: Profile,
     tool: Option<ToolSpec>,
     inflight: Option<InFlight>,
-    tool_inflight: Option<ToolInFlight>,
+    tool_stop: Option<ToolStopInFlight>,
     enablement: Enablement,
     /// Latched near-singularity warning for the cart path in flight
     /// (vendor thresholds; STATUS `warnings` carries it).
@@ -471,7 +535,7 @@ impl Par6Planner {
             profile: Profile::default(),
             tool,
             inflight: None,
-            tool_inflight: None,
+            tool_stop: None,
             // Nothing measured yet, and the wire has no "unknown": claim
             // no freedom until the first probe runs (the next poll).
             enablement: NO_FREEDOM,
@@ -503,10 +567,8 @@ impl Par6Planner {
     /// re-gate the REMAINDER of a running trajectory with the same rule.
     ///
     /// The path is walked at [`COLLISION_STEP_RAD`] joint-space pitch —
-    /// the endpoints of a move are usually clear while its interior is
-    /// not, and the samples ARE the trajectory the arm will run, so this
-    /// gates what actually happens rather than a straight line between
-    /// the two endpoints.
+    /// the caller samples the RT interpolant at this pitch and includes
+    /// its turning points. Every supplied position is checked.
     ///
     /// Normally any collision along the path refuses the move. The
     /// exception is a path that STARTS in collision — a keep-out
@@ -579,19 +641,7 @@ impl Par6Planner {
 
         let total = samples.len();
         let mut checked = 0usize;
-        let mut last: Option<[f64; NQ]> = None;
         for (k, q) in samples.enumerate().skip(from) {
-            let coarse = last.is_some_and(|prev| {
-                q.iter()
-                    .zip(prev.iter())
-                    .all(|(a, b)| (a - b).abs() <= COLLISION_STEP_RAD)
-            });
-            // The last sample is where the arm comes to rest, so it is
-            // checked however close it sits to its predecessor.
-            if coarse && k + 1 != total {
-                continue;
-            }
-            last = Some(q);
             checked += 1;
             let touching = named(&col.check(&q, false).map_err(collision_error)?);
             let offending: Vec<(String, String)> = touching
@@ -666,19 +716,25 @@ impl Par6Planner {
         };
         let index = *server_index;
         let q = self.snapshots.latest().q;
-        let nearest = samples
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| joint_distance(&a.q, &q).total_cmp(&joint_distance(&b.q, &q)))
-            .map_or(0, |(i, _)| i);
-        let gated = Self::gate_collisions_from(
-            &mut self.collision,
-            &self.shape_names,
-            &mut self.collision_latch,
-            q,
-            samples.iter().map(|s| s.q),
-            nearest,
-        );
+        let gated = crate::execution_path::positions(samples, self.dt, &self.exec_limits)
+            .map_err(planning_error)
+            .and_then(|positions| {
+                let nearest = positions
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        joint_distance(a, &q).total_cmp(&joint_distance(b, &q))
+                    })
+                    .map_or(0, |(i, _)| i);
+                Self::gate_collisions_from(
+                    &mut self.collision,
+                    &self.shape_names,
+                    &mut self.collision_latch,
+                    q,
+                    positions.into_iter(),
+                    nearest.saturating_sub(1),
+                )
+            });
         if let Err(error) = gated {
             log::warn!(
                 "command {index} invalidated by a world change: {}",
@@ -704,6 +760,7 @@ impl Par6Planner {
     /// stream the arm must not follow; see [`par6_motion::gate`].
     fn start_exec(
         &mut self,
+        start_q: [f64; MAX_JOINTS],
         samples: Vec<[f64; 3 * MAX_JOINTS]>,
         seen_exec: bool,
     ) -> Result<InFlightKind, WireError> {
@@ -718,20 +775,7 @@ impl Par6Planner {
             par6_motion::gate::ACCEL_TOLERANCE,
         )
         .map_err(planning_error)?;
-        self.gate_collisions(
-            samples.iter().map(|s| {
-                let mut q = [0.0; NQ];
-                q.copy_from_slice(&s[..NQ]);
-                q
-            }),
-            0,
-        )?;
-        // A fresh fill generation: a flush already queued for an earlier
-        // command can no longer reach these samples, however far behind
-        // the RT command queue is running.
-        self.producer.begin_generation();
         let ring_index = self.next_ring_index;
-        self.next_ring_index = self.next_ring_index.checked_add(1).unwrap_or(1);
         let n = samples.len();
         // The planned acceleration becomes the ring's torque feedforward
         // (`M(q)·q̈ + C(q,q̇)·q̇`; the law adds G(q) itself). A feedforward
@@ -747,6 +791,8 @@ impl Par6Planner {
                     q: [0.0; MAX_JOINTS],
                     qd: [0.0; MAX_JOINTS],
                     tau_ff: [0.0; MAX_JOINTS],
+                    inertia_velocity: [0.0; MAX_JOINTS],
+                    start: None,
                     meta: SampleMeta {
                         command_index: ring_index,
                         checkpoint_id: ring_index,
@@ -758,21 +804,49 @@ impl Par6Planner {
                 s.qd.copy_from_slice(&qqa[MAX_JOINTS..2 * MAX_JOINTS]);
                 let mut qdd = [0.0; MAX_JOINTS];
                 qdd.copy_from_slice(&qqa[2 * MAX_JOINTS..]);
-                match kin.dyn_feedforward(&s.q, &s.qd, &qdd) {
-                    Ok(tau) => {
+                if k == 0 {
+                    let acceleration = std::array::from_fn(|i| {
+                        (6.0 * (s.q[i] - start_q[i]) - 2.0 * s.qd[i] * self.dt)
+                            / (self.dt * self.dt)
+                    });
+                    let tau_ff =
+                        match kin.dyn_feedforward(&start_q, &[0.0; MAX_JOINTS], &acceleration) {
+                            Ok(tau) => tau.map(|t| t as f32),
+                            Err(e) => {
+                                id_failed = true;
+                                log::warn!("initial torque feedforward degraded to zero: {e}");
+                                [0.0; MAX_JOINTS]
+                            }
+                        };
+                    s.start = Some(par6_rt::SampleStart { q: start_q, tau_ff });
+                }
+                match (
+                    kin.dyn_feedforward(&s.q, &s.qd, &qdd),
+                    kin.dyn_feedforward(&s.q, &[0.0; MAX_JOINTS], &s.qd),
+                ) {
+                    (Ok(tau), Ok(inertia_velocity)) => {
                         for (out, t) in s.tau_ff.iter_mut().zip(tau.iter()) {
                             *out = *t as f32;
                         }
+                        for (out, t) in s.inertia_velocity.iter_mut().zip(inertia_velocity) {
+                            *out = t as f32;
+                        }
                     }
-                    Err(e) if !id_failed => {
+                    (Err(e), _) | (_, Err(e)) if !id_failed => {
                         id_failed = true;
                         log::warn!("torque feedforward degraded to zero: {e}");
                     }
-                    Err(_) => {}
+                    (Err(_), _) | (_, Err(_)) => {}
                 }
                 s
             })
             .collect();
+        let positions = crate::execution_path::positions(&samples, self.dt, &self.exec_limits)
+            .map_err(planning_error)?;
+        self.gate_collisions(positions.into_iter(), 0)?;
+        // A flush queued for an earlier command must not erase this fill.
+        self.producer.begin_generation();
+        self.next_ring_index = self.next_ring_index.checked_add(1).unwrap_or(1);
         self.link.send(RtCommand::SetMode(Mode::Exec));
         self.heartbeat.feed();
         Ok(InFlightKind::Exec {
@@ -797,7 +871,7 @@ impl Par6Planner {
         if samples.is_empty() {
             return Ok(InFlightKind::Instant);
         }
-        self.start_exec(samples, snap.mode == Mode::Exec)
+        self.start_exec(snap.q, samples, snap.mode == Mode::Exec)
     }
 
     /// The tick-rate samples a joint-space move from `start` to `target`
@@ -816,7 +890,7 @@ impl Par6Planner {
     ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
         let kind = match self.profile {
             Profile::Ruckig => ProfileKind::Ruckig,
-            Profile::Trapezoid => ProfileKind::Trapezoid,
+            Profile::Trapezoid | Profile::Linear => ProfileKind::Trapezoid,
             Profile::Quintic => ProfileKind::Quintic,
             Profile::Septic => ProfileKind::Septic,
             // TOPPRA times the straight joint-space path instead of
@@ -919,14 +993,17 @@ impl Par6Planner {
         )
     }
 
-    /// The one solver call both cartesian lanes go through.
+    /// The one solver call every planned path goes through.
     ///
     /// `knots` places each waypoint on the path parameter (`None` spaces
-    /// them evenly) and `max_path_speed` caps `ds/dt`. The path is
-    /// degree-1 by default: the poses are already spaced a couple of
-    /// millimetres apart by the resampler, and a spline through them
-    /// would bow off the chain IK actually solved — inventing curvature,
-    /// which is acceleration, between the samples that were checked.
+    /// them evenly) and `max_path_speed` caps `ds/dt`. The path is a cubic
+    /// spline through the waypoints. Its knots sit on the poses IK solved,
+    /// and between knots a couple of millimetres apart the bow off the
+    /// straight chain is far below the sampling pitch; what the spline
+    /// buys is a continuous joint velocity. A degree-1 path would turn at
+    /// every knot inside one tick, and the commanded-acceleration gate
+    /// reads that as an impulse many times the joint limits and refuses
+    /// the move (parol6 times a degree-1 path, and has no such gate).
     #[allow(clippy::too_many_arguments)]
     fn toppra_samples_with(
         &self,
@@ -1034,14 +1111,14 @@ impl Par6Planner {
         match cmd.action.as_str() {
             "move" => {
                 let [position, speed, current] = scalars(&cmd.params)
-                    .ok_or_else(|| invalid("move takes [position, speed, current_ma]".into()))?;
-                for (what, v, hi) in [
-                    ("position", position, 1.0),
-                    ("speed", speed, 1.0),
-                    ("current", current, tool.ilim_ma),
+                    .ok_or_else(|| invalid("move takes [position, speed, current]".into()))?;
+                for (what, v) in [
+                    ("position", position),
+                    ("speed", speed),
+                    ("current", current),
                 ] {
-                    if !v.is_finite() || v < 0.0 || v > hi {
-                        return Err(invalid(format!("{what} = {v} is outside [0, {hi}]")));
+                    if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                        return Err(invalid(format!("{what} = {v} is outside [0, 1]")));
                     }
                 }
                 // The RT gate never streams a move to an uncalibrated
@@ -1054,7 +1131,9 @@ impl Par6Planner {
                     ));
                 }
                 self.link.send(RtCommand::Gripper(gripper_move_command(
-                    position, speed, current,
+                    position,
+                    speed,
+                    current * tool.ilim_ma,
                 )));
             }
             "calibrate" => {
@@ -1284,13 +1363,8 @@ impl Par6Planner {
         // collision refusal below runs nothing, and a warning standing
         // in STATUS with nothing in flight would be attributed to
         // whatever move runs next.
-        let samples = match timing {
-            CartTiming::TimeOptimal => self.toppra_samples(&waypoints, speed, accel, duration)?,
-            CartTiming::ConstantToolSpeed => {
-                self.arclen_samples(&waypoints, poses, speed, accel, duration)?
-            }
-        };
-        let kind = self.start_exec(samples, snap.mode == Mode::Exec)?;
+        let samples = self.arclen_samples(&waypoints, poses, speed, accel, duration, timing)?;
+        let kind = self.start_exec(snap.q, samples, snap.mode == Mode::Exec)?;
         self.near_singularity = singularity_verdict(&self.motion, worst_sigma, worst_cond);
         Ok(kind)
     }
@@ -1401,18 +1475,21 @@ impl Par6Planner {
         )
     }
 
-    /// Time a cartesian path so the TOOL crosses it at a constant
-    /// speed, rather than as fast as the joints allow.
+    /// Time a cartesian path against the distance the TOOL travels.
     ///
-    /// Same solver as every other cartesian move; two things differ.
     /// The knots sit at cumulative tool distance rather than at even
-    /// spacing, so the path parameter IS tool distance — and `ds/dt` is
-    /// then capped at one value for the whole path, which is what holds
-    /// the tool to a single speed instead of letting it run away over
-    /// the stretches where the joints have room. That cap is the
-    /// fastest constant the steepest part of the path allows, so this is
-    /// never faster than the time-optimal answer and usually slower.
-    /// That is what MOVE_P promises and what the others do not.
+    /// spacing, so the path parameter IS tool distance and a ceiling on
+    /// `ds/dt` is a ceiling on tool speed: `speed` times the configured
+    /// planned-move linear maximum, which is what keeps a full-speed
+    /// `move_l` from sweeping the tool as fast as the joints happen to
+    /// allow. Under `TimeOptimal` the solver runs the joints as hard as
+    /// they go beneath that ceiling; under `ConstantToolSpeed` the
+    /// ceiling is also brought down to the fastest constant the steepest
+    /// part of the path allows, which holds the tool to a single speed
+    /// instead of letting it run away over the stretches where the
+    /// joints have room. That is what MOVE_P promises and the others do
+    /// not.
+    #[allow(clippy::too_many_arguments)]
     fn arclen_samples(
         &self,
         waypoints: &[f64],
@@ -1420,6 +1497,7 @@ impl Par6Planner {
         speed: Option<f64>,
         accel: Option<f64>,
         duration: Option<f64>,
+        timing: CartTiming,
     ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
         use par6_motion::cart::LineSegment;
         let steps: Vec<(f64, f64)> = poses
@@ -1453,12 +1531,29 @@ impl Par6Planner {
             )
         };
         let knots = par6_motion::arclen::ArcKnots::new(&q, &cart_s).ok_or_else(no_extent)?;
-        let cap = par6_motion::arclen::max_path_speed(
-            &knots.max_slope(),
-            &self.exec_limits,
-            speed.unwrap_or(1.0),
-        )
-        .ok_or_else(no_extent)?;
+        let fraction = speed.unwrap_or(1.0);
+        // The ceiling is on the tool's linear speed, as parol6's is: the
+        // path parameter runs 0..1 over `length_m`, and the step that
+        // translates most per unit of it sets the bound. A path that only
+        // turns the tool has no linear speed to cap.
+        let share = par6_motion::arclen::max_translation_share(
+            &steps,
+            self.motion.path_rot_weight_m_per_rad,
+        );
+        let tool_cap = (share > 0.0)
+            .then(|| self.motion.planned_linear_max_m_s * fraction / (knots.length_m() * share));
+        let cap = match timing {
+            CartTiming::TimeOptimal => tool_cap,
+            CartTiming::ConstantToolSpeed => {
+                let joint_cap = par6_motion::arclen::max_path_speed(
+                    &knots.max_slope(),
+                    &self.exec_limits,
+                    fraction,
+                )
+                .ok_or_else(no_extent)?;
+                Some(tool_cap.map_or(joint_cap, |c| c.min(joint_cap)))
+            }
+        };
         self.toppra_samples_with(
             &knots.waypoints_flat(),
             speed,
@@ -1466,57 +1561,67 @@ impl Par6Planner {
             duration,
             Some(knots.knots()),
             par6_kin::PathDegree::Cubic,
-            Some(cap),
+            cap,
         )
     }
 
-    /// A chain of `move_l`s linked by blend radii, planned as ONE
-    /// cartesian path whose interior corners are rounded.
+    /// The planned return to the home pose both `home` routes end with,
+    /// held there.
+    fn start_home_return(&mut self, snap: &StateSnapshot) -> Result<InFlightKind, WireError> {
+        self.start_joint_move(
+            snap,
+            self.home_pose_rad,
+            None,
+            Some(HOME_RETURN_SPEED_FRAC),
+            None,
+        )
+    }
+
+    /// A chain of cartesian moves (`move_l` / `move_c`) linked by blend
+    /// radii, planned as ONE cartesian path whose junctions are rounded.
     ///
     /// Each move's target resolves against its PREDECESSOR's target, not
     /// against the live pose: a relative or tool-frame move in the
     /// middle of a chain means "from where the move before it ends",
     /// which is where the arm will be (parol6 does the same in
-    /// `commands/cartesian_commands.py`, `do_setup_with_blend`).
+    /// `commands/cartesian_commands.py`, `do_setup_with_blend`). An arc
+    /// runs from its predecessor's end through its via pose to its end.
     ///
     /// The chain runs under the slowest speed and acceleration fraction
     /// in it; durations add up when every move carries one, and are
     /// dropped when they are mixed with speed-parameterised moves —
     /// there is no meaningful total otherwise.
-    fn start_move_l_chain(
-        &mut self,
-        chain: &[&par6_proto::command::MoveL],
-    ) -> Result<InFlightKind, WireError> {
-        use par6_motion::cart::LineSegment;
+    fn start_cart_chain(&mut self, chain: &[CartMove<'_>]) -> Result<InFlightKind, WireError> {
+        use par6_motion::cart::{ArcSegment, CartSegment, LineSegment};
 
         let snap = self.snapshots.latest();
-        let start_pose = self.current_pose(&snap.q)?;
-        let mut waypoints = Vec::with_capacity(chain.len() + 1);
-        waypoints.push(start_pose);
+        let mut previous = self.current_pose(&snap.q)?;
+        let mut segments = Vec::with_capacity(chain.len());
         for cmd in chain {
-            let previous = *waypoints.last().expect("seeded with the start pose");
-            waypoints.push(target_pose(&previous, &cmd.pose, cmd.frame, cmd.rel));
+            let (segment, end) = match cmd.geometry {
+                CartGeometry::Line(p) => {
+                    let end = target_pose(&previous, &p.pose, p.frame, p.rel);
+                    (CartSegment::Line(LineSegment::new(&previous, &end)), end)
+                }
+                CartGeometry::Arc(p) => {
+                    let via = target_pose(&previous, &p.via, p.frame, p.rel);
+                    let end = target_pose(&previous, &p.end, p.frame, p.rel);
+                    let arc = ArcSegment::new(&previous, &via, &end).map_err(planning_error)?;
+                    (CartSegment::Arc(arc), end)
+                }
+            };
+            segments.push(segment);
+            previous = end;
         }
         let radii: Vec<f64> = chain[..chain.len() - 1]
             .iter()
             .map(|c| c.blend_radius.unwrap_or(0.0).max(0.0) / 1000.0)
             .collect();
-        let poses =
-            par6_motion::cart::blended_polyline(&waypoints, &radii, path_sampling(&self.motion))
-                .map_err(planning_error)?;
+        let poses = par6_motion::cart::blended_path(&segments, &radii, path_sampling(&self.motion))
+            .map_err(planning_error)?;
 
-        let speed = chain
-            .iter()
-            .filter_map(|c| c.speed)
-            .fold(None::<f64>, |acc, s| Some(acc.map_or(s, |a: f64| a.min(s))));
-        let accel = chain
-            .iter()
-            .filter_map(|c| c.accel)
-            .fold(None::<f64>, |acc, a| Some(acc.map_or(a, |x: f64| x.min(a))));
-        let duration = chain
-            .iter()
-            .try_fold(0.0, |acc, c| c.duration.map(|d| acc + d))
-            .filter(|_| chain.iter().all(|c| c.duration.is_some()));
+        let (speed, accel, duration) =
+            chain_timing(chain.iter().map(|c| (c.speed, c.accel, c.duration)));
         log::debug!(
             "blended cartesian chain: {} moves, {} poses, {:.1} mm of path",
             chain.len(),
@@ -1604,20 +1709,10 @@ impl Par6Planner {
         for q in &path {
             flat.extend_from_slice(q);
         }
-        let speed = chain
-            .iter()
-            .filter_map(|c| c.speed)
-            .fold(None::<f64>, |acc, s| Some(acc.map_or(s, |a: f64| a.min(s))));
-        let accel = chain
-            .iter()
-            .filter_map(|c| c.accel)
-            .fold(None::<f64>, |acc, a| Some(acc.map_or(a, |x: f64| x.min(a))));
-        let duration = chain
-            .iter()
-            .try_fold(0.0, |acc, c| c.duration.map(|d| acc + d))
-            .filter(|_| chain.iter().all(|c| c.duration.is_some()));
+        let (speed, accel, duration) =
+            chain_timing(chain.iter().map(|c| (c.speed, c.accel, c.duration)));
         let samples = self.toppra_samples(&flat, speed, accel, duration)?;
-        self.start_exec(samples, snap.mode == Mode::Exec)
+        self.start_exec(snap.q, samples, snap.mode == Mode::Exec)
     }
 
     /// Plan `cmd`, looking at the queue standing behind it (`rest`, in
@@ -1631,16 +1726,15 @@ impl Par6Planner {
         // Rounding a corner means re-planning both of its segments as
         // one path, which takes IK and TOPPRA.
         if let Some(consumed) = self.blend_chain_len(cmd, rest) {
-            let kind = match cmd {
-                Command::MoveL(head) => {
+            let kind = match CartMove::of(cmd) {
+                Some(head) => {
                     let mut chain = vec![head];
-                    chain.extend(rest[..consumed].iter().map(|q| match q.cmd {
-                        Command::MoveL(p) => p,
-                        _ => unreachable!("the chain only accepts move_l"),
+                    chain.extend(rest[..consumed].iter().map(|q| {
+                        CartMove::of(q.cmd).expect("the chain only accepts cartesian moves")
                     }));
-                    self.start_move_l_chain(&chain)?
+                    self.start_cart_chain(&chain)?
                 }
-                _ => {
+                None => {
                     let mut chain = vec![JointTarget::of(cmd).expect("a joint move")];
                     chain.extend(
                         rest[..consumed]
@@ -1674,13 +1768,7 @@ impl Par6Planner {
                     // already-referenced `HomeCmd` to exactly this move,
                     // `server/motion_planner.py:239-241`). `calibrate`
                     // asks for the seek regardless.
-                    self.start_joint_move(
-                        &snap,
-                        self.home_pose_rad,
-                        None,
-                        Some(HOME_RETURN_SPEED_FRAC),
-                        None,
-                    )?
+                    self.start_home_return(&snap)?
                 } else {
                     // The RT core only enters Homing from Idle; after a
                     // completed planned move it is still holding in Exec.
@@ -1694,13 +1782,23 @@ impl Par6Planner {
                 let ticks = (p.seconds * self.ticks_per_s).round().max(1.0) as u64;
                 InFlightKind::Delay {
                     target_tick: snap.tick + ticks,
+                    paused_ticks_at_start: snap.exec.paused_ticks,
                 }
             }
             Command::SelectTool(p) => match self.adopt_tool(&p.tool_name)? {
                 Some(applied) => InFlightKind::ToolSwap { applied },
                 None => InFlightKind::Instant,
             },
-            Command::Checkpoint(_) | Command::SetTcpOffset(_) => InFlightKind::Instant,
+            Command::Checkpoint(_)
+            | Command::SetTcpOffset(_)
+            | Command::SetTcpTransform(_)
+            | Command::WriteIo(_) => InFlightKind::Instant,
+            Command::ToolAction(p) => {
+                let snap = self.snapshots.latest();
+                InFlightKind::Tool {
+                    epoch_at_send: self.start_tool_action(&snap, p)?,
+                }
+            }
             Command::MoveJPose(p) => self.start_move_j_pose(p)?,
             Command::MoveL(p) => self.start_move_l(p)?,
             Command::MoveC(p) => self.start_move_c(p)?,
@@ -1727,22 +1825,20 @@ impl Par6Planner {
     /// corner (positive blend radius) AND the next queued command is a
     /// move of the SAME family — straight cartesian moves round corners
     /// against straight cartesian moves, joint moves against joint
-    /// moves. Anything else (an arc, a delay, a move with no radius)
-    /// ends the chain: the arm stops at that target, which is exactly
-    /// what "no blend radius" asks for. A tool action cannot end one —
-    /// it runs on the side channel and never joins the queue, so a
-    /// gripper command between two blended moves no longer breaks the
-    /// corner it had no reason to break.
+    /// moves. Anything else (an arc, a delay, a tool action, a move with
+    /// no radius) ends the chain: the arm stops at that target, which is
+    /// exactly what "no blend radius" asks for — and what a gripper
+    /// command between two moves needs, since the jaws act at the corner.
     ///
     /// A positive radius on the LAST move of a chain has nothing to
     /// round — there is no following segment — so that move stops at its
     /// target like any other. That is also what a lone blended move
     /// does after the server's blend hold expires.
     fn blend_chain_len(&self, cmd: &Command, rest: &[QueuedCommand<'_>]) -> Option<usize> {
-        let cartesian = matches!(cmd, Command::MoveL(_));
+        let cartesian = CartMove::of(cmd).is_some();
         let same_family = |c: &Command| {
             if cartesian {
-                matches!(c, Command::MoveL(_))
+                CartMove::of(c).is_some()
             } else {
                 matches!(c, Command::MoveJ(_) | Command::MoveJPose(_))
             }
@@ -1784,8 +1880,10 @@ impl Par6Planner {
         // is pinned to what is queued now and cannot swallow the fill of
         // whatever the client sends next.
         self.producer.flush_marker().mark();
-        self.link.send(RtCommand::ExecFlush);
-        self.link.send(RtCommand::SetMode(Mode::Idle));
+        // Braked along the path and held, not cut to IDLE: IDLE has no
+        // velocity authority, so an arm dropped into it mid-move coasts on
+        // its own momentum — past whatever invalidated the move.
+        self.link.send(RtCommand::ExecStop);
     }
 
     /// Poll-time verdict for the in-flight command; `None` = keep going,
@@ -1799,6 +1897,7 @@ impl Par6Planner {
             return Some(Err(rt_error(snap)));
         }
         match &mut fl.kind {
+            InFlightKind::Tool { epoch_at_send } => tool_settle(snap, *epoch_at_send),
             InFlightKind::Exec {
                 ring_index,
                 seen_exec,
@@ -1846,7 +1945,12 @@ impl Par6Planner {
                     None
                 }
             }
-            InFlightKind::Delay { target_tick } => (snap.tick >= *target_tick).then_some(Ok(None)),
+            InFlightKind::Delay {
+                target_tick,
+                paused_ticks_at_start,
+            } => (snap.exec.target_scale > 0.0
+                && delay_remaining_ticks(snap, *target_tick, *paused_ticks_at_start) == 0)
+                .then_some(Ok(None)),
             InFlightKind::ToolSwap { applied } => {
                 applied.load(Ordering::Acquire).then_some(Ok(None))
             }
@@ -2266,7 +2370,7 @@ pub(crate) enum PlannedMotion<'a> {
 
 impl Par6Planner {
     /// The in-flight command's planned motion, for the offline preview.
-    pub(crate) fn planned_motion(&self, now_tick: u64) -> PlannedMotion<'_> {
+    pub(crate) fn planned_motion(&self, snap: &StateSnapshot) -> PlannedMotion<'_> {
         match &self.inflight {
             Some(InFlight {
                 kind: InFlightKind::Exec { samples, .. },
@@ -2277,9 +2381,17 @@ impl Par6Planner {
                 ..
             }) => PlannedMotion::Home,
             Some(InFlight {
-                kind: InFlightKind::Delay { target_tick },
+                kind:
+                    InFlightKind::Delay {
+                        target_tick,
+                        paused_ticks_at_start,
+                    },
                 ..
-            }) => PlannedMotion::Hold(target_tick.saturating_sub(now_tick)),
+            }) => PlannedMotion::Hold(delay_remaining_ticks(
+                snap,
+                *target_tick,
+                *paused_ticks_at_start,
+            )),
             _ => PlannedMotion::Still,
         }
     }
@@ -2332,7 +2444,25 @@ impl Planner for Par6Planner {
         // command is taken out of `self` for the call and put back.
         let mut fl = self.inflight.take()?;
         let index = fl.server_index;
-        let verdict = self.verdict(&mut fl, &snap);
+        let mut verdict = self.verdict(&mut fl, &snap);
+        // A completed seek leaves the arm where the referencing sequence
+        // ends; the command ends where the already-referenced fast path
+        // ends — at the home pose, held — so `home` lands in one place
+        // whichever route it took.
+        if let (Some(Ok(_)), InFlightKind::Home { .. }) = (&verdict, &fl.kind) {
+            match self.start_home_return(&snap) {
+                Ok(InFlightKind::Instant) => {}
+                Ok(kind) => {
+                    // The mode grace is measured from THIS move's start,
+                    // not from the seek's, which may have run for minutes.
+                    fl.started = Instant::now();
+                    fl.kind = kind;
+                    self.inflight = Some(fl);
+                    return None;
+                }
+                Err(e) => verdict = Some(Err(e)),
+            }
+        }
         self.inflight = Some(fl);
         match verdict {
             None => None,
@@ -2346,7 +2476,19 @@ impl Planner for Par6Planner {
                 })
             }
             Some(Err(e)) => {
-                self.discard_planned();
+                // A tool action put nothing in the ring: a failed grip must
+                // not brake an arm that is holding still under it.
+                if matches!(
+                    self.inflight,
+                    Some(InFlight {
+                        kind: InFlightKind::Tool { .. },
+                        ..
+                    })
+                ) {
+                    self.inflight = None;
+                } else {
+                    self.discard_planned();
+                }
                 self.near_singularity = None;
                 Some(CommandOutcome {
                     index,
@@ -2357,13 +2499,26 @@ impl Planner for Par6Planner {
         }
     }
 
-    fn cancel(&mut self) {
-        // Only this planner's own state. The RT half of a cancellation —
-        // flushing the ring, putting the loop back to IDLE — is the
-        // server's `RtCommands::discard_exec`, because it has to be
+    fn cancel(&mut self, halt_tool: bool) {
+        // Only this planner's own state — and the jaws. The RT half of a
+        // cancelled motion — braking the program and flushing the ring —
+        // is the server's `RtCommands::discard_exec`, because it has to be
         // ordered against the stream that may be replacing this motion,
         // and an answer arriving from another thread cannot be.
-        self.inflight = None;
+        let inflight = self.inflight.take();
+        if halt_tool
+            && matches!(
+                inflight,
+                Some(InFlight {
+                    kind: InFlightKind::Tool { .. },
+                    ..
+                })
+            )
+        {
+            // Halt in place rather than release: a cancellation must never
+            // drop whatever the jaws are holding.
+            self.link.send(RtCommand::GripperStop);
+        }
         self.near_singularity = None;
     }
 
@@ -2372,61 +2527,41 @@ impl Planner for Par6Planner {
         index: u64,
         cmd: &par6_proto::command::ToolAction,
     ) -> Result<(), WireError> {
+        if cmd.action != "stop" {
+            return Err(make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    &format!("only `stop` runs ahead of the queue, not '{}'", cmd.action),
+                )],
+            ));
+        }
         let snap = self.snapshots.latest();
         let epoch_at_send = self.start_tool_action(&snap, cmd)?;
-        self.tool_inflight = Some(ToolInFlight {
+        self.tool_stop = Some(ToolStopInFlight {
             server_index: index,
             epoch_at_send,
         });
         Ok(())
     }
 
-    /// Read the RT's settle verdict for the tool action in flight.
+    /// Read the RT's settle verdict for the tool stop in flight.
     ///
-    /// Deliberately narrow: it touches `tool_inflight` and nothing else.
-    /// The motion lane's failure path flushes the sample ring and forces
-    /// IDLE, and reaching it from here would stop an arm move because a
-    /// gripper faulted.
+    /// Deliberately narrow: it touches `tool_stop` and nothing else. The
+    /// queue's failure path flushes the sample ring and forces IDLE, and
+    /// reaching it from here would stop an arm move because a gripper
+    /// faulted.
     fn poll_tool(&mut self) -> Option<CommandOutcome> {
-        let fl = self.tool_inflight.as_ref()?;
+        let fl = self.tool_stop.as_ref()?;
         let snap = self.snapshots.latest();
-        if snap.tool.epoch == fl.epoch_at_send {
-            return None; // the RT has not armed it yet
-        }
+        let outcome = tool_settle(&snap, fl.epoch_at_send)?;
         let index = fl.server_index;
-        let (error, verdict) = match snap.tool.verdict {
-            ToolSettle::Running => return None,
-            ToolSettle::Done => (None, None),
-            ToolSettle::Settled(od) => (None, Some(od as u8)),
-            ToolSettle::Timeout(w) => (
-                Some(make_error(
-                    ErrorCode::MotnToolTimeout,
-                    UNATTRIBUTED,
-                    &[("state", w.as_str())],
-                )),
-                None,
-            ),
-            ToolSettle::Fault(bits) => (
-                Some(make_error(
-                    ErrorCode::MotnToolFault,
-                    UNATTRIBUTED,
-                    &[("fault_code", &bits.to_string())],
-                )),
-                None,
-            ),
-            // Another owner (homing, a flashing window) took the tool
-            // and released it on our behalf. Nothing is left to
-            // complete, and waiting would hang the client.
-            ToolSettle::Unarmed => (
-                Some(make_error(
-                    ErrorCode::MotnCancelled,
-                    UNATTRIBUTED,
-                    &[("scope", "the tool changed owner")],
-                )),
-                None,
-            ),
+        self.tool_stop = None;
+        let (error, verdict) = match outcome {
+            Ok(verdict) => (None, verdict),
+            Err(error) => (Some(error), None),
         };
-        self.tool_inflight = None;
         Some(CommandOutcome {
             index,
             error,
@@ -2434,12 +2569,8 @@ impl Planner for Par6Planner {
         })
     }
 
-    fn cancel_tool(&mut self, halt: bool) {
-        if self.tool_inflight.take().is_some() && halt {
-            // Halt in place rather than release: a stop must never drop
-            // whatever the jaws are holding.
-            self.link.send(RtCommand::GripperStop);
-        }
+    fn cancel_tool(&mut self) {
+        self.tool_stop = None;
     }
 
     fn warnings(&self) -> Vec<WireError> {
@@ -2480,17 +2611,14 @@ impl Planner for Par6Planner {
                 ctx.profile
             ),
         }
-        // The offset composes AFTER the variant's own TCP frame, which
-        // the URDF already carries — so publishing the commanded
-        // translation is the whole application. The cell is shared with
-        // the bridge's and housekeeping's models and with the RT FK hook,
-        // so planning, streaming and the reported pose all resolve at the
-        // same point; `TCP_OFFSET` still reads back the COMMANDED value,
-        // which the server owns.
+        // Every kinematics consumer shares this correction; the registered
+        // physical tool geometry and its inertial frame remain unchanged.
         {
             let mm = ctx.tcp_offset_mm;
-            self.tool_offset
-                .set([mm[0] / 1000.0, mm[1] / 1000.0, mm[2] / 1000.0]);
+            self.tool_offset.set_transform(par6_proto::pose_matrix(
+                [mm[0] / 1000.0, mm[1] / 1000.0, mm[2] / 1000.0],
+                ctx.tcp_rotation_deg.map(f64::to_radians),
+            ));
             // The workspace the enablement probe measured is the old TCP's.
             self.probe.invalidate();
         }
@@ -2518,6 +2646,14 @@ impl Planner for Par6Planner {
             .map_err(|e| refuse(e.to_string()))?;
         if let Some(dup) = first_duplicate(&converted) {
             return Err(refuse(format!("duplicate shape name {dup:?}")));
+        }
+        if let Some(dup) = self
+            .shape_names
+            .first_shared_with_other_layer(layer, &converted)
+        {
+            return Err(refuse(format!(
+                "shape name {dup:?} is already applied on the other keep-out layer"
+            )));
         }
         // The epoch is the collision world's, not a parallel counter:
         // `set_layer` moves it only for a world it actually applied.
@@ -2623,9 +2759,15 @@ impl Planner for Par6Planner {
                 ticks as f64 * self.dt
             }
             Some(InFlight {
-                kind: InFlightKind::Delay { target_tick },
+                kind:
+                    InFlightKind::Delay {
+                        target_tick,
+                        paused_ticks_at_start,
+                    },
                 ..
-            }) => target_tick.saturating_sub(snap.tick) as f64 * self.dt,
+            }) => {
+                delay_remaining_ticks(snap, *target_tick, *paused_ticks_at_start) as f64 * self.dt
+            }
             _ => 0.0,
         }
     }
@@ -2652,6 +2794,16 @@ fn format_pairs(pairs: &[(String, String)]) -> String {
 }
 
 /// Max-norm joint distance \[rad\] between two configurations.
+/// Ticks a delay still owes: the ticks it spent paused do not count.
+fn delay_remaining_ticks(
+    snap: &StateSnapshot,
+    target_tick: u64,
+    paused_ticks_at_start: u64,
+) -> u64 {
+    let elapsed_pause = snap.exec.paused_ticks.saturating_sub(paused_ticks_at_start);
+    target_tick.saturating_sub(snap.tick.saturating_sub(elapsed_pause))
+}
+
 fn joint_distance(a: &[f64; MAX_JOINTS], b: &[f64; MAX_JOINTS]) -> f64 {
     a.iter()
         .zip(b.iter())
@@ -2694,6 +2846,43 @@ fn planning_error(e: MotionError) -> WireError {
         _ => ErrorCode::MotnSetupFailed,
     };
     make_error(code, UNATTRIBUTED, &[("detail", &e.to_string())])
+}
+
+/// The jaws' verdict on the action armed after `epoch_at_send` was
+/// read; `None` while they are still working.
+///
+/// The RT bumps the epoch when it arms, so a verdict still carrying the
+/// value read before the send belongs to the PREVIOUS action. Whether an
+/// action finished is decided against the reply stream at the tick rate
+/// (see `par6_rt::gripper_settle`), because every window in that decision
+/// counts replies and the planner polls at its own unrelated cadence.
+fn tool_settle(snap: &StateSnapshot, epoch_at_send: u32) -> Option<Result<Option<u8>, WireError>> {
+    if snap.tool.epoch == epoch_at_send {
+        return None;
+    }
+    match snap.tool.verdict {
+        ToolSettle::Running => None,
+        ToolSettle::Done => Some(Ok(None)),
+        ToolSettle::Settled(od) => Some(Ok(Some(od as u8))),
+        ToolSettle::Timeout(w) => Some(Err(make_error(
+            ErrorCode::MotnToolTimeout,
+            UNATTRIBUTED,
+            &[("state", w.as_str())],
+        ))),
+        ToolSettle::Fault(bits) => Some(Err(make_error(
+            ErrorCode::MotnToolFault,
+            UNATTRIBUTED,
+            &[("fault_code", &bits.to_string())],
+        ))),
+        // Another owner (homing, a flashing window) took the tool and
+        // released it on our behalf. Nothing is left to complete, and
+        // waiting would hang the client.
+        ToolSettle::Unarmed => Some(Err(make_error(
+            ErrorCode::MotnCancelled,
+            UNATTRIBUTED,
+            &[("scope", "the tool changed owner")],
+        ))),
+    }
 }
 
 /// The RT error latch as the failure of the command that was in flight.

@@ -38,8 +38,8 @@ fn box_at(x: f64, y: f64, z: f64, side: f64) -> ShapeDesc {
 }
 
 #[test]
-fn abi_version_is_v11() {
-    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 11);
+fn abi_version_is_v12() {
+    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 12);
 }
 
 #[test]
@@ -208,6 +208,7 @@ fn null_and_out_of_range_arguments_are_rejected() {
                 layer,
                 std::ptr::null(),
                 0,
+                std::ptr::null(),
                 err.as_mut_ptr().cast(),
                 err.len() as i32,
             )

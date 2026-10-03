@@ -63,6 +63,7 @@ fn boot_core(
         gravity,
         jog: Box::new(RampJog::new(robot)),
         stream: Box::new(ClampStream::new(robot)),
+        stream_shaped: Box::new(ClampStream::new(robot)),
         settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
         estop: Box::new(gpio),
         io: Box::new(io),
@@ -192,18 +193,17 @@ fn a_teleport_under_a_load_past_the_holding_friction_is_held() {
     let q: [f64; MAX_JOINTS] = std::array::from_fn(|i| POSES_DEG[1][i].to_radians());
     let tau = common::plant_gravity(&bundle, &q);
     // The premise of the case, checked rather than asserted in prose: the
-    // wrist is loaded past what the drivetrain holds unpowered, and not past
-    // what its own current limit can produce.
+    // wrist carries a load, which a released drive does not hold (the plant
+    // gives it no support), and not more than its own current limit can
+    // produce.
     let wrist = tau[4].abs();
-    let held_unpowered = bundle.robot.sim.holding_friction_nm[4];
     let ceiling = {
         let c = &bundle.robot.joints[4];
         c.kt_nm_a * (c.ilim_ma / 1000.0) * c.gear_ratio * c.gear_efficiency
     };
     assert!(
-        wrist > held_unpowered,
-        "J5 carries {wrist:.3} Nm, inside the {held_unpowered:.3} Nm the drivetrain \
-         holds unpowered: the case would pass with the drivers limp"
+        wrist > 0.01,
+        "J5 carries {wrist:.3} Nm: the case would pass with the drivers limp"
     );
     assert!(
         wrist < ceiling,

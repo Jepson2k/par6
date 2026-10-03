@@ -14,8 +14,9 @@ import contextlib
 import threading
 import weakref
 from collections.abc import Callable, Coroutine, Iterable
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
+from waldoctl.execution import ExecutionSpeed
 from waldoctl.shapes import Shape, ShapeWorld
 from waldoctl.status import (
     ActivityResult,
@@ -39,6 +40,9 @@ from .async_client import (
     StatusResult,
 )
 from .errors import RobotError
+
+if TYPE_CHECKING:
+    from par6.robot import Robot
 
 T = TypeVar("T")
 
@@ -137,6 +141,20 @@ class RobotClient:
             rbt.home(wait=True)
     """
 
+    def run_skill(
+        self, invoke: Callable[[AsyncRobotClient], Coroutine[Any, Any, T]]
+    ) -> T:
+        """Run a skill on this facade's loop with the connected async client."""
+        return _run(invoke(self._inner))
+
+    @property
+    def robot(self) -> Robot:
+        return self._inner.robot
+
+    @robot.setter
+    def robot(self, value: Robot | None) -> None:
+        self._inner.robot = value
+
     def __init__(
         self,
         host: str | None = None,
@@ -212,8 +230,8 @@ class RobotClient:
         *,
         pose: list[float] | None = None,
         duration: float = 0.0,
-        speed: float = 0.0,
-        accel: float = 1.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         r: float = 0.0,
         rel: bool = False,
         wait: bool = True,
@@ -240,8 +258,8 @@ class RobotClient:
         *,
         frame: Frame = "WRF",
         duration: float = 0.0,
-        speed: float = 0.0,
-        accel: float = 1.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         r: float = 0.0,
         rel: bool = False,
         wait: bool = True,
@@ -268,11 +286,10 @@ class RobotClient:
         end: list[float],
         *,
         frame: Frame = "WRF",
-        duration: float | None = None,
-        speed: float | None = None,
-        accel: float = 1.0,
+        duration: float = 0.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         r: float = 0.0,
-        rel: bool = False,
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
@@ -286,7 +303,6 @@ class RobotClient:
                 speed=speed,
                 accel=accel,
                 r=r,
-                rel=rel,
                 wait=wait,
                 timeout=timeout,
             )
@@ -297,10 +313,9 @@ class RobotClient:
         waypoints: list[list[float]],
         *,
         frame: Frame = "WRF",
-        duration: float | None = None,
-        speed: float | None = None,
-        accel: float = 1.0,
-        rel: bool = False,
+        duration: float = 0.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
@@ -312,7 +327,6 @@ class RobotClient:
                 duration=duration,
                 speed=speed,
                 accel=accel,
-                rel=rel,
                 wait=wait,
                 timeout=timeout,
             )
@@ -323,10 +337,9 @@ class RobotClient:
         waypoints: list[list[float]],
         *,
         frame: Frame = "WRF",
-        duration: float | None = None,
-        speed: float | None = None,
-        accel: float = 1.0,
-        rel: bool = False,
+        duration: float = 0.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
@@ -338,7 +351,6 @@ class RobotClient:
                 duration=duration,
                 speed=speed,
                 accel=accel,
-                rel=rel,
                 wait=wait,
                 timeout=timeout,
             )
@@ -351,14 +363,14 @@ class RobotClient:
         angles: list[float] | None = None,
         *,
         pose: list[float] | None = None,
-        speed: float = 1.0,
-        accel: float = 1.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
     ) -> int:
         """Streaming joint position target (fire-and-forget)."""
         return _run(self._inner.servo_j(angles, pose=pose, speed=speed, accel=accel))
 
     def servo_l(
-        self, pose: list[float], *, speed: float = 1.0, accel: float = 1.0
+        self, pose: list[float], *, speed: float = 0.5, accel: float = 0.5
     ) -> int:
         """Streaming linear Cartesian target (fire-and-forget)."""
         return _run(self._inner.servo_l(pose, speed=speed, accel=accel))
@@ -371,7 +383,7 @@ class RobotClient:
         *,
         joints: list[int] | None = None,
         speeds: list[float] | None = None,
-        accel: float = 1.0,
+        accel: float = 0.5,
     ) -> int:
         """Joint velocity jog (duration-watchdogged, fire-and-forget)."""
         return _run(
@@ -389,7 +401,7 @@ class RobotClient:
         *,
         axes: list[Axis] | None = None,
         speeds_list: list[float] | None = None,
-        accel: float = 1.0,
+        accel: float = 0.5,
     ) -> int:
         """Cartesian velocity jog (duration-watchdogged, fire-and-forget)."""
         return _run(
@@ -422,13 +434,21 @@ class RobotClient:
         """Protective stop: latch the controller disabled until ``reset()``."""
         return _run(self._inner.estop())
 
-    def pause(self) -> int:
-        """Hold the executing trajectory; the queue survives."""
-        return _run(self._inner.pause())
+    def execution_speed(self, *, timeout: float = 3.0) -> ExecutionSpeed:
+        """Read the controller's selected and applied execution speed."""
+        return _run(self._inner.execution_speed(timeout=timeout))
 
-    def resume(self) -> int:
+    def set_execution_speed(self, scale: float, *, timeout: float = 3.0) -> int:
+        """Select queued-motion speed without releasing pause."""
+        return _run(self._inner.set_execution_speed(scale, timeout=timeout))
+
+    def pause(self, *, timeout: float = 3.0) -> int:
+        """Hold the executing trajectory; the queue survives."""
+        return _run(self._inner.pause(timeout=timeout))
+
+    def resume(self, *, timeout: float = 3.0) -> int:
         """Continue a trajectory held by :meth:`pause`."""
-        return _run(self._inner.resume())
+        return _run(self._inner.resume(timeout=timeout))
 
     def freedrive(self, enabled: bool) -> int:
         """Enter or leave freedrive: IDLE under G(q) with no position hold."""
@@ -562,6 +582,18 @@ class RobotClient:
         """Set the active end-effector tool on the controller."""
         return _run(self._inner.select_tool(tool_name, variant_key=variant_key))
 
+    def set_tcp_transform(
+        self,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        roll: float = 0,
+        pitch: float = 0,
+        yaw: float = 0,
+    ) -> int:
+        """Queue the TCP transform; wait for its returned command index."""
+        return _run(self._inner.set_tcp_transform(x, y, z, roll, pitch, yaw))
+
     def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0) -> int:
         """Set TCP offset in mm on top of the current tool transform."""
         return _run(self._inner.set_tcp_offset(x=x, y=y, z=z))
@@ -575,7 +607,9 @@ class RobotClient:
         return _run(self._inner.set_completion_policy(policy))
 
     def write_io(self, index: int, value: int) -> int:
-        """Set digital output by logical index (0 = first output pin)."""
+        """Queue a digital output level by logical index (0 = first output
+        pin); it lands at its turn between the commands around it, and
+        the returned index completes when it does."""
         return _run(self._inner.write_io(index, value))
 
     def tool_action(
@@ -584,10 +618,10 @@ class RobotClient:
         action: str,
         params: list[Any] | None = None,
         *,
-        wait: bool = True,
+        wait: bool = False,
         timeout: float = 10.0,
     ) -> int:
-        """Invoke a tool-specific action by key (blocking by default)."""
+        """Invoke a tool-specific action by key."""
         return _run(
             self._inner.tool_action(
                 tool_key, action, params, wait=wait, timeout=timeout
@@ -625,7 +659,7 @@ class RobotClient:
         return _run(self._inner.io())
 
     def joint_speeds(self) -> list[float] | None:
-        """Current joint velocities in rad/s."""
+        """Current joint velocities in deg/s."""
         return _run(self._inner.joint_speeds())
 
     def status(self) -> StatusResult | None:
@@ -668,9 +702,13 @@ class RobotClient:
         """Whether the e-stop is engaged."""
         return _run(self._inner.is_estop_pressed())
 
-    def is_robot_stopped(self, threshold_speed: float = 0.01) -> bool:
-        """Whether every joint is below *threshold_speed* (rad/s)."""
+    def is_robot_stopped(self, threshold_speed: float = 0.5) -> bool:
+        """Whether every joint is below *threshold_speed* (deg/s)."""
         return _run(self._inner.is_robot_stopped(threshold_speed))
+
+    def tcp_transform(self) -> list[float]:
+        """Read the applied TCP correction (mm, intrinsic XYZ degrees)."""
+        return _run(self._inner.tcp_transform())
 
     def tcp_offset(self) -> list[float]:
         """Current TCP offset in mm [x, y, z]."""
@@ -736,7 +774,7 @@ class RobotClient:
         self,
         timeout: float = 10.0,
         settle_window: float = 0.25,
-        speed_threshold: float = 0.01,
+        speed_threshold: float = 0.5,
         angle_threshold: float = 0.5,
         motion_start_timeout: float = 1.0,
     ) -> bool:

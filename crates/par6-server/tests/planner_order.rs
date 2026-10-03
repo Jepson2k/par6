@@ -48,7 +48,7 @@ impl Planner for Recorder {
     fn poll(&mut self) -> Option<CommandOutcome> {
         None
     }
-    fn cancel(&mut self) {
+    fn cancel(&mut self, _halt_tool: bool) {
         self.0.push("cancel");
     }
     fn sync(&mut self, _ctx: PlanContext<'_>) {}
@@ -106,7 +106,7 @@ fn a_cancel_sent_after_a_start_cancels_that_start() {
     handle.send(PlanRequest::Start {
         batch: vec![a_move(1)],
     });
-    handle.send(PlanRequest::Cancel);
+    handle.send(PlanRequest::Cancel { halt_tool: true });
 
     let worker = std::thread::spawn(run);
     std::thread::sleep(Duration::from_millis(80));
@@ -142,7 +142,7 @@ fn a_second_expensive_request_does_not_strand_what_came_after_it() {
     handle.send(PlanRequest::Start {
         batch: vec![a_move(2)],
     });
-    handle.send(PlanRequest::Cancel);
+    handle.send(PlanRequest::Cancel { halt_tool: true });
 
     let worker = std::thread::spawn(run);
     std::thread::sleep(Duration::from_millis(120));

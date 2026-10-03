@@ -2,8 +2,8 @@
 //! path the planner produces.
 //!
 //! These claims are about the PLAN, so they are measured on the plan:
-//! `PreviewResult::tcp_poses` is the same planner the daemon runs,
-//! sampled at tick dt with no arm in the loop. That buys two things over
+//! the commanded record (`Preview::plan_record`) is the same planner the
+//! daemon runs, one FK'd row per tick with no arm in the loop. That buys two things over
 //! measuring the same claims off a live STATUS broadcast — the tolerance
 //! stops being the simulated arm's tracking lag (8-12 mm) and becomes
 //! the planner's own error, and the whole file runs in milliseconds
@@ -19,8 +19,8 @@ use par6d::preview::{Preview, PreviewResult};
 mod common;
 use common::{
     assets_dir, distance, distance_to_segment, path_misses, process_corner, progress_along,
-    retimed_config, rotation_angle_deg, spline_waypoints, to_rad, wire_pose_at, ARC_RADIUS_MM,
-    CURVE_START_DEG,
+    retimed_config, rotation_angle_deg, span_tcp, spline_waypoints, to_rad, wire_pose_at,
+    ARC_RADIUS_MM, CURVE_START_DEG,
 };
 
 /// The planner's own path error. Two orders tighter than the live suite's
@@ -56,14 +56,19 @@ fn tcp_mm(pose: &[f64; 16]) -> [f64; 3] {
     [pose[3] * 1000.0, pose[7] * 1000.0, pose[11] * 1000.0]
 }
 
-/// The planned TCP path \[mm\], one point per tick.
-fn path_of(r: &PreviewResult) -> Vec<[f64; 3]> {
+/// The planned TCP path \[mm\] of `r`, one point per row of the commanded
+/// record it owns.
+fn path_of(preview: &mut Preview, r: &PreviewResult) -> Vec<[f64; 3]> {
     assert!(
         r.error.is_none(),
         "the move must be accepted, got {:?}",
         r.error
     );
-    let path: Vec<[f64; 3]> = r.tcp_poses.iter().map(tcp_mm).collect();
+    let record = preview.plan_record(None);
+    let path: Vec<[f64; 3]> = span_tcp(&record, r.start_row, r.rows)
+        .iter()
+        .map(tcp_mm)
+        .collect();
     assert!(
         path.len() > 50,
         "expected a sampled path, got {} points",
@@ -84,7 +89,7 @@ fn move_c_traces_the_circle_through_its_via_point() {
     let via = [center[0], center[1], center[2] - ARC_RADIUS_MM];
     let end = [center[0] + ARC_RADIUS_MM, center[1], center[2]];
 
-    let path = path_of(&p.preview.submit(Command::MoveC(MoveC {
+    let r = p.preview.submit(Command::MoveC(MoveC {
         key: 4001,
         via: wire_pose_at(&p.pose, via),
         end: wire_pose_at(&p.pose, end),
@@ -94,7 +99,8 @@ fn move_c_traces_the_circle_through_its_via_point() {
         accel: None,
         blend_radius: None,
         rel: false,
-    })));
+    }));
+    let path = path_of(&mut p.preview, &r);
 
     let radial = path
         .iter()
@@ -144,7 +150,7 @@ fn a_relative_move_c_lands_where_its_absolute_twin_lands() {
     let mut p = planned("curve-arc-rel");
     let end = [p.start[0] + 2.0 * ARC_RADIUS_MM, p.start[1], p.start[2]];
 
-    let path = path_of(&p.preview.submit(Command::MoveC(MoveC {
+    let r = p.preview.submit(Command::MoveC(MoveC {
         key: 4005,
         via: [ARC_RADIUS_MM, 0.0, -ARC_RADIUS_MM, 0.0, 0.0, 0.0],
         end: [2.0 * ARC_RADIUS_MM, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -154,7 +160,8 @@ fn a_relative_move_c_lands_where_its_absolute_twin_lands() {
         accel: None,
         blend_radius: None,
         rel: true,
-    })));
+    }));
+    let path = path_of(&mut p.preview, &r);
 
     let miss = distance(*path.last().expect("path"), end);
     assert!(
@@ -179,20 +186,19 @@ fn move_s_passes_through_every_waypoint_and_curves_between_them() {
     let mut p = planned("curve-spline");
     let waypoints = spline_waypoints(p.start);
 
-    let path = path_of(
-        &p.preview.submit(Command::MoveS(MoveS {
-            key: 4002,
-            waypoints: waypoints
-                .iter()
-                .map(|w| wire_pose_at(&p.pose, *w))
-                .collect(),
-            frame: Frame::Wrf,
-            duration: Some(6.0),
-            speed: None,
-            accel: None,
-            rel: false,
-        })),
-    );
+    let r = p.preview.submit(Command::MoveS(MoveS {
+        key: 4002,
+        waypoints: waypoints
+            .iter()
+            .map(|w| wire_pose_at(&p.pose, *w))
+            .collect(),
+        frame: Frame::Wrf,
+        duration: Some(6.0),
+        speed: None,
+        accel: None,
+        rel: false,
+    }));
+    let path = path_of(&mut p.preview, &r);
 
     let last = *waypoints.last().expect("waypoints");
     for (k, w) in waypoints.iter().enumerate() {
@@ -250,8 +256,8 @@ fn move_p_rounds_its_corner_and_holds_one_tool_speed() {
         accel: None,
         rel: false,
     }));
-    let dt = p.preview.tick_dt_s();
-    let path = path_of(&result);
+    let dt = p.preview.plan_record(None).row_dt_s;
+    let path = path_of(&mut p.preview, &result);
 
     // 25 mm of auto-blend on 100 mm segments: the corner is cut, by less
     // than the blend zone and by more than nothing.
@@ -334,7 +340,7 @@ fn a_full_speed_move_p_prices_its_corner_instead_of_refusing() {
         fast.duration_s,
         paced.duration_s
     );
-    let path = path_of(&fast);
+    let path = path_of(&mut p.preview, &fast);
     let corner_miss = path_misses(&path, corner);
     assert!(
         (1.0..25.0).contains(&corner_miss),
@@ -386,15 +392,16 @@ fn a_rounded_square_holds_the_tool_orientation_through_every_corner() {
     results.extend(p.preview.flush());
     let motion = PreviewResult::concat(results.into_iter().filter(|r| !r.pending).collect())
         .expect("the closed chain plans a motion");
+    let poses = span_tcp(&p.preview.plan_record(None), motion.start_row, motion.rows);
     assert!(
-        motion.tcp_poses.len() > 100,
+        poses.len() > 100,
         "expected a sampled contour, got {} poses",
-        motion.tcp_poses.len()
+        poses.len()
     );
 
     // Every corner rounded: the path passes near each one but not
     // through it, and lands on the last.
-    let path: Vec<[f64; 3]> = motion.tcp_poses.iter().map(tcp_mm).collect();
+    let path: Vec<[f64; 3]> = poses.iter().map(tcp_mm).collect();
     for (k, c) in corners[..4].iter().enumerate() {
         let miss = path_misses(&path, *c);
         assert!(
@@ -408,13 +415,219 @@ fn a_rounded_square_holds_the_tool_orientation_through_every_corner() {
         "the chain planned to end {end_miss:.3} mm off its last pose"
     );
 
-    let drift = motion
-        .tcp_poses
+    let drift = poses
         .iter()
         .map(|pose| rotation_angle_deg(&p.pose, pose))
         .fold(0.0f64, f64::max);
     assert!(
         drift < 1.0,
         "the tool tilted {drift:.3}° somewhere along four blended corners"
+    );
+}
+
+/// A full-speed `move_l` never sweeps the tool faster than the planned
+/// linear ceiling, however much room the joints have: the `speed`
+/// fraction scales a TCP speed, as it does on parol6.
+#[test]
+fn a_full_speed_move_l_runs_at_the_tcp_ceiling_not_the_joints() {
+    let mut p = planned("curve-ceiling");
+    let far = [p.start[0] + 150.0, p.start[1], p.start[2]];
+    let result = p.preview.submit(Command::MoveL(MoveL {
+        key: 4101,
+        pose: wire_pose_at(&p.pose, far),
+        frame: Frame::Wrf,
+        duration: None,
+        speed: Some(1.0),
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    }));
+    assert!(
+        result.error.is_none(),
+        "the move must be accepted, got {:?}",
+        result.error
+    );
+    let record = p.preview.plan_record(None);
+    let dt = record.row_dt_s;
+    let path: Vec<[f64; 3]> = span_tcp(&record, result.start_row, result.rows)
+        .iter()
+        .map(tcp_mm)
+        .collect();
+    // 150 mm at up to 0.2 m/s is under a second of rows at the row rate.
+    assert!(
+        path.len() > 25,
+        "expected a sampled path, got {} points",
+        path.len()
+    );
+    let speeds: Vec<f64> = path.windows(2).map(|w| distance(w[0], w[1]) / dt).collect();
+    let fastest = speeds.iter().copied().fold(0.0f64, f64::max);
+    // 0.2 m/s is the shipped `planned_linear_max_m_s`; a row-rate sample
+    // of a path sampled every 2 mm rounds by well under 2%.
+    assert!(
+        fastest <= 200.0 * 1.02,
+        "the tool peaked at {fastest:.1} mm/s over a 200 mm/s ceiling"
+    );
+    assert!(
+        fastest >= 150.0,
+        "the tool never got near the ceiling ({fastest:.1} mm/s): the ceiling is not what bounds this move"
+    );
+}
+
+/// The planned ceiling is on the tool's LINEAR speed, as parol6's is: a
+/// `move_l` that only turns the tool about its own axis has no linear
+/// speed to cap, and runs as fast as the wrist allows rather than at the
+/// ceiling over the rotation weight (0.2 m/s / 0.15 m/rad ≈ 1.33 rad/s).
+#[test]
+fn a_move_l_that_only_turns_the_tool_is_not_held_to_the_linear_ceiling() {
+    let mut p = planned("curve-turn-in-place");
+    let mut target = wire_pose_at(&p.pose, p.start);
+    target[5] += 90.0;
+    let result = p.preview.submit(Command::MoveL(MoveL {
+        key: 4151,
+        pose: target,
+        frame: Frame::Wrf,
+        duration: None,
+        speed: Some(1.0),
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    }));
+    assert!(
+        result.error.is_none(),
+        "the move must be accepted, got {:?}",
+        result.error
+    );
+    let record = p.preview.plan_record(None);
+    let dt = record.row_dt_s;
+    let poses = span_tcp(&record, result.start_row, result.rows);
+    let drift = poses
+        .iter()
+        .map(|pose| distance(tcp_mm(pose), p.start))
+        .fold(0.0f64, f64::max);
+    assert!(
+        drift < PLAN_TOL_MM,
+        "the TCP moved {drift:.3} mm turning in place"
+    );
+    let fastest = poses
+        .windows(2)
+        .map(|w| rotation_angle_deg(&w[0], &w[1]).to_radians() / dt)
+        .fold(0.0f64, f64::max);
+    let old_ceiling = 0.2 / 0.15;
+    assert!(
+        fastest > 1.3 * old_ceiling,
+        "the tool turned at no more than {fastest:.2} rad/s: the linear ceiling is holding a rotation"
+    );
+}
+
+/// `move_l` → `move_c` → `move_l` with blend radii: one C¹ path, the
+/// corners rounded inside their zones, the arc still an arc where no
+/// zone touches it.
+#[test]
+fn a_move_c_rounds_into_and_out_of_its_neighbours() {
+    let mut p = planned("curve-arc-chain");
+    // Straight in along +x to `a`; the arc bows down through `via` to
+    // `b`, which is a right-angle corner at each end; straight out along
+    // +x to `c`.
+    let a = [p.start[0] + 100.0, p.start[1], p.start[2]];
+    let via = [a[0] + ARC_RADIUS_MM, a[1], a[2] - ARC_RADIUS_MM];
+    let b = [a[0] + 2.0 * ARC_RADIUS_MM, a[1], a[2]];
+    let c = [b[0] + 100.0, b[1], b[2]];
+    let center = [a[0] + ARC_RADIUS_MM, a[1], a[2]];
+    let r_mm = 20.0;
+    let line = |key, to: [f64; 3], r| {
+        Command::MoveL(MoveL {
+            key,
+            pose: wire_pose_at(&p.pose, to),
+            frame: Frame::Wrf,
+            duration: None,
+            speed: Some(0.5),
+            accel: None,
+            blend_radius: r,
+            rel: false,
+        })
+    };
+    let first = p.preview.submit(line(4201, a, Some(r_mm)));
+    assert!(
+        first.pending,
+        "a blended head waits for its chain: {first:?}"
+    );
+    let arc = p.preview.submit(Command::MoveC(MoveC {
+        key: 4202,
+        via: wire_pose_at(&p.pose, via),
+        end: wire_pose_at(&p.pose, b),
+        frame: Frame::Wrf,
+        duration: None,
+        speed: Some(0.5),
+        accel: None,
+        blend_radius: Some(r_mm),
+        rel: false,
+    }));
+    assert!(
+        arc.error.is_none(),
+        "an arc joins a blend chain: {:?}",
+        arc.error
+    );
+    let last = p.preview.submit(line(4203, c, None));
+    assert!(last.error.is_none(), "{:?}", last.error);
+    let flushed = p.preview.flush();
+    assert!(
+        flushed.is_none(),
+        "the chain closed on its last move: {flushed:?}"
+    );
+    let record = p.preview.plan_record(None);
+    let path: Vec<[f64; 3]> = span_tcp(&record, 0, record.rows)
+        .iter()
+        .map(tcp_mm)
+        .collect();
+    assert!(
+        path.len() > 100,
+        "expected a sampled chain, got {} rows",
+        path.len()
+    );
+
+    // C¹: the direction of travel never jumps between rows. A corner
+    // left sharp turns 90° in one step; a zone of this radius sampled
+    // at the row rate turns a few degrees.
+    let mut worst_turn = 0.0f64;
+    for w in path.windows(3) {
+        let u = [w[1][0] - w[0][0], w[1][1] - w[0][1], w[1][2] - w[0][2]];
+        let v = [w[2][0] - w[1][0], w[2][1] - w[1][1], w[2][2] - w[1][2]];
+        let (lu, lv) = (distance(w[0], w[1]), distance(w[1], w[2]));
+        if lu < 0.05 || lv < 0.05 {
+            continue; // at rest at either end
+        }
+        let cos = ((u[0] * v[0] + u[1] * v[1] + u[2] * v[2]) / (lu * lv)).clamp(-1.0, 1.0);
+        worst_turn = worst_turn.max(cos.acos().to_degrees());
+    }
+    assert!(
+        worst_turn < 25.0,
+        "the path turned {worst_turn:.1}° in one row: a corner was left sharp"
+    );
+    // Each corner is rounded inside its zone: cut, and by no more than r.
+    for corner in [a, b] {
+        let miss = path_misses(&path, corner);
+        assert!(
+            (1.0..=r_mm + PLAN_TOL_MM).contains(&miss),
+            "the corner at {corner:?} was missed by {miss:.2} mm against a {r_mm} mm zone"
+        );
+    }
+    // Where no zone reaches — the lower half of the arc — it is still
+    // the circle through the via point.
+    let mut on_arc = 0;
+    for q in &path {
+        if q[2] < a[2] - ARC_RADIUS_MM / 2.0 {
+            on_arc += 1;
+            let radial = (distance(*q, center) - ARC_RADIUS_MM).abs();
+            assert!(
+                radial < PLAN_TOL_MM,
+                "the arc left its circle by {radial:.3} mm at {q:?}"
+            );
+        }
+    }
+    assert!(on_arc > 20, "expected rows on the arc, got {on_arc}");
+    let end_miss = distance(*path.last().expect("path"), c);
+    assert!(
+        end_miss < PLAN_TOL_MM,
+        "the chain ends {end_miss:.3} mm off its last target"
     );
 }

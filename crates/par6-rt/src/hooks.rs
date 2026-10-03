@@ -66,12 +66,15 @@ pub enum RtCommand {
     JogRelease,
     /// End a STREAM session by braking to rest, rather than abandoning
     /// the arm at speed. STREAM outlives this until the ramp and measured arm are at rest,
-    /// then the mode goes IDLE on its own — IDLE holds against gravity
-    /// and has no velocity authority, so a moving arm dropped into it
-    /// coasts on its own momentum.
+    /// then the core holds the rest pose on its own (see
+    /// [`RtCommand::Hold`]) — IDLE holds against gravity and has no
+    /// velocity authority, so a moving arm dropped into it coasts on its
+    /// own momentum, and a resting one floats.
     StreamRelease,
     /// Pause/resume EXEC playback (pause holds in place, ring untouched).
     ExecSetPaused(bool),
+    /// Queued trajectory scale in [0.1, 1], preserving the explicit pause state.
+    ExecSetSpeedScale(f64),
     /// Discard the EXEC ring samples the planner marked for discard
     /// (stop/flush — NOT pause). The bound rides the ring itself
     /// ([`FlushMarker::mark`](crate::FlushMarker::mark)), because this
@@ -80,6 +83,21 @@ pub enum RtCommand {
     /// queued behind the stop. Marking is the sender's job — an
     /// unmarked flush discards nothing.
     ExecFlush,
+    /// Stop EXEC playback the way `stop()` promises: brake ALONG the
+    /// planned path at the joint acceleration limits, then discard the
+    /// marked samples (as [`RtCommand::ExecFlush`]) and hold where the
+    /// brake ended. A running HOMING sequence is aborted to IDLE — it has
+    /// no path to brake along and leaves the arm unreferenced. Anywhere
+    /// else nothing is moving under the ring, so the marked samples are
+    /// discarded at once.
+    ExecStop,
+    /// End a jog or stream session where it stands: hold the last
+    /// commanded pose under EXEC's position loop when the arm may be held
+    /// (homed, enabled, no hard error), IDLE otherwise. For the cut a
+    /// session cannot brake out of — a ramp that never reported rest, a
+    /// gate that cannot be queried — where IDLE would hand a homed arm to
+    /// the gravity float. A no-op outside JOG and STREAM.
+    Hold,
     /// Firmware gripper command for the per-tick gripper slot; replaces
     /// the standing gripper frame until the next one.
     Gripper(FirmwareGripperCommand),
@@ -549,7 +567,10 @@ pub struct SpecSettle {
     policy: CompletionPolicy,
     tolerance_rad: f64,
     timeout_ticks: u32,
+    /// Ticks since the error last improved on `best_err`.
     elapsed: u32,
+    /// The smallest worst-joint error seen since arming.
+    best_err: f64,
 }
 
 impl SpecSettle {
@@ -561,6 +582,7 @@ impl SpecSettle {
             tolerance_rad: motion.settle_tolerance_rad,
             timeout_ticks: ((motion.settle_timeout_s / dt).round() as u32).max(1),
             elapsed: 0,
+            best_err: f64::INFINITY,
         }
     }
 
@@ -573,6 +595,7 @@ impl SpecSettle {
 impl SettlePolicy for SpecSettle {
     fn arm(&mut self, blend_continues: bool) -> bool {
         self.elapsed = 0;
+        self.best_err = f64::INFINITY;
         blend_continues || self.policy == CompletionPolicy::Commanded
     }
 
@@ -588,6 +611,14 @@ impl SettlePolicy for SpecSettle {
             );
         if max_err <= self.tolerance_rad {
             return SettleVerdict::Complete;
+        }
+        // The timeout is "no progress for this long", not "this long
+        // since arming": a joint still closing on its target is settling,
+        // not stuck. Progress has to clear a tenth of the tolerance so
+        // encoder noise cannot keep resetting the clock.
+        if max_err + self.tolerance_rad * 0.1 <= self.best_err {
+            self.best_err = max_err;
+            self.elapsed = 0;
         }
         self.elapsed += 1;
         if self.elapsed >= self.timeout_ticks {

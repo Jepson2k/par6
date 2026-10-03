@@ -90,6 +90,8 @@ pub struct Shape {
     pub collision: bool,
     /// Standoff override \[m\]; `None` = the model's default clearance.
     pub margin: Option<f64>,
+    /// Declared flange-relative geometry and scoped contact partners.
+    pub attachment: Option<par6_proto::Attachment>,
 }
 
 /// Why a wire shape could not be turned into a [`Shape`].
@@ -163,6 +165,7 @@ impl Shape {
             pose,
             collision: s.collision,
             margin: s.margin,
+            attachment: s.attachment.clone(),
         })
     }
 }

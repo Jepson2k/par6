@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import math
 import socket
+import subprocess
+import sys
 import time
 
 import pytest
@@ -20,6 +22,27 @@ from par6 import config as _cfg
 from par6.client import RobotClient
 
 pytestmark = [pytest.mark.e2e, requires_par6d]
+
+
+def test_short_sync_and_async_processes_exit_cleanly_with_status_in_flight(daemon):
+    endpoint = (
+        f"host='127.0.0.1', port={daemon.command_port}, "
+        f"status_transport='UNICAST', status_port={daemon.status_port}, "
+        "status_unicast_host='127.0.0.1'"
+    )
+    programs = (
+        f"from par6 import RobotClient\ndef main():\n    with RobotClient({endpoint}) as rbt:\n        assert rbt.wait_status(lambda s: s.seq > 0, timeout=3)\nmain()\n",
+        f"import asyncio\nfrom par6 import AsyncRobotClient\nasync def main():\n    async with AsyncRobotClient({endpoint}) as rbt:\n        assert await rbt.wait_status(lambda s: s.seq > 0, timeout=3)\nasyncio.run(main())\n",
+    )
+    for source in programs:
+        for _ in range(6):
+            result = subprocess.run(
+                [sys.executable, "-c", source],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
 
 
 def park_deg() -> list[float]:
@@ -137,6 +160,94 @@ def test_sync_facade_refuses_use_inside_a_running_loop():
 
 
 @pytest.mark.timeout(120)
+def test_skill_runs_nested_motion_on_the_existing_sync_connection(daemon):
+    from waldoctl.skills import observe_skills, skill
+
+    from par6.client import AsyncRobotClient
+
+    @skill(id="test.turn", version="1.0.0")
+    async def turn(rbt: AsyncRobotClient, degrees: float) -> list[float]:
+        angles = await rbt.angles()
+        assert angles is not None
+        angles[0] += degrees
+        index = await rbt.move_j(angles, speed=0.5)
+        assert index >= 0 and await rbt.wait_command(index, timeout=30.0)
+        observed = await rbt.angles()
+        assert observed is not None
+        return observed
+
+    @skill(id="test.round_trip", version="1.0.0")
+    async def round_trip(rbt: AsyncRobotClient) -> tuple[list[float], list[float]]:
+        outward = await turn.async_call(rbt, 5.0)
+        homeward = await turn.async_call(rbt, -5.0)
+        return outward, homeward
+
+    with sync_client(daemon) as client:
+        assert client.wait_ready(timeout=10.0)
+        park = park_deg()
+        settle_at(client, park)
+        events = []
+        with observe_skills(events.append):
+            outward, homeward = round_trip(client)
+        # Each move lands within the runtime's settle tolerance of a target
+        # taken from where the arm was, and the teleport within 0.5 deg.
+        tolerance = math.degrees(_cfg.config().motion()["settle_tolerance_rad"])
+        assert outward[0] == pytest.approx(park[0] + 5, abs=0.5 + tolerance)
+        assert homeward[0] == pytest.approx(outward[0] - 5, abs=tolerance)
+        assert [e.phase for e in events] == [
+            "started",
+            "started",
+            "completed",
+            "started",
+            "completed",
+            "completed",
+        ]
+        assert events[1].parent_id == events[0].invocation_id
+
+    async def cancel_motion() -> None:
+        from par6.protocol import ErrorCode
+
+        async with daemon.client() as client:
+            moving = asyncio.Event()
+
+            @skill(id="test.cancel", version="1.0.0")
+            async def sequence(rbt: AsyncRobotClient) -> None:
+                target = list(park)
+                target[0] += 20.0
+                index = await rbt.move_j(target, duration=5.0)
+                assert index >= 0
+                moving.set()
+                try:
+                    await rbt.wait_command(index, timeout=15.0)
+                except asyncio.CancelledError:
+                    await rbt.move_j(park, speed=0.5)
+                    pytest.fail("a cancelled skill issued another motion")
+
+            cancelled_events = []
+            with observe_skills(cancelled_events.append):
+                task = asyncio.create_task(sequence.async_call(client))
+                await asyncio.wait_for(moving.wait(), timeout=10.0)
+                assert await client.wait_status(
+                    lambda s: s.angles[0] > park[0] + 1.0, timeout=10.0
+                )
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            assert cancelled_events[-1].phase == "cancelled"
+            assert cancelled_events[-1].stop_confirmed is True
+            assert await client.wait_status(
+                lambda s: s.executing_index == -1 and s.queued_segments == 0,
+                timeout=3.0,
+            )
+            standing = await client.error()
+            assert standing is not None and standing.code == ErrorCode.MOTN_CANCELLED
+            # Cancellation belongs to the invocation, not the connection.
+            await turn.async_call(client, -2.0)
+
+    asyncio.run(cancel_motion())
+
+
+@pytest.mark.timeout(120)
 def test_cli_reads_a_live_runtime_and_reports_an_unreachable_one(daemon, capsys):
     """The console script is the shell view of the sync client.
 
@@ -226,3 +337,36 @@ def test_cli_scan_lists_every_node_id_with_the_configured_drives_present(
     assert present == [r["node"] for r in rows if r["configured"]]
     assert len(present) >= 6
     assert all(r["freshness"] == 1 for r in rows if r["configured"])
+
+
+@pytest.mark.timeout(120)
+def test_tcp_offset_refuses_to_answer_for_a_controller_that_did_not(daemon):
+    """An unreachable controller must raise, not answer ``[0, 0, 0]``.
+
+    Zero is a legitimate offset -- a tool deliberately cleared -- so a
+    caller handed it as a not-answered sentinel cannot tell "the offset is
+    zero" from "there is no controller". waldoctl's contract says so in as
+    many words, and a host that adopts the readback quietly erases the
+    offset the user just set.
+
+    The sibling queries answer ``None`` for the same condition and are
+    right to: no real rate or pose is ``None``. This one has no spare
+    value, so it raises.
+    """
+    with sync_client(daemon) as client:
+        assert client.wait_ready(timeout=10.0) is True
+        assert client.set_tcp_offset(0.0, 0.0, 0.0) is not None
+        # A real, deliberate zero reads back as a value, not as an error.
+        assert [float(v) for v in client.tcp_offset()] == [0.0, 0.0, 0.0]
+
+    # Nothing is listening on a port we know is free.
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        dead = int(probe.getsockname()[1])
+
+    mute = RobotClient(host="127.0.0.1", port=dead, timeout=0.2, retries=1)
+    try:
+        with pytest.raises(TimeoutError):
+            mute.tcp_offset()
+    finally:
+        mute.close()
