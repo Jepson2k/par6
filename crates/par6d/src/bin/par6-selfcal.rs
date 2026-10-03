@@ -1303,6 +1303,9 @@ struct Arm {
     captures_written: u32,
     blind: bool,
     stopping: bool,
+    /// A gain restore is on the drive's frames: the motion guard, which
+    /// restores gains itself, stands aside so it cannot recurse.
+    restoring: bool,
     tick: u64,
     dt: f64,
     deadline: Duration,
@@ -1390,6 +1393,7 @@ impl Arm {
             captures_written: 0,
             blind: false,
             stopping: false,
+            restoring: false,
             tick: 0,
             deadline: Duration::ZERO,
             simulated,
@@ -1504,7 +1508,7 @@ impl Arm {
             let node = &self.state.nodes[self.node(j)];
             let guarded = check
                 && !self.blind
-                && !self.stopping
+                && !self.restoring
                 && !self.homing
                 && self.homed[j]
                 // Gain trials have their own guard and bounded backoff path.
@@ -4123,6 +4127,7 @@ impl Arm {
     /// The cancellation flag stays set so calibration cannot resume afterward.
     fn gain_restore(&mut self, j: usize, gains: Gains) -> Result<()> {
         let stopping = std::mem::replace(&mut self.stopping, true);
+        let restoring = std::mem::replace(&mut self.restoring, true);
         // A trial that ended on a missed deadline would otherwise fail every
         // restore frame on that same deadline and leave its gains installed.
         if !self.simulated {
@@ -4130,6 +4135,7 @@ impl Arm {
         }
         let restored = self.gain_configure(j, gains);
         self.stopping = stopping;
+        self.restoring = restoring;
         restored
     }
 
@@ -5161,7 +5167,8 @@ impl Arm {
 
     // ------------------------------------------------------------ parking
 
-    /// Return every joint somewhere safe, then release.
+    /// Park every joint, then release: on the configured gains, with the
+    /// motion guard on, a failed park retried once.
     ///
     /// The shoulder and elbow go back to their homing endstops so releasing
     /// them lets them rest on the stops instead of dropping; everything else
@@ -5192,6 +5199,18 @@ impl Arm {
         for j in 0..N {
             if let Ok(p) = self.pos(j) {
                 self.hold[j] = p;
+            }
+        }
+        // Parking runs on the configured gains, whatever a stage left on a
+        // drive; the motion guard stays on, and a joint that runs away is
+        // held on them and parked again.
+        for j in 0..N {
+            let configured = self.bundle.robot.joints[j].gains;
+            if self.gains[j] != configured && self.gain_restore(j, configured).is_err() {
+                self.emit(Event::Phase(
+                    "configured gains not confirmed before parking",
+                    j,
+                ));
             }
         }
         // Back along the legs the run came by, each checked before it was
@@ -5236,7 +5255,15 @@ impl Arm {
             .collect();
         for j in order {
             self.only = Some(j);
-            let outcome = self.park_one(j);
+            let mut outcome = self.park_one(j);
+            if outcome.is_err() {
+                self.emit(Event::Phase(
+                    "parking failed; once more on its configured gains",
+                    j,
+                ));
+                let _ = self.gain_restore(j, self.bundle.robot.joints[j].gains);
+                outcome = self.park_one(j);
+            }
             self.only = None;
             if let Err(error) = outcome {
                 self.emit(Event::Phase("parking failed", j));
