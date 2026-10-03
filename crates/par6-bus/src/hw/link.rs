@@ -410,8 +410,118 @@ impl Drop for LinkMonitor {
     }
 }
 
+/// What the monitor carries from one sample to the next.
+#[derive(Debug, Default)]
+struct Sampler {
+    previous: LinkState,
+    counters: Option<xstats::CanDeviceStats>,
+    counters_missing_logged: bool,
+    /// The kernel's restart counter is lifetime-absolute; what the daemon
+    /// reports is relative to the first sample it took.
+    restart_base: Option<u32>,
+}
+
+impl Sampler {
+    /// Fold one sample into `shared`: the link state, and the device
+    /// counters when there was a query to make (`None` = no ifindex or no
+    /// socket). Returns whether the query failed and should be re-opened.
+    fn absorb(
+        &mut self,
+        iface: &str,
+        state: LinkState,
+        counters: Option<std::io::Result<Option<xstats::CanDeviceStats>>>,
+        shared: &Shared,
+    ) -> bool {
+        let mut failed = false;
+        let mut kernel_restarts = None;
+        match counters {
+            Some(Ok(Some(now))) => {
+                kernel_restarts = Some(now.restarts);
+                if let Some(prev) = self.counters {
+                    let d = xstats::counter_deltas(&prev, &now);
+                    if d.rebased {
+                        log::info!(
+                            "CAN interface '{iface}': counters re-based (interface re-created)"
+                        );
+                        self.restart_base = None;
+                    } else {
+                        // The kernel state is reported as it is. A
+                        // bus-off the auto-restart already recovered
+                        // from is carried as an event count for the
+                        // RT latch, so it neither masquerades as the
+                        // current state nor masks a real edge seen in
+                        // the same sample.
+                        if d.bus_off > 0 {
+                            log::error!(
+                                "CAN interface '{iface}': {} bus-off event(s) between samples",
+                                d.bus_off
+                            );
+                            shared
+                                .bus_off_events
+                                .fetch_add(d.bus_off, Ordering::Relaxed);
+                        }
+                        if d.error_passive > 0 && state == LinkState::Up {
+                            log::warn!(
+                                "CAN interface '{iface}': {} error-passive transition(s) \
+                                 between samples",
+                                d.error_passive
+                            );
+                        }
+                    }
+                }
+                self.counters = Some(now);
+            }
+            Some(Ok(None)) => {
+                if !self.counters_missing_logged {
+                    log::debug!(
+                        "CAN interface '{iface}': no device counters (vcan or old kernel); \
+                         state-only monitoring"
+                    );
+                    self.counters_missing_logged = true;
+                }
+                self.counters = None;
+            }
+            // A failed sample keeps the last good baseline, so an event
+            // inside the gap still shows in the next delta.
+            Some(Err(e)) => {
+                log::debug!("CAN link monitor '{iface}': xstats query failed ({e})");
+                failed = true;
+            }
+            None => {}
+        }
+        match kernel_restarts {
+            // The kernel's own auto-restart counter is authoritative,
+            // reported relative to the daemon's first sample.
+            Some(r) => {
+                let base = *self.restart_base.get_or_insert(r);
+                shared
+                    .restarts
+                    .store(r.saturating_sub(base), Ordering::Relaxed);
+            }
+            // Without counters a restart is counted where it is
+            // observable: the bus-off -> recovered edge the 100 ms
+            // auto-restart produces.
+            None => {
+                if self.previous == LinkState::BusOff && state != LinkState::BusOff {
+                    shared.restarts.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        if self.previous == LinkState::BusOff && state != LinkState::BusOff {
+            log::warn!("CAN interface '{iface}' recovered from bus-off");
+        } else if self.previous != LinkState::BusOff && state == LinkState::BusOff {
+            log::error!("CAN interface '{iface}' is BUS-OFF");
+        } else if self.previous != LinkState::ErrorPassive && state == LinkState::ErrorPassive {
+            log::warn!("CAN interface '{iface}' is error-passive");
+        }
+        self.previous = state;
+        shared.state.store(state_code(state), Ordering::Relaxed);
+        shared.samples.fetch_add(1, Ordering::Relaxed);
+        failed
+    }
+}
+
 fn sample_loop(iface: &str, nl: CanInterface, shared: &Shared, stop: &AtomicBool) {
-    let mut previous = LinkState::Unknown;
     // Cumulative-counter side channel: catches a bus-off that fires and
     // auto-recovers BETWEEN two state samples, which the state reads
     // straight through. Unavailable (vcan, old kernels) degrades to the
@@ -419,11 +529,7 @@ fn sample_loop(iface: &str, nl: CanInterface, shared: &Shared, stop: &AtomicBool
     let ifidx = xstats::ifindex(iface)
         .map_err(|e| log::debug!("CAN link monitor '{iface}': no ifindex ({e})"))
         .ok();
-    let mut counters: Option<xstats::CanDeviceStats> = None;
-    let mut counters_missing_logged = false;
-    // The kernel's restart counter is lifetime-absolute; what the daemon
-    // reports is relative to the first sample it took.
-    let mut restart_base: Option<u32> = None;
+    let mut sampler = Sampler::default();
     let mut query: Option<xstats::Query> = None;
     while !stop.load(Ordering::Relaxed) {
         let state = match nl.state() {
@@ -438,103 +544,95 @@ fn sample_loop(iface: &str, nl: CanInterface, shared: &Shared, stop: &AtomicBool
                 LinkState::Unknown
             }
         };
-        let mut kernel_restarts = None;
-        if let Some(idx) = ifidx {
+        let counters = ifidx.and_then(|idx| {
             if query.is_none() {
                 query = xstats::Query::open()
                     .map_err(|e| log::debug!("CAN link monitor '{iface}': netlink socket ({e})"))
                     .ok();
             }
-            match query.as_mut().map(|q| q.sample(idx)) {
-                Some(Ok(Some(now))) => {
-                    kernel_restarts = Some(now.restarts);
-                    if let Some(prev) = counters {
-                        let d = xstats::counter_deltas(&prev, &now);
-                        if d.rebased {
-                            log::info!(
-                                "CAN interface '{iface}': counters re-based (interface re-created)"
-                            );
-                            restart_base = None;
-                        } else {
-                            // The kernel state is reported as it is. A
-                            // bus-off the auto-restart already recovered
-                            // from is carried as an event count for the
-                            // RT latch, so it neither masquerades as the
-                            // current state nor masks a real edge seen in
-                            // the same sample.
-                            if d.bus_off > 0 {
-                                log::error!(
-                                    "CAN interface '{iface}': {} bus-off event(s) between samples",
-                                    d.bus_off
-                                );
-                                shared
-                                    .bus_off_events
-                                    .fetch_add(d.bus_off, Ordering::Relaxed);
-                            }
-                            if d.error_passive > 0 && state == LinkState::Up {
-                                log::warn!(
-                                    "CAN interface '{iface}': {} error-passive transition(s) \
-                                     between samples",
-                                    d.error_passive
-                                );
-                            }
-                        }
-                    }
-                    counters = Some(now);
-                }
-                Some(Ok(None)) => {
-                    if !counters_missing_logged {
-                        log::debug!(
-                            "CAN interface '{iface}': no device counters (vcan or old kernel); \
-                             state-only monitoring"
-                        );
-                        counters_missing_logged = true;
-                    }
-                    counters = None;
-                }
-                // A failed sample keeps the last good baseline, so an
-                // event inside the gap still shows in the next delta; the
-                // socket is re-opened for the next round.
-                Some(Err(e)) => {
-                    log::debug!("CAN link monitor '{iface}': xstats query failed ({e})");
-                    query = None;
-                }
-                None => {}
-            }
+            query.as_mut().map(|q| q.sample(idx))
+        });
+        // A failed query is re-opened for the next round.
+        if sampler.absorb(iface, state, counters, shared) {
+            query = None;
         }
-        match kernel_restarts {
-            // The kernel's own auto-restart counter is authoritative,
-            // reported relative to the daemon's first sample.
-            Some(r) => {
-                let base = *restart_base.get_or_insert(r);
-                shared
-                    .restarts
-                    .store(r.saturating_sub(base), Ordering::Relaxed);
-            }
-            // Without counters a restart is counted where it is
-            // observable: the bus-off -> recovered edge the 100 ms
-            // auto-restart produces.
-            None => {
-                if previous == LinkState::BusOff && state != LinkState::BusOff {
-                    shared.restarts.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        if previous == LinkState::BusOff && state != LinkState::BusOff {
-            log::warn!("CAN interface '{iface}' recovered from bus-off");
-        } else if previous != LinkState::BusOff && state == LinkState::BusOff {
-            log::error!("CAN interface '{iface}' is BUS-OFF");
-        } else if previous != LinkState::ErrorPassive && state == LinkState::ErrorPassive {
-            log::warn!("CAN interface '{iface}' is error-passive");
-        }
-        previous = state;
-        shared.state.store(state_code(state), Ordering::Relaxed);
-        shared.samples.fetch_add(1, Ordering::Relaxed);
 
         let mut waited = Duration::ZERO;
         while waited < SAMPLE_PERIOD && !stop.load(Ordering::Relaxed) {
             std::thread::sleep(STOP_POLL);
             waited += STOP_POLL;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xstats::CanDeviceStats;
+
+    fn published(shared: &Shared) -> (LinkState, u32, u32) {
+        (
+            state_from_code(shared.state.load(Ordering::Relaxed)),
+            shared.restarts.load(Ordering::Relaxed),
+            shared.bus_off_events.load(Ordering::Relaxed),
+        )
+    }
+
+    /// A bus-off that fires and auto-recovers between two samples reaches
+    /// the published health only through the device counters; restarts
+    /// are reported relative to the first sample, a failed query keeps
+    /// the baseline, and a re-created interface re-bases instead of
+    /// alarming.
+    #[test]
+    fn counter_samples_publish_bus_off_events_and_relative_restarts() {
+        let shared = Shared::default();
+        let mut s = Sampler::default();
+        let mut c = CanDeviceStats {
+            bus_error: 40,
+            restarts: 7,
+            ..CanDeviceStats::default()
+        };
+        let sample =
+            |s: &mut Sampler, state, c: Option<std::io::Result<Option<CanDeviceStats>>>| {
+                s.absorb("can0", state, c, &shared)
+            };
+        assert!(!sample(&mut s, LinkState::Up, Some(Ok(Some(c)))));
+        assert_eq!(published(&shared), (LinkState::Up, 0, 0));
+
+        c.bus_off += 2;
+        c.restarts += 2;
+        sample(&mut s, LinkState::Up, Some(Ok(Some(c))));
+        assert_eq!(published(&shared), (LinkState::Up, 2, 2));
+
+        assert!(
+            sample(
+                &mut s,
+                LinkState::Up,
+                Some(Err(std::io::Error::other("timeout")))
+            ),
+            "a failed query asks to be re-opened"
+        );
+        c.bus_off += 1;
+        sample(&mut s, LinkState::Up, Some(Ok(Some(c))));
+        assert_eq!(
+            published(&shared).2,
+            3,
+            "an event inside a failed sample still shows in the next delta"
+        );
+
+        // Down/up re-creates the counters: bus_error alone went backward,
+        // so the advanced bus_off is a new baseline, not an event.
+        let recreated = CanDeviceStats {
+            bus_error: 0,
+            bus_off: c.bus_off + 5,
+            ..c
+        };
+        sample(&mut s, LinkState::Up, Some(Ok(Some(recreated))));
+        assert_eq!(published(&shared), (LinkState::Up, 0, 3));
+
+        // Without counters, a restart is the bus-off -> recovered edge.
+        sample(&mut s, LinkState::BusOff, None);
+        sample(&mut s, LinkState::Up, None);
+        assert_eq!(published(&shared), (LinkState::Up, 1, 3));
     }
 }

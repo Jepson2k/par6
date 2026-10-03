@@ -188,4 +188,12 @@ impl DriverBus for RuntimeBus {
     fn link_health(&self) -> LinkHealth {
         dispatch!(self, link_health())
     }
+
+    fn recover_link(&mut self) -> bool {
+        dispatch!(self, recover_link())
+    }
+
+    fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>) {
+        dispatch!(self, fit_tool(robot, tool))
+    }
 }

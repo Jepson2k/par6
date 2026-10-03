@@ -14,7 +14,8 @@ use par6_bus::sim::SimBus;
 use par6_bus::spectral::JointConversion;
 use par6_bus::{DriverBus, GripperReply, JointCommand, LoopbackBus, NodeId, Reply, TxRecord};
 use par6_config::ConfigBundle;
-use par6_rt::hooks::{ClampStream, RampJog};
+use par6_rt::adapters::{MotionJog, MotionStream};
+use par6_rt::hooks::ClampStream;
 use par6_rt::{
     sample_ring, CompletionPolicy, GravityModel, Mode, NoFk, RtCommand, RtCore, RtHandles, RtHooks,
     SampleProducer, SharedDigitalIo, SharedFlashMarker, SharedIoLines, SharedLineGpio, SpecSettle,
@@ -193,8 +194,10 @@ impl Rig {
         let (producer, consumer) = sample_ring(4096);
         let hooks = RtHooks {
             gravity,
-            jog: Box::new(RampJog::new(robot)),
-            stream: stream.unwrap_or_else(|| Box::new(ClampStream::new(robot))),
+            jog: Box::new(MotionJog::from_config(robot).expect("jog engine")),
+            stream: stream.unwrap_or_else(|| {
+                Box::new(MotionStream::from_config(robot).expect("stream limiter"))
+            }),
             stream_shaped: Box::new(ClampStream::new(robot)),
             settle: Box::new(SpecSettle::new(policy, dt, robot.motion)),
             estop: Box::new(gpio),
@@ -403,5 +406,110 @@ impl Rig {
         }
         let s = self.snap();
         panic!("condition never held in {max} ticks; last snapshot: {s:?}");
+    }
+}
+
+/// The plant's own `G(q)` as the feedforward: what par6d's model is, to
+/// within `dynamics_conformance`'s tolerance, wherever the arm moves.
+pub struct PlantGravity(SimBus);
+
+impl PlantGravity {
+    pub fn new(bundle: &ConfigBundle) -> Self {
+        let mut bus = SimBus::new(scene(bundle));
+        bus.boot_configure(&bundle.robot, bundle.active_tool(), 1)
+            .expect("sim boot");
+        Self(bus)
+    }
+}
+
+impl GravityModel for PlantGravity {
+    fn gravity(&mut self, q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
+        let tau = self.0.gravity_at(q).expect("plant gravity");
+        for (o, t) in out.iter_mut().zip(tau) {
+            *o = t;
+        }
+    }
+
+    /// The plant carries no declared payload, so neither does its model.
+    fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
+}
+
+/// An RT core on the simulator with the hooks par6d installs, its command
+/// channel, its ESTOP_1 line and the EXEC ring's producer.
+pub struct SimCore {
+    pub core: RtCore<SimBus>,
+    pub handles: RtHandles,
+    pub cmds: mpsc::Sender<RtCommand>,
+    pub estop_line: Arc<AtomicBool>,
+    pub producer: SampleProducer,
+    pub dt: f64,
+}
+
+impl SimCore {
+    pub fn new(bundle: &ConfigBundle, gravity: Box<dyn GravityModel>) -> Self {
+        let robot = &bundle.robot;
+        let dt = robot.robot.tick_dt_s;
+        let (cmds, rx) = mpsc::channel();
+        let (gpio, estop_line) = SharedLineGpio::new(true);
+        let (marker, _flash) = SharedFlashMarker::new();
+        let (io, _io_lines) = SharedDigitalIo::new(robot.io.inputs.len(), robot.io.outputs.len());
+        let (producer, consumer) = sample_ring(256);
+        let hooks = RtHooks {
+            gravity,
+            jog: Box::new(MotionJog::from_config(robot).expect("jog engine")),
+            stream: Box::new(MotionStream::from_config(robot).expect("stream limiter")),
+            stream_shaped: Box::new(ClampStream::new(robot)),
+            settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
+            estop: Box::new(gpio),
+            io: Box::new(io),
+            flash: Box::new(marker),
+            commands: Box::new(rx),
+            fk: Box::new(NoFk),
+            samples: consumer,
+        };
+        let (core, handles) =
+            RtCore::new(bundle, SimBus::new(scene(bundle)), hooks).expect("sim core");
+        Self {
+            core,
+            handles,
+            cmds,
+            estop_line,
+            producer,
+            dt,
+        }
+    }
+
+    pub fn tick(&mut self) -> StateSnapshot {
+        let dt = self.dt;
+        self.core.tick(dt, false);
+        self.handles.snapshots.latest()
+    }
+
+    pub fn cmd(&mut self, cmd: RtCommand) -> StateSnapshot {
+        self.cmds.send(cmd).expect("command channel");
+        self.tick()
+    }
+
+    /// Booted, enabled and referenced at `q` \[rad\]: the plant placed
+    /// there and the core's homing adopting it, as a teleport does.
+    pub fn landed_at(bundle: &ConfigBundle, q: &[f64; MAX_JOINTS]) -> Self {
+        let mut sim = Self::new(bundle, Box::new(PlantGravity::new(bundle)));
+        let mut s = sim.tick();
+        for _ in 0..100 {
+            if s.mode == Mode::Idle {
+                break;
+            }
+            s = sim.tick();
+        }
+        assert_eq!(s.mode, Mode::Idle, "the sim core boots to IDLE");
+        sim.cmd(RtCommand::Enable);
+        sim.core
+            .bus_mut()
+            .teleport_joint_rad(&q[..bundle.robot.joints.len()])
+            .expect("sim re-seed");
+        sim.core.adopt_landed_pose(&bundle.robot, q);
+        let s = sim.tick();
+        assert!(s.homed, "a landed core is referenced");
+        sim
     }
 }

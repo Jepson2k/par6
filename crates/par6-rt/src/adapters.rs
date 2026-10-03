@@ -1,8 +1,9 @@
 //! The real `par6-motion` engines behind the `par6-rt` per-tick hook
 //! traits — thin lifecycle mappings, no behavior of their own.
 
-use par6_motion::{JogDirection, MotionLimits, StreamStep, StreamingExecutor};
-use par6_rt::{JogEngine as RtJogEngine, StreamTracker, MAX_JOINTS};
+use crate::{JogEngine as RtJogEngine, StreamTracker, MAX_JOINTS};
+use par6_config::{LimitMode, RobotConfig};
+use par6_motion::{JogDirection, MotionError, MotionLimits, StreamStep, StreamingExecutor};
 
 /// `par6_motion::JogEngine` (jerk-aware lookahead, direction-block
 /// latching) behind the RT jog hook.
@@ -20,6 +21,14 @@ impl MotionJog {
             engine,
             base_accel_time_s,
         }
+    }
+
+    /// The jog the robot's `[jog]` config describes.
+    pub fn from_config(robot: &RobotConfig) -> Result<Self, MotionError> {
+        Ok(Self::new(
+            par6_motion::JogEngine::new(robot)?,
+            robot.jog.accel_time_s,
+        ))
     }
 }
 
@@ -130,6 +139,18 @@ impl MotionStream {
             scale_refused: false,
             finished: false,
         }
+    }
+
+    /// The stream limiter at the robot's tick under its STREAM limits.
+    pub fn from_config(robot: &RobotConfig) -> Result<Self, MotionError> {
+        let dt = robot.robot.tick_dt_s;
+        let limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
+        Ok(Self::new(
+            StreamingExecutor::new(dt, &limits)?,
+            dt,
+            limits,
+            robot.stream.fault_latch_s,
+        ))
     }
 
     fn clamp(&self, q: &mut [f64; MAX_JOINTS]) {
@@ -456,6 +477,3 @@ mod tests {
         );
     }
 }
-
-#[cfg(test)]
-mod braking_tests;

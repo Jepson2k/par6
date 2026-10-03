@@ -41,6 +41,7 @@
 //! - [`state`]: [`StateSnapshot`] and its component types (modes, error
 //!   latch list, homing/exec/jog/stream status, loop stats).
 
+pub mod adapters;
 pub mod core;
 pub mod dispatch;
 pub mod drift_lock;

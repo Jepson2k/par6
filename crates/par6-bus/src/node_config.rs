@@ -82,15 +82,12 @@ impl NodeConfig {
     /// The frames beyond the vendor's configuration this drive is set up with
     /// (par6 firmware): its ripple slots and its speed filter window, none
     /// for a drive configured like the vendor's.
-    pub(crate) fn extra_frames(&self) -> Vec<CanFrame> {
-        let mut frames = Vec::new();
-        if self.has_ripple() {
-            frames.extend(self.ripple_frames());
-        }
-        if let Some(w) = self.velocity_window {
-            frames.push(encode_velocity_window(self.node, w));
-        }
-        frames
+    pub(crate) fn extra_frames(&self) -> impl Iterator<Item = CanFrame> + '_ {
+        let ripple = self.has_ripple().then(|| self.ripple_frames());
+        let window = self
+            .velocity_window
+            .map(|w| encode_velocity_window(self.node, w));
+        ripple.into_iter().flatten().chain(window)
     }
 
     /// Whether this drive carries ripple feedforward; one without sends no

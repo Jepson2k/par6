@@ -34,7 +34,8 @@ use std::sync::{mpsc, Arc};
 
 use par6_bus::sim::SimBus;
 use par6_config::HomingStrategy;
-use par6_rt::hooks::{ClampStream, RampJog};
+use par6_rt::adapters::{MotionJog, MotionStream};
+use par6_rt::hooks::ClampStream;
 use par6_rt::{
     sample_ring, CompletionPolicy, Mode, NoFk, RtCommand, RtCore, RtHandles, RtHooks,
     SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity, MAX_JOINTS,
@@ -63,8 +64,8 @@ fn boot_core(
     let (_producer, consumer) = sample_ring(64);
     let hooks = RtHooks {
         gravity: Box::new(ZeroGravity),
-        jog: Box::new(RampJog::new(robot)),
-        stream: Box::new(ClampStream::new(robot)),
+        jog: Box::new(MotionJog::from_config(robot).expect("jog engine")),
+        stream: Box::new(MotionStream::from_config(robot).expect("stream limiter")),
         stream_shaped: Box::new(ClampStream::new(robot)),
         settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
         estop: Box::new(gpio),

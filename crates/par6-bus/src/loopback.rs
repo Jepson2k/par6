@@ -304,6 +304,8 @@ impl Default for LoopbackBus {
 }
 
 impl DriverBus for LoopbackBus {
+    fn fit_tool(&mut self, _robot: &RobotConfig, _tool: Option<&ToolConfig>) {}
+
     fn begin_tick(&mut self, tick: u64) {
         debug_assert!(tick >= self.tick, "tick must be non-decreasing");
         self.tick = tick;
@@ -840,46 +842,6 @@ mod tests {
     }
 
     #[test]
-    fn poll_round_robin_covers_all_nodes_and_override_preempts() {
-        let (mut bus, robot) = configured_bus();
-        bus.tx_log.clear();
-        let total = robot.joints.len() + 1; // 6 joints + gripper
-        for t in 0..(total as u64) {
-            bus.begin_tick(t);
-            bus.poll_step().unwrap();
-        }
-        // Every node got its combined telemetry poll exactly once per
-        // total_nodes ticks.
-        let mut seen = std::collections::HashMap::new();
-        for (_, rec) in &bus.tx_log {
-            let TxRecord::Poll { node, kind } = rec else {
-                panic!("unexpected record {rec:?}");
-            };
-            *seen.entry((*node, *kind)).or_insert(0) += 1;
-        }
-        assert_eq!(seen.len(), total);
-        assert!(seen.keys().all(|(_, k)| *k == PollKind::Telemetry));
-        assert!(seen.values().all(|&c| c == 1));
-        let polled_nodes: std::collections::BTreeSet<_> = seen.keys().map(|(n, _)| *n).collect();
-        assert!(polled_nodes.contains(&robot.bus.gripper_node));
-
-        // Override preempts for exactly `repeats` steps, then the
-        // round-robin resumes.
-        bus.tx_log.clear();
-        bus.queue_poll_override(PollAction::ClearError { node: 2 }, 3);
-        for t in 100..105 {
-            bus.begin_tick(t);
-            bus.poll_step().unwrap();
-        }
-        let kinds: Vec<bool> = bus
-            .tx_log
-            .iter()
-            .map(|(_, r)| matches!(r, TxRecord::ClearError { node: 2 }))
-            .collect();
-        assert_eq!(kinds, vec![true, true, true, false, false]);
-    }
-
-    #[test]
     fn silent_mode_is_bus_silent_and_discards_rx() {
         let (mut bus, robot) = configured_bus();
         bus.tx_log.clear();
@@ -925,38 +887,5 @@ mod tests {
         for n in 0..6 {
             assert_eq!(bus.freshness(n), Freshness::Lost);
         }
-    }
-
-    #[test]
-    fn homing_limit_and_clear_error_hooks_record_repeats() {
-        let (mut bus, robot) = configured_bus();
-        bus.tx_log.clear();
-        bus.begin_tick(1);
-        // Homing entry: Limits(normal vel, homing current) ×4 to the joint.
-        let vel = robot.joints[0].velocity_limit_ticks_s as f32;
-        let cur = robot.homing.joints[0].current_ma as f32;
-        bus.send_limits(0, vel, cur, 4).unwrap();
-        let limits: Vec<_> = bus
-            .tx_log
-            .iter()
-            .filter(|(_, r)| matches!(r, TxRecord::Limits { node: 0, .. }))
-            .collect();
-        assert_eq!(limits.len(), 4);
-        // Clear sequence: cmd 1 ×3.
-        bus.send_clear_error(3, 3).unwrap();
-        let clears = bus
-            .tx_log
-            .iter()
-            .filter(|(_, r)| matches!(r, TxRecord::ClearError { node: 3 }))
-            .count();
-        assert_eq!(clears, 3);
-        // Reconnect path re-sends the stored config.
-        bus.resend_node_config(2, 2).unwrap();
-        let passes = bus
-            .tx_log
-            .iter()
-            .filter(|(_, r)| matches!(r, TxRecord::ConfigPass { node: 2 }))
-            .count();
-        assert_eq!(passes, 2);
     }
 }

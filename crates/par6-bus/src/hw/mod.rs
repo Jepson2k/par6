@@ -587,6 +587,8 @@ fn apply_payload(decoded: &DecodedFrame, state: &mut BusState) {
 }
 
 impl DriverBus for SocketCanBus {
+    fn fit_tool(&mut self, _robot: &RobotConfig, _tool: Option<&ToolConfig>) {}
+
     fn begin_tick(&mut self, tick: u64) {
         debug_assert!(tick >= self.tick, "tick must be non-decreasing");
         self.tick = tick;

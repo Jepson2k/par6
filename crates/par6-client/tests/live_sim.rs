@@ -64,7 +64,9 @@ where
         client.close();
     });
     drop(rt);
-    daemon.shutdown();
+    daemon
+        .shutdown()
+        .expect("the daemon's threads exit cleanly");
 }
 
 /// A fresh daemon for `tag`, and one session against it.
@@ -978,7 +980,9 @@ fn a_restart_mid_wait_is_reported_as_the_session_changing() {
             let client = client.clone();
             rt.spawn(async move { client.wait_command(index, BUDGET).await })
         };
-        daemon.shutdown();
+        daemon
+            .shutdown()
+            .expect("the daemon's threads exit cleanly");
         let mut opts =
             common::sim_options(common::retimed_config("client-restart", 0.02), status_port);
         opts.command_port = Some(command_port);
@@ -990,7 +994,9 @@ fn a_restart_mid_wait_is_reported_as_the_session_changing() {
     }
     client.close();
     drop(rt);
-    daemon.shutdown();
+    daemon
+        .shutdown()
+        .expect("the daemon's threads exit cleanly");
 }
 
 /// A `servo_l` stream that goes silent brakes the tool ALONG its line and

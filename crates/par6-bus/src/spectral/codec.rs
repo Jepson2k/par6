@@ -348,13 +348,6 @@ pub enum EncodeError {
     /// too, silently; we refuse loudly).
     #[error("cmd 2 has no wire form for position without velocity")]
     PositionWithoutVelocity,
-    /// RTR polls exist only for the telemetry/reply commands
-    /// (10/23/24/25/26/27/28/33).
-    #[error("cmd {cmd} is not pollable via RTR")]
-    NotPollable {
-        /// The refused command.
-        cmd: u8,
-    },
 }
 
 /// Encode one joint motion frame per `command.pack`.
@@ -742,17 +735,6 @@ pub fn poll_command(kind: PollKind) -> CommandId {
 /// Encode the RTR telemetry poll for a [`PollKind`].
 pub fn encode_poll(node: NodeId, kind: PollKind) -> CanFrame {
     CanFrame::rtr_frame(pack_can_id(node, poll_command(kind), false))
-}
-
-/// Encode an RTR poll for any pollable command
-/// (10/23/24/25/26/27/28/33/37 — [`PollKind`] plus Iq data).
-pub fn encode_rtr_poll(node: NodeId, cmd: CommandId) -> Result<CanFrame, EncodeError> {
-    use CommandId::*;
-    match cmd {
-        Ping | Temperature | Voltage | DeviceInfo | StateOfErrors | IqData | EncoderData
-        | RespondKt | Telemetry => Ok(CanFrame::rtr_frame(pack_can_id(node, cmd, false))),
-        other => Err(EncodeError::NotPollable { cmd: other.raw() }),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1429,33 +1411,6 @@ mod tests {
             .unwrap();
         assert_eq!(unpack_can_id(m.id), (6, 2, false));
         assert_eq!(m.dlc, 5);
-    }
-
-    #[test]
-    fn rtr_poll_whitelist_refuses_non_telemetry_commands() {
-        for cmd in [
-            CommandId::Ping,
-            CommandId::Temperature,
-            CommandId::Voltage,
-            CommandId::DeviceInfo,
-            CommandId::StateOfErrors,
-            CommandId::IqData,
-            CommandId::EncoderData,
-            CommandId::RespondKt,
-            CommandId::Telemetry,
-        ] {
-            let f = encode_rtr_poll(3, cmd).unwrap();
-            assert!(f.rtr);
-            assert_eq!(f.dlc, 0);
-        }
-        assert_eq!(
-            encode_rtr_poll(3, CommandId::DataPack1),
-            Err(EncodeError::NotPollable { cmd: 2 })
-        );
-        assert_eq!(
-            encode_rtr_poll(3, CommandId::Reset),
-            Err(EncodeError::NotPollable { cmd: 14 })
-        );
     }
 
     #[test]

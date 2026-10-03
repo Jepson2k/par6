@@ -16,8 +16,6 @@
 //!   (move_j planning → sample ring → EXEC completion via the snapshot).
 //! - [`bridge`] adapts immediate effects behind `RtCommands` (streams,
 //!   e-stop latch, teleport re-seeding of the sim, backend switches).
-//! - [`adapters`] puts the real `par6-motion` jog/stream engines behind
-//!   the `par6-rt` per-tick hook traits.
 //! - [`daemon`] owns thread spawn/wiring and clean shutdown;
 //!   [`options`] the CLI/env surface.
 //!
@@ -26,7 +24,8 @@
 
 #![warn(missing_docs)]
 
-mod adapters;
+#[cfg(test)]
+mod braking_tests;
 mod bridge;
 pub mod calibrate;
 pub mod collision_world;

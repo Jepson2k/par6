@@ -238,13 +238,35 @@ impl CartSampling {
 /// `max_points`, leaving every piece at least one interval.
 fn fit_budget(counts: &mut [usize], max_points: usize) {
     let total: usize = counts.iter().sum();
-    let budget = max_points.max(counts.len() + 1);
-    if total < budget {
+    let allowed = max_points.max(counts.len() + 1) - 1;
+    if total <= allowed {
         return;
     }
-    let factor = (budget - 1) as f64 / total as f64;
-    for c in counts.iter_mut() {
-        *c = ((*c as f64 * factor).round() as usize).max(1);
+    let factor = allowed as f64 / total as f64;
+    let exact: Vec<f64> = counts.iter().map(|&c| c as f64 * factor).collect();
+    for (c, x) in counts.iter_mut().zip(&exact) {
+        *c = (x.floor() as usize).max(1);
+    }
+    // The one-interval floor can still overshoot; the longest pieces give
+    // it back. Then the floors' leftovers go where rounding cut deepest.
+    let mut sum: usize = counts.iter().sum();
+    while sum > allowed {
+        let i = (0..counts.len())
+            .max_by_key(|&i| counts[i])
+            .expect("pieces");
+        counts[i] -= 1;
+        sum -= 1;
+    }
+    while sum < allowed {
+        let short = |i: usize| exact[i] - counts[i] as f64;
+        let i = (0..counts.len())
+            .max_by(|&a, &b| short(a).total_cmp(&short(b)))
+            .expect("pieces");
+        if short(i) <= 0.0 {
+            break;
+        }
+        counts[i] += 1;
+        sum += 1;
     }
 }
 
@@ -678,8 +700,8 @@ pub struct Trim {
 /// waypoint (`seg_lengths.len() - 1` of them). The ABB zone rule, ported
 /// from parol6 (`motion/geometry.py`,
 /// `build_composite_cartesian_path`): a radius never eats more than half
-/// of either adjacent segment, and two zones sharing a segment are
-/// scaled down together until they fit inside it.
+/// of either adjacent segment, so two zones sharing a segment meet at
+/// most in its middle.
 ///
 /// Returns the per-segment trims and the clamped radii.
 pub fn corner_trims(
@@ -697,7 +719,7 @@ pub fn corner_trims(
             ),
         });
     }
-    let mut clamped: Vec<f64> = radii
+    let clamped: Vec<f64> = radii
         .iter()
         .enumerate()
         .map(|(i, r)| {
@@ -706,15 +728,6 @@ pub fn corner_trims(
                 .min(seg_lengths[i + 1] / 2.0)
         })
         .collect();
-    for i in 0..clamped.len().saturating_sub(1) {
-        let total = clamped[i] + clamped[i + 1];
-        let len = seg_lengths[i + 1];
-        if total > len && total > 0.0 {
-            let factor = len / total;
-            clamped[i] *= factor;
-            clamped[i + 1] *= factor;
-        }
-    }
     let mut trims = vec![Trim::default(); seg_lengths.len()];
     for (i, r) in clamped.iter().enumerate() {
         if *r <= 0.0 {
@@ -1457,21 +1470,47 @@ mod tests {
 
     #[test]
     fn the_sample_budget_bounds_a_long_path() {
-        let wps: Vec<Pose> = (0..50)
-            .map(|i| pose(0.01 * i as f64, 0.35, 0.25, 0.0, 0.0, 0.0))
-            .collect();
+        // A power-of-two pitch keeps every leg exactly three pitches long.
+        let pitch = 1.0 / 1024.0;
         let s = CartSampling {
-            step_m: 0.0001,
+            step_m: pitch,
             rotation: RotationPitch::Independent(0.05),
-            max_points: 300,
+            max_points: 280,
         };
-        let radii = vec![0.002; wps.len() - 2];
-        let path = blended_polyline(&wps, &radii, s).expect("path");
-        assert!(
-            path.len() <= 300 && path.len() > 50,
-            "budgeted path has {} points",
-            path.len()
-        );
+        // A hundred three-pitch legs ask for 301 points; scaling each down
+        // by 279/300 and rounding would give every leg its 3 back.
+        let straight: Vec<Pose> = (0..=100)
+            .map(|i| pose(3.0 * pitch * i as f64, 0.35, 0.25, 0.0, 0.0, 0.0))
+            .collect();
+        // Uneven pieces: one long leg among short ones, corners rounded.
+        let uneven: Vec<Pose> = [0.0, 0.002, 0.004, 0.40, 0.402, 0.404]
+            .iter()
+            .enumerate()
+            .map(|(i, x)| pose(*x, 0.35 + 0.001 * (i % 2) as f64, 0.25, 0.0, 0.0, 0.0))
+            .collect();
+        for (wps, radii) in [
+            (&straight, vec![0.0; straight.len() - 2]),
+            (&uneven, vec![0.0005; uneven.len() - 2]),
+        ] {
+            let path = blended_polyline(wps, &radii, s).expect("path");
+            assert!(
+                path.len() <= s.max_points,
+                "a {}-point budget gave {} points",
+                s.max_points,
+                path.len()
+            );
+            assert_eq!(path.first(), wps.first(), "the path starts at its start");
+            assert_eq!(path.last(), wps.last(), "the path ends at its end");
+        }
+        let path = blended_polyline(&straight, &vec![0.0; straight.len() - 2], s).expect("path");
+        for w in &straight {
+            assert!(
+                path.iter()
+                    .any(|p| [3, 7, 11].iter().all(|&k| (p[k] - w[k]).abs() < 1e-12)),
+                "the sharp corner at x = {} stays on the path",
+                w[3]
+            );
+        }
     }
 
     /// `exp` and `log` must invert each other across the range the

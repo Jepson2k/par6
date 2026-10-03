@@ -125,6 +125,9 @@ pub struct SimBus {
     /// Test hook: the bus swallows every reply, as a controller that
     /// came up error-passive does, until `recover_link` cycles it.
     deaf: bool,
+    /// Test hook: a cycle does not bring the link back (the drives are
+    /// unpowered or the cable is cut).
+    stays_deaf: bool,
     tx_failure_after: Option<usize>,
     tx_frames_this_tick: usize,
     peak_tx_frames_per_tick: usize,
@@ -197,6 +200,7 @@ impl SimBus {
             dt: 0.004,
             silent: false,
             deaf: false,
+            stays_deaf: false,
             tx_failure_after: None,
             tx_frames_this_tick: 0,
             peak_tx_frames_per_tick: 0,
@@ -666,7 +670,6 @@ impl SimBus {
             .plant
             .as_mut()
             .expect("the plant exists once boot_configure ran");
-        let probe_t = std::time::Instant::now();
         plant.step(
             dt,
             &mut self.drivers,
@@ -678,10 +681,6 @@ impl SimBus {
                 supply_scale: self.scenario.supply_scale(self.tick),
             },
         );
-        let probe_ms = probe_t.elapsed().as_secs_f64() * 1e3;
-        if probe_ms > 15.0 {
-            eprintln!("PROBE slow plant step {probe_ms:.1} ms");
-        }
         // The scene owns the object positions unless a test declared them:
         // whatever physically jammed the jaws becomes the front end's
         // obstruction.
@@ -1139,7 +1138,34 @@ impl SimBus {
     }
 }
 
+/// The tool's mass as the plant carries it, from the same kinematics the
+/// controller's gravity model reads.
+fn tool_inertial(g: &ToolConfig) -> scene::ToolInertial {
+    scene::ToolInertial {
+        d_m: g.kinematics.d_m,
+        a_m: g.kinematics.a_m,
+        alpha_rad: g.kinematics.alpha_rad,
+        mass_kg: g.kinematics.mass_kg,
+        com_m: g.kinematics.com_m,
+        inertia_kg_m2: g.kinematics.inertia_kg_m2,
+    }
+}
+
 impl DriverBus for SimBus {
+    /// The plant takes the new tool's geometry and mass. The CAN nodes
+    /// stay the ones the bus was configured with, as the runtime's own
+    /// bookkeeping does.
+    fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>) {
+        let q = self.true_joint_rad();
+        self.scene.tool = tool
+            .and_then(|g| g.urdf_variant.as_deref())
+            .and_then(scene::Tool::from_urdf_variant)
+            .unwrap_or(scene::Tool::Flange);
+        self.tool = tool.map(tool_inertial);
+        self.plant = Some(self.make_plant(robot, &q));
+        self.mj_jaw_cmd = None;
+    }
+
     fn begin_tick(&mut self, tick: u64) {
         debug_assert!(tick >= self.tick, "tick must be non-decreasing");
         if self.configured {
@@ -1418,14 +1444,7 @@ impl DriverBus for SimBus {
             })
             .collect();
 
-        self.tool = gripper.map(|g| scene::ToolInertial {
-            d_m: g.kinematics.d_m,
-            a_m: g.kinematics.a_m,
-            alpha_rad: g.kinematics.alpha_rad,
-            mass_kg: g.kinematics.mass_kg,
-            com_m: g.kinematics.com_m,
-            inertia_kg_m2: g.kinematics.inertia_kg_m2,
-        });
+        self.tool = gripper.map(tool_inertial);
         self.gravity_correction
             .clone_from(&robot.gravity_correction);
         self.plant = Some(self.make_plant(robot, &q0));
@@ -1651,8 +1670,11 @@ impl DriverBus for SimBus {
     }
 
     fn recover_link(&mut self) -> bool {
-        self.deaf = false;
         self.health.restarts += 1;
+        if self.stays_deaf {
+            return true;
+        }
+        self.deaf = false;
         self.health.state = LinkState::Up;
         // The drives answer again the moment the link is back.
         self.connected = self
@@ -1664,12 +1686,19 @@ impl DriverBus for SimBus {
 }
 
 impl SimBus {
+    /// Test hook: a deaf link that cycling does not revive.
+    pub fn set_dead(&mut self) {
+        self.set_deaf(true);
+        self.stays_deaf = true;
+    }
+
     /// Test hook: make the link deaf (every reply is dropped undecoded,
     /// the way an error-passive controller hears nobody) until the
     /// runtime cycles it through `recover_link`. The link reports
     /// error-passive while deaf.
     pub fn set_deaf(&mut self, deaf: bool) {
         self.deaf = deaf;
+        self.stays_deaf = false;
         self.health.state = if deaf {
             LinkState::ErrorPassive
         } else {

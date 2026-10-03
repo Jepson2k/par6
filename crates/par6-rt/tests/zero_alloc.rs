@@ -9,7 +9,8 @@ use std::sync::mpsc;
 
 use par6_bus::sim::scene::{Scene, Tool};
 use par6_bus::sim::SimBus;
-use par6_rt::hooks::{ClampStream, RampJog};
+use par6_rt::adapters::{MotionJog, MotionStream};
+use par6_rt::hooks::ClampStream;
 use par6_rt::{
     sample_ring, CompletionPolicy, Mode, NoFk, RtCommand, RtCore, RtHooks, Sample, SampleMeta,
     SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity, MAX_JOINTS,
@@ -54,11 +55,21 @@ fn assert_no_allocs<F: FnMut()>(mut window: F, ctx: &str) {
 
 #[test]
 fn steady_state_ticks_allocate_nothing() {
-    let bundle = {
+    let mut bundle = {
         let path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
         par6_config::ConfigBundle::load(&path).expect("PAR6 config bundle")
     };
+    // Every config re-send also carries the par6-firmware frames a
+    // self-calibrated drive is configured with.
+    for j in &mut bundle.robot.joints {
+        j.ripple = vec![par6_config::RippleHarmonic {
+            harmonic: 2,
+            a_ma: 40,
+            b_ma: -25,
+        }];
+        j.velocity_window = Some(16);
+    }
     let robot = &bundle.robot;
     let dt = robot.robot.tick_dt_s;
     let (tx, rx) = mpsc::channel();
@@ -68,8 +79,8 @@ fn steady_state_ticks_allocate_nothing() {
     let (mut producer, consumer) = sample_ring(4096);
     let hooks = RtHooks {
         gravity: Box::new(ZeroGravity),
-        jog: Box::new(RampJog::new(robot)),
-        stream: Box::new(ClampStream::new(robot)),
+        jog: Box::new(MotionJog::from_config(robot).expect("jog engine")),
+        stream: Box::new(MotionStream::from_config(robot).expect("stream limiter")),
         stream_shaped: Box::new(ClampStream::new(robot)),
         settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
         estop: Box::new(gpio),

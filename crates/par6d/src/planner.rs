@@ -796,7 +796,6 @@ impl Par6Planner {
                     meta: SampleMeta {
                         command_index: ring_index,
                         checkpoint_id: ring_index,
-                        blend_continues: false,
                         is_last: k + 1 == n,
                     },
                 };
@@ -936,7 +935,6 @@ impl Par6Planner {
                     profile: kind,
                     speed_fraction: speed.unwrap_or(1.0),
                     min_duration_s: duration,
-                    blend_with_next: false,
                     checkpoint_id: None,
                 },
             )

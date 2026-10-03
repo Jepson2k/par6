@@ -2446,15 +2446,16 @@ fn to_deg(rad: [f64; NUM_JOINTS]) -> [f64; NUM_JOINTS] {
     rad.map(f64::to_degrees)
 }
 
-/// A posture whose pose the seeded solve reaches only by turning: from
-/// the park pose, DLS converges on a configuration with J4 and J6 each
-/// a full revolution out (`+2π`) — the same arm and numbers the
-/// soft-limit check rejects verbatim. Chosen near the park pose so the
-/// executed move is short and the sim's tracking lag stays far inside
-/// the landing tolerance.
+/// A posture clear of the wrist singularity, with J6 near the top of
+/// its window.
 const TURNED_POSTURE_RAD: [f64; NUM_JOINTS] = [
     0.585_609, -1.010_888, 3.205_22, -0.031_356, -0.093_302, 3.045_917,
 ];
+
+/// J6 where the move to [`TURNED_POSTURE_RAD`] starts: more than π below
+/// the target, so the solution nearest this seed is the target's `-2π`
+/// alias — below J6's window, while the target itself is inside it.
+const SEED_J6_RAD: f64 = -0.5;
 
 /// J5 held past its SOFT window (1.9 rad) but inside its hard one: a
 /// posture the arm can be teleported into and whose pose no turn of any
@@ -2464,17 +2465,12 @@ const BEYOND_SOFT_J5_RAD: f64 = 1.9;
 /// A converged IK solution is judged as a configuration, not as a turn
 /// count.
 ///
-/// Damped least squares integrates joint increments without bound, so a
-/// solve routinely lands on `q + 2πk`: the same arm posture, carried by
-/// a number the soft-limit check refuses verbatim — measured on this
-/// rig as `move target for joint 3 (5.366112773926797 rad) is outside
-/// soft limits [-2.6147335, 2.5547335]`, for a solution 0.917 rad
-/// inside that window.
-///
-/// Both halves are the fix: the turned solution has to run and land on
-/// the commanded pose, and a target that is out of range at every turn
-/// count has to stay refused — wrapping is branch selection, never a
-/// way past the limits.
+/// The closed-form solve returns each joint on the branch nearest its
+/// seed, and for a joint whose window is wider than π that branch can
+/// sit outside the window while a turn of it sits inside. That turned
+/// solution has to run and land on the commanded pose, and a target
+/// that is out of range at every turn count has to stay refused —
+/// wrapping is branch selection, never a way past the limits.
 #[test]
 fn ik_solutions_are_wrapped_into_their_soft_window() {
     let rig = boot_tagged("ikwrap");
@@ -2494,9 +2490,9 @@ fn ik_solutions_are_wrapped_into_their_soft_window() {
     });
     let target = wire_pose_at(&at_posture.pose, tcp_mm(&at_posture));
 
-    // Commanded from the park pose, the seeded solve turns J1 and J4 a
-    // revolution past their windows to reach it.
-    enable_and_teleport(&rig, &mut c, park);
+    let mut seed_deg = turned_deg;
+    seed_deg[5] = SEED_J6_RAD.to_degrees();
+    enable_and_teleport(&rig, &mut c, seed_deg);
     let i = c.ok_index(&move_j_pose(9101, target, 8.0));
     let (ok, detail) = c.wait_complete(i);
     assert!(
@@ -2521,6 +2517,12 @@ fn ik_solutions_are_wrapped_into_their_soft_window() {
             soft[j]
         );
     }
+    assert!(
+        (settled.angles[5] - turned_deg[5]).abs() < 1.0,
+        "J6 turned onto the in-window branch: {} deg, wanted {}",
+        settled.angles[5],
+        turned_deg[5]
+    );
 
     // Out of range at every turn count: J5 beyond its soft window, which
     // the wrist flip mirrors to the far side of the same window.
@@ -2892,94 +2894,6 @@ fn a_held_servo_target_settles() {
          (settle tolerance {tol_deg:.3} deg)",
         tail[tail.len() - 1] - target[0]
     );
-}
-
-/// Manual system-identification experiment through the public retuning and
-/// servo interfaces. This reports measurements; it does not relax or replace
-/// the held-target regression or change the shipped profile.
-#[test]
-#[ignore = "manual simulator gain experiment"]
-fn diagnose_extended_pose_servo_gains() {
-    use std::io::Write;
-
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../2026-09-10/sim-servo-gain-sweep.csv");
-    let mut out = std::fs::File::create(&path).expect("diagnostic csv");
-    writeln!(out, "case,t_s,q_deg,qd_rad_s,current_ma,target_deg").unwrap();
-    let bundle = par6_config::ConfigBundle::load(&shipped_config()).unwrap();
-    let j = &bundle.robot.joints[0];
-    for (name, kpp, kpv, kiv) in [
-        ("vendor", 5.0, 0.015, 0.0015),
-        ("lower_position_p", 2.0, 0.015, 0.0015),
-        ("higher_velocity_p", 5.0, 0.030, 0.0015),
-        ("lower_velocity_i", 5.0, 0.015, 0.0005),
-        ("combined", 3.0, 0.030, 0.0005),
-        ("high_velocity_p", 5.0, 0.060, 0.0015),
-    ] {
-        let rig = boot_tagged(&format!("gain-{name}"));
-        let mut c = Client::new(rig.addr());
-        rig.wait_status("link_ok", |s| s.link_ok == 1);
-        c.ok(&Command::Reset);
-        c.ok(&Command::SetPidGains(par6_proto::command::SetPidGains {
-            node: j.node_id,
-            kpp,
-            kpv,
-            kiv,
-            kpiq: j.gains.kpiq,
-            kiiq: j.gains.kiiq,
-            kp: j.gains.kp,
-            kd: j.gains.kd,
-            ilim_ma: j.ilim_ma,
-            velocity_limit_ticks_s: j.velocity_limit_ticks_s,
-            voltage_limit_mv: j.voltage_limit_mv,
-        }));
-        enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
-        rig.drain_status();
-        let target = with_j0(SWEEP_START_DEG, 20.0);
-        let started = Instant::now();
-        let mut sent = started - Duration::from_secs(1);
-        let mut tail = Vec::new();
-        while started.elapsed() < Duration::from_secs(6) {
-            if sent.elapsed() >= Duration::from_millis(50) {
-                c.send(&Command::ServoJ(par6_proto::command::ServoJ {
-                    angles: target,
-                    speed: None,
-                    accel: None,
-                }));
-                sent = Instant::now();
-            }
-            if let Some(s) = rig.recv_status() {
-                let t = started.elapsed().as_secs_f64();
-                let current = s
-                    .drive_health
-                    .currents_ma
-                    .first()
-                    .copied()
-                    .unwrap_or(f64::NAN);
-                writeln!(
-                    out,
-                    "{name},{t},{},{},{current},{}",
-                    s.angles[0], s.speeds[0], target[0]
-                )
-                .unwrap();
-                if t >= 5.0 {
-                    tail.push(s.angles[0]);
-                }
-            }
-        }
-        rig.shutdown();
-        assert!(tail.len() >= 20, "fresh final-second measurements");
-        let lo = tail.iter().copied().fold(f64::INFINITY, f64::min);
-        let hi = tail.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-        let rms =
-            (tail.iter().map(|q| (q - target[0]).powi(2)).sum::<f64>() / tail.len() as f64).sqrt();
-        println!(
-            "{name}: kpp={kpp} kpv={kpv} kiv={kiv} peak_to_peak_deg={:.6} rms_error_deg={rms:.6}",
-            hi - lo
-        );
-        out.flush().unwrap();
-    }
-    println!("Diagnostic trace: {}", path.display());
 }
 
 // ---- curved moves: the arm ON the plan ------------------------------------

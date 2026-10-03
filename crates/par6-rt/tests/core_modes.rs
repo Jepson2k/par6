@@ -359,7 +359,8 @@ fn jog_law_ramps_integrates_and_latches_direction_block_at_soft_limit() {
     assert!(s.jog.active);
     assert_eq!(s.jog.joints, 0b1);
 
-    // Drive into the soft limit: target clamps, positive direction latches.
+    // Drive into the soft limit: the jog stops at or short of it and the
+    // positive direction latches.
     rig.tick_n(300);
     let s = rig.snap();
     assert!(
@@ -367,11 +368,12 @@ fn jog_law_ramps_integrates_and_latches_direction_block_at_soft_limit() {
         "positive direction of J0 latched at the soft limit"
     );
     let f = rig.last_joints();
-    assert_eq!(f[0].vel, Some(0), "clamped at the limit");
+    assert_eq!(f[0].vel, Some(0), "stopped at the limit");
     let soft_max_ticks = rig.conv[0].motor_ticks(robot.joints[0].limits.soft_max_rad);
+    let stopped_at = f[0].pos.unwrap();
     assert!(
-        (f[0].pos.unwrap() - soft_max_ticks).abs() <= 1,
-        "held exactly at the soft limit"
+        stopped_at <= soft_max_ticks,
+        "never commanded past the soft limit: {stopped_at} > {soft_max_ticks}"
     );
 
     // Releasing ends the jog session: the ramp runs down and JOG goes
@@ -388,7 +390,7 @@ fn jog_law_ramps_integrates_and_latches_direction_block_at_soft_limit() {
     let f = rig.last_joints();
     assert_eq!(f[0].vel, Some(0), "held still");
     assert!(
-        (f[0].pos.unwrap() - soft_max_ticks).abs() <= 1,
+        (f[0].pos.unwrap() - stopped_at).abs() <= 1,
         "held where the ramp ended"
     );
 

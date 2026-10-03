@@ -37,9 +37,35 @@ fn box_at(x: f64, y: f64, z: f64, side: f64) -> ShapeDesc {
     }
 }
 
+/// The Rust mirrors read the same bytes the shim writes: every value
+/// struct that crosses the boundary has the shim's size and field
+/// offsets.
 #[test]
-fn abi_version_is_v12() {
-    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 12);
+fn the_rust_mirrors_have_the_shims_layout() {
+    use std::mem::{offset_of, size_of};
+    let ours = [
+        size_of::<ffi::par6_tool_params>(),
+        offset_of!(ffi::par6_tool_params, transform),
+        offset_of!(ffi::par6_tool_params, mass),
+        offset_of!(ffi::par6_tool_params, com),
+        offset_of!(ffi::par6_tool_params, inertia),
+        size_of::<ffi::par6_shape>(),
+        offset_of!(ffi::par6_shape, kind),
+        offset_of!(ffi::par6_shape, n_params),
+        offset_of!(ffi::par6_shape, params),
+        offset_of!(ffi::par6_shape, pose),
+        offset_of!(ffi::par6_shape, margin),
+        size_of::<ffi::par6_shape_placement>(),
+        offset_of!(ffi::par6_shape_placement, name),
+        offset_of!(ffi::par6_shape_placement, parent_frame),
+        offset_of!(ffi::par6_shape_placement, allowed_contacts),
+        offset_of!(ffi::par6_shape_placement, n_allowed_contacts),
+    ]
+    .map(|v| v as u64);
+    let mut theirs = [0u64; 16];
+    let n = unsafe { ffi::par6_shim_layout(theirs.as_mut_ptr(), theirs.len() as i32) };
+    assert_eq!(n as usize, ours.len(), "the shim reports every field");
+    assert_eq!(theirs, ours);
 }
 
 #[test]

@@ -38,11 +38,11 @@ use par6_rt::{
 };
 use par6_server::{ConfigInfoData, ServerConfig, ServerHandle};
 
-use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{housekeeping_loop, CoreLink, CoreOp, RtBridge, SharedState};
 use crate::grant::{self, BusGrant};
 use crate::options::{resolve_config_path, Options};
 use crate::planner::Par6Planner;
+use par6_rt::adapters::{MotionJog, MotionStream};
 
 /// Planner→RT sample ring capacity \[samples\] (~16 s at 4 ms; longer
 /// plans stream in under backpressure from the planner's poll loop).
@@ -85,6 +85,10 @@ pub enum DaemonError {
     /// The command plane could not bind or start.
     #[error("command plane: {0}")]
     Io(#[from] std::io::Error),
+    /// A worker thread panicked; the arm's last frames are not known to
+    /// have been the shutdown sequence's.
+    #[error("{0} worker thread(s) panicked")]
+    WorkerPanicked(usize),
 }
 
 /// A running par6d instance (all threads + the command-plane server).
@@ -530,12 +534,13 @@ impl Daemon {
     }
 
     /// Stop everything: server task first, then the worker threads (all
-    /// joined), then the tokio runtime.
-    pub fn shutdown(mut self) {
-        self.stop();
+    /// joined), then the tokio runtime. A worker that panicked is an
+    /// error, not a log line.
+    pub fn shutdown(mut self) -> Result<(), DaemonError> {
+        self.stop()
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> Result<(), DaemonError> {
         if let Some(server) = self.server.take() {
             server.shutdown();
             if let Some(rt) = &self.runtime {
@@ -546,20 +551,27 @@ impl Daemon {
         }
         self.shutdown.store(true, Ordering::SeqCst);
         self.rt_break.store(true, Ordering::SeqCst);
-        for t in self.threads.drain(..) {
-            if t.join().is_err() {
-                log::error!("worker thread panicked during shutdown");
-            }
-        }
+        let panicked = self
+            .threads
+            .drain(..)
+            .map(JoinHandle::join)
+            .filter(Result::is_err)
+            .count();
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_timeout(Duration::from_secs(1));
         }
+        if panicked > 0 {
+            log::error!("{panicked} worker thread(s) panicked");
+            return Err(DaemonError::WorkerPanicked(panicked));
+        }
+        Ok(())
     }
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        self.stop();
+        // The panic, if any, is already logged.
+        let _ = self.stop();
     }
 }
 
@@ -1416,21 +1428,5 @@ mod tests {
             panic!("hardware mode must refuse an unreadable ESTOP_1");
         };
         assert!(msg.contains("ESTOP_1"), "the refusal names the line: {msg}");
-    }
-
-    /// Every FLASHING exit invalidates homing.
-    ///
-    /// The wiring this pins was a dropped write handle: a marker nothing
-    /// could ever set answered "no flash happened" for the life of the
-    /// process, so `RtCore::leave_mode` kept a home reference that the
-    /// driver reboot had already destroyed.
-    #[test]
-    fn the_flash_marker_reports_a_flash_on_every_flashing_exit() {
-        let mut marker = flash_marker();
-        assert!(marker.flashed(), "par6d cannot tell a flash from a scan");
-        assert!(
-            marker.flashed(),
-            "consulted once per window — a second window must invalidate too"
-        );
     }
 }

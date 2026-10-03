@@ -103,7 +103,10 @@ fn main() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    daemon.shutdown();
+    if let Err(e) = daemon.shutdown() {
+        eprintln!("par6d: {e}");
+        std::process::exit(1);
+    }
 }
 
 /// Whether `pid` is still this process's parent.

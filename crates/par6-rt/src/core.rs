@@ -61,7 +61,8 @@ use crate::MAX_JOINTS;
 /// The `boot_configure` arguments, retained for a live bus swap.
 struct BootConfig {
     robot: par6_config::RobotConfig,
-    gripper: Option<par6_config::ToolConfig>,
+    /// The fitted tool, driven or not: the simulator carries its mass.
+    tool: Option<par6_config::ToolConfig>,
     config_repeats: u8,
 }
 
@@ -731,8 +732,9 @@ impl<B: DriverBus> RtCore<B> {
             });
         }
         let dt = robot.robot.tick_dt_s;
-        let gripper = bundle.active_tool().filter(|g| g.driver.is_some());
-        bus.boot_configure(robot, gripper, robot.bus.boot_config_repeats)?;
+        let tool = bundle.active_tool();
+        bus.boot_configure(robot, tool, robot.bus.boot_config_repeats)?;
+        let gripper = tool.filter(|g| g.driver.is_some());
 
         let conv: [JointConversion; MAX_JOINTS] =
             std::array::from_fn(|i| JointConversion::from_config(&robot.joints[i]));
@@ -780,7 +782,7 @@ impl<B: DriverBus> RtCore<B> {
             config_repush_armed_at: 0,
             boot: BootConfig {
                 robot: robot.clone(),
-                gripper: gripper.cloned(),
+                tool: tool.cloned(),
                 config_repeats: robot.bus.boot_config_repeats,
             },
             torque_ma_factor,
@@ -987,6 +989,8 @@ impl<B: DriverBus> RtCore<B> {
         repeats: u8,
     ) {
         let dt = self.dt;
+        self.boot.tool = gripper.cloned();
+        self.bus.fit_tool(&self.boot.robot, gripper);
         self.homing.set_gripper(gripper, dt);
         if let Some(d) = gripper.and_then(|g| g.driver.as_ref()) {
             let tune = par6_bus::DriveTune {
@@ -1039,7 +1043,7 @@ impl<B: DriverBus> RtCore<B> {
     pub fn replace_bus(&mut self, mut bus: B) -> Result<(), CoreError> {
         bus.boot_configure(
             &self.boot.robot,
-            self.boot.gripper.as_ref(),
+            self.boot.tool.as_ref(),
             self.boot.config_repeats,
         )?;
         self.bus = bus;
@@ -1198,7 +1202,7 @@ impl<B: DriverBus> RtCore<B> {
     /// before the process exits. BOOTING / ACTIVE_ERROR / SAFETY_STOP
     /// already run a stationary law and are left in place; FLASHING is a
     /// bus-silent maintenance window and must stay silent.
-    pub fn shutdown_halt(&mut self) {
+    pub(crate) fn shutdown_halt(&mut self) {
         if matches!(
             self.mode,
             Mode::Idle | Mode::Booting | Mode::ActiveError | Mode::SafetyStop | Mode::Flashing
@@ -1209,7 +1213,7 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     /// Ticks the shutdown retreat may run before its timeout.
-    pub fn shutdown_park_timeout_ticks(&self) -> u32 {
+    pub(crate) fn shutdown_park_timeout_ticks(&self) -> u32 {
         self.park.timeout_ticks
     }
 
@@ -1230,7 +1234,7 @@ impl<B: DriverBus> RtCore<B> {
     /// which is what makes a slow retreat smooth rather than sluggish.
     /// The scale is restored by [`RtCore::shutdown_park_end`] whatever
     /// happens.
-    pub fn shutdown_park_begin(&mut self) -> bool {
+    pub(crate) fn shutdown_park_begin(&mut self) -> bool {
         if !self.park.enabled || self.mode == Mode::Flashing {
             return false;
         }
@@ -1283,7 +1287,7 @@ impl<B: DriverBus> RtCore<B> {
     /// `true` once every joint measures within tolerance of the pose,
     /// or when the retreat can no longer run (a hard error dropped the
     /// mode) — the caller then proceeds to the halt.
-    pub fn shutdown_park_feed(&mut self) -> bool {
+    pub(crate) fn shutdown_park_feed(&mut self) -> bool {
         if !self.park.running || self.mode != Mode::Stream {
             return true;
         }
@@ -1305,7 +1309,7 @@ impl<B: DriverBus> RtCore<B> {
 
     /// End the retreat: restore the stream scale the retreat overrode.
     /// Runs on every exit from the retreat, reached or not.
-    pub fn shutdown_park_end(&mut self) {
+    pub(crate) fn shutdown_park_end(&mut self) {
         if !self.park.running {
             return;
         }
@@ -1320,7 +1324,7 @@ impl<B: DriverBus> RtCore<B> {
     /// Whether every joint's measured speed is inside the shutdown rest
     /// band — the condition the exit path waits on before idling the
     /// drives.
-    pub fn at_rest(&self) -> bool {
+    pub(crate) fn at_rest(&self) -> bool {
         self.qd_filt.iter().all(|v| v.abs() < SHUTDOWN_REST_RAD_S)
     }
 
@@ -1330,7 +1334,7 @@ impl<B: DriverBus> RtCore<B> {
     /// the last motion frame until the CAN watchdog expires and drops
     /// them out mid-hold. No-op in FLASHING (the bus is silent by
     /// contract there, and the arm is parked and asserted).
-    pub fn shutdown_limp(&mut self) {
+    pub(crate) fn shutdown_limp(&mut self) {
         if self.mode == Mode::Flashing {
             return;
         }

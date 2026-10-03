@@ -1,18 +1,14 @@
 //! Integration seams between the RT core and the motion stack.
 //!
 //! The tick loop consumes jog ramps, streaming target tracking, and EXEC
-//! completion policies through these SMALL per-tick traits instead of
-//! depending on `par6-motion` directly — `par6d` adapts the real engines
-//! (`par6_motion::JogEngine`, `StreamingExecutor`, `CompletionMonitor`)
-//! onto them at wiring time. The trait shapes mirror those engines'
-//! lifecycles (activate / command / tick) so the adapters are thin.
+//! completion policies through these SMALL per-tick traits; the real
+//! `par6-motion` engines sit behind them in [`crate::adapters`]. The
+//! trait shapes mirror those engines' lifecycles (activate / command /
+//! tick) so the adapters are thin.
 //!
-//! Built-in implementations ship alongside for tests and the simulated
-//! runtime: [`RampJog`] (linear ramp + soft-limit clamp with direction
-//! blocks), [`ClampStream`] (soft-limit clamp passthrough), and
-//! [`SpecSettle`] — the FULL spec completion-policy state machine
-//! (commanded / settled / strict with the blend-continues bypass), which
-//! is not a stub but the reference implementation.
+//! [`ClampStream`] (soft-limit clamp passthrough) is the tracker for
+//! streams that arrive already shaped, and [`SpecSettle`] the
+//! completion-policy state machine (commanded / settled / strict).
 //!
 //! All per-tick methods must be allocation-free.
 
@@ -256,154 +252,6 @@ pub trait JogEngine: Send {
     ) -> u16;
 }
 
-/// Built-in jog engine: trapezoid velocity ramp (`Δv ≤ a·dt`), target
-/// integration, hard clamp + direction-block latch at the soft limits.
-/// The jerk-aware lookahead lives in `par6-motion`; this one is the
-/// simple reference used by tests and the sim runtime.
-pub struct RampJog {
-    dt: f64,
-    vmax: [f64; MAX_JOINTS],
-    /// Configured ramp acceleration, before the command's fraction.
-    base_accel: [f64; MAX_JOINTS],
-    accel: [f64; MAX_JOINTS],
-    soft_min: [f64; MAX_JOINTS],
-    soft_max: [f64; MAX_JOINTS],
-    target_q: [f64; MAX_JOINTS],
-    vel: [f64; MAX_JOINTS],
-    request: [f64; MAX_JOINTS],
-    /// Joints driven by the previous command; survives `release()` so a
-    /// joint re-entering the set after a stop still clears its blocks.
-    last_set: u8,
-    blocked: u16,
-}
-
-impl RampJog {
-    /// Build from the robot's jog-mode limits.
-    pub fn new(cfg: &RobotConfig) -> Self {
-        let mut vmax = [0.0; MAX_JOINTS];
-        let mut accel = [0.0; MAX_JOINTS];
-        let mut soft_min = [0.0; MAX_JOINTS];
-        let mut soft_max = [0.0; MAX_JOINTS];
-        for (i, j) in cfg.joints.iter().enumerate().take(MAX_JOINTS) {
-            let l = j.limits.for_mode(par6_config::LimitMode::Jog);
-            vmax[i] = l.velocity_rad_s;
-            accel[i] = l.acceleration_rad_s2;
-            soft_min[i] = j.limits.soft_min_rad;
-            soft_max[i] = j.limits.soft_max_rad;
-        }
-        Self {
-            dt: cfg.robot.tick_dt_s,
-            vmax,
-            base_accel: accel,
-            accel,
-            soft_min,
-            soft_max,
-            target_q: [0.0; MAX_JOINTS],
-            vel: [0.0; MAX_JOINTS],
-            request: [0.0; MAX_JOINTS],
-            last_set: 0,
-            blocked: 0,
-        }
-    }
-}
-
-impl JogEngine for RampJog {
-    fn activate(&mut self, q_meas: &[f64; MAX_JOINTS]) {
-        self.target_q = *q_meas;
-        self.vel = [0.0; MAX_JOINTS];
-        self.request = [0.0; MAX_JOINTS];
-        self.last_set = 0;
-        self.blocked = 0;
-    }
-
-    fn command(&mut self, speeds: &[f64; MAX_JOINTS]) {
-        let mut set = 0u8;
-        for (i, (want, v)) in self.request.iter_mut().zip(speeds.iter()).enumerate() {
-            // A non-finite entry is a stop for that joint, never "keep
-            // whatever it was doing".
-            let v = if v.is_finite() {
-                v.clamp(-1.0, 1.0)
-            } else {
-                0.0
-            };
-            // A joint dropping out of the driven set clears its blocks.
-            if self.last_set & (1 << i) != 0 && v == 0.0 {
-                self.blocked &= !(0b11 << (2 * i));
-            }
-            if v != 0.0 {
-                set |= 1 << i;
-            }
-            *want = v;
-        }
-        self.last_set = set;
-    }
-
-    fn set_accel_scale(&mut self, accel: f64) {
-        for (a, base) in self.accel.iter_mut().zip(self.base_accel.iter()) {
-            *a = base * accel;
-        }
-    }
-
-    fn release(&mut self) {
-        self.request = [0.0; MAX_JOINTS];
-    }
-
-    fn tick(
-        &mut self,
-        q_meas: &[f64; MAX_JOINTS],
-        q_out: &mut [f64; MAX_JOINTS],
-        qd_out: &mut [f64; MAX_JOINTS],
-    ) -> u16 {
-        // The loop threads one index through five parallel per-joint
-        // arrays; iterator zipping would only obscure that.
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..MAX_JOINTS {
-            let mut want = self.request[i] * self.vmax[i];
-            // A latched block in the commanded direction zeroes the
-            // request; the opposite direction clears the latch.
-            let neg_bit = 1u16 << (2 * i);
-            let pos_bit = 2u16 << (2 * i);
-            if want > 0.0 {
-                if self.blocked & pos_bit != 0 {
-                    want = 0.0;
-                } else {
-                    self.blocked &= !neg_bit;
-                }
-            } else if want < 0.0 {
-                if self.blocked & neg_bit != 0 {
-                    want = 0.0;
-                } else {
-                    self.blocked &= !pos_bit;
-                }
-            }
-            let dv = (want - self.vel[i]).clamp(-self.accel[i] * self.dt, self.accel[i] * self.dt);
-            self.vel[i] += dv;
-            self.target_q[i] += self.vel[i] * self.dt;
-            // Hard clamp at the soft limits; latch the outward direction.
-            if self.target_q[i] >= self.soft_max[i] && self.vel[i] > 0.0 {
-                self.target_q[i] = self.soft_max[i];
-                self.vel[i] = 0.0;
-                self.blocked |= 2u16 << (2 * i);
-            } else if self.target_q[i] <= self.soft_min[i] && self.vel[i] < 0.0 {
-                self.target_q[i] = self.soft_min[i];
-                self.vel[i] = 0.0;
-                self.blocked |= 1u16 << (2 * i);
-            }
-            // Measured position past a soft limit moving outward: clamp.
-            if q_meas[i] > self.soft_max[i] && self.vel[i] > 0.0 {
-                self.vel[i] = 0.0;
-                self.blocked |= 2u16 << (2 * i);
-            } else if q_meas[i] < self.soft_min[i] && self.vel[i] < 0.0 {
-                self.vel[i] = 0.0;
-                self.blocked |= 1u16 << (2 * i);
-            }
-        }
-        *q_out = self.target_q;
-        *qd_out = self.vel;
-        self.blocked
-    }
-}
-
 // ---------------------------------------------------------------- stream
 
 /// Per-tick streaming target tracker: newest
@@ -538,11 +386,9 @@ pub enum SettleVerdict {
 
 /// EXEC completion policy.
 pub trait SettlePolicy: Send {
-    /// Arm at a segment boundary, passing the boundary sample's
-    /// `blend_continues`. Returns `true` when the boundary completes
-    /// immediately (commanded policy, or any policy with blend-continues
-    /// set — blended corners must stay velocity-continuous).
-    fn arm(&mut self, blend_continues: bool) -> bool;
+    /// Arm at a segment boundary. Returns `true` when the boundary
+    /// completes immediately (the commanded policy).
+    fn arm(&mut self) -> bool;
     /// One settling tick with measured and boundary-target positions.
     fn tick(&mut self, q_meas: &[f64; MAX_JOINTS], q_target: &[f64; MAX_JOINTS]) -> SettleVerdict;
 }
@@ -593,10 +439,10 @@ impl SpecSettle {
 }
 
 impl SettlePolicy for SpecSettle {
-    fn arm(&mut self, blend_continues: bool) -> bool {
+    fn arm(&mut self) -> bool {
         self.elapsed = 0;
         self.best_err = f64::INFINITY;
-        blend_continues || self.policy == CompletionPolicy::Commanded
+        self.policy == CompletionPolicy::Commanded
     }
 
     fn tick(&mut self, q_meas: &[f64; MAX_JOINTS], q_target: &[f64; MAX_JOINTS]) -> SettleVerdict {

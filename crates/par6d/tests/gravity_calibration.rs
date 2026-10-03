@@ -137,7 +137,9 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
         client.close_joined().await;
         samples
     });
-    daemon.shutdown();
+    daemon
+        .shutdown()
+        .expect("the daemon's threads exit cleanly");
 
     let mut truth = par6d::kin::load_gravity_kin(&assets_dir(), gripper).unwrap();
     for s in &samples {
@@ -320,7 +322,9 @@ fn a_failed_estimate_leaves_the_declared_payload_standing() {
         client.close_joined().await;
         (err, carried)
     });
-    daemon.shutdown();
+    daemon
+        .shutdown()
+        .expect("the daemon's threads exit cleanly");
 
     let (err, (mass, com)) = outcome;
     assert!(
@@ -337,111 +341,4 @@ fn a_failed_estimate_leaves_the_declared_payload_standing() {
             "the declared centre of mass moved: {com:?}"
         );
     }
-}
-
-/// Offline experiment for replacing the biased static torque sampler.
-/// It uses the real client/daemon/drive/plant path and records the physical
-/// load separately from the deliberately incorrect controller declaration.
-#[test]
-#[ignore = "manual calibration measurement experiment; writes CSV when explicitly run"]
-fn diagnose_slow_sweep_torque() {
-    use par6_client::Ack;
-    use par6_config::LimitMode;
-    use par6_proto::ControllerMode;
-    use std::fmt::Write as _;
-
-    let config = test_config();
-    let bundle = par6_config::ConfigBundle::load(&config).unwrap();
-    let mut truth = par6d::kin::load_gravity_kin(&assets_dir(), bundle.active_tool()).unwrap();
-    let status_port = free_udp_port();
-    let daemon = boot_for_client(config, status_port).unwrap();
-    let cmd = daemon.command_addr();
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    let csv = rt.block_on(async {
-        let client = Client::connect(ClientConfig {
-            host: cmd.ip().to_string(), port: cmd.port(),
-            status: StatusTransport::Unicast { host: "127.0.0.1".parse().unwrap() },
-            status_port, ..ClientConfig::default()
-        }).await.unwrap();
-        assert!(client.wait_status(|s| s.link_ok == 1, BUDGET).await);
-        client.reset().await.unwrap();
-        assert_eq!(client.set_payload(0.8, [0.0, 0.0, 0.05], None).await.unwrap(), Ack::Confirmed);
-        let mut csv = String::from("pose,joint,direction,command_rad_s,time_s,angle_rad,speed_rad_s,torque_nm,gravity_nm,current_ma,age_ms\n");
-        let mut park = [0.0; NQ];
-        park.copy_from_slice(&bundle.robot.robot.park_pose_rad[..NQ]);
-        let mut extended = park;
-        extended[1] += 0.4;
-        extended[2] -= 0.4;
-        extended[4] = 0.5;
-        for (pose_index, center) in [park, extended].into_iter().enumerate() {
-            for j in [1, 2] {
-                for speed in [0.04, 0.08] {
-                    for dir in [-1.0, 1.0] {
-                        let mut start = center;
-                        start[j] -= dir * 0.08;
-                        let start_deg = start.map(f64::to_degrees);
-                        let deadline = tokio::time::Instant::now() + BUDGET;
-                        loop {
-                            client.teleport(start_deg, None).await.unwrap();
-                            if client.wait_status(|s| s.homed && (0..NQ).all(|k|
-                                (s.angles[k] - start_deg[k]).abs() < 0.1), Duration::from_millis(200)).await {
-                                break;
-                            }
-                            assert!(tokio::time::Instant::now() < deadline, "teleport failed");
-                        }
-                        let mut command = [0.0; NUM_JOINTS];
-                        command[j] = dir * speed / bundle.robot.joints[j].limits.for_mode(LimitMode::Jog).velocity_rad_s;
-                        let mut rx = client.subscribe_status();
-                        let mut heartbeat = tokio::time::interval(Duration::from_millis(20));
-                        heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                        let begin = tokio::time::Instant::now();
-                        let deadline = begin + Duration::from_secs_f64(0.16 / speed + 0.5);
-                        let mut seen = None;
-                        let mut samples = 0;
-                        let run: Result<(), String> = async {
-                            loop {
-                                tokio::select! {
-                                    _ = tokio::time::sleep_until(deadline) => break,
-                                    _ = heartbeat.tick() => {
-                                        client.jog_j(command, 0.15, None).await.map_err(|e| e.to_string())?;
-                                        continue;
-                                    }
-                                    changed = rx.changed() => { changed.map_err(|e| e.to_string())?; }
-                                }
-                                let Some(s) = rx.borrow_and_update().clone() else { continue; };
-                                if seen.is_some_and(|seq| s.seq <= seq) { continue; }
-                                seen = Some(s.seq);
-                                if s.error.is_some() || !s.enabled || !s.homed || s.link_ok != 1 {
-                                    return Err(format!("sweep lost readiness: {:?}", s.error));
-                                }
-                                let q: [f64; NQ] = std::array::from_fn(|k| s.angles[k].to_radians());
-                                if dir * (q[j] - center[j]) > 0.08 { break; }
-                                if s.mode != ControllerMode::Jog || (q[j] - center[j]).abs() > 0.035 { continue; }
-                                let mut gravity = [0.0; NQ];
-                                truth.gravity(&q, &mut gravity).map_err(|e| e.to_string())?;
-                                writeln!(csv, "{pose_index},{j},{dir},{speed},{:.6},{:.8},{:.8},{:.8},{:.8},{:.5},{}",
-                                    begin.elapsed().as_secs_f64(), q[j], s.speeds[j], s.torques[j], gravity[j],
-                                    s.drive_health.currents_ma[j], s.data_age_ms).unwrap();
-                                samples += 1;
-                            }
-                            if samples < 10 { return Err(format!("too few moving samples: pose{pose_index} J{} dir{dir} speed{speed}: {samples}", j + 1)); }
-                            Ok(())
-                        }.await;
-                        assert_eq!(client.stop(true).await.unwrap(), Ack::Confirmed);
-                        if let Err(error) = run {
-                            client.close_joined().await;
-                            panic!("{error}");
-                        }
-                    }
-                }
-            }
-        }
-        client.close_joined().await;
-        csv
-    });
-    daemon.shutdown();
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../2026-09-10/sim-calibration-sweeps.csv");
-    std::fs::write(&path, csv).unwrap();
-    println!("sweep measurements: {}", path.display());
 }

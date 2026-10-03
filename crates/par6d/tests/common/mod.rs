@@ -446,7 +446,11 @@ impl Rig {
     }
 
     pub fn shutdown(mut self) {
-        self.daemon.take().expect("running").shutdown();
+        self.daemon
+            .take()
+            .expect("running")
+            .shutdown()
+            .expect("the daemon's threads exit cleanly");
     }
 }
 
@@ -462,7 +466,10 @@ impl Drop for Rig {
     /// reused port, not as the leak it is.
     fn drop(&mut self) {
         if let Some(daemon) = self.daemon.take() {
-            daemon.shutdown();
+            let stopped = daemon.shutdown();
+            if !std::thread::panicking() {
+                stopped.expect("the daemon's threads exit cleanly");
+            }
         }
     }
 }

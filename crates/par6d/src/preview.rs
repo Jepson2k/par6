@@ -40,7 +40,6 @@ use par6_server::{
     QueuedCommand, ServerConfig, ShapeLayer,
 };
 
-use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{
     housekeeping_period, project_cart_jog, step_cart_jog, step_cart_servo, CartJogProbe,
     CartJogState, CartServoState, CoreLink, CoreOp, StreamGate,
@@ -49,6 +48,7 @@ use crate::daemon::{load_preview_kin, DaemonError};
 use crate::kin::{matrix_to_xyzrpy, CartKin};
 use crate::options::{resolve_config_path, Options};
 use crate::planner::{profile_names, Par6Planner, PlannedMotion, PlannerKin};
+use par6_rt::adapters::{MotionJog, MotionStream};
 use plan::PlanRecorder;
 
 /// Braking time a stream preview allows beyond the motion itself before it

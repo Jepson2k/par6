@@ -6,24 +6,15 @@
 //! - **Trapezoid**: accel–cruise–decel run on the normalized path
 //!   coordinate `s`, which synchronizes all joints on the slowest one
 //!   (the binding joint sets the scalar velocity/acceleration budget).
-//!   Corner blending overlaps one segment's deceleration tail with the
-//!   next segment's acceleration head; both blending ramps are planned at
-//!   HALF the acceleration limit so the summed contribution never exceeds
-//!   it, and the summed velocity is bounded by the larger of the two
-//!   cruise velocities — both bounds hold per joint.
-//! - **Ruckig**: jerk-limited point-to-point via rsruckig. A blend chain
-//!   becomes one rsruckig calculation with the interior targets as
-//!   `intermediate_positions` (pass-through waypoints, velocity-continuous
-//!   corners, limits enforced by the solver); per-move speed fractions and
-//!   minimum durations map to per-section limits.
+//! - **Ruckig**: jerk-limited point-to-point via rsruckig.
 //! - **Quintic** and **Septic**: one polynomial on the path coordinate,
 //!   point-to-point. The quintic starts and stops at rest in velocity and
 //!   acceleration; the septic in jerk too, and holds the jerk limit.
 //!
-//! Sample metadata carries the ring contract: `command_index` per queued
-//! move, `checkpoint_id` boundaries, `blend_continues` on every sample of
-//! a move that blends into the next (the completion policy must not settle
-//! there), `is_last` on the final sample of the program.
+//! Every move is point-to-point; corners are rounded upstream, on the
+//! path, by the planner. Sample metadata carries the ring contract:
+//! `command_index` per queued move, `checkpoint_id` boundaries, `is_last`
+//! on the final sample of the program.
 
 use rsruckig::prelude::*;
 
@@ -50,13 +41,12 @@ pub enum ProfileKind {
     /// acceleration are zero at both ends, so the move starts and stops
     /// without a step in either. No cruise phase and no jerk limiting —
     /// peak jerk is `60/T³` over a unit distance, bounded by nothing but
-    /// the duration. Point-to-point only: see [`MotionError::ProfileCannotBlend`].
+    /// the duration.
     Quintic,
     /// Septic polynomial on the path coordinate: velocity, acceleration
     /// AND jerk are zero at both ends, so unlike the quintic there is no
     /// jerk step when the move starts or stops. Peak jerk, `52.5/T³` over
     /// a unit distance, is held under the jerk limit where one is set.
-    /// Point-to-point only: see [`MotionError::ProfileCannotBlend`].
     Septic,
 }
 
@@ -70,10 +60,6 @@ pub struct MoveParams {
     /// Stretch the move to at least this duration \[s\]. Shorter requests
     /// than the limit-constrained minimum have no effect.
     pub min_duration_s: Option<f64>,
-    /// Blend this move's corner into the next queued move
-    /// (velocity-continuous handoff, no settle at the boundary). Ignored
-    /// on the last move of a program.
-    pub blend_with_next: bool,
     /// Checkpoint label carried on this move's samples; defaults to the
     /// move's command index.
     pub checkpoint_id: Option<u32>,
@@ -85,7 +71,6 @@ impl Default for MoveParams {
             profile: ProfileKind::default(),
             speed_fraction: 1.0,
             min_duration_s: None,
-            blend_with_next: false,
             checkpoint_id: None,
         }
     }
@@ -209,35 +194,25 @@ impl ProgramBuilder {
             });
         }
         let mut samples: Vec<Sample> = Vec::new();
-        let mut chain_start = self.start;
-        let mut i = 0;
-        while i < self.moves.len() {
-            let mut j = i;
-            while j + 1 < self.moves.len() && self.moves[j].params.blend_with_next {
-                j += 1;
-            }
-            let chain = &self.moves[i..=j];
-            for (w, pair) in chain.windows(2).enumerate() {
-                if pair[0].params.profile != pair[1].params.profile {
-                    return Err(MotionError::MixedProfileBlend {
-                        first: i + w,
-                        second: i + w + 1,
-                    });
-                }
-            }
-            match chain[0].params.profile {
-                ProfileKind::Trapezoid => {
-                    self.emit_trapezoid_chain(&mut samples, &chain_start, chain, i as u32);
-                }
-                ProfileKind::Ruckig => {
-                    self.emit_ruckig_chain(&mut samples, &chain_start, chain, i as u32)?;
-                }
-                ProfileKind::Quintic | ProfileKind::Septic => {
-                    self.emit_polynomial_chain(&mut samples, &chain_start, chain, i as u32)?;
-                }
-            }
-            chain_start = self.moves[j].target;
-            i = j + 1;
+        let mut start = self.start;
+        for (i, mv) in self.moves.iter().enumerate() {
+            let meta = SampleMeta {
+                command_index: i as u32,
+                checkpoint_id: mv.params.checkpoint_id.unwrap_or(i as u32),
+                is_last: false,
+            };
+            let seg = match mv.params.profile {
+                ProfileKind::Trapezoid => self.trapezoid(&start, mv),
+                ProfileKind::Ruckig => self.ruckig(&start, mv)?,
+                ProfileKind::Quintic | ProfileKind::Septic => self.polynomial(&start, mv),
+            };
+            samples.extend((0..seg.q.len()).map(|t| Sample {
+                q: seg.q[t],
+                qd: seg.qd[t],
+                qdd: seg.qdd[t],
+                meta,
+            }));
+            start = mv.target;
         }
         if let Some(last) = samples.last_mut() {
             last.meta.is_last = true;
@@ -248,201 +223,51 @@ impl ProgramBuilder {
         })
     }
 
-    fn meta_for(&self, chain: &[MoveSpec], chain_offset: u32, k: usize) -> SampleMeta {
-        let cmd = chain_offset + k as u32;
-        SampleMeta {
-            command_index: cmd,
-            checkpoint_id: chain[k].params.checkpoint_id.unwrap_or(cmd),
-            blend_continues: k + 1 < chain.len(),
-            is_last: false,
-        }
-    }
-
-    fn emit_trapezoid_chain(
-        &self,
-        out: &mut Vec<Sample>,
-        start: &[f64; NUM_JOINTS],
-        chain: &[MoveSpec],
-        chain_offset: u32,
-    ) {
-        let mut segs = Vec::with_capacity(chain.len());
-        let mut prev = *start;
-        for (k, mv) in chain.iter().enumerate() {
-            let path = JointLinePath::new(prev, mv.target);
-            let mut scale = [0.0; NUM_JOINTS];
-            for (s, (a, b)) in scale.iter_mut().zip(prev.iter().zip(mv.target.iter())) {
-                *s = (b - a).abs();
-            }
-            segs.push(trapezoid_segment(
-                &path,
-                &scale,
-                &self.limits,
-                mv.params.speed_fraction,
-                mv.params.min_duration_s,
-                k > 0,
-                k + 1 < chain.len(),
-                self.dt,
-            ));
-            prev = mv.target;
-        }
-        // Overlap between consecutive segments, capped so the two splices
-        // touching a segment never claim overlapping sample ranges.
-        let mut overlaps = vec![0usize; chain.len().saturating_sub(1)];
-        for (k, ov) in overlaps.iter_mut().enumerate() {
-            *ov = segs[k]
-                .exit_ticks
-                .min(segs[k + 1].entry_ticks)
-                .min(segs[k].q.len() / 2)
-                .min(segs[k + 1].q.len() / 2);
-        }
-        let mut consumed_head = 0usize;
-        for (k, seg) in segs.iter().enumerate() {
-            let meta = self.meta_for(chain, chain_offset, k);
-            let ov_next = overlaps.get(k).copied().unwrap_or(0);
-            let len = seg.q.len();
-            for t in consumed_head..len - ov_next {
-                out.push(Sample {
-                    q: seg.q[t],
-                    qd: seg.qd[t],
-                    qdd: seg.qdd[t],
-                    meta,
-                });
-            }
-            if ov_next > 0 {
-                let next = &segs[k + 1];
-                let corner = &chain[k].target;
-                for t in 0..ov_next {
-                    let mut q = [0.0; NUM_JOINTS];
-                    let mut qd = [0.0; NUM_JOINTS];
-                    let mut qdd = [0.0; NUM_JOINTS];
-                    for j in 0..NUM_JOINTS {
-                        q[j] = seg.q[len - ov_next + t][j] + next.q[t][j] - corner[j];
-                        qd[j] = seg.qd[len - ov_next + t][j] + next.qd[t][j];
-                        qdd[j] = seg.qdd[len - ov_next + t][j] + next.qdd[t][j];
-                    }
-                    out.push(Sample { q, qd, qdd, meta });
-                }
-            }
-            consumed_head = ov_next;
-        }
-    }
-
-    /// A polynomial move is point-to-point. The trapezoid's corner splice
-    /// adds the tail of one segment to the head of the next, and that is
-    /// limit-safe there because two complementary LINEAR ramps sum to a
-    /// constant. Two complementary polynomial halves do not: quintic
-    /// halves sum to a velocity of `2.109/T` against the profile's own
-    /// `1.875/T`, and on a joint that reverses at the corner septic halves
-    /// sum to an acceleration of `14.77/T²` against its own `7.513/T²`.
-    /// So a blend request is refused rather than honoured over the limit
-    /// or silently ignored.
-    fn emit_polynomial_chain(
-        &self,
-        out: &mut Vec<Sample>,
-        start: &[f64; NUM_JOINTS],
-        chain: &[MoveSpec],
-        chain_offset: u32,
-    ) -> Result<(), MotionError> {
-        let mv = &chain[0];
-        let septic = mv.params.profile == ProfileKind::Septic;
-        if chain.len() > 1 {
-            return Err(MotionError::ProfileCannotBlend {
-                profile: if septic { "septic" } else { "quintic" },
-                first: chain_offset as usize,
-                second: chain_offset as usize + 1,
-            });
-        }
+    fn trapezoid(&self, start: &[f64; NUM_JOINTS], mv: &MoveSpec) -> SegSamples {
         let path = JointLinePath::new(*start, mv.target);
-        let mut scale = [0.0; NUM_JOINTS];
-        for (s, (a, b)) in scale.iter_mut().zip(start.iter().zip(mv.target.iter())) {
-            *s = (b - a).abs();
-        }
-        let seg = polynomial_segment(
+        trapezoid_segment(
             &path,
-            &scale,
+            &joint_spans(start, &mv.target),
             &self.limits,
             mv.params.speed_fraction,
             mv.params.min_duration_s,
-            septic,
             self.dt,
-        );
-        let meta = self.meta_for(chain, chain_offset, 0);
-        for t in 0..seg.q.len() {
-            out.push(Sample {
-                q: seg.q[t],
-                qd: seg.qd[t],
-                qdd: seg.qdd[t],
-                meta,
-            });
-        }
-        Ok(())
+        )
     }
 
-    fn emit_ruckig_chain(
-        &self,
-        out: &mut Vec<Sample>,
-        start: &[f64; NUM_JOINTS],
-        chain: &[MoveSpec],
-        chain_offset: u32,
-    ) -> Result<(), MotionError> {
+    fn polynomial(&self, start: &[f64; NUM_JOINTS], mv: &MoveSpec) -> SegSamples {
+        let path = JointLinePath::new(*start, mv.target);
+        polynomial_segment(
+            &path,
+            &joint_spans(start, &mv.target),
+            &self.limits,
+            mv.params.speed_fraction,
+            mv.params.min_duration_s,
+            mv.params.profile == ProfileKind::Septic,
+            self.dt,
+        )
+    }
+
+    fn ruckig(&self, start: &[f64; NUM_JOINTS], mv: &MoveSpec) -> Result<SegSamples, MotionError> {
         self.limits.require_finite_jerk()?;
-        let n_way = chain.len() - 1;
-        let mut otg;
-        let mut input;
-        let mut output;
-        if n_way > 0 {
-            otg = Ruckig::<NUM_JOINTS, ThrowErrorHandler>::with_waypoints(None, self.dt, n_way);
-            input = InputParameter::<NUM_JOINTS>::with_waypoints(None, n_way);
-            output = OutputParameter::<NUM_JOINTS>::with_waypoints(None, n_way);
-        } else {
-            otg = Ruckig::<NUM_JOINTS, ThrowErrorHandler>::new(None, self.dt);
-            input = InputParameter::<NUM_JOINTS>::new(None);
-            output = OutputParameter::<NUM_JOINTS>::new(None);
-        }
-        let last = chain.len() - 1;
+        let mut otg = Ruckig::<NUM_JOINTS, ThrowErrorHandler>::new(None, self.dt);
+        let mut input = InputParameter::<NUM_JOINTS>::new(None);
+        let mut output = OutputParameter::<NUM_JOINTS>::new(None);
         for (j, &q0) in start.iter().enumerate() {
             input.current_position[j] = q0;
-            input.target_position[j] = chain[last].target[j];
-            input.max_velocity[j] = self.limits.velocity[j];
+            input.target_position[j] = mv.target[j];
+            input.max_velocity[j] = self.limits.velocity[j] * mv.params.speed_fraction;
             input.max_acceleration[j] = self.limits.acceleration[j];
             input.max_jerk[j] = self.limits.jerk[j];
         }
-        if n_way > 0 {
-            for mv in &chain[..last] {
-                input
-                    .intermediate_positions
-                    .push(DataArrayOrVec::Stack(mv.target));
-            }
-            let mut per_vel = Vec::with_capacity(chain.len());
-            for mv in chain {
-                let mut v = [0.0; NUM_JOINTS];
-                for (dst, lim) in v.iter_mut().zip(self.limits.velocity.iter()) {
-                    *dst = lim * mv.params.speed_fraction;
-                }
-                per_vel.push(DataArrayOrVec::Stack(v));
-            }
-            input.per_section_max_velocity = Some(per_vel);
-            if chain.iter().any(|m| m.params.min_duration_s.is_some()) {
-                input.per_section_minimum_duration = Some(
-                    chain
-                        .iter()
-                        .map(|m| m.params.min_duration_s.unwrap_or(0.0))
-                        .collect(),
-                );
-            }
-        } else {
-            for (dst, lim) in input
-                .max_velocity
-                .iter_mut()
-                .zip(self.limits.velocity.iter())
-            {
-                *dst = lim * chain[0].params.speed_fraction;
-            }
-            input.minimum_duration = chain[0].params.min_duration_s;
-        }
+        input.minimum_duration = mv.params.min_duration_s;
 
+        let mut seg = SegSamples {
+            q: Vec::new(),
+            qd: Vec::new(),
+            qdd: Vec::new(),
+        };
         let mut cap: Option<usize> = None;
-        let mut n_emitted = 0usize;
         loop {
             let res = otg
                 .update(&input, &mut output)
@@ -468,18 +293,13 @@ impl ProgramBuilder {
                 qd[j] = output.new_velocity[j];
                 qdd[j] = output.new_acceleration[j];
             }
-            let k = output.new_section.min(last);
-            out.push(Sample {
-                q,
-                qd,
-                qdd,
-                meta: self.meta_for(chain, chain_offset, k),
-            });
-            n_emitted += 1;
+            seg.q.push(q);
+            seg.qd.push(qd);
+            seg.qdd.push(qdd);
             if finished {
-                return Ok(());
+                return Ok(seg);
             }
-            if n_emitted >= cap.unwrap_or(usize::MAX) {
+            if seg.q.len() >= cap.unwrap_or(usize::MAX) {
                 return Err(MotionError::Ruckig(
                     "trajectory sampling ran past its computed duration".into(),
                 ));
@@ -489,12 +309,15 @@ impl ProgramBuilder {
     }
 }
 
+/// Each joint's travel \[rad\], the path coordinate's per-joint scale.
+fn joint_spans(start: &[f64; NUM_JOINTS], target: &[f64; NUM_JOINTS]) -> [f64; NUM_JOINTS] {
+    std::array::from_fn(|j| (target[j] - start[j]).abs())
+}
+
 struct SegSamples {
     q: Vec<[f64; NUM_JOINTS]>,
     qd: Vec<[f64; NUM_JOINTS]>,
     qdd: Vec<[f64; NUM_JOINTS]>,
-    entry_ticks: usize,
-    exit_ticks: usize,
 }
 
 /// Scalar asymmetric trapezoid over a unit distance: accelerate at `a_in`,
@@ -718,8 +541,6 @@ fn polynomial_segment(
             q: vec![q],
             qd: vec![[0.0; NUM_JOINTS]],
             qdd: vec![[0.0; NUM_JOINTS]],
-            entry_ticks: 0,
-            exit_ticks: 0,
         };
     }
     let (t_total, sample): (f64, UnitSampler) = if septic {
@@ -759,8 +580,6 @@ fn polynomial_segment(
         q: qs,
         qd: qds,
         qdd: qdds,
-        entry_ticks: 0,
-        exit_ticks: 0,
     }
 }
 
@@ -771,20 +590,14 @@ fn trapezoid_segment(
     limits: &MotionLimits,
     speed_fraction: f64,
     min_duration_s: Option<f64>,
-    half_entry: bool,
-    half_exit: bool,
     dt: f64,
 ) -> SegSamples {
-    let entry_scale = if half_entry { 0.5 } else { 1.0 };
-    let exit_scale = if half_exit { 0.5 } else { 1.0 };
     let mut v_s = f64::INFINITY;
-    let mut a_in_s = f64::INFINITY;
-    let mut a_out_s = f64::INFINITY;
+    let mut a_s = f64::INFINITY;
     for (j, &sc) in scale.iter().enumerate() {
         if sc > ZERO_DELTA {
             v_s = v_s.min(limits.velocity[j] * speed_fraction / sc);
-            a_in_s = a_in_s.min(limits.acceleration[j] * entry_scale / sc);
-            a_out_s = a_out_s.min(limits.acceleration[j] * exit_scale / sc);
+            a_s = a_s.min(limits.acceleration[j] / sc);
         }
     }
     if !v_s.is_finite() {
@@ -796,11 +609,9 @@ fn trapezoid_segment(
             q: vec![q],
             qd: vec![[0.0; NUM_JOINTS]],
             qdd: vec![[0.0; NUM_JOINTS]],
-            entry_ticks: 0,
-            exit_ticks: 0,
         };
     }
-    let prof = STrapezoid::new(v_s, a_in_s, a_out_s, min_duration_s);
+    let prof = STrapezoid::new(v_s, a_s, a_s, min_duration_s);
     let n = ((prof.t_total / dt).ceil() as usize).max(1);
     let mut qs = Vec::with_capacity(n);
     let mut qds = Vec::with_capacity(n);
@@ -830,13 +641,9 @@ fn trapezoid_segment(
     path.sample(1.0, &mut qs[last]);
     qds[last] = [0.0; NUM_JOINTS];
     qdds[last] = [0.0; NUM_JOINTS];
-    let entry_ticks = ((prof.t_in / dt).floor() as usize).min(n);
-    let exit_ticks = (((prof.v / prof.a_out) / dt).floor() as usize).min(n);
     SegSamples {
         q: qs,
         qd: qds,
         qdd: qdds,
-        entry_ticks,
-        exit_ticks,
     }
 }

@@ -9,16 +9,20 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 
 use par6_bus::sim::SimBus;
-use par6_rt::hooks::{ClampStream, RampJog};
+use par6_bus::RuntimeBus;
+use par6_rt::adapters::{MotionJog, MotionStream};
+use par6_rt::hooks::ClampStream;
 use par6_rt::{
     sample_ring, CompletionPolicy, ErrorCode, Mode, NoFk, RtCommand, RtCore, RtHandles, RtHooks,
     SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle, StateSnapshot, ZeroGravity,
 };
 
+/// The daemon's bus type over the simulator, so the dispatch layer is
+/// on the path the way it is in `par6d`.
 fn sim_core(
-    deaf: bool,
+    link: impl FnOnce(&mut SimBus),
 ) -> (
-    RtCore<SimBus>,
+    RtCore<RuntimeBus>,
     RtHandles,
     mpsc::Sender<RtCommand>,
     Arc<AtomicBool>,
@@ -33,8 +37,8 @@ fn sim_core(
     let (_producer, consumer) = sample_ring(64);
     let hooks = RtHooks {
         gravity: Box::new(ZeroGravity),
-        jog: Box::new(RampJog::new(robot)),
-        stream: Box::new(ClampStream::new(robot)),
+        jog: Box::new(MotionJog::from_config(robot).expect("jog engine")),
+        stream: Box::new(MotionStream::from_config(robot).expect("stream limiter")),
         stream_shaped: Box::new(ClampStream::new(robot)),
         settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
         estop: Box::new(gpio),
@@ -45,8 +49,8 @@ fn sim_core(
         samples: consumer,
     };
     let mut bus = SimBus::new(common::scene(&bundle));
-    bus.set_deaf(deaf);
-    let (core, handles) = RtCore::new(&bundle, bus, hooks).expect("sim core");
+    link(&mut bus);
+    let (core, handles) = RtCore::new(&bundle, RuntimeBus::from(bus), hooks).expect("sim core");
     (core, handles, tx, line)
 }
 
@@ -60,7 +64,7 @@ fn can_lost(s: &StateSnapshot) -> bool {
 #[test]
 fn a_silent_boot_scan_cycles_the_link_once_before_faulting() {
     // Control: a healthy bus boots to IDLE without touching the link.
-    let (mut core, mut handles, _tx, _line) = sim_core(false);
+    let (mut core, mut handles, _tx, _line) = sim_core(|_| {});
     let dt = core.tick_dt_s();
     for _ in 0..40 {
         core.tick(dt, false);
@@ -72,7 +76,7 @@ fn a_silent_boot_scan_cycles_the_link_once_before_faulting() {
 
     // A deaf link: nobody answers the first scan. The cycle is judged by
     // a re-scan half a second later, after the first stored-config shot.
-    let (mut core, mut handles, _tx, _line) = sim_core(true);
+    let (mut core, mut handles, _tx, _line) = sim_core(|bus| bus.set_deaf(true));
     let dt = core.tick_dt_s();
     for _ in 0..(1.0 / dt).round() as u32 {
         core.tick(dt, false);
@@ -91,7 +95,7 @@ fn a_silent_boot_scan_cycles_the_link_once_before_faulting() {
 
     // The bus goes deaf again: that is a real disconnect, not a second
     // cycle — the freshness latch reports it and the link stays as it is.
-    core.bus_mut().set_deaf(true);
+    core.bus_mut().sim_mut().expect("sim").set_deaf(true);
     let lost_ticks = (common::bundle().robot.bus.lost_s / dt).round() as u32 + 10;
     for _ in 0..lost_ticks {
         core.tick(dt, false);
@@ -103,4 +107,27 @@ fn a_silent_boot_scan_cycles_the_link_once_before_faulting() {
         s.errors
     );
     assert_eq!(s.link.restarts, 1, "only the boot scan may cycle the link");
+}
+
+/// A link the cycle cannot revive is cycled exactly once, then every
+/// drive is reported lost; the runtime does not keep cycling it.
+#[test]
+fn a_link_that_stays_silent_after_its_cycle_latches_can_lost() {
+    let (mut core, mut handles, _tx, _line) = sim_core(SimBus::set_dead);
+    let dt = core.tick_dt_s();
+    for _ in 0..(2.0 / dt).round() as u32 {
+        core.tick(dt, false);
+    }
+    let s = handles.snapshots.latest();
+    assert_eq!(s.link.restarts, 1, "the boot scan cycles the link once");
+    for j in 0..6u8 {
+        assert!(
+            s.errors
+                .as_slice()
+                .iter()
+                .any(|e| e.code == ErrorCode::CanLost && e.joint == Some(j)),
+            "J{j} is lost after the cycle failed: {:?}",
+            s.errors
+        );
+    }
 }

@@ -1,6 +1,6 @@
 //! Planned-move profile tests against the real PAR6 exec limits: limit
 //! adherence by finite differences, duration/speed parameterization,
-//! corner blending continuity, and input validation.
+//! and input validation.
 
 mod common;
 
@@ -293,58 +293,6 @@ fn polynomial_moves_respect_limits_and_parameterization() {
 }
 
 #[test]
-fn polynomial_profiles_refuse_to_blend() {
-    // Two complementary polynomial halves sum to more than the profile's
-    // own peak, so a spliced corner would run over a limit. The program is
-    // refused, not quietly stopped at the corner.
-    let (limits, dt) = exec_limits();
-    for (profile, name) in [
-        (ProfileKind::Quintic, "quintic"),
-        (ProfileKind::Septic, "septic"),
-    ] {
-        let mut b = ProgramBuilder::new(HOME, limits, dt).unwrap();
-        b.move_j(
-            TARGET,
-            MoveParams {
-                profile,
-                blend_with_next: true,
-                ..MoveParams::default()
-            },
-        )
-        .unwrap()
-        .move_j(
-            second_target(),
-            MoveParams {
-                profile,
-                ..MoveParams::default()
-            },
-        )
-        .unwrap();
-        match b.plan() {
-            Err(MotionError::ProfileCannotBlend {
-                profile: refused,
-                first: 0,
-                second: 1,
-            }) => assert_eq!(refused, name),
-            other => panic!("{name}: expected a blend refusal, got {other:?}"),
-        }
-        // The flag on a LAST move is documented as ignored, so a single
-        // move carrying it still plans.
-        let mut b = ProgramBuilder::new(HOME, limits, dt).unwrap();
-        b.move_j(
-            TARGET,
-            MoveParams {
-                profile,
-                blend_with_next: true,
-                ..MoveParams::default()
-            },
-        )
-        .unwrap();
-        assert!(b.plan().is_ok(), "{name}: a lone move must plan");
-    }
-}
-
-#[test]
 fn ruckig_move_respects_limits_including_jerk() {
     let (plan, limits, dt) = plan_one(ProfileKind::Ruckig, MoveParams::default());
     let qs = positions_with_start(HOME, plan.samples());
@@ -392,142 +340,6 @@ fn ruckig_move_respects_limits_including_jerk() {
             0.5 * v
         );
     }
-}
-
-/// Second target continuing every joint in its HOME→TARGET direction
-/// (clipped inside the soft windows) so a blended corner keeps cruising
-/// instead of reversing.
-fn second_target() -> [f64; NUM_JOINTS] {
-    [2.0, -0.2, 2.0, 2.0, 1.5, -0.5]
-}
-
-fn plan_two(profile: ProfileKind, blend: bool) -> (Plan, MotionLimits, f64) {
-    let (limits, dt) = exec_limits();
-    let mut b = ProgramBuilder::new(HOME, limits, dt).unwrap();
-    b.move_j(
-        TARGET,
-        MoveParams {
-            profile,
-            blend_with_next: blend,
-            ..MoveParams::default()
-        },
-    )
-    .unwrap()
-    .move_j(
-        second_target(),
-        MoveParams {
-            profile,
-            ..MoveParams::default()
-        },
-    )
-    .unwrap();
-    (b.plan().unwrap(), limits, dt)
-}
-
-/// Largest velocity utilization max_j |qd_j| / v_limit_j at one sample.
-fn vel_utilization(s: &par6_motion::Sample, limits: &MotionLimits) -> f64 {
-    (0..NUM_JOINTS)
-        .map(|j| s.qd[j].abs() / limits.velocity[j])
-        .fold(0.0, f64::max)
-}
-
-fn boundary_index(plan: &Plan) -> usize {
-    plan.samples()
-        .iter()
-        .position(|s| s.meta.command_index == 1)
-        .expect("second command must appear in the stream")
-}
-
-fn assert_blend_behavior(profile: ProfileKind) {
-    let (plan, limits, dt) = plan_two(profile, true);
-    let jerk = match profile {
-        ProfileKind::Ruckig => Some(&limits.jerk),
-        _ => None,
-    };
-    let qs = positions_with_start(HOME, plan.samples());
-    assert_within_limits(
-        &qs,
-        dt,
-        &limits.velocity,
-        &limits.acceleration,
-        jerk,
-        "blend",
-    );
-
-    // C1 continuity: the commanded velocity stream never slews faster than
-    // the acceleration limit, splice included, and stays consistent with
-    // the position stream.
-    let mut prev_qd = [0.0; NUM_JOINTS];
-    for (k, s) in plan.samples().iter().enumerate() {
-        for j in 0..NUM_JOINTS {
-            let dv = (s.qd[j] - prev_qd[j]).abs();
-            assert!(
-                dv <= limits.acceleration[j] * dt * (1.0 + 1e-6) + 1e-9,
-                "qd slew {dv} on joint {j} at tick {k} exceeds a*dt"
-            );
-            let fd = (qs[k + 1][j] - qs[k][j]) / dt;
-            let mid = 0.5 * (s.qd[j] + prev_qd[j]);
-            assert!(
-                (fd - mid).abs() <= limits.acceleration[j] * dt + 1e-6,
-                "qd inconsistent with positions on joint {j} at tick {k}: fd {fd} vs {mid}"
-            );
-        }
-        prev_qd = s.qd;
-    }
-
-    // The corner is taken at speed: the peak cruise utilization does not
-    // collapse at the command boundary.
-    let peak_util = plan
-        .samples()
-        .iter()
-        .map(|s| vel_utilization(s, &limits))
-        .fold(0.0, f64::max);
-    let b = boundary_index(&plan);
-    let boundary_util = vel_utilization(&plan.samples()[b], &limits);
-    assert!(
-        boundary_util > 0.25 * peak_util,
-        "blended corner nearly stopped: {boundary_util} vs peak {peak_util}"
-    );
-
-    // Metadata semantics.
-    for s in &plan.samples()[..b] {
-        assert!(
-            s.meta.blend_continues,
-            "blending segment must carry the flag"
-        );
-        assert_eq!(s.meta.command_index, 0);
-        assert_eq!(s.meta.checkpoint_id, 0);
-    }
-    for s in &plan.samples()[b..] {
-        assert!(!s.meta.blend_continues);
-        assert_eq!(s.meta.command_index, 1);
-        assert_eq!(s.meta.checkpoint_id, 1);
-    }
-    let last = plan.samples().last().unwrap();
-    assert!(last.meta.is_last);
-    assert!(max_err(&last.q, &second_target()) < 1e-9);
-
-    // Contrast: without blending the same program settles to rest at the
-    // boundary and carries no blend flag.
-    let (unblended, _, _) = plan_two(profile, false);
-    let b = boundary_index(&unblended);
-    let handoff = &unblended.samples()[b - 1];
-    assert!(
-        handoff.qd.iter().all(|&v| v.abs() < 1e-9),
-        "unblended boundary must be at rest, got {:?}",
-        handoff.qd
-    );
-    assert!(!handoff.meta.blend_continues);
-}
-
-#[test]
-fn corner_blending_is_velocity_continuous_trapezoid() {
-    assert_blend_behavior(ProfileKind::Trapezoid);
-}
-
-#[test]
-fn corner_blending_is_velocity_continuous_ruckig() {
-    assert_blend_behavior(ProfileKind::Ruckig);
 }
 
 /// `qdd` against the centered difference of the emitted `qd`. A
@@ -594,83 +406,8 @@ fn emitted_acceleration_is_the_derivative_of_emitted_velocity() {
         ProfileKind::Septic,
     ] {
         let (plan, limits, dt) = plan_one(profile, MoveParams::default());
-        assert_qdd_is_the_derivative_of_qd(
-            &format!("{profile:?} single"),
-            profile,
-            &plan,
-            &limits,
-            dt,
-        );
-        if matches!(profile, ProfileKind::Quintic | ProfileKind::Septic) {
-            continue; // point-to-point: no blended form to check
-        }
-        let (plan, limits, dt) = plan_two(profile, true);
-        assert_qdd_is_the_derivative_of_qd(
-            &format!("{profile:?} blend"),
-            profile,
-            &plan,
-            &limits,
-            dt,
-        );
+        assert_qdd_is_the_derivative_of_qd(&format!("{profile:?}"), profile, &plan, &limits, dt);
     }
-}
-
-#[test]
-fn ruckig_waypoint_chain_passes_through_waypoints() {
-    let (limits, dt) = exec_limits();
-    let way1 = TARGET;
-    let way2: [f64; NUM_JOINTS] = [0.5, -1.0, 2.7, 0.5, 0.2, 2.0];
-    let end: [f64; NUM_JOINTS] = [-0.5, -2.0, 3.5, -0.5, -0.4, 3.0];
-    let mut b = ProgramBuilder::new(HOME, limits, dt).unwrap();
-    let blend = MoveParams {
-        profile: ProfileKind::Ruckig,
-        blend_with_next: true,
-        ..MoveParams::default()
-    };
-    b.move_j(way1, blend)
-        .unwrap()
-        .move_j(way2, blend)
-        .unwrap()
-        .move_j(
-            end,
-            MoveParams {
-                profile: ProfileKind::Ruckig,
-                ..MoveParams::default()
-            },
-        )
-        .unwrap();
-    let plan = b.plan().unwrap();
-    let qs = positions_with_start(HOME, plan.samples());
-    assert_within_limits(
-        &qs,
-        dt,
-        &limits.velocity,
-        &limits.acceleration,
-        Some(&limits.jerk),
-        "waypoint chain",
-    );
-    for (name, wp) in [("way1", way1), ("way2", way2)] {
-        let closest = plan
-            .samples()
-            .iter()
-            .map(|s| max_err(&s.q, &wp))
-            .fold(f64::INFINITY, f64::min);
-        assert!(
-            closest < 0.05,
-            "chain must pass through {name}, closest approach {closest} rad"
-        );
-    }
-    assert!(max_err(&plan.samples().last().unwrap().q, &end) < 1e-9);
-    // Three commands appear in order.
-    let cmds: Vec<u32> = plan
-        .samples()
-        .iter()
-        .map(|s| s.meta.command_index)
-        .collect();
-    assert!(cmds.windows(2).all(|w| w[0] <= w[1]));
-    assert_eq!(*cmds.last().unwrap(), 2);
-    assert_eq!(cmds[0], 0);
-    assert!(cmds.contains(&1));
 }
 
 #[test]
@@ -740,33 +477,6 @@ fn builder_rejects_invalid_programs() {
     assert!(matches!(
         b.plan(),
         Err(MotionError::InvalidInput { what: "moves", .. })
-    ));
-
-    // A blend chain must not mix profiles.
-    let mut b = ProgramBuilder::new(HOME, limits, dt).unwrap();
-    b.move_j(
-        TARGET,
-        MoveParams {
-            profile: ProfileKind::Trapezoid,
-            blend_with_next: true,
-            ..MoveParams::default()
-        },
-    )
-    .unwrap()
-    .move_j(
-        second_target(),
-        MoveParams {
-            profile: ProfileKind::Ruckig,
-            ..MoveParams::default()
-        },
-    )
-    .unwrap();
-    assert!(matches!(
-        b.plan(),
-        Err(MotionError::MixedProfileBlend {
-            first: 0,
-            second: 1
-        })
     ));
 
     // The ruckig profile needs finite jerk limits.

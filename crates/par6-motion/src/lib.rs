@@ -3,10 +3,9 @@
 //! Division of labor (mirrors parol6):
 //! - [`ProgramBuilder`] compiles queued joint-space moves into tick-rate
 //!   [`Sample`] streams in the EXEC ring's format: trapezoid
-//!   (accel–cruise–decel, slowest-joint synchronized) and rsruckig
-//!   (jerk-limited point-to-point, waypoint chains) profiles, corner
-//!   blending with `blend_continues` metadata, duration/speed
-//!   parameterization.
+//!   (accel–cruise–decel, slowest-joint synchronized), rsruckig
+//!   (jerk-limited) and polynomial point-to-point profiles, with
+//!   duration/speed parameterization.
 //! - [`PathSampler`] is the geometry seam for cartesian paths: the
 //!   planner will implement it over IK-solved waypoints from `par6-kin`;
 //!   joint-space moves run through it today via [`JointLinePath`].

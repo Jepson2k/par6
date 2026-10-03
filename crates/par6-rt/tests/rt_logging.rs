@@ -23,7 +23,8 @@ use par6_bus::{
     LoopbackBus, NodeId, PollAction,
 };
 use par6_config::{ConfigBundle, RobotConfig, ToolConfig};
-use par6_rt::hooks::{ClampStream, RampJog};
+use par6_rt::adapters::{MotionJog, MotionStream};
+use par6_rt::hooks::ClampStream;
 use par6_rt::{
     sample_ring, CompletionPolicy, NoFk, RtCore, SharedDigitalIo, SharedFlashMarker,
     SharedLineGpio, SpecSettle, ZeroGravity,
@@ -62,6 +63,10 @@ struct FailingBus {
 impl DriverBus for FailingBus {
     fn begin_tick(&mut self, tick: u64) {
         self.inner.begin_tick(tick);
+    }
+
+    fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>) {
+        self.inner.fit_tool(robot, tool);
     }
 
     fn drain_rx(&mut self, state: &mut BusState) -> Result<usize, BusError> {
@@ -217,8 +222,8 @@ fn a_permanent_bus_fault_does_not_log_once_per_tick() {
     let (_producer, consumer) = sample_ring(64);
     let hooks = par6_rt::RtHooks {
         gravity: Box::new(ZeroGravity),
-        jog: Box::new(RampJog::new(&bundle.robot)),
-        stream: Box::new(ClampStream::new(&bundle.robot)),
+        jog: Box::new(MotionJog::from_config(&bundle.robot).expect("jog engine")),
+        stream: Box::new(MotionStream::from_config(&bundle.robot).expect("stream limiter")),
         stream_shaped: Box::new(ClampStream::new(&bundle.robot)),
         settle: Box::new(SpecSettle::new(
             CompletionPolicy::Settled,

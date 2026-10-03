@@ -1,6 +1,6 @@
 //! EXEC ring playback through the full core: all three completion
-//! policies, the blend-continues bypass, the strict-timeout error, pause
-//! semantics, and the exec link watchdog.
+//! policies, the strict-timeout error, pause semantics, and the exec link
+//! watchdog.
 
 mod common;
 
@@ -10,9 +10,8 @@ use par6_rt::{
 };
 
 /// Push `n` samples for command `index` ramping J0 from `from` by `step`
-/// per sample; `blend` marks every sample's segment as blending onward;
-/// `last` marks the final sample as the program end.
-fn push_cmd(rig: &mut Rig, index: u32, from: f64, step: f64, n: usize, blend: bool, last: bool) {
+/// per sample; `last` marks the final sample as the program end.
+fn push_cmd(rig: &mut Rig, index: u32, from: f64, step: f64, n: usize, last: bool) {
     let mut q = rig.pose;
     for k in 0..n {
         q[0] = from + step * (k + 1) as f64;
@@ -25,7 +24,6 @@ fn push_cmd(rig: &mut Rig, index: u32, from: f64, step: f64, n: usize, blend: bo
             meta: SampleMeta {
                 command_index: index,
                 checkpoint_id: index,
-                blend_continues: blend,
                 is_last: last && k == n - 1,
             },
         };
@@ -53,7 +51,7 @@ fn playback_pops_one_sample_per_tick_and_holds_when_starved() {
     let mut rig = Rig::new();
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0, 0.001, 10, false, false);
+    push_cmd(&mut rig, 1, q0, 0.001, 10, false);
     let start = rig.snap().tick;
     rig.tick_n(15);
 
@@ -83,8 +81,8 @@ fn commanded_policy_completes_at_the_last_sample_without_holding() {
     let q0 = rig.pose[0];
     // Target far from the measured pose: a settling policy would hold
     // here; commanded must not.
-    push_cmd(&mut rig, 1, q0, 0.02, 5, false, false);
-    push_cmd(&mut rig, 2, q0 + 0.1, 0.02, 5, false, true);
+    push_cmd(&mut rig, 1, q0, 0.02, 5, false);
+    push_cmd(&mut rig, 2, q0 + 0.1, 0.02, 5, true);
     let start = rig.snap().tick;
     rig.tick_n(13);
 
@@ -107,10 +105,10 @@ fn settled_policy_holds_until_tracking_then_resumes() {
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
     let target = q0 + 0.05;
-    push_cmd(&mut rig, 1, q0, 0.01, 5, false, false);
+    push_cmd(&mut rig, 1, q0, 0.01, 5, false);
     // Command 2 holds at the same target so its own final settle can
     // complete once the measured pose tracks.
-    push_cmd(&mut rig, 2, target, 0.0, 5, false, true);
+    push_cmd(&mut rig, 2, target, 0.0, 5, true);
     rig.tick_n(8);
 
     // Boundary reached with the measured pose 0.05 rad off: settling.
@@ -146,7 +144,7 @@ fn settled_timeout_completes_without_error_strict_timeout_latches() {
     let mut rig = Rig::new();
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, false, true);
+    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, true);
     rig.tick_n(4 + 500 + 5);
     let s = rig.snap();
     assert_eq!(s.exec.completed_index, 1, "timeout completes under settled");
@@ -157,7 +155,7 @@ fn settled_timeout_completes_without_error_strict_timeout_latches() {
     let mut rig = Rig::with_policy(CompletionPolicy::Strict);
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, false, true);
+    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, true);
     rig.tick_n(4 + 500 + 5);
     let s = rig.snap();
     let latched = s
@@ -192,7 +190,7 @@ fn strict_settle_faults_on_stalled_progress_not_on_elapsed_time() {
     let mut rig = Rig::with_policy(CompletionPolicy::Strict);
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, false, true);
+    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, true);
     rig.tick_n(4);
     assert!(rig.snap().exec.settling, "the ring has run out: settling");
     // Closing by 0.002 rad every 300 ticks: every step clears the
@@ -219,7 +217,7 @@ fn strict_settle_faults_on_stalled_progress_not_on_elapsed_time() {
     let mut rig = Rig::with_policy(CompletionPolicy::Strict);
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, false, true);
+    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, true);
     rig.tick_n(4);
     for k in 1..=6 {
         rig.pose[0] = q0 + 0.0004 * f64::from(k % 2);
@@ -237,40 +235,11 @@ fn strict_settle_faults_on_stalled_progress_not_on_elapsed_time() {
 }
 
 #[test]
-fn blend_continues_bypasses_settling_across_the_boundary() {
-    let mut rig = Rig::new(); // Settled policy — the bypass must win
-    enter_exec(&mut rig);
-    let q0 = rig.pose[0];
-    // Command 1 blends into command 2; targets far from measured, so
-    // only the bypass can keep motion continuous.
-    push_cmd(&mut rig, 1, q0, 0.02, 5, true, false);
-    push_cmd(&mut rig, 2, q0 + 0.1, 0.02, 5, false, true);
-    let start = rig.snap().tick;
-    rig.tick_n(12);
-
-    let pos = j0_positions(&mut rig, start + 1);
-    let expected: Vec<i32> = (1..=10)
-        .map(|k| rig.conv[0].motor_ticks(q0 + 0.02 * k as f64))
-        .collect();
-    // No hold tick at the 1→2 boundary: blended corners stay
-    // velocity-continuous even under the settled policy.
-    assert_eq!(&pos[..10], &expected[..], "continuous through the blend");
-    let s = rig.snap();
-    assert_eq!(
-        s.exec.completed_index, 1,
-        "cmd 1 completed via blend bypass"
-    );
-    // The final (non-blended) boundary settles normally — measured is
-    // far off, so playback is holding there.
-    assert!(s.exec.settling, "final boundary settles under the policy");
-}
-
-#[test]
 fn pause_holds_in_place_with_the_ring_untouched() {
     let mut rig = Rig::new();
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0, 0.0, 1000, false, false);
+    push_cmd(&mut rig, 1, q0, 0.0, 1000, false);
     rig.tick_n(10);
 
     rig.cmd(RtCommand::ExecSetPaused(true));
@@ -328,7 +297,7 @@ fn exec_link_watchdog_latches_after_heartbeat_silence_with_samples_pending() {
     let mut rig = Rig::new();
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0, 0.0001, 2000, false, false);
+    push_cmd(&mut rig, 1, q0, 0.0001, 2000, false);
 
     // Fed heartbeat: no error while playing.
     for _ in 0..200 {
@@ -361,7 +330,7 @@ fn gravity_comp_after_a_finished_program_floats_instead_of_holding() {
     let mut rig = Rig::with_policy(CompletionPolicy::Commanded);
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0, 0.02, 8, false, true);
+    push_cmd(&mut rig, 1, q0, 0.02, 8, true);
     rig.tick_n(3);
     assert_eq!(rig.snap().mode, Mode::Exec);
 
@@ -415,7 +384,7 @@ fn a_pause_requested_while_idle_holds_the_next_program() {
     rig.tick();
     assert_eq!(rig.snap().mode, Mode::Exec);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0, 0.001, 100, false, false);
+    push_cmd(&mut rig, 1, q0, 0.001, 100, false);
     rig.tick();
     let before = rig.snap().exec.samples_remaining;
     rig.tick_n(30);
@@ -472,7 +441,6 @@ fn a_stop_brakes_along_the_path_within_the_acceleration_limit_then_holds() {
             meta: SampleMeta {
                 command_index: 1,
                 checkpoint_id: 1,
-                blend_continues: false,
                 is_last: k == 1999,
             },
         };
@@ -567,7 +535,6 @@ fn a_jog_cutting_a_stop_short_leaves_nothing_for_the_hold_to_play() {
             meta: SampleMeta {
                 command_index: 1,
                 checkpoint_id: 1,
-                blend_continues: false,
                 is_last: k == 1999,
             },
         };

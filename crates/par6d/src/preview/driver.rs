@@ -31,10 +31,10 @@ use par6_rt::{
     SnapshotWriter, SpecSettle, StateSnapshot, MAX_JOINTS,
 };
 
-use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{CoreLink, CoreOp};
 use crate::daemon::{flash_marker, RING_CAPACITY};
 use crate::kin::{KinFk, KinGravity};
+use par6_rt::adapters::{MotionJog, MotionStream};
 
 /// How long each boot phase may take, in simulated seconds. Generous:
 /// these bound a wedge, they are not schedules. A boot that needs more

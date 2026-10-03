@@ -20,8 +20,9 @@ use par6_bus::{
     Reply, TxRecord,
 };
 use par6_config::{ConfigBundle, GripperHomeMode, HomeGroup, MoveTo, SequenceStep};
+use par6_rt::adapters::{MotionJog, MotionStream};
 use par6_rt::homing::{HomingSystem, SeqStatus};
-use par6_rt::hooks::{ClampStream, RampJog};
+use par6_rt::hooks::ClampStream;
 use par6_rt::{
     sample_ring, ArmState, CompletionPolicy, ErrorCode, GravityModel, HomingJointStatus,
     HomingPhase, Mode, NoFk, RtCommand, RtCore, RtHandles, RtHooks, SharedDigitalIo,
@@ -70,8 +71,8 @@ fn sim_core_with_gravity(
     let (_producer, consumer) = sample_ring(64);
     let hooks = RtHooks {
         gravity,
-        jog: Box::new(RampJog::new(robot)),
-        stream: Box::new(ClampStream::new(robot)),
+        jog: Box::new(MotionJog::from_config(robot).expect("jog engine")),
+        stream: Box::new(MotionStream::from_config(robot).expect("stream limiter")),
         stream_shaped: Box::new(ClampStream::new(robot)),
         settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
         estop: Box::new(gpio),

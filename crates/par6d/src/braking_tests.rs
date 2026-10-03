@@ -1,7 +1,9 @@
 //! Stream release against the real driver and plant, advanced in virtual time.
-use super::*;
 use par6_bus::sim::{scene::Scene, SimBus};
 use par6_config::{ConfigBundle, LimitMode};
+use par6_motion::{MotionLimits, StreamingExecutor};
+use par6_rt::adapters::{MotionJog, MotionStream};
+use par6_rt::MAX_JOINTS;
 use par6_rt::{
     sample_ring, ArmState, CompletionPolicy, Mode, RtCommand, RtCore, RtHandles, RtHooks,
     SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle,

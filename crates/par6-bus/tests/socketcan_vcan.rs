@@ -738,8 +738,40 @@ fn kt_fetch_garbage_and_late_replies_are_provenance_not_re_asks() {
 fn steady_state_ticks_allocate_nothing() {
     let iface = require_vcan!();
     let wire = Wire::open(&iface);
-    let (mut bus, _robot, _gripper) = quiet_bus(&iface);
-    let joints = [JointCommand::idle(); 6];
+    let (mut robot, gripper) = configs(&iface);
+    robot.robot.kt_source = KtSource::Config;
+    robot.bus.scan.rounds = 0;
+    // Config re-sends carry the par6-firmware frames of a self-calibrated
+    // drive as well.
+    for j in &mut robot.joints {
+        j.ripple = vec![par6_config::RippleHarmonic {
+            harmonic: 2,
+            a_ma: 40,
+            b_ma: -25,
+        }];
+        j.velocity_window = Some(16);
+    }
+    let mut bus = SocketCanBus::open(&robot.bus).expect("open SocketCanBus");
+    bus.boot_configure(&robot, Some(&gripper), 0)
+        .expect("boot_configure");
+    let shapes = [
+        JointCommand::position(1000, 2000, 300),
+        JointCommand::velocity(-500, 250),
+        JointCommand::current(-150),
+        JointCommand::hall(4500, 2),
+        JointCommand::pd(10, 0, 50),
+        JointCommand::idle(),
+    ];
+    let grip = GripperCommand::Firmware(par6_bus::FirmwareGripperCommand {
+        position: 128,
+        speed: 40,
+        current_ma: 600,
+        activate: true,
+        action: true,
+        estop: false,
+        release_dir: false,
+    });
+    let node0 = robot.joints[0].node_id;
     let mut state = BusState::new();
     let (motion_id, motion) = motion_reply(0, false, -150, -187, 3047);
     let reply = socketcan::CanFrame::from_raw_id(u32::from(motion_id), &motion).expect("frame");
@@ -748,26 +780,43 @@ fn steady_state_ticks_allocate_nothing() {
         wire.0.write_frame(&reply).expect("inject");
         bus.begin_tick(t);
         bus.drain_rx(state).expect("drain");
+        let joints: [JointCommand; 6] = std::array::from_fn(|j| shapes[(j + t as usize) % 6]);
         bus.send_joint_commands(&joints).expect("joints");
-        bus.send_gripper(&GripperCommand::NoGripper)
-            .expect("gripper");
+        bus.send_gripper(if t.is_multiple_of(2) {
+            &grip
+        } else {
+            &GripperCommand::NoGripper
+        })
+        .expect("gripper");
+        match t % 50 {
+            0 => bus.resend_node_config(node0, 1).expect("resend"),
+            10 => bus.queue_poll_override(par6_bus::PollAction::ResendConfig { node: node0 }, 1),
+            20 => bus.queue_poll_override(
+                par6_bus::PollAction::ConfigFrame {
+                    node: node0,
+                    kind: par6_bus::ConfigKind::Limits,
+                },
+                1,
+            ),
+            30 => bus.queue_poll_override(
+                par6_bus::PollAction::Poll {
+                    node: node0,
+                    kind: PollKind::Errors,
+                },
+                4,
+            ),
+            _ => {}
+        }
         bus.poll_step().expect("poll");
     };
 
-    // Warm up: first touch of every buffer, and the poll override path.
-    bus.queue_poll_override(
-        par6_bus::PollAction::Poll {
-            node: 0,
-            kind: PollKind::Errors,
-        },
-        4,
-    );
-    for t in 1..20 {
+    // Warm up: first touch of every buffer and every path above.
+    for t in 1..60 {
         tick(&mut bus, &mut state, t);
     }
 
     let before = allocs();
-    for t in 20..320 {
+    for t in 60..360 {
         tick(&mut bus, &mut state, t);
     }
     let after = allocs();

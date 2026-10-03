@@ -17,11 +17,19 @@
 //! the same `gravity_at` the sim exposes, the controller by the same
 //! `load_gravity_kin` the daemon builds its feedforward from.
 
+use std::sync::mpsc;
+
 use par6_bus::sim::scene::{Scene, Tool};
 use par6_bus::sim::SimBus;
-use par6_bus::DriverBus;
-use par6_config::ConfigBundle;
+use par6_bus::RuntimeBus;
+use par6_config::{ConfigBundle, ToolConfig};
 use par6_kin::Kin;
+use par6_rt::adapters::{MotionJog, MotionStream};
+use par6_rt::hooks::ClampStream;
+use par6_rt::{
+    sample_ring, CompletionPolicy, NoFk, RtCore, RtHooks, SharedDigitalIo, SharedFlashMarker,
+    SharedLineGpio, SpecSettle, ZeroGravity,
+};
 
 mod common;
 
@@ -58,33 +66,53 @@ fn scene(bundle: &ConfigBundle) -> Scene {
 }
 
 /// The controller's `G(q)`, built exactly as the daemon builds it: the
-/// model, then the identified correction on top.
-fn controller_gravity(bundle: &ConfigBundle) -> Kin {
-    let mut kin = par6d::kin::load_gravity_kin(&common::assets_dir(), bundle.active_tool())
+/// model for the fitted tool, then the identified correction on top.
+fn controller_gravity(bundle: &ConfigBundle, tool: Option<&ToolConfig>) -> Kin {
+    let mut kin = par6d::kin::load_gravity_kin(&common::assets_dir(), tool)
         .expect("controller gravity model");
     kin.set_gravity_correction(&bundle.robot.gravity_correction)
         .expect("the config's gravity correction");
     kin
 }
 
-/// The plant's `G(q)`, through the bus the sim actually runs.
-fn plant(bundle: &ConfigBundle) -> SimBus {
-    let mut bus = SimBus::new(scene(bundle));
-    bus.boot_configure(&bundle.robot, bundle.active_tool(), 1)
-        .expect("sim boot");
-    bus
+/// The plant as the daemon boots it: the RT core on the daemon's bus
+/// type decides which tool the simulator carries.
+fn sim_core(bundle: &ConfigBundle) -> RtCore<RuntimeBus> {
+    let robot = &bundle.robot;
+    let (_tx, rx) = mpsc::channel();
+    let (gpio, _line) = SharedLineGpio::new(true);
+    let (marker, _flash) = SharedFlashMarker::new();
+    let (io, _lines) = SharedDigitalIo::new(robot.io.inputs.len(), robot.io.outputs.len());
+    let (_producer, consumer) = sample_ring(16);
+    let hooks = RtHooks {
+        gravity: Box::new(ZeroGravity),
+        jog: Box::new(MotionJog::from_config(robot).expect("jog engine")),
+        stream: Box::new(MotionStream::from_config(robot).expect("stream limiter")),
+        stream_shaped: Box::new(ClampStream::new(robot)),
+        settle: Box::new(SpecSettle::new(
+            CompletionPolicy::Settled,
+            robot.robot.tick_dt_s,
+            robot.motion,
+        )),
+        estop: Box::new(gpio),
+        io: Box::new(io),
+        flash: Box::new(marker),
+        commands: Box::new(rx),
+        fk: Box::new(NoFk),
+        samples: consumer,
+    };
+    let bus = RuntimeBus::from(SimBus::new(scene(bundle)));
+    RtCore::new(bundle, bus, hooks).expect("sim core").0
 }
 
-fn compare(bundle: &ConfigBundle, label: &str) {
-    let mut kin = controller_gravity(bundle);
-    let mut bus = plant(bundle);
-    let n = bundle.robot.joints.len();
+fn compare(core: &mut RtCore<RuntimeBus>, kin: &mut Kin, label: &str) {
+    let plant = core.bus_mut().sim_mut().expect("sim bus");
     for deg in &POSES_DEG {
         let q: [f64; 6] = std::array::from_fn(|i| deg[i].to_radians());
-        let theirs = bus.gravity_at(&q[..n]).expect("plant gravity");
+        let theirs = plant.gravity_at(&q).expect("plant gravity");
         let mut ours = [0.0; 6];
         kin.gravity(&q, &mut ours).expect("controller gravity");
-        for j in 0..n {
+        for j in 0..6 {
             let diff = (ours[j] - theirs[j]).abs();
             assert!(
                 diff < TOL_NM,
@@ -97,40 +125,63 @@ fn compare(bundle: &ConfigBundle, label: &str) {
     }
 }
 
-/// With the tool the shipped config selects.
+/// The models track the fitted tool together — booted with it, driven or
+/// not, and changed under a running core the way `select_tool` changes it
+/// — or the feedforward describes a load the arm is not carrying.
 #[test]
-fn the_plant_and_the_controller_agree_about_gravity() {
-    compare(&bundle(), "shipped tool");
-}
-
-/// And with a different one. This is the case that was never covered: the
-/// models have to track `active_tool` together, or a tool change leaves the
-/// feedforward describing a load the arm is not carrying.
-#[test]
-fn they_still_agree_after_the_active_tool_changes() {
-    let mut bundle = bundle();
-    let bare = bundle
+fn the_plant_and_the_controller_agree_about_gravity_through_tool_changes() {
+    let bundle = bundle();
+    let shipped = bundle
+        .active_tool()
+        .expect("the shipped config fits a tool");
+    // An undriven tool whose mass is its config's, not its URDF's: the
+    // scene borrows the bare flange's tree for it.
+    let passive = bundle
         .tools
         .iter()
-        .any(|g| g.name == "Flange")
-        .then(|| "Flange".to_string())
-        .expect("the config declares the bare Flange attachment");
-    bundle.robot.robot.active_tool = bare;
-    compare(&bundle, "bare flange");
-}
+        .find(|g| g.name == "MHZ2-10D")
+        .expect("the config declares the MHZ2-10D");
+    let gripper_node = bundle.robot.bus.gripper_node;
 
-/// And with a payload the model was not built with — the arm carrying
-/// something heavier than its declared tool, which is what an identification
-/// run exists to discover.
-#[test]
-fn they_still_agree_under_an_undeclared_payload() {
-    let mut bundle = bundle();
-    let name = bundle.robot.robot.active_tool.clone();
-    let gripper = bundle
+    let mut core = sim_core(&bundle);
+    compare(
+        &mut core,
+        &mut controller_gravity(&bundle, Some(shipped)),
+        "shipped tool",
+    );
+    core.set_gripper_tool(Some(passive), gripper_node, 1);
+    compare(
+        &mut core,
+        &mut controller_gravity(&bundle, Some(passive)),
+        "after select_tool to the MHZ2-10D",
+    );
+    core.set_gripper_tool(Some(shipped), gripper_node, 1);
+    compare(
+        &mut core,
+        &mut controller_gravity(&bundle, Some(shipped)),
+        "after select_tool back to the shipped tool",
+    );
+
+    let mut undriven = bundle.clone();
+    undriven.robot.robot.active_tool.clone_from(&passive.name);
+    compare(
+        &mut sim_core(&undriven),
+        &mut controller_gravity(&undriven, undriven.active_tool()),
+        "booted with the MHZ2-10D",
+    );
+
+    // A heavier declared tool: both models read the declared mass.
+    let mut heavy = bundle.clone();
+    heavy
         .tools
         .iter_mut()
-        .find(|g| g.name == name)
-        .expect("active gripper");
-    gripper.kinematics.mass_kg = 2.0;
-    compare(&bundle, "2 kg tool");
+        .find(|g| g.name == shipped.name)
+        .expect("shipped tool")
+        .kinematics
+        .mass_kg = 2.0;
+    compare(
+        &mut sim_core(&heavy),
+        &mut controller_gravity(&heavy, heavy.active_tool()),
+        "a 2 kg tool",
+    );
 }

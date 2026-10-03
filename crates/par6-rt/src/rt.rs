@@ -87,14 +87,30 @@ impl<B: DriverBus> RtCore<B> {
     /// [`SHUTDOWN_SETTLE_BUDGET_S`]), then one SAFETY_STOP tick so the
     /// last frame on the bus idles the drives on purpose. In FLASHING
     /// the bus is silent by contract and the whole sequence is skipped.
+    /// Ticks are paced in real time.
     pub fn shutdown_stop(&mut self) {
+        let dt_ns = (self.tick_dt_s() * 1e9).round() as u64;
+        let mut deadline = monotonic_ns();
+        self.shutdown_stop_paced(|| {
+            deadline += dt_ns;
+            let now = monotonic_ns();
+            if now < deadline {
+                sleep_until(deadline);
+            } else {
+                deadline = now;
+            }
+        });
+    }
+
+    /// [`Self::shutdown_stop`] with `pace` called after every tick but
+    /// the terminal one — the wall clock in production, nothing under a
+    /// virtual clock.
+    pub fn shutdown_stop_paced(&mut self, mut pace: impl FnMut()) {
         if self.mode() == crate::Mode::Flashing {
             return;
         }
         let dt = self.tick_dt_s();
-        let dt_ns = (dt * 1e9).round() as u64;
         if self.shutdown_park_begin() {
-            let mut deadline = monotonic_ns();
             let mut reached = false;
             for _ in 0..self.shutdown_park_timeout_ticks() {
                 if self.shutdown_park_feed() {
@@ -102,13 +118,7 @@ impl<B: DriverBus> RtCore<B> {
                     break;
                 }
                 self.tick(dt, false);
-                deadline += dt_ns;
-                let now = monotonic_ns();
-                if now < deadline {
-                    sleep_until(deadline);
-                } else {
-                    deadline = now;
-                }
+                pace();
             }
             if !reached {
                 log::warn!("shutdown: retreat timed out; halting where the arm is");
@@ -117,19 +127,12 @@ impl<B: DriverBus> RtCore<B> {
         }
         let budget = (SHUTDOWN_SETTLE_BUDGET_S / dt).ceil() as u32;
         self.shutdown_halt();
-        let mut deadline = monotonic_ns();
         for _ in 0..budget {
             self.tick(dt, false);
             if self.at_rest() {
                 break;
             }
-            deadline += dt_ns;
-            let now = monotonic_ns();
-            if now < deadline {
-                sleep_until(deadline);
-            } else {
-                deadline = now;
-            }
+            pace();
         }
         self.shutdown_limp();
         self.tick(dt, false);
