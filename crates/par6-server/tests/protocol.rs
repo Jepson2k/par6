@@ -1364,6 +1364,14 @@ async fn a_stalled_rt_reports_the_tcp_speed_of_its_last_tick() {
     let mut h = start(|cfg| cfg.config_info.tick_dt_s = 0.01).await;
     h.publish(|_| {});
     let mut c = Client::new(&h).await;
+    // A speed is a difference of two described ticks, so the start has to
+    // have been described before the tool moves: the server polls the
+    // snapshot, and a fast host publishes all ten ticks inside one poll,
+    // so only the last is ever described.
+    status_where(&h.status_rx, "the starting tick is described", |s| {
+        s.angles[0].abs() < 1e-9
+    })
+    .await;
 
     // The tool advances 1 mm every 10 ms tick: 100 mm/s. Each tick is
     // read back before the next is published, so the server sees all ten.
