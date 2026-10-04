@@ -171,36 +171,10 @@ mod tests {
         link.send(0, b"probe").await;
     }
 
-    /// `send()` itself resets the consecutive-error counter on success —
-    /// driven through real sends on the socket the link binds, so the
-    /// reset asserted here is the code's, not the test's.
-    #[tokio::test]
-    async fn a_successful_send_resets_the_consecutive_error_counter() {
-        let rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("rx");
-        let port = rx.local_addr().expect("addr").port();
-        let cfg = ServerConfig {
-            status_transport: StatusTransport::Unicast,
-            status_dest_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ..ServerConfig::default()
-        };
-        let mut link = BroadcastLink::open(&cfg).await.expect("bind");
-
-        failing_send(&mut link).await;
-        failing_send(&mut link).await;
-        assert_eq!(link.errors, 2, "real send errors must count");
-
-        link.send(port, b"delivered").await;
-        let mut buf = [0u8; 32];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(2), rx.recv_from(&mut buf))
-            .await
-            .expect("delivery within budget")
-            .expect("recv");
-        assert_eq!(&buf[..n], b"delivered", "the send really went out");
-        assert_eq!(link.errors, 0, "a successful send resets the counter");
-    }
-
     /// The `auto` ladder keeps multicast when the group is genuinely
-    /// reachable on the CONFIGURED interface.
+    /// reachable on the CONFIGURED interface, and delivers both to
+    /// clients already listening at startup and to one that joins later
+    /// on another port.
     ///
     /// Regression: the send socket never set `IP_MULTICAST_IF`, so the
     /// probe left by whatever interface the routing table chose rather
@@ -208,39 +182,6 @@ mod tests {
     /// is no interface at all, so the probe failed and every `auto`
     /// deployment silently ran on the unicast leg — the fallback working
     /// perfectly is exactly what hid it.
-    #[tokio::test]
-    async fn auto_keeps_multicast_when_the_configured_interface_reaches_the_group() {
-        let cfg = ServerConfig {
-            status_transport: StatusTransport::Auto,
-            multicast_iface: Ipv4Addr::LOCALHOST,
-            status_dest_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ..ServerConfig::default()
-        };
-        let link = BroadcastLink::open(&cfg).await.expect("bind");
-        assert!(
-            !link.unicast,
-            "the probe reached the group on {} but the ladder fell back to unicast",
-            cfg.multicast_iface
-        );
-
-        // And it delivers: a receiver joined on the same interface gets
-        // what the link sends to the group.
-        let rx = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-            .await
-            .expect("rx");
-        let port = rx.local_addr().expect("addr").port();
-        rx.join_multicast_v4(cfg.multicast_group, cfg.multicast_iface)
-            .expect("join");
-        let mut link = link;
-        link.send(port, b"broadcast").await;
-        let mut buf = [0u8; 32];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(2), rx.recv_from(&mut buf))
-            .await
-            .expect("multicast delivery within budget")
-            .expect("recv");
-        assert_eq!(&buf[..n], b"broadcast");
-    }
-
     #[tokio::test]
     async fn auto_broadcasts_to_clients_already_listening_at_startup() {
         let cfg = ServerConfig {
@@ -287,18 +228,38 @@ mod tests {
             .await
             .expect("each existing subscriber receives the broadcast");
         }
+
+        let late = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .expect("late subscriber");
+        let late_port = late.local_addr().expect("addr").port();
+        late.join_multicast_v4(cfg.multicast_group, cfg.multicast_iface)
+            .expect("join");
+        link.send(late_port, b"broadcast").await;
+        let mut buf = [0u8; 32];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), late.recv_from(&mut buf))
+            .await
+            .expect("multicast delivery within budget")
+            .expect("recv");
+        assert_eq!(
+            &buf[..n],
+            b"broadcast",
+            "a client joining later receives it"
+        );
     }
 
-    /// Three consecutive real send errors fail over to unicast, and the
-    /// failover is permanent: later sends succeed FOR REAL — delivered to
-    /// the unicast destination and resetting the error counter — and the
-    /// link still never returns to multicast.
+    /// Three CONSECUTIVE real send errors fail over to unicast — a success
+    /// in between starts the count again — and the failover is permanent:
+    /// later sends succeed FOR REAL, delivered to the unicast destination
+    /// and resetting the error counter, and the link still never returns
+    /// to multicast.
     #[tokio::test]
     async fn three_consecutive_send_errors_fail_over_permanently() {
         let rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("rx");
         let port = rx.local_addr().expect("addr").port();
         let cfg = ServerConfig {
             status_transport: StatusTransport::Multicast,
+            multicast_iface: Ipv4Addr::LOCALHOST,
             status_dest_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             ..ServerConfig::default()
         };
@@ -306,6 +267,16 @@ mod tests {
         assert!(!link.unicast);
 
         failing_send(&mut link).await;
+        failing_send(&mut link).await;
+        assert_eq!(link.errors, 2, "real send errors must count");
+        link.send(port, b"to the group").await;
+        assert_eq!(link.errors, 0, "a successful send resets the counter");
+        failing_send(&mut link).await;
+        assert!(
+            !link.unicast,
+            "three errors that were not consecutive must not fail over"
+        );
+
         failing_send(&mut link).await;
         assert!(!link.unicast, "two errors must not fail over");
         failing_send(&mut link).await;

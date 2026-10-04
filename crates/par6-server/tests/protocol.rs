@@ -99,6 +99,9 @@ struct RtLog {
     flashing_verdict: Option<WireError>,
     /// The pending answer, collected exactly once by the server.
     flashing_outcome: Option<Result<(), WireError>>,
+    /// While true the RT is "still inside the flashing window":
+    /// `take_flashing_outcome` answers `None`.
+    hold_flashing_outcome: bool,
     /// The pending backend-swap answer, collected exactly once.
     bus_outcome: Option<Result<(), WireError>>,
     /// While true the RT is "still installing the bus": `take_bus_outcome`
@@ -199,7 +202,11 @@ impl RtCommands for TestRt {
         });
     }
     fn take_flashing_outcome(&mut self) -> Option<Result<(), WireError>> {
-        self.0.lock().unwrap().flashing_outcome.take()
+        let mut log = self.0.lock().unwrap();
+        if log.hold_flashing_outcome {
+            return None;
+        }
+        log.flashing_outcome.take()
     }
     fn set_pid_gains(&mut self, p: &par6_proto::command::SetPidGains) {
         self.push(RtEvent::SetPidGains(p.clone()));
@@ -1105,10 +1112,20 @@ async fn a_pose_target_is_reported_as_the_move_j_that_sent_it() {
         })
     };
 
+    // The pose move waits behind a running one, so it is still listed
+    // when the queue is read.
     let first = c.ok_index(&move_j(501)).await;
+    h.wait_started(first).await;
     let second = c.ok_index(&pose_move(502)).await;
     match c.query(&Command::Queue).await {
-        QueryResult::Queue { queue, .. } => assert_eq!(queue, ["move_j", "move_j"]),
+        QueryResult::Queue {
+            queue,
+            executing_index,
+            ..
+        } => {
+            assert_eq!(executing_index, first as i64);
+            assert_eq!(queue, ["move_j"]);
+        }
         other => panic!("unexpected {other:?}"),
     }
     h.complete_ok(first);
@@ -1308,10 +1325,11 @@ async fn status_frames_map_one_to_one_onto_every_nth_tick() {
 
     // Each tick carries its own number in J0's angle. A tick that crosses
     // a stride is followed by the frame describing it, and that frame is
-    // the next one out; a tick inside a stride gets a few polls of room,
-    // in which a server reporting off the stride would describe it.
-    // The still RT is reported by the timer. Starting right after a fresh
-    // timer frame leaves its full stand-down for the burst.
+    // the next one out; a tick inside a stride is read back before the
+    // next is published, so a server reporting off the stride has already
+    // sent its frame. The still RT is reported by the timer. Starting
+    // right after a fresh timer frame leaves its full stand-down for the
+    // burst.
     let mut buf = [0u8; 4096];
     while h.status_rx.try_recv_from(&mut buf).is_ok() {}
     let mut prev = recv_status(&h.status_rx).await.seq;
@@ -1319,7 +1337,13 @@ async fn status_frames_map_one_to_one_onto_every_nth_tick() {
         let tick = h.tick + 1;
         h.publish(|s| s.q[0] = (tick as f64).to_radians());
         if tick / stride == (tick - 1) / stride {
-            tokio::time::sleep(Duration::from_millis(3)).await;
+            wait_query(
+                &mut c,
+                &Command::Angles,
+                "the server read the tick",
+                |r| matches!(r, QueryResult::Angles { angles } if angles[0].round() as u64 == tick),
+            )
+            .await;
             continue;
         }
         let s = recv_status(&h.status_rx).await;
@@ -1436,8 +1460,20 @@ async fn flashing_enter_and_exit_follow_the_rt_verdict() {
     let enter = Command::EnterFlashing(EnterFlashing {
         assertion: FlashingAssertion::Parked,
     });
-    c.ok(&enter).await;
-    assert!(h.rt_events().contains(&RtEvent::EnterFlashing));
+    h.rt.lock().unwrap().hold_flashing_outcome = true;
+    c.send(&enter).await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::EnterFlashing)).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), c.recv())
+            .await
+            .is_err(),
+        "the enter must not be answered before the RT's verdict"
+    );
+    h.rt.lock().unwrap().hold_flashing_outcome = false;
+    match c.recv().await {
+        Reply::Ok { index: None, .. } => {}
+        other => panic!("the verdict must answer the enter OK, got {other:?}"),
+    }
 
     // Enter refused by the RT (e.g. requested from EXEC): the ERROR
     // carries the RT's own verdict instead of a fabricated OK.
