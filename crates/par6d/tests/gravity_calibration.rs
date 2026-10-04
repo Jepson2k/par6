@@ -147,7 +147,21 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
         truth.gravity(&s.q, &mut expected).unwrap();
         println!("q={:?} measured={:?} expected={expected:?}", s.q, s.tau);
     }
-    let fit = gravity::fit_payload(&mut kin, &samples, 1e-4).expect("fit");
+    // Fit on two poses in three and judge on the third: a fit that only
+    // reproduces the torques it was given proves nothing about the load.
+    let (held_out, training): (Vec<_>, Vec<_>) = samples
+        .iter()
+        .cloned()
+        .enumerate()
+        .partition(|(k, _)| k % 3 == 2);
+    let training: Vec<_> = training.into_iter().map(|(_, s)| s).collect();
+    let held_out: Vec<_> = held_out.into_iter().map(|(_, s)| s).collect();
+    assert!(
+        !held_out.is_empty() && training.len() >= 3,
+        "{} poses cannot be split into a fit and a check",
+        samples.len()
+    );
+    let fit = gravity::fit_payload(&mut kin, &training, 1e-4).expect("fit");
     println!(
         "carried {carried_kg:.4} kg, identified {:.4} kg at com {:?}\n\
          residual {:.4} Nm, against {:.4} Nm with an empty model\n\
@@ -181,6 +195,31 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
         fit.determined[0] > par6d::calibrate::MEASURED,
         "swinging the wrist must measure the mass, determined {:?}",
         fit.determined
+    );
+
+    // The poses it never saw: the fitted load must explain their torque
+    // as well as it explains its own, and far better than no load.
+    let rms = |kin: &mut Kin| {
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        for s in &held_out {
+            let mut g = [0.0; NQ];
+            kin.gravity(&s.q, &mut g).expect("gravity");
+            for (got, want) in g.iter().zip(&s.tau) {
+                sum += (got - want).powi(2);
+                n += 1.0;
+            }
+        }
+        (sum / n).sqrt()
+    };
+    let unloaded = rms(&mut kin);
+    kin.set_tool(fit.mass, fit.com, None)
+        .expect("the fitted load");
+    let predicted = rms(&mut kin);
+    assert!(
+        predicted < 0.5 * unloaded,
+        "the fit predicts the held-out poses to {predicted:.4} Nm, against {unloaded:.4} Nm \
+         with no load: it learned its training poses, not the load"
     );
 }
 
@@ -264,13 +303,14 @@ fn planned_poses_keep_their_approach_offsets_inside_the_window() {
     }
 }
 
-/// A failed estimate puts the declared payload back.
+/// A failed estimate leaves the declared payload standing.
 ///
-/// `estimate` clears the declaration so it measures against an unloaded
-/// model. An arm holding a declared 1.2 kg part that is asked for an
-/// estimate somewhere the wrist has no room must not be left
-/// compensating for nothing — the failure arrives at the caller, the
-/// gravity model does not change underneath it.
+/// `estimate` measures with the existing declaration in place and only
+/// replaces it once a valid fit is ready. An arm holding a declared
+/// 1.2 kg part that is asked for an estimate somewhere the wrist has no
+/// room must not be left compensating for anything else — the failure
+/// arrives at the caller, the gravity model does not change underneath
+/// it.
 #[test]
 fn a_failed_estimate_leaves_the_declared_payload_standing() {
     const DECLARED_KG: f64 = 1.2;
@@ -310,7 +350,7 @@ fn a_failed_estimate_leaves_the_declared_payload_standing() {
                 .expect("estimation model");
 
         // A spread no wrist has room for: the run fails in planning,
-        // before any motion, with the declaration already cleared.
+        // before any motion.
         let err = par6d::calibrate::estimate(&client, &mut model, 6.0, 1e-6, true)
             .await
             .expect_err("an unplannable spread must fail");

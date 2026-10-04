@@ -289,6 +289,64 @@ pub fn free_udp_port() -> u16 {
 /// run the whole workspace and mean something.
 static RT_SLOT: Mutex<()> = Mutex::new(());
 
+/// A spawned `par6d` process. It holds the [`RT_SLOT`] for its life, as
+/// an in-process [`Rig`] does, and is killed if the test that spawned it
+/// fails before stopping it — a leaked child would go on ticking and
+/// broadcasting into every test after it.
+pub struct Par6dChild {
+    pub child: std::process::Child,
+    /// Everything the child wrote to stderr so far.
+    pub stderr: std::sync::Arc<Mutex<String>>,
+    _slot: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Par6dChild {
+    /// Spawn `cmd`, waiting for the slot first, with stderr collected
+    /// into [`Par6dChild::stderr`].
+    pub fn spawn(cmd: &mut std::process::Command) -> Par6dChild {
+        let slot = RT_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child = cmd
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn par6d");
+        let stderr = std::sync::Arc::new(Mutex::new(String::new()));
+        let pipe = child.stderr.take().expect("piped stderr");
+        let sink = stderr.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
+                let mut text = sink.lock().unwrap();
+                text.push_str(&line);
+                text.push('\n');
+            }
+        });
+        Par6dChild {
+            child,
+            stderr,
+            _slot: slot,
+        }
+    }
+}
+
+impl Drop for Par6dChild {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// A fresh directory for one spawned daemon's bus-grant segments, so no
+/// two of them, and no in-process rig, ever share a claim.
+pub fn private_shm_dir() -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("par6-child-shm-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("child shm dir");
+    dir
+}
+
 pub struct Rig {
     daemon: Option<Daemon>,
     status_rx: UdpSocket,

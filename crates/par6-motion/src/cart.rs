@@ -1478,6 +1478,21 @@ mod tests {
             assert!(position(m).distance(position(&a)) < 1e-12);
         }
         assert!(rotation(path.last().unwrap()).angle_between(rotation(&b)) < 1e-9);
+
+        // A segment that both moves and turns: its length and angle are
+        // the endpoints', and its middle is halfway along both.
+        let start = pose(0.1, 0.0, 0.2, 0.0, 0.0, 0.0);
+        let end = pose(0.2, 0.05, 0.2, 0.0, 0.0, std::f64::consts::FRAC_PI_2);
+        let seg = LineSegment::new(&start, &end);
+        assert!((seg.length_m() - (0.1f64.powi(2) + 0.05f64.powi(2)).sqrt()).abs() < 1e-12);
+        assert!((seg.angle_rad() - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+        let mid = seg.sample(0.5);
+        assert!(position(&mid).distance(DVec3::new(0.15, 0.025, 0.2)) < 1e-12);
+        let halfway = pose(0.0, 0.0, 0.0, 0.0, 0.0, std::f64::consts::FRAC_PI_4);
+        assert!(rotation(&mid).angle_between(rotation(&halfway)) < 1e-9);
+        for (g, w) in seg.sample(1.0).iter().zip(end.iter()) {
+            assert!((g - w).abs() < 1e-9);
+        }
     }
     /// The multi-segment paths fold rotation into path length as
     /// √(t² + (w·θ)²): a pure twist is priced at w·θ metres, a mixed piece

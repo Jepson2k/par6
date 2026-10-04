@@ -503,6 +503,13 @@ fn cartesian_surface_over_protocol_v2() {
     rig.shutdown();
 }
 
+/// The runtime model's G(q) for the tick a frame describes: STATUS
+/// carries the measured torque and the external estimate, measured minus
+/// G(q) from the same tick.
+fn model_g(s: &Status) -> [f64; NUM_JOINTS] {
+    std::array::from_fn(|j| s.torques[j] - s.torques_ext[j])
+}
+
 /// The gravity hook is wired, signed right and scaled right, end to end.
 ///
 /// With comp on — the simulator's default, now that the plant has weight
@@ -532,10 +539,19 @@ fn gravity_hook_holds_the_arm() {
         held.gravity_comp,
         "the simulator applies the feedforward: its plant has the weight to cancel"
     );
+    // Held where it was placed: a hook that does not carry the arm lets
+    // it sag until the gearbox friction catches it, and the still pose
+    // is then wherever that was.
+    for (i, (now, placed)) in held.angles.iter().zip(CART_START_DEG).enumerate() {
+        assert!(
+            (now - placed).abs() < HOLD_TOL,
+            "joint {i} gave way on release: placed at {placed:.2}, still at {now:.2} deg"
+        );
+    }
 
-    // Hold: three seconds of IDLE must not move the arm.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
+    // Hold: three seconds of the runtime's IDLE must not move the arm.
+    let until = held.mono_time_ns + 3_000_000_000;
+    loop {
         let s = rig.wait_status("a status while holding", |_| true);
         for (i, (now, then)) in s.angles.iter().zip(held.angles.iter()).enumerate() {
             assert!(
@@ -546,23 +562,28 @@ fn gravity_hook_holds_the_arm() {
                 held.angles
             );
         }
+        if s.mono_time_ns >= until {
+            break;
+        }
     }
 
-    // Scale and sign: the shoulder holds the outstretched arm against
-    // gravity and reads a torque of the right order; the wrist roll is
-    // on gravity's axis and reads nearly none.
+    // Sign and scale: IDLE's law is torque-only, so what the drives
+    // deliver IS the hook's output, and it must be the model's G(q) at the
+    // held pose — the external estimate (measured minus model) is what a
+    // mis-signed or mis-scaled hook leaves over.
     let s = wait_still(&rig);
+    let g = model_g(&s);
     assert!(
-        s.torques[1].abs() > 1.0,
-        "the shoulder carries the arm's weight, got {:.3} Nm ({:?})",
-        s.torques[1],
-        s.torques
+        g[1].abs() > 1.0,
+        "the shoulder carries the arm's weight here, the model says {:.3} Nm",
+        g[1]
     );
-    assert!(
-        s.torques[5].abs() < 0.5,
-        "the wrist roll is on gravity's axis and carries nearly none, got {:.3} Nm",
-        s.torques[5]
-    );
+    for (j, (t, gj)) in s.torques.iter().zip(g.iter()).enumerate() {
+        assert!(
+            (t - gj).abs() <= 0.02 * gj.abs() + 0.02,
+            "J{j}: the drives deliver {t:.4} Nm, the model's G(q) is {gj:.4} Nm"
+        );
+    }
 
     rig.shutdown();
 }
@@ -602,13 +623,17 @@ fn a_full_speed_move_lands_cleanly() {
     }));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "the full-speed move must complete: {detail:?}");
-    // The plant settles into its stiction band, so the landing tolerance
-    // asks "did the trajectory arrive", not "did the servo null out" — a
+    // Landed, measured once the arm is still rather than on the first
+    // frame that happens to pass: the plant settles into its stiction
+    // band, so the tolerance is the band, not the servo's null — a
     // feedforward with the wrong sign or scale misses by tens of degrees
-    // or latches an error.
-    let s = rig.wait_status("landed on the target", |s| {
-        angles_close(&s.angles, &target, 8.0)
-    });
+    // or latches an error, and a plan aimed elsewhere lands elsewhere.
+    let s = wait_still(&rig);
+    assert!(
+        angles_close(&s.angles, &target, 2.0),
+        "the move came to rest at {:?}, not on {target:?}",
+        s.angles
+    );
     assert!(
         s.error.is_none(),
         "standing error after the move: {:?}",
@@ -680,9 +705,6 @@ fn a_path_past_the_singularity_thresholds_warns_while_it_runs() {
 /// G(q) whatever the plant is doing.
 #[test]
 fn gripper_config_mass_changes_published_gravity_torque() {
-    let model_g = |s: &Status| -> [f64; NUM_JOINTS] {
-        std::array::from_fn(|j| s.torques[j] - s.torques_ext[j])
-    };
     let payload = SetPayload {
         mass: 1.2,
         com: [0.02, -0.01, 0.06],
@@ -979,7 +1001,8 @@ fn collision_world_is_enforced_over_protocol_v2() {
 
     // A malformed set is refused WHOLE. Every flavour of malformed: a
     // kind waldoctl does not define, an arity that does not match the
-    // kind, a dimension coal cannot build, and a name already taken.
+    // kind, a dimension coal cannot build, a name the set repeats
+    // anywhere in it, and a name the installation layer already uses.
     let mut unknown_kind = keepout.clone();
     unknown_kind.kind = "pyramid".to_owned();
     unknown_kind.name = "bad".to_owned();
@@ -990,18 +1013,35 @@ fn collision_world_is_enforced_over_protocol_v2() {
     negative.kind = "sphere".to_owned();
     negative.params = vec![-1.0];
     negative.name = "bad".to_owned();
-    let duplicate = keepout.clone();
-    for (label, bad) in [
-        ("unknown kind", unknown_kind),
-        ("wrong arity", short_params),
-        ("negative radius", negative),
-        ("duplicate name", duplicate),
+    let mut between = keepout.clone();
+    between.name = "between".to_owned();
+    let mut floor = keepout.clone();
+    floor.name = "floor".to_owned();
+    for (label, set, named) in [
+        ("unknown kind", vec![keepout.clone(), unknown_kind], ""),
+        ("wrong arity", vec![keepout.clone(), short_params], ""),
+        ("negative radius", vec![keepout.clone(), negative], ""),
+        (
+            "duplicate name",
+            vec![keepout.clone(), between, keepout.clone()],
+            "\"keepout\"",
+        ),
+        (
+            "installation name",
+            vec![keepout.clone(), floor.clone()],
+            "\"floor\"",
+        ),
     ] {
-        let err = c.expect_error(&set_shapes(vec![keepout.clone(), bad]));
+        let err = c.expect_error(&set_shapes(set));
         assert_eq!(
             err.code,
             ErrorCode::CommValidationError as u16,
             "a {label} shape must be refused, got {err:?}"
+        );
+        assert!(
+            err.cause.contains(named),
+            "the {label} refusal must name the shape: {}",
+            err.cause
         );
         let (program, refused_epoch) = shapes_readback(&mut c);
         assert_eq!(
@@ -1023,6 +1063,13 @@ fn collision_world_is_enforced_over_protocol_v2() {
         detail.expect("a failed COMPLETE carries the error").code,
         ErrorCode::SysSelfCollision as u16
     );
+
+    // A visualization-only shape never appears in a colliding pair, so
+    // the installation's name is free for it.
+    floor.collision = false;
+    c.ok(&set_shapes(vec![keepout.clone(), floor.clone()]));
+    let (program, _) = shapes_readback(&mut c);
+    assert_eq!(program, vec![keepout.clone(), floor]);
 
     // A world change does not spare motion already committed: drop the
     // keep-out onto the path of a move that is already running and it
@@ -1093,17 +1140,35 @@ fn collision_world_is_enforced_over_protocol_v2() {
     );
     enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
     let i = c.ok_index(&move_j(7005, end_deg, SWEEP_S));
+    // And a world change clear of the remaining path leaves the running
+    // move alone: a runtime that failed every running move on ANY world
+    // change would pass the loop above just the same.
+    rig.drain_status();
+    rig.wait_status("the sweep is under way", |s| {
+        s.executing_index == i as i64 && s.angles[0] > SWEEP_START_DEG[0] + 3.0
+    });
+    c.ok(&set_shapes(vec![keepout_at("far", [900.0, 900.0, 900.0])]));
+    let (program, _) = shapes_readback(&mut c);
+    assert_eq!(program.len(), 1, "the far box must be applied, not ignored");
     let (ok, detail) = c.wait_complete(i);
     assert!(
         ok,
-        "the sweep must run once the keep-out is removed, got {detail:?}"
+        "the sweep must run once the keep-out is removed, past a box clear of \
+         its path, got {detail:?}"
     );
-    rig.drain_status();
-    let s = rig.wait_status("a clean move clears the verdict", |_| true);
+    let s = settled_tcp(&rig, "the arm at rest at the end of the sweep");
     assert!(
-        !s.collision_active && s.collision_pairs.is_empty(),
-        "the refusal's pairs outlived the motion that caused them: {:?}",
-        s.collision_pairs
+        angles_close(&s.angles, &end_deg, 1.0),
+        "the move must run to its target: {:?}",
+        s.angles
+    );
+    assert!(
+        !s.collision_active && s.collision_pairs.is_empty() && s.error.is_none(),
+        "a clean move clears the verdict and leaves none behind: active={} pairs={:?} \
+         error={:?}",
+        s.collision_active,
+        s.collision_pairs,
+        s.error
     );
 
     // reset_state clears the program layer: the readback empties and the
@@ -2959,29 +3024,41 @@ fn a_held_servo_target_settles() {
     enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
     rig.drain_status();
 
+    // Five seconds of the runtime's own clock, the target re-sent on
+    // every other frame — well inside the stream watchdog.
     let target = with_j0(SWEEP_START_DEG, 20.0);
-    let end = Instant::now() + Duration::from_secs(5);
-    let mut sent = Instant::now() - Duration::from_secs(1);
-    let mut trace: Vec<f64> = Vec::new();
-    while Instant::now() < end {
-        if sent.elapsed() >= Duration::from_millis(50) {
-            c.send(&Command::ServoJ(par6_proto::command::ServoJ {
-                angles: target,
-                speed: None,
-                accel: None,
-            }));
-            sent = Instant::now();
-        }
+    let hold = || {
+        Command::ServoJ(par6_proto::command::ServoJ {
+            angles: target,
+            speed: None,
+            accel: None,
+        })
+    };
+    c.send(&hold());
+    let first = rig.wait_status("the hold started", |_| true);
+    let mut trace: Vec<(u64, f64)> = Vec::new();
+    while trace
+        .last()
+        .is_none_or(|(t, _)| *t < first.mono_time_ns + 5_000_000_000)
+    {
         if let Some(s) = rig.recv_status() {
-            trace.push(s.angles[0]);
+            if s.seq % 2 == 0 {
+                c.send(&hold());
+            }
+            trace.push((s.mono_time_ns, s.angles[0]));
         }
     }
     rig.shutdown();
 
-    // The last second of a five-second hold: by then the arm has had
-    // four seconds to cover twenty degrees.
-    assert!(trace.len() > 40, "no status stream to judge");
-    let tail = &trace[trace.len() - 30..];
+    // The last second of the hold: by then the arm has had four seconds
+    // to cover twenty degrees.
+    let last_t = trace.last().expect("status during the hold").0;
+    let tail: Vec<f64> = trace
+        .iter()
+        .filter(|(t, _)| *t + 1_000_000_000 >= last_t)
+        .map(|(_, a)| *a)
+        .collect();
+    assert!(tail.len() > 10, "no status stream to judge");
     let lo = tail.iter().cloned().fold(f64::INFINITY, f64::min);
     let hi = tail.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let tol_deg = tol_rad.to_degrees();
@@ -3173,52 +3250,6 @@ fn move_p_tracks_its_corner_without_stopping_in_it() {
     rig.shutdown();
 }
 
-/// A world change during a move does not manufacture a failure: a
-/// keep-out that stays clear of the remaining path leaves the move to
-/// complete, with no verdict and no standing error.
-///
-/// The control for the mid-flight re-guard beside it: without this, a
-/// runtime that failed every running move on ANY world change would
-/// pass the keep-out-on-the-path test just the same.
-#[test]
-fn an_off_path_world_change_leaves_a_running_move_alone() {
-    let rig = boot_tagged("collision-offpath");
-    let mut c = Client::new(rig.addr());
-    rig.wait_status("link_ok", |s| s.link_ok == 1);
-    c.ok(&Command::Reset);
-    let end_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG);
-
-    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
-    let i = c.ok_index(&move_j(8101, end_deg, SWEEP_S));
-    rig.drain_status();
-    rig.wait_status("the sweep is under way", |s| {
-        s.executing_index == i as i64 && s.angles[0] > SWEEP_START_DEG[0] + 3.0
-    });
-    c.ok(&set_shapes(vec![keepout_at("far", [900.0, 900.0, 900.0])]));
-    let (program, _) = shapes_readback(&mut c);
-    assert_eq!(program.len(), 1, "the far box must be applied, not ignored");
-
-    let (ok, detail) = c.wait_complete(i);
-    assert!(
-        ok,
-        "a world change clear of the path must not stop the move, got {detail:?}"
-    );
-    let s = settled_tcp(&rig, "the arm at rest at the end of the sweep");
-    assert!(
-        angles_close(&s.angles, &end_deg, 1.0),
-        "the move must run to its target: {:?}",
-        s.angles
-    );
-    assert!(
-        !s.collision_active && s.collision_pairs.is_empty() && s.error.is_none(),
-        "an off-path change must leave no verdict behind: active={} pairs={:?} error={:?}",
-        s.collision_active,
-        s.collision_pairs,
-        s.error
-    );
-    rig.shutdown();
-}
-
 /// A move queued behind another is re-guarded when it ACTIVATES, not
 /// only when it was accepted.
 ///
@@ -3298,13 +3329,17 @@ fn planning_does_not_stall_the_command_plane() {
     let s = curve_start(&rig, &mut c);
     let start = tcp_mm(&s);
 
-    // Twenty-four reversals: every corner is an IK solve and a blend,
-    // and the retimer has to search hard across them.
-    let waypoints: Vec<[f64; 6]> = (0..24)
+    // Ninety-six right-angle corners, a descending square spiral: every
+    // corner is an IK solve and a blend, and the retimer has to search
+    // hard across them. Not reversals: a path that doubles back on itself
+    // has a cusp the retimer cannot give a speed to, and the move is
+    // refused instead of planned.
+    let square = [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)];
+    let waypoints: Vec<[f64; 6]> = (0..96)
         .map(|i| {
-            let leg = f64::from(i);
-            let x = start[0] + if i % 2 == 0 { 60.0 } else { 0.0 };
-            wire_pose_at(&s.pose, [x, start[1], start[2] - leg * 4.0])
+            let (dx, dy) = square[i % 4];
+            let z = start[2] - f64::from(i as u32);
+            wire_pose_at(&s.pose, [start[0] + dx, start[1] + dy, z])
         })
         .collect();
 
@@ -3337,20 +3372,21 @@ fn planning_does_not_stall_the_command_plane() {
         "the queue ack took {ack:?}, which is not the enqueue it is supposed to be"
     );
 
-    // Watch for exactly as long as the command takes, so the window is
-    // the planning window rather than a guess about it.
+    // Watch until the move starts executing, so the window is the
+    // planning window rather than a guess about it — and a path the
+    // planner refused never starts, so starting is the plan succeeding.
     let mut worst = Duration::ZERO;
     let mut ping_worst = Duration::ZERO;
     let mut last = Instant::now();
     let deadline = Instant::now() + BUDGET;
-    while !c.peek_complete(i) {
-        assert!(Instant::now() < deadline, "the command never completed");
-        if rig.recv_status().is_some() {
+    let mut started = false;
+    while !started {
+        assert!(Instant::now() < deadline, "the command never started");
+        if let Some(s) = rig.recv_status() {
             worst = worst.max(last.elapsed());
             last = Instant::now();
+            started = s.executing_index == i as i64;
         }
-        // Also the receive-side probe: each one reads replies, which is
-        // what stashes the COMPLETE this loop is waiting for.
         let t = Instant::now();
         let _ = c.query(&Command::Ping);
         ping_worst = ping_worst.max(t.elapsed());

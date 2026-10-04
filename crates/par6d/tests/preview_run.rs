@@ -83,6 +83,68 @@ fn physics_applies_program_configuration_and_reports_unsupported_operations() {
     assert!(run.commands.last().unwrap().rows > 0);
     assert_eq!(preview.payload(), initial_payload);
 
+    // The configuration reaches the run, not just the command list. Under
+    // COMMANDED a move ends with its trajectory; under SETTLED it waits for
+    // the arm, so the same move spans more rows.
+    let mut away = park_deg();
+    away[0] += 20.0;
+    let move_rows = |policy| {
+        let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+        let run = preview
+            .run(
+                &[
+                    Command::SetCompletionPolicy(SetCompletionPolicy { policy }),
+                    move_j_cmd(away, 9952, 0.5),
+                ],
+                RunLimits { max_seconds: 10.0 },
+            )
+            .unwrap();
+        assert_eq!(run.stop, StopReason::Completed, "{:?}", run.commands);
+        run.commands[1].rows
+    };
+    let (commanded, settled) = (
+        move_rows(CompletionPolicy::Commanded),
+        move_rows(CompletionPolicy::Settled),
+    );
+    assert!(
+        commanded < settled,
+        "the policy did not reach the run: {commanded} rows commanded, {settled} settled"
+    );
+    // A declared payload the plant does not carry is a load the
+    // controller lifts: the floating arm drifts where the undeclared one
+    // holds.
+    let held_after = |declare: bool| {
+        let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+        let mut program = vec![];
+        if declare {
+            program.push(Command::SetPayload(SetPayload {
+                mass: 1.5,
+                com: [0.0, 0.0, 0.05],
+                inertia: None,
+            }));
+        }
+        program.push(Command::Delay(Delay {
+            key: 9953,
+            seconds: 1.0,
+        }));
+        let run = preview
+            .run(&program, RunLimits { max_seconds: 3.0 })
+            .unwrap();
+        let last = run.rows - 1;
+        run.q_rad[last * run.joints..(last + 1) * run.joints].to_vec()
+    };
+    let (bare, loaded) = (held_after(false), held_after(true));
+    let moved = bare
+        .iter()
+        .zip(&loaded)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
+        .to_degrees();
+    assert!(
+        moved > 0.5,
+        "the declared payload did not reach the run's gravity model: the arm ends \
+         {moved:.3}° from where it ends undeclared"
+    );
+
     let unsupported = preview
         .run(
             &[Command::Reset, commands[4].clone()],
@@ -130,7 +192,11 @@ fn physics_refuses_stale_attachments_before_running_later_commands() {
                 Command::SetShapes(SetShapes { shapes: vec![part] })
             }
             _ => {
+                // The epoch is read after the arm loses its reference, so
+                // the attachment is fresh and only the homed gate can
+                // refuse it.
                 preview.set_homed(false);
+                part.attachment.as_mut().unwrap().epoch = preview.shapes().3;
                 Command::SetShapes(SetShapes { shapes: vec![part] })
             }
         };
@@ -338,6 +404,24 @@ fn execution_controls_reach_the_simulated_runtime() {
         jaw.iter().all(|&j| j < 0.05),
         "a paused program closed the jaws: {jaw:?}"
     );
+
+    // A run starts unpaused whatever the session it was loaded from was doing.
+    {
+        use par6_proto::command::Pause;
+        let config = test_config();
+        let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+        assert!(preview.submit(Command::Pause(Pause { on: true })).valid());
+        let mut target = park_deg();
+        target[0] += 5.0;
+        let run = preview
+            .run(
+                &[move_j_cmd(target, 9970, 0.5)],
+                RunLimits { max_seconds: 5.0 },
+            )
+            .unwrap();
+        assert_eq!(run.stop, StopReason::Completed, "{:?}", run.commands);
+        assert!(run.commands[0].rows > 0, "the first move never ran");
+    }
 }
 
 /// The simulated run against the planner it replaces.
@@ -578,7 +662,7 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
 /// report neither as a failure of the run.
 #[test]
 fn physics_replays_io_writes_and_runs_on_after_a_stop() {
-    use par6_proto::command::{Stop, WriteIo};
+    use par6_proto::command::{Pause, Stop, WriteIo};
     let config = test_config();
     let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
     let mut target = park_deg();
@@ -590,6 +674,7 @@ fn physics_replays_io_writes_and_runs_on_after_a_stop() {
             value: 1,
         }),
         move_j_cmd(target, 9960, 0.2),
+        Command::Pause(Pause { on: true }),
         Command::Stop(Stop { clear_queue: true }),
         move_j_cmd(park_deg(), 9961, 0.2),
     ];
@@ -603,11 +688,12 @@ fn physics_replays_io_writes_and_runs_on_after_a_stop() {
         "the move after the write never ran"
     );
     // Live, a stop with nothing queued behind it cancels nothing and the
-    // program goes on: the move after it runs and lands.
-    assert_eq!(run.commands[2].rows, 0);
-    assert!(run.commands[2].error.is_none(), "{:?}", run.commands[2]);
+    // program goes on; a clearing stop drops the pause standing before
+    // it, so the move after it runs and lands without a resume.
+    assert_eq!(run.commands[3].rows, 0);
+    assert!(run.commands[3].error.is_none(), "{:?}", run.commands[3]);
     assert!(
-        run.commands[3].rows > 0,
+        run.commands[4].rows > 0,
         "the move after the stop never ran"
     );
     let joints = run.joints;
@@ -619,24 +705,4 @@ fn physics_replays_io_writes_and_runs_on_after_a_stop() {
             "joint {j} ended at {got} rad, not {want}: the move after the stop did not land"
         );
     }
-}
-
-/// A run boots its engine unpaused whatever the session's pause: the
-/// program's own pause commands are what it replays.
-#[test]
-fn a_run_starts_unpaused_from_a_paused_session() {
-    use par6_proto::command::Pause;
-    let config = test_config();
-    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
-    assert!(preview.submit(Command::Pause(Pause { on: true })).valid());
-    let mut target = park_deg();
-    target[0] += 5.0;
-    let run = preview
-        .run(
-            &[move_j_cmd(target, 9970, 0.5)],
-            RunLimits { max_seconds: 5.0 },
-        )
-        .unwrap();
-    assert_eq!(run.stop, StopReason::Completed, "{:?}", run.commands);
-    assert!(run.commands[0].rows > 0, "the first move never ran");
 }

@@ -1293,7 +1293,8 @@ mod tests {
     /// The startup retry: a bus that appears mid-window opens (the boot
     /// race the loop exists for), a bus that never appears fails with
     /// the last error after exactly `1 + floor(retry_s)` second-paced
-    /// attempts, and `retry_s = 0` means one attempt and no waiting.
+    /// attempts, `retry_s = 0` means one attempt and no waiting, and an
+    /// absurd window is bounded rather than wrapped.
     #[test]
     fn bus_open_retries_once_per_second_until_the_window_closes() {
         let mut calls = 0;
@@ -1318,15 +1319,19 @@ mod tests {
 
         let mut calls = 0;
         let mut waits = Vec::new();
-        let failed: Result<u32, &str> = open_with_retry(
+        let failed: Result<u32, String> = open_with_retry(
             3.9,
             || {
                 calls += 1;
-                Err("ENODEV")
+                Err(format!("attempt {calls}"))
             },
             |d| waits.push(d),
         );
-        assert_eq!(failed, Err("ENODEV"));
+        assert_eq!(
+            failed,
+            Err("attempt 4".to_owned()),
+            "the last error is reported"
+        );
         assert_eq!(calls, 4, "1 + floor(3.9) attempts");
         assert_eq!(waits.len(), 3, "no wait after the last attempt");
 
@@ -1346,13 +1351,10 @@ mod tests {
             (1, 0),
             "0 = fail on the first attempt"
         );
-    }
 
-    /// A retry window past the config ceiling is clamped to the ceiling
-    /// (an hour of attempts, not a wrapped count of zero), and a NaN
-    /// window still runs its one attempt.
-    #[test]
-    fn an_absurd_retry_window_is_bounded_not_wrapped() {
+        // A window past the config ceiling is clamped to the ceiling (an
+        // hour of attempts, not a wrapped count of zero), and a NaN window
+        // still runs its one attempt.
         let attempts_for = |window: f64| {
             let mut calls = 0u32;
             let failed: Result<u32, &str> = open_with_retry(
