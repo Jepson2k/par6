@@ -176,69 +176,67 @@ fn a_nine_byte_datagram_cannot_ask_for_a_gigabyte() {
         let why = refusal(&data, what);
         assert!(why.contains(what), "the refusal must name {what}: {why}");
     }
-}
 
-/// The cap is what bounds the reservation, so a header UNDER it that the
-/// datagram cannot back up must still fail — as truncation, having
-/// reserved only what the cap permits.
-#[test]
-fn a_header_the_datagram_cannot_back_up_is_truncation_not_a_reservation() {
-    let data = move_s_header(MAX_WAYPOINTS as u32);
-    assert!(
-        matches!(decode_command(&data), Err(DecodeError::Truncated)),
-        "a plausible header with no elements behind it must read as truncated"
-    );
-}
+    // The cap is what bounds the reservation, so a header UNDER it that the
+    // datagram cannot back up must still fail — as truncation, having
+    // reserved only what the cap permits.
+    {
+        let data = move_s_header(MAX_WAYPOINTS as u32);
+        assert!(
+            matches!(decode_command(&data), Err(DecodeError::Truncated)),
+            "a plausible header with no elements behind it must read as truncated"
+        );
+    }
 
-/// The caps admit everything a real program sends, and refuse the count
-/// above them — the planner-work bound, not just the allocator one.
-#[test]
-fn the_counts_a_real_program_sends_still_decode() {
-    let mut buf = Vec::new();
-    let waypoints = |n: usize| {
-        Command::MoveS(par6_proto::command::MoveS {
-            key: 1,
-            waypoints: (0..n)
-                .map(|i| [i as f64, 0.0, 0.0, 0.0, 0.0, 0.0])
-                .collect(),
-            frame: par6_proto::Frame::Wrf,
-            duration: Some(1.0),
-            speed: None,
-            accel: None,
-            rel: false,
-        })
-    };
-    encode_command(&waypoints(MAX_WAYPOINTS), 1, &mut buf).expect("the cap itself must encode");
-    let (_, decoded) = decode_command(&buf).expect("and decode");
-    assert_eq!(decoded, waypoints(MAX_WAYPOINTS));
+    // The caps admit everything a real program sends, and refuse the count
+    // above them — the planner-work bound, not just the allocator one.
+    {
+        let mut buf = Vec::new();
+        let waypoints = |n: usize| {
+            Command::MoveS(par6_proto::command::MoveS {
+                key: 1,
+                waypoints: (0..n)
+                    .map(|i| [i as f64, 0.0, 0.0, 0.0, 0.0, 0.0])
+                    .collect(),
+                frame: par6_proto::Frame::Wrf,
+                duration: Some(1.0),
+                speed: None,
+                accel: None,
+                rel: false,
+            })
+        };
+        encode_command(&waypoints(MAX_WAYPOINTS), 1, &mut buf).expect("the cap itself must encode");
+        let (_, decoded) = decode_command(&buf).expect("and decode");
+        assert_eq!(decoded, waypoints(MAX_WAYPOINTS));
 
-    let too_many = encode_command(&waypoints(MAX_WAYPOINTS + 1), 1, &mut buf)
-        .expect_err("one past the cap must be refused")
-        .to_string();
-    assert!(too_many.contains("move_s.waypoints"), "{too_many}");
+        let too_many = encode_command(&waypoints(MAX_WAYPOINTS + 1), 1, &mut buf)
+            .expect_err("one past the cap must be refused")
+            .to_string();
+        assert!(too_many.contains("move_s.waypoints"), "{too_many}");
 
-    let shapes = |n: usize| {
-        Command::SetShapes(par6_proto::command::SetShapes {
-            shapes: (0..n)
-                .map(|i| par6_proto::Shape {
-                    attachment: None,
-                    kind: "sphere".into(),
-                    params: vec![0.05],
-                    pose: vec![0.0; 6],
-                    collision: true,
-                    margin: None,
-                    name: format!("s{i}"),
-                    physics: None,
-                })
-                .collect(),
-        })
-    };
-    encode_command(&shapes(MAX_SHAPES), 1, &mut buf).expect("a full shape world must encode");
-    decode_command(&buf).expect("and decode");
-    let too_many = encode_command(&shapes(MAX_SHAPES + 1), 1, &mut buf)
-        .expect_err("one shape past the cap must be refused")
-        .to_string();
-    assert!(too_many.contains("set_shapes.shapes"), "{too_many}");
+        let shapes = |n: usize| {
+            Command::SetShapes(par6_proto::command::SetShapes {
+                shapes: (0..n)
+                    .map(|i| par6_proto::Shape {
+                        attachment: None,
+                        kind: "sphere".into(),
+                        params: vec![0.05],
+                        pose: vec![0.0; 6],
+                        collision: true,
+                        margin: None,
+                        name: format!("s{i}"),
+                        physics: None,
+                    })
+                    .collect(),
+            })
+        };
+        encode_command(&shapes(MAX_SHAPES), 1, &mut buf).expect("a full shape world must encode");
+        decode_command(&buf).expect("and decode");
+        let too_many = encode_command(&shapes(MAX_SHAPES + 1), 1, &mut buf)
+            .expect_err("one shape past the cap must be refused")
+            .to_string();
+        assert!(too_many.contains("set_shapes.shapes"), "{too_many}");
+    }
 }
 
 // ---- durations -------------------------------------------------------------
@@ -277,23 +275,22 @@ fn a_jog_duration_can_neither_abort_the_runtime_nor_outlive_the_operator() {
         "one second past the jog ceiling",
     );
     assert!(why.contains("jog_j.duration"), "{why}");
-}
 
-/// Every other duration reaches the same panicking arithmetic through
-/// the exec path, so the same bound applies — just a looser one, since
-/// an hour-long dwell is a real program step.
-#[test]
-fn a_queued_dwell_is_bounded_by_the_same_arithmetic() {
-    for hostile in [1e30, f64::MAX] {
-        let why = refusal(&delay_bytes(hostile), "an unbounded delay");
+    // Every other duration reaches the same panicking arithmetic through
+    // the exec path, so the same bound applies — just a looser one, since
+    // an hour-long dwell is a real program step.
+    {
+        for hostile in [1e30, f64::MAX] {
+            let why = refusal(&delay_bytes(hostile), "an unbounded delay");
+            assert!(why.contains("delay.seconds"), "{why}");
+        }
+        decode_command(&delay_bytes(MAX_DURATION_S)).expect("an hour-long dwell is a real program");
+        let why = refusal(
+            &delay_bytes(MAX_DURATION_S + 1.0),
+            "one second past the duration ceiling",
+        );
         assert!(why.contains("delay.seconds"), "{why}");
     }
-    decode_command(&delay_bytes(MAX_DURATION_S)).expect("an hour-long dwell is a real program");
-    let why = refusal(
-        &delay_bytes(MAX_DURATION_S + 1.0),
-        "one second past the duration ceiling",
-    );
-    assert!(why.contains("delay.seconds"), "{why}");
 }
 
 // ---------------------------------------------------------------------------

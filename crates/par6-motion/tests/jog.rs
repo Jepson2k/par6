@@ -67,10 +67,8 @@ fn config_floors_and_input_validation() {
     let cfg = par6_config();
     let dt = cfg.robot.tick_dt_s;
 
-    // accel_time floor 0.05 s: requesting 0.001 s ramps at the floor rate
-    // (capped by the jog acceleration limit).
-    // An acceleration ceiling the floor sits under, so it is the floor
-    // that binds: a 1 ms ramp time is held to MIN_ACCEL_TIME_S.
+    // The ramp-time floor is 0.05 s: under an acceleration ceiling it
+    // sits beneath, a 1 ms ramp time is held to it.
     let mut roomy = cfg.clone();
     roomy.joints[0].limits.acceleration_rad_s2 = 1.0e6;
     let mut engine = JogEngine::new(&roomy).unwrap();
@@ -78,7 +76,7 @@ fn config_floors_and_input_validation() {
     engine.set_profile(JogProfile::Trapezoid);
     engine.set_accel_time_s(0.001).unwrap();
     engine.command(&one(0, 1.0)).unwrap();
-    let a_floor = roomy.joints[0].limits.velocity_rad_s / par6_motion::MIN_ACCEL_TIME_S;
+    let a_floor = roomy.joints[0].limits.velocity_rad_s / 0.05;
     let out = engine.tick(&HOME);
     assert!(
         (out.qd[0] - a_floor * dt).abs() < 1e-9,
@@ -94,7 +92,7 @@ fn config_floors_and_input_validation() {
     engine.set_jerk_factor(0.01).unwrap();
     engine.command(&one(0, 1.0)).unwrap();
     let a = jog_accels(&cfg)[0];
-    let expected_dv = (a * par6_motion::MIN_JERK_FACTOR) * dt * dt;
+    let expected_dv = (a * 0.5) * dt * dt;
     let out = engine.tick(&HOME);
     assert!(
         (out.qd[0] - expected_dv).abs() < 1e-12,

@@ -37,21 +37,21 @@ fn set_tool_id_and_the_bus_scan_tool_id_survive_the_wire() {
     let mut buf = Vec::new();
     encode_reply(&reply, &mut buf);
     assert_eq!(decode_reply(&buf).unwrap(), reply);
-}
 
-#[test]
-fn a_tool_id_past_a_byte_is_refused() {
-    // [SET_TOOL_ID, req_id 1, node 6, tool_id 256 (uint16), force false]
-    let buf = [
-        0x95,
-        CmdType::SetToolId as u8,
-        0x01,
-        0x06,
-        0xcd,
-        0x01,
-        0x00,
-        0xc2,
-    ];
-    let err = decode_command(&buf).expect_err("256 is no tool id");
-    assert!(err.to_string().contains("set_tool_id.tool_id"), "{err}");
+    // A tool id past a byte is refused, naming the field.
+    {
+        // [SET_TOOL_ID, req_id 1, node 6, tool_id 256 (uint16), force false]
+        let buf = [
+            0x95,
+            CmdType::SetToolId as u8,
+            0x01,
+            0x06,
+            0xcd,
+            0x01,
+            0x00,
+            0xc2,
+        ];
+        let err = decode_command(&buf).expect_err("256 is no tool id");
+        assert!(err.to_string().contains("set_tool_id.tool_id"), "{err}");
+    }
 }

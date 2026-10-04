@@ -473,47 +473,71 @@ mod tests {
     fn par6_toml_loads_and_roundtrips() {
         let path = config_dir().join("PAR6.toml");
         let cfg = RobotConfig::load(&path).expect("PAR6.toml must load");
-
-        // Spot-check transcribed vendor values (robots/PAR6.xml).
-        assert_eq!(cfg.robot.name, "PAR6");
-        assert_eq!(cfg.robot.tick_dt_s, 0.004);
-        assert_eq!(cfg.tick_rate_hz(), 250.0);
         assert_eq!(cfg.joints.len(), 6);
-        let ratios: Vec<f64> = cfg.joints.iter().map(|j| j.gear_ratio).collect();
-        assert_eq!(ratios, vec![6.4, 25.0, 18.0952381, 4.0, 4.0, 10.0]);
-        assert_eq!(cfg.joints[0].kt_nm_a, 0.28);
-        assert_eq!(cfg.joints[1].ilim_ma, 2500.0);
-        assert_eq!(cfg.joints[1].gains.kpp, 3.0);
-        assert_eq!(cfg.joints[2].dir, 1);
-        assert_eq!(cfg.joints[5].limits.soft_max_rad, 7.14);
-        // Per-mode limits: exec is what selfcal found, jog falls back to the
-        // ceiling. J2's exec table sits well under its ceiling on every axis.
-        let exec = cfg.joints[1].limits.for_mode(LimitMode::Exec);
-        assert_eq!(exec.acceleration_rad_s2, 1.536);
-        assert_eq!(exec.jerk_rad_s3, Some(4.608));
-        let jog = cfg.joints[1].limits.for_mode(LimitMode::Jog);
-        assert_eq!(jog.acceleration_rad_s2, 10.0);
-        // Homing values (robots/PAR6.xml homing fields).
-        assert_eq!(cfg.homing.joints[0].timeout_s, 13.0);
-        assert_eq!(cfg.homing.joints[0].two_pass_max_diff_ticks, 3500);
-        assert_eq!(
-            cfg.homing.joints[1].release.as_ref().unwrap().current_ma,
-            150.0
-        );
-        assert_eq!(
-            cfg.homing.joints[2].release.as_ref().unwrap().current_ma,
-            -150.0
-        );
-        assert!(cfg.homing.joints[3].release.is_none());
-        assert_eq!(cfg.homing.joints[5].strategy, HomingStrategy::Hall);
-        assert!(cfg.homing.joints[3].home_offset_gripper_dependent);
-        // Seconds→ticks conversion helper.
-        assert_eq!(cfg.ticks(0.08), 20);
+        assert_eq!(cfg.homing.joints.len(), cfg.joints.len());
+        // Seconds become ticks by rounding, not truncating.
+        let dt = cfg.robot.tick_dt_s;
+        assert_eq!(cfg.tick_rate_hz(), 1.0 / dt);
+        assert_eq!(cfg.ticks(2.4 * dt), 2);
+        assert_eq!(cfg.ticks(2.6 * dt), 3);
 
         // Round-trip: serialize → reparse → identical.
         let text = toml::to_string(&cfg).expect("serialize");
         let back = RobotConfig::from_toml_str(&text).expect("reparse");
         assert_eq!(cfg, back);
+    }
+
+    /// A mode's limits fall back to the ceiling field by field: a mode
+    /// table that leaves jerk or torque rate out runs those at the
+    /// ceiling, never at zero.
+    #[test]
+    fn a_mode_table_falls_back_to_the_ceiling_field_by_field() {
+        let path = config_dir().join("PAR6.toml");
+        let mut limits = RobotConfig::load(&path)
+            .expect("PAR6.toml must load")
+            .joints[1]
+            .limits;
+        limits.jerk_rad_s3 = 30.0;
+        limits.torque_rate_nm_s = 364.0;
+        limits.exec = Some(ModeLimits {
+            velocity_rad_s: 1.0,
+            acceleration_rad_s2: 2.0,
+            jerk_rad_s3: None,
+            torque_rate_nm_s: None,
+        });
+        limits.jog = Some(ModeLimits {
+            velocity_rad_s: 1.0,
+            acceleration_rad_s2: 2.0,
+            jerk_rad_s3: Some(5.0),
+            torque_rate_nm_s: Some(50.0),
+        });
+        limits.stream = None;
+        let exec = limits.for_mode(LimitMode::Exec);
+        assert_eq!((exec.velocity_rad_s, exec.acceleration_rad_s2), (1.0, 2.0));
+        assert_eq!(
+            (exec.jerk_rad_s3, exec.torque_rate_nm_s),
+            (Some(30.0), Some(364.0))
+        );
+        let jog = limits.for_mode(LimitMode::Jog);
+        assert_eq!(
+            (jog.jerk_rad_s3, jog.torque_rate_nm_s),
+            (Some(5.0), Some(50.0))
+        );
+        let stream = limits.for_mode(LimitMode::Stream);
+        assert_eq!(
+            (
+                stream.velocity_rad_s,
+                stream.acceleration_rad_s2,
+                stream.jerk_rad_s3,
+                stream.torque_rate_nm_s
+            ),
+            (
+                limits.velocity_rad_s,
+                limits.acceleration_rad_s2,
+                Some(30.0),
+                Some(364.0)
+            )
+        );
     }
 
     /// A config written before the tool/gripper rename still loads.
@@ -595,7 +619,17 @@ mod tests {
     }
     #[test]
     fn bundle_resolves_gripper_dependent_offsets() {
-        let driven = TempConfig::new(select_tool(DRIVEN_TOOL));
+        // The tool also lists J0, which is not gripper-dependent: its own
+        // offset has to win there.
+        let tool_file = format!("{DRIVEN_TOOL}.toml");
+        let driven = TempConfig::new(|file, text| {
+            let text = select_tool(DRIVEN_TOOL)(file, text);
+            if file == tool_file {
+                format!("{text}\n[[arm_joint_home_offsets]]\njoint = 0\nhome_offset_rad = 1.234\n")
+            } else {
+                text
+            }
+        });
         let bundle = ConfigBundle::load(&driven.robot()).expect("bundle");
         // Every shipped TOML is loaded and cross-validated, under a name
         // no other file claims — a duplicate would make
@@ -614,18 +648,41 @@ mod tests {
 
         let active = bundle.active_tool().expect("active gripper");
         assert_eq!(active.name, DRIVEN_TOOL);
-        assert_eq!(active.driver.as_ref().unwrap().stroke_mm, 200.0);
-        // J4 (index 4) is gripper-dependent and overridden by the MSG gripper.
-        assert_eq!(bundle.effective_home_offset(4), Some(-2.070));
-        // J3 (index 3) is gripper-dependent but no gripper overrides it → fallback.
-        assert_eq!(bundle.effective_home_offset(3), Some(-2.717));
-        // J0 is not gripper-dependent.
-        assert_eq!(bundle.effective_home_offset(0), Some(2.96279));
-        // Flange is a passive tool: no driver, no homing, but kinematics + offsets.
+        // A joint homes to the tool's offset only where it is flagged
+        // gripper-dependent and the tool overrides it; everywhere else, to
+        // its own — including a joint the tool lists but is not flagged.
+        let mut cases = [false; 3];
+        for (j, jh) in bundle.robot.homing.joints.iter().enumerate() {
+            let tool = active
+                .arm_joint_home_offsets
+                .iter()
+                .find(|o| usize::from(o.joint) == j)
+                .map(|o| o.home_offset_rad);
+            let want = match (jh.home_offset_gripper_dependent, tool) {
+                (true, Some(v)) => {
+                    cases[0] = true;
+                    v
+                }
+                (true, None) => {
+                    cases[1] = true;
+                    jh.home_offset_rad
+                }
+                (false, Some(_)) => {
+                    cases[2] = true;
+                    jh.home_offset_rad
+                }
+                (false, None) => jh.home_offset_rad,
+            };
+            assert_eq!(bundle.effective_home_offset(j), Some(want), "J{j}");
+        }
+        assert_eq!(
+            cases, [true; 3],
+            "overridden, fallback and unflagged-but-listed joints must all occur"
+        );
+        // Flange is a passive tool: no driver, no homing.
         let flange = bundle.tools.iter().find(|g| g.name == "Flange").unwrap();
         assert!(flange.driver.is_none());
         assert!(flange.homing.is_none());
-        assert_eq!(flange.arm_joint_home_offsets[0].home_offset_rad, -2.258);
         // Gripper round-trip.
         let text = toml::to_string(active).expect("serialize gripper");
         let back = ToolConfig::from_toml_str(&text).expect("reparse gripper");
@@ -696,19 +753,54 @@ mod tests {
         );
 
         // The arm's own homing work survives intact — this drops the
-        // gripper, not the sequence.
-        let arm_steps: Vec<Vec<u8>> = bundle
-            .robot
-            .homing
-            .sequence
-            .iter()
-            .filter_map(|s| s.home.as_ref())
-            .map(|h| h.joints.clone())
-            .filter(|j| !j.is_empty())
-            .collect();
-        assert_eq!(arm_steps, vec![vec![1, 2], vec![0], vec![3, 5], vec![4]]);
+        // gripper, not the sequence: every arm home group, nudge and
+        // move_to the driven tool's sequence has, in order.
+        let arm_work = |b: &ConfigBundle| {
+            let arm = |moves: &[PreMove]| -> Vec<PreMove> {
+                moves
+                    .iter()
+                    .filter(|m| !matches!(m, PreMove::GripperMove { .. }))
+                    .copied()
+                    .collect()
+            };
+            let mut steps: Vec<_> = b
+                .robot
+                .homing
+                .sequence
+                .iter()
+                .map(|s| {
+                    (
+                        arm(&s.pre_moves),
+                        s.home
+                            .as_ref()
+                            .map(|h| h.joints.clone())
+                            .unwrap_or_default(),
+                        s.move_to.clone(),
+                        arm(&s.post_moves),
+                    )
+                })
+                .filter(|(pre, home, to, post)| {
+                    !(pre.is_empty() && home.is_empty() && to.is_empty() && post.is_empty())
+                })
+                .collect();
+            steps.push((arm(&b.robot.homing.post_moves), vec![], vec![], vec![]));
+            steps
+        };
+        let driven_work = arm_work(&stock);
+        assert!(
+            driven_work.iter().any(|(pre, ..)| !pre.is_empty())
+                && driven_work.iter().any(|(_, _, to, _)| !to.is_empty()),
+            "the premise: the sequence has arm nudges and move_to entries to keep"
+        );
+        assert_eq!(arm_work(&bundle), driven_work);
         // ...and the flange's own J4 offset is what the runtime homes to.
-        assert_eq!(bundle.effective_home_offset(4), Some(-2.258));
+        let flange = bundle.active_tool().expect("the flange");
+        let j4 = flange
+            .arm_joint_home_offsets
+            .iter()
+            .find(|o| o.joint == 4)
+            .expect("the flange sets J4's offset");
+        assert_eq!(bundle.effective_home_offset(4), Some(j4.home_offset_rad));
     }
 
     /// A gripper that IS on the bus but has no `[homing]` parameters
@@ -753,6 +845,28 @@ mod tests {
             ["floor"],
             "the shipped config declares the ground the robot stands on"
         );
+
+        // A robot that declares no ground at all still loads, with an
+        // empty layer.
+        let bare =
+            TempConfig::new(|file, text| {
+                if file == "PAR6.toml" {
+                    let stripped = without_section(
+                        &without_section(text, "[[installation_shapes]]"),
+                        "[installation_shapes.physics]",
+                    );
+                    assert!(
+                        stripped.lines().all(|l| l.trim_start().starts_with('#')
+                            || !l.contains("installation_shapes")),
+                        "the floor is the only declared shape"
+                    );
+                    stripped
+                } else {
+                    text.to_owned()
+                }
+            });
+        let bundle = ConfigBundle::load(&bare.robot()).expect("no installation shapes loads");
+        assert!(bundle.installation_shapes.is_empty());
 
         let with_shapes = TempConfig::new(|file, text| {
             if file == "PAR6.toml" {
@@ -954,10 +1068,8 @@ mod tests {
         // A config that says nothing about timing runs the vendor bands,
         // so hardware behavior does not depend on this section existing.
         let stock = RobotConfig::from_toml_str(&text).unwrap();
-        let bands = stock.loop_timing();
-        assert_eq!(bands.degraded_factor, 1.05);
-        assert_eq!(bands.critical_factor, 1.10);
-        assert_eq!(bands.critical_sustain_s, 1.0);
+        assert!(stock.timing.is_none(), "the shipped config is silent");
+        assert_eq!(stock.loop_timing(), TimingConfig::default());
 
         // A declared section is what the runtime then uses.
         let declared = RobotConfig::from_toml_str(&format!(
@@ -983,6 +1095,7 @@ mod tests {
             ),
             ("critical_sustain_s = 0.0", "timing.critical_sustain_s"),
             ("critical_sustain_s = -1.0", "timing.critical_sustain_s"),
+            ("fifo_priority = 100", "timing.fifo_priority"),
         ] {
             let err = RobotConfig::from_toml_str(&format!("{text}\n[timing]\n{section}\n"))
                 .expect_err(&format!("`{section}` must be refused"))

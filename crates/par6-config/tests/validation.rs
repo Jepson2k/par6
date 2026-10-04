@@ -112,8 +112,10 @@ fn every_joint_can_seek_across_its_whole_range() {
         let span_ticks = (joint.limits.hard_max_rad - joint.limits.hard_min_rad) * ticks_per_rad;
         let crossing_s = span_ticks / homing.speed_ticks_s;
         let budget_s = homing.seek_timeout_s(joint);
+        // A bare crossing leaves nothing for the ramp up to seek speed or
+        // the stall confirmation at the stop: a fifth more, at least.
         assert!(
-            budget_s >= crossing_s,
+            budget_s >= 1.2 * crossing_s,
             "J{}: seek budget {budget_s:.1} s covers only {:.0}% of the {crossing_s:.1} s \
              needed to cross its range at {} ticks/s",
             i + 1,
