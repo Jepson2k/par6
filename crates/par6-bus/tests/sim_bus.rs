@@ -2364,3 +2364,43 @@ fn capture_records_a_velocity_step_at_the_loop_rate_and_reads_back() {
         "a new capture forgets the last one"
     );
 }
+
+/// The simulator keeps the backend contracts the hardware does: nothing
+/// goes out before it is configured, joint commands are sent once a tick
+/// and only for every joint, and the RX drain stops at its per-tick cap
+/// with the rest kept for the next tick.
+#[test]
+fn the_send_contracts_and_the_rx_cap_hold() {
+    let mut robot = par6();
+    robot.bus.rx_frames_per_tick_cap = 4;
+    let mut bus = SimBus::new(scene());
+    let joints = [JointCommand::idle(); 6];
+    assert!(
+        bus.send_joint_commands(&joints).is_err(),
+        "nothing is sent before the bus is configured"
+    );
+    bus.boot_configure(&robot, Some(&msg_gripper()), 1)
+        .expect("sim boot");
+
+    bus.begin_tick(1);
+    bus.send_joint_commands(&joints).expect("the tick's send");
+    assert!(
+        bus.send_joint_commands(&joints).is_err(),
+        "a second send in one tick is refused"
+    );
+    bus.begin_tick(2);
+    assert!(
+        bus.send_joint_commands(&joints[..5]).is_err(),
+        "a send that does not cover every joint is refused"
+    );
+
+    // Every joint answers its tick's frame: more replies than the cap.
+    let mut state = BusState::new();
+    bus.begin_tick(3);
+    bus.send_joint_commands(&joints).expect("send");
+    bus.begin_tick(4);
+    let first = bus.drain_rx(&mut state).expect("drain");
+    let second = bus.drain_rx(&mut state).expect("drain");
+    assert_eq!(first, 4, "the drain stops at its cap");
+    assert!(second >= 2, "the rest is kept for the next drain: {second}");
+}

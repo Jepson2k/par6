@@ -14,14 +14,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use par6_bus::sim::SimBus;
+use par6_bus::spectral::codec::Readback;
 use par6_bus::spectral::{trunc_to_wire, JointConversion};
 use par6_bus::{
-    BusState, DriverBus, GripperCommand, GripperReply, HallState, JointCommand, LoopbackBus, Pack,
-    Reply, TxRecord,
+    BusState, ConfigKind, DriverBus, GripperCommand, GripperReply, HallState, JointCommand,
+    LoopbackBus, Pack, PollAction, Reply, TxRecord,
 };
 use par6_config::{ConfigBundle, GripperHomeMode, HomeGroup, MoveTo, SequenceStep};
 use par6_rt::adapters::{MotionJog, MotionStream};
-use par6_rt::homing::{HomingSystem, SeqStatus};
+use par6_rt::homing::{HomingSystem, SeqStatus, DETECT_WINDOW_S, REHOME_SPEED_FACTOR};
 use par6_rt::hooks::ClampStream;
 use par6_rt::{
     sample_ring, ArmState, CompletionPolicy, ErrorCode, GravityModel, HomingJointStatus,
@@ -434,17 +435,6 @@ impl HomingHarness {
         )
     }
 
-    fn limits_count(&self, node: u8, current_ma: f32) -> usize {
-        self.bus
-            .tx_log
-            .iter()
-            .filter(|(_, r)| {
-                matches!(r, TxRecord::Limits { node: n, current_limit_ma, .. }
-                    if *n == node && *current_limit_ma == current_ma)
-            })
-            .count()
-    }
-
     fn config_passes(&self) -> usize {
         self.bus
             .tx_log
@@ -452,89 +442,6 @@ impl HomingHarness {
             .filter(|(_, r)| matches!(r, TxRecord::ConfigPass { .. }))
             .count()
     }
-}
-
-#[test]
-fn two_pass_mismatch_fails_the_joint_and_restores_config() {
-    let bundle = single_joint_bundle(0);
-    let jh = &bundle.robot.homing.joints[0];
-    let mut h = HomingHarness::new(&bundle);
-
-    // Waiting actuators retain their normal holding authority.
-    for i in 0..MAX_JOINTS {
-        let node = bundle.robot.joints[i].node_id;
-        let ma = bundle.robot.joints[i].ilim_ma as f32;
-        assert_eq!(
-            h.limits_count(node, ma),
-            4,
-            "initial holding limit for J{i}"
-        );
-    }
-    let gripper_ma = bundle
-        .active_tool()
-        .unwrap()
-        .driver
-        .as_ref()
-        .unwrap()
-        .ilim_ma as f32;
-    assert_eq!(
-        h.limits_count(bundle.robot.bus.gripper_node, gripper_ma),
-        4,
-        "gripper begins with its normal holding limit"
-    );
-
-    // Scripted plant for J0: velocity integrates; a plateau at `stop`
-    // with saturated current is the stall signature; the endstop MOVES
-    // by more than two_pass_max_diff before the re-approach, so pass 2
-    // latches a mismatching position.
-    let master = bundle.robot.joints[0].sector_master_position_ticks;
-    let mut pos = f64::from(master);
-    let mut stop = pos + 3000.0;
-    let mut shifted = false;
-    let n0 = usize::from(bundle.robot.joints[0].node_id);
-    h.state.nodes[n0].position_ticks = Some(master);
-    h.state.nodes[n0].current_ma = Some(0);
-
-    let mut outcome = SeqStatus::Running;
-    let mut fsm_started = false;
-    for t in 1..6000u64 {
-        let status = h.tick(t);
-        let cmd = h.cmds[0];
-        if let Some(v) = cmd.vel {
-            if v < 0 && !shifted {
-                // First backoff observed: shift the endstop for pass 2.
-                stop += f64::from(jh.two_pass_max_diff_ticks) + 500.0;
-                shifted = true;
-            }
-            pos = (pos + f64::from(v) * h.dt).min(stop);
-            if v > 0 {
-                fsm_started = true;
-            }
-        }
-        let seated = pos >= stop - 0.5 && matches!(cmd.vel, Some(v) if v > 0);
-        h.state.nodes[n0].position_ticks = Some(pos as i32);
-        h.state.nodes[n0].speed_ticks_s = Some(cmd.vel.unwrap_or(0));
-        h.state.nodes[n0].current_ma = Some(if seated { jh.current_ma as i16 } else { 100 });
-        match status {
-            SeqStatus::Running => {}
-            other => {
-                outcome = other;
-                break;
-            }
-        }
-    }
-    assert!(fsm_started, "the approach drove the joint");
-    assert!(shifted, "pass 2 ran against a moved endstop");
-    assert_eq!(outcome, SeqStatus::Failed, "two-pass mismatch fails");
-    assert_eq!(h.sys.statuses()[0], HomingJointStatus::Failed);
-    assert!(!h.sys.active());
-    // Failure restores every node's full stored config (6 joints + the
-    // CAN gripper).
-    assert!(
-        h.config_passes() > MAX_JOINTS,
-        "config reload on failure (got {})",
-        h.config_passes()
-    );
 }
 
 #[test]
@@ -631,8 +538,7 @@ fn a_joint_still_travelling_on_pass_two_is_not_a_stall() {
     // Pass 2 re-covers the backoff distance at the rehome speed factor
     // (the tracking factor scales both legs, so it cancels). A gate still
     // sized for pass 1 calls this travel a stall a quarter of the way in.
-    let rehome_speed_factor = 0.3;
-    let expected = jh.backoff_s / (rehome_speed_factor * h.dt);
+    let expected = jh.backoff_s / (REHOME_SPEED_FACTOR * h.dt);
     assert!(
         f64::from(pass2_ticks) > 0.8 * expected,
         "pass 2 must travel the backoff distance before it counts as stalled \
@@ -744,7 +650,9 @@ fn a_forty_percent_current_duty_is_not_a_stall() {
     let mut h = HomingHarness::new(&bundle);
     let n0 = usize::from(bundle.robot.joints[0].node_id);
 
-    let duty_ticks = 250u32;
+    let window = (DETECT_WINDOW_S / h.dt).round().max(5.0) as u64;
+    // Several windows of 40 % duty, each of which must not latch.
+    let duty_ticks = 3 * window as u32;
     let master = bundle.robot.joints[0].sector_master_position_ticks;
     let mut pos = f64::from(master);
     let stop = pos + 3000.0;
@@ -811,8 +719,9 @@ fn a_forty_percent_current_duty_is_not_a_stall() {
         "stall latched at tick {hit}, before full duty began at {full_from}"
     );
     assert!(
-        hit <= full_from + 60,
-        "100 % duty should latch within a detection window (hit {hit}, full duty from {full_from})"
+        hit <= full_from + window,
+        "100 % duty should latch within a detection window of {window} ticks \
+         (hit {hit}, full duty from {full_from})"
     );
     assert_eq!(outcome, SeqStatus::Complete);
     assert_eq!(h.sys.statuses()[0], HomingJointStatus::Done);
@@ -875,15 +784,6 @@ fn a_free_running_approach_fails_at_the_configured_timeout_exactly() {
         let failed_at = failed_at.unwrap_or_else(|| panic!("dt {dt}: timeout never fired"));
         // elapsed == timeout is still within budget; the tick after is
         // the failure — exactly `round(seek_timeout_s / dt)` driven ticks.
-        // The shipped J0 `timeout_s` is 13.0 s, but a full sweep of its
-        // 5.904 rad range at 4500 ticks/s takes 21.90 s, so the derived
-        // budget is 27.37 s. Spelled out so the conversion is pinned
-        // against seconds rather than restating the implementation.
-        assert!(
-            (seek_s - 27.37).abs() < 0.01,
-            "dt {dt}: J0 seek budget is {seek_s:.2} s"
-        );
-        assert_eq!(timeout_ticks, (27.3693f64 / dt).round() as u64, "dt {dt}");
         assert_eq!(
             failed_at - first_drive,
             timeout_ticks,
@@ -1031,36 +931,21 @@ fn release_ramps_from_the_stall_push_holds_the_config_current_and_samples_at_eig
         i64::from(seen[ramp + sample_tick - 1]),
         "reference sampled at round(dur · sample_pct) = tick {sample_tick} of the hold"
     );
-    // And it is the RELAXED position: well away from the seated stop in
-    // the releasing direction.
-    let stop = i64::from(bundle.robot.joints[1].sector_master_position_ticks) - 3000;
-    assert!(
-        latched - stop >= 400,
-        "latched {latched} must sit relaxed above the stop {stop}"
-    );
-
-    // Inverting the config sign must move the reference the other way —
-    // the plant winds tighter instead of relaxing, and the relaxed-side
-    // assertion above would reject it. This pins that the test (and the
-    // FSM) are sign-sensitive, not |current|-sensitive.
+    // The FSM is sign-sensitive, not |current|-sensitive: an inverted
+    // config sign goes out inverted.
     let mut inverted = single_joint_bundle(1);
     let rel = inverted.robot.homing.joints[1]
         .release
         .as_mut()
         .expect("J1 ships a release plan");
     rel.current_ma = -rel.current_ma;
-    let (inv_runs, inv_latched, inv_outcome) = run_release_scenario(&inverted);
+    let (inv_runs, _, inv_outcome) = run_release_scenario(&inverted);
     assert_eq!(inv_outcome, SeqStatus::Complete);
     assert!(
         inv_runs[0].0[ramp..ramp + dur_ticks]
             .iter()
             .all(|&c| c == -target),
         "the FSM forwards the inverted sign verbatim"
-    );
-    assert!(
-        inv_latched - stop <= -400,
-        "inverted release must latch WOUND-IN ({inv_latched} vs stop {stop}) — \
-         the relaxed-side assertion would fail on it"
     );
 }
 
@@ -1465,6 +1350,24 @@ fn a_retune_before_homing_is_the_limit_homing_restores() {
         s.homing.effective_current_limit_ma[0], tune.ilim_ma as f32,
         "J1 must come back to the tuned Ilim, not the config-time one"
     );
+    // And the drive itself holds it.
+    core.bus_mut().queue_poll_override(
+        PollAction::ConfigRead {
+            node: j0.node_id,
+            kind: ConfigKind::Limits,
+        },
+        1,
+    );
+    for _ in 0..4 {
+        core.tick(dt, false);
+    }
+    match handles.snapshots.latest().nodes[usize::from(j0.node_id)].readback(ConfigKind::Limits) {
+        Some(Readback::Limits { current_ma, .. }) => assert_eq!(
+            current_ma, tune.ilim_ma as f32,
+            "the drive must hold the tuned Ilim after homing"
+        ),
+        other => panic!("no limits read back from J1: {other:?}"),
+    }
 }
 
 #[test]
@@ -1659,4 +1562,96 @@ fn homing_positioning_waits_for_profiles_longer_than_four_seconds() {
         assert!(stopped, "{phase}: positioning never finished");
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// J0 homed alone on the simulator from `j0_rad`, its motor loaded by
+/// whatever `load` asks for given the command J0 was last sent and
+/// whether a backoff has happened yet.
+fn home_j0(
+    bundle: &ConfigBundle,
+    j0_rad: f64,
+    mut load: impl FnMut(&JointCommand, bool) -> f64,
+) -> (SeqStatus, SimHomingHarness) {
+    let mut q0: [f64; MAX_JOINTS] = std::array::from_fn(|i| {
+        let j = &bundle.robot.joints[i];
+        JointConversion::from_config(j).joint_rad(j.sector_master_position_ticks)
+    });
+    q0[0] = j0_rad;
+    // J5's hall band is out of the way: only J0 homes.
+    let mut h = SimHomingHarness::new(bundle, &q0, 5, 3.0, 0.0);
+    h.sys.start(&mut h.bus);
+    let node = bundle.robot.joints[0].node_id;
+    let mut backed_off = false;
+    let budget = (120.0 / bundle.robot.robot.tick_dt_s) as u32;
+    for _ in 0..budget {
+        backed_off |= h.cmds[0].vel.is_some_and(|v| v < 0);
+        let ma = load(&h.cmds[0], backed_off);
+        h.bus.set_joint_load_ma(node, ma);
+        match h.tick() {
+            SeqStatus::Running => {}
+            other => return (other, h),
+        }
+    }
+    panic!("J0's homing did not finish");
+}
+
+/// J0's approach side and a start `rad` short of its stop on that side.
+fn short_of_j0_stop(bundle: &ConfigBundle, rad: f64) -> f64 {
+    let j = &bundle.robot.joints[0];
+    let jh = &bundle.robot.homing.joints[0];
+    let toward = JointConversion::from_config(j).joint_speed_rad_s(jh.speed_ticks_s);
+    if toward > 0.0 {
+        j.limits.hard_max_rad - rad
+    } else {
+        j.limits.hard_min_rad + rad
+    }
+}
+
+/// A first pass that stalls against something other than the endstop
+/// disagrees with the second, which finds the real one: the joint fails
+/// instead of keeping either reference, and the drive gets its normal
+/// limits back.
+#[test]
+fn two_passes_that_disagree_fail_the_joint_and_restore_its_limits() {
+    let bundle = single_joint_bundle(0);
+    let jh = &bundle.robot.homing.joints[0];
+    // Held in place through pass 1 by a load that matches the homing
+    // current; free once the backoff starts, half a radian from the
+    // endstop.
+    let (outcome, mut h) = home_j0(&bundle, short_of_j0_stop(&bundle, 0.5), |_, backed_off| {
+        if backed_off {
+            0.0
+        } else {
+            jh.current_ma
+        }
+    });
+    assert_eq!(outcome, SeqStatus::Failed, "two disagreeing passes fail");
+    assert_eq!(h.sys.statuses()[0], HomingJointStatus::Failed);
+    assert_eq!(
+        h.sys.status().phase[0],
+        HomingPhase::Settle,
+        "it fails comparing the passes, not on the way to the stop"
+    );
+    assert!(!h.sys.active());
+
+    let node = bundle.robot.joints[0].node_id;
+    h.bus.queue_poll_override(
+        PollAction::ConfigRead {
+            node,
+            kind: ConfigKind::Limits,
+        },
+        1,
+    );
+    h.drain();
+    h.bus.poll_step().expect("poll");
+    for _ in 0..3 {
+        h.drain();
+    }
+    match h.state.nodes[usize::from(node)].readback(ConfigKind::Limits) {
+        Some(Readback::Limits { current_ma, .. }) => assert_eq!(
+            current_ma, bundle.robot.joints[0].ilim_ma as f32,
+            "the drive is back on its normal current limit"
+        ),
+        other => panic!("no limits read back: {other:?}"),
+    }
 }

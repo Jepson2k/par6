@@ -826,3 +826,197 @@ fn steady_state_ticks_allocate_nothing() {
         "the measured window actually decoded frames"
     );
 }
+
+/// The RTRs the bus put on the wire, in order, as (node, command).
+fn rtrs(seen: &[Seen]) -> Vec<(NodeId, u8)> {
+    seen.iter()
+        .filter(|s| s.rtr)
+        .map(|s| (s.node, s.cmd))
+        .collect()
+}
+
+/// Every poll target is asked in its own firmware's dialect: a drive that
+/// answered the combined telemetry probe gets one telemetry RTR a cycle,
+/// a vendor drive temperature, voltage and errors. An override takes the
+/// slots it asked for and the round robin resumes where it left off, and
+/// the device-info sweep asks each node once, in one contiguous run.
+#[test]
+fn polls_reach_every_node_in_its_dialect_and_overrides_take_their_slots() {
+    let iface = require_vcan!();
+    let wire = Wire::open(&iface);
+    let (mut robot, gripper) = configs(&iface);
+    robot.robot.kt_source = KtSource::Config;
+    robot.bus.scan.rounds = 0;
+    let mut bus = SocketCanBus::open(&robot.bus).expect("open SocketCanBus");
+    // Node 0 answers the telemetry probe the par6 way.
+    wire.send(pack_can_id(0, CommandId::Telemetry, false), &[0u8; 8]);
+    bus.boot_configure(&robot, Some(&gripper), 0)
+        .expect("boot_configure");
+    let _ = wire.drain();
+    let nodes: Vec<NodeId> = robot
+        .joints
+        .iter()
+        .map(|j| j.node_id)
+        .chain([robot.bus.gripper_node])
+        .collect();
+
+    let mut tick = 0;
+    let mut step = |bus: &mut SocketCanBus, n: usize| {
+        let mut seen = Vec::new();
+        for _ in 0..n {
+            tick += 1;
+            bus.begin_tick(tick);
+            bus.poll_step().expect("poll");
+            seen.extend(wire.drain());
+        }
+        seen
+    };
+
+    let vendor = [
+        CommandId::Temperature,
+        CommandId::Voltage,
+        CommandId::StateOfErrors,
+    ];
+    let cycle = 1 + (nodes.len() - 1) * vendor.len();
+    let polled = rtrs(&step(&mut bus, cycle));
+    assert_eq!(polled.len(), cycle, "one RTR per slot");
+    for &node in &nodes {
+        let mut asked: Vec<u8> = polled
+            .iter()
+            .filter(|(n, _)| *n == node)
+            .map(|(_, c)| *c)
+            .collect();
+        asked.sort_unstable();
+        let mut want: Vec<u8> = if node == 0 {
+            vec![CommandId::Telemetry.raw()]
+        } else {
+            vendor.iter().map(|c| c.raw()).collect()
+        };
+        want.sort_unstable();
+        assert_eq!(asked, want, "node {node} in one cycle");
+    }
+
+    // An override owns exactly its slots; the round robin then resumes at
+    // its own cursor.
+    let next = step(&mut bus, 1);
+    bus.queue_poll_override(par6_bus::PollAction::ClearError { node: 2 }, 3);
+    let preempted = step(&mut bus, 4);
+    let clears = preempted
+        .iter()
+        .filter(|s| !s.rtr && s.node == 2 && s.cmd == CommandId::ClearError.raw())
+        .count();
+    assert_eq!(clears, 3, "the override takes its three slots");
+    assert_eq!(rtrs(&next), vec![polled[0]], "the second cycle starts over");
+    assert_eq!(
+        rtrs(&preempted),
+        vec![polled[1]],
+        "the round robin resumes at its own cursor after the override"
+    );
+
+    // The device-info sweep: one RTR per node, contiguous.
+    let long = rtrs(&step(&mut bus, 1100));
+    let sweep: Vec<usize> = long
+        .iter()
+        .enumerate()
+        .filter(|(_, (_, c))| *c == CommandId::DeviceInfo.raw())
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(sweep.len(), nodes.len(), "one device-info RTR per node");
+    assert!(
+        sweep.windows(2).all(|w| w[1] == w[0] + 1),
+        "one contiguous sweep"
+    );
+    let mut swept: Vec<NodeId> = sweep.iter().map(|&i| long[i].0).collect();
+    swept.sort_unstable();
+    let mut all = nodes.clone();
+    all.sort_unstable();
+    assert_eq!(swept, all);
+}
+
+/// The backend's own contracts: nothing goes out before it is configured,
+/// joint commands are sent once a tick and only for every joint, and the
+/// RX drain stops at its per-tick cap with the rest kept for the next.
+#[test]
+fn the_send_contracts_and_the_rx_cap_hold() {
+    let iface = require_vcan!();
+    let wire = Wire::open(&iface);
+    let (mut robot, gripper) = configs(&iface);
+    robot.robot.kt_source = KtSource::Config;
+    robot.bus.scan.rounds = 0;
+    robot.bus.rx_frames_per_tick_cap = 4;
+    let mut bus = SocketCanBus::open(&robot.bus).expect("open SocketCanBus");
+    let joints = [JointCommand::idle(); 6];
+    assert!(
+        bus.send_joint_commands(&joints).is_err(),
+        "nothing is sent before the bus is configured"
+    );
+    bus.boot_configure(&robot, Some(&gripper), 0)
+        .expect("boot_configure");
+    let _ = wire.drain();
+
+    bus.begin_tick(1);
+    bus.send_joint_commands(&joints).expect("the tick's send");
+    assert!(
+        bus.send_joint_commands(&joints).is_err(),
+        "a second send in one tick is refused"
+    );
+    bus.begin_tick(2);
+    assert!(
+        bus.send_joint_commands(&joints[..5]).is_err(),
+        "a send that does not cover every joint is refused"
+    );
+    let _ = wire.drain();
+
+    let mut state = BusState::new();
+    for k in 0..10 {
+        let (id, data) = motion_reply(0, false, 1000 + k, 0, 0);
+        wire.send(id, &data);
+    }
+    let mut drained = Vec::new();
+    for t in 3..7 {
+        bus.begin_tick(t);
+        drained.push(bus.drain_rx(&mut state).expect("drain"));
+    }
+    assert_eq!(
+        drained,
+        vec![4, 4, 2, 0],
+        "the cap holds and nothing is lost"
+    );
+    assert_eq!(state.nodes[0].position_ticks, Some(1009), "in order");
+}
+
+/// SET_PID_GAINS replaces the node's stored config: the retune goes out
+/// with its values, and so does every later resend of that node.
+#[test]
+fn a_retune_is_what_every_later_resend_carries() {
+    let iface = require_vcan!();
+    let wire = Wire::open(&iface);
+    let (mut bus, robot, _) = quiet_bus(&iface);
+    let _ = wire.drain();
+    let node = robot.joints[2].node_id;
+    let tune = par6_bus::DriveTune {
+        gains: robot.joints[2].gains,
+        ilim_ma: 1111.0,
+        velocity_limit_ticks_s: 150_000.0,
+        voltage_limit_mv: 0,
+    };
+    let limits = |seen: Vec<Seen>| -> Vec<(f32, f32)> {
+        seen.iter()
+            .filter(|s| s.node == node && s.cmd == CommandId::Limits.raw() && !s.rtr)
+            .map(|s| {
+                let f = |i: usize| {
+                    f32::from_be_bytes([s.data[i], s.data[i + 1], s.data[i + 2], s.data[i + 3]])
+                };
+                (f(0), f(4))
+            })
+            .collect()
+    };
+    bus.retune_node(node, &tune, 1).expect("retune");
+    assert_eq!(limits(wire.drain()), vec![(150_000.0, 1111.0)]);
+    bus.resend_node_config(node, 1).expect("resend");
+    assert_eq!(
+        limits(wire.drain()),
+        vec![(150_000.0, 1111.0)],
+        "a later resend carries the tune"
+    );
+}

@@ -77,14 +77,14 @@ const SETTLE_S: f64 = 0.08;
 /// target by the whole seek speed in one tick.
 const RAMP_S: f64 = 0.25;
 /// Stall/current detection window \[s\].
-const DETECT_WINDOW_S: f64 = 0.08;
+pub const DETECT_WINDOW_S: f64 = 0.08;
 /// Current-detector startup guard \[s\].
 const STARTUP_GUARD_S: f64 = 0.15;
 /// Hall pre-clear guard: a trigger this early means "started on the
 /// sensor" \[s\].
 const PRECLEAR_GUARD_S: f64 = 0.5;
 /// Pass-2 speed factor (vendor `rehome_speed_factor` default).
-const REHOME_SPEED_FACTOR: f64 = 0.3;
+pub const REHOME_SPEED_FACTOR: f64 = 0.3;
 /// Current-ratio threshold on the homing current.
 const CURRENT_RATIO: f64 = 0.70;
 /// Fraction of the detection window that must be above threshold.

@@ -102,7 +102,8 @@ const STREAM_REST_RAD_S: f64 = 1e-9;
 const RELEASE_REST_BAND_RAD: f64 = 0.05;
 const RELEASE_REST_WINDOW_S: f64 = 0.2;
 
-const BOOT_SELFCHECK_S: f64 = 0.032;
+/// Wait from a bus coming up to its selfcheck scan \[s\].
+pub const BOOT_SELFCHECK_S: f64 = 0.032;
 /// Settling time between a boot-time link cycle and the re-scan that
 /// judges it \[s\]: the interface comes back up, the first stored-config
 /// shot (0.2 s) reaches the drives, and their replies fill the roll.

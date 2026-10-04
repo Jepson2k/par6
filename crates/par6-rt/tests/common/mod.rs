@@ -281,8 +281,9 @@ impl Rig {
             );
         }
         if self.skip_nodes & (1 << u16::from(self.gripper_node)) == 0 {
+            let err_bit = self.fault_nodes & (1 << u16::from(self.gripper_node)) != 0;
             self.core.bus_mut().inject(
-                false,
+                err_bit,
                 Reply::Gripper {
                     reply: self.gripper_reply,
                 },
@@ -511,5 +512,18 @@ impl SimCore {
         let s = sim.tick();
         assert!(s.homed, "a landed core is referenced");
         sim
+    }
+}
+
+impl SimCore {
+    /// Tick until the boot selfcheck has brought the core to IDLE.
+    pub fn tick_until_idle(&mut self) -> StateSnapshot {
+        for _ in 0..100 {
+            let s = self.tick();
+            if s.mode == Mode::Idle {
+                return s;
+            }
+        }
+        panic!("the sim core never reached IDLE");
     }
 }

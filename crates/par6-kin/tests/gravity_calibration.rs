@@ -392,61 +392,91 @@ fn spread_poses(n: usize) -> Vec<[f64; NQ]> {
         .collect()
 }
 
+/// An arm that is not the table, built without the correction under
+/// test: the arm URDF with every link's mass 10-20 % off, each by its own amount, and
+/// its centre of mass shifted, and its gravity from the full rigid-body
+/// model of that tree.
+fn printed_arm() -> Kin {
+    let src = assets_dir().join(Kin::ARM_URDF_RELPATH);
+    let text = std::fs::read_to_string(&src).expect("arm URDF");
+    let mut out = String::new();
+    let mut rest = text.as_str();
+    let mut link = 0usize;
+    while let Some(at) = rest.find("<inertial>") {
+        let end = rest[at..].find("</inertial>").expect("closed inertial") + at;
+        out.push_str(&rest[..at]);
+        let mut block = rest[at..end].to_string();
+        let off = 0.1 + 0.1 * (link as f64 / 7.0);
+        // Scale the mass.
+        let m0 = block.find("value=\"").expect("mass value") + 7;
+        let m1 = block[m0..].find('"').expect("quoted") + m0;
+        let mass: f64 = block[m0..m1].trim().parse().expect("mass");
+        block.replace_range(m0..m1, &format!("{}", mass * (1.0 + off)));
+        // Shift the centre of mass.
+        let c0 = block.find("xyz=\"").expect("com") + 5;
+        let c1 = block[c0..].find('"').expect("quoted") + c0;
+        let com: Vec<f64> = block[c0..c1]
+            .split_whitespace()
+            .map(|v| v.parse().expect("com value"))
+            .collect();
+        let shifted = format!("{} {} {}", com[0] + 0.01 * off, com[1], com[2] + 0.05 * off);
+        block.replace_range(c0..c1, &shifted);
+        out.push_str(&block);
+        rest = &rest[end..];
+        link += 1;
+    }
+    out.push_str(rest);
+    let dir = std::env::temp_dir().join(format!("par6-printed-arm-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let urdf = dir.join("par6_arm.urdf");
+    std::fs::write(&urdf, out).expect("perturbed URDF");
+    Kin::from_urdf(&urdf, Some(Kin::ARM_EE_FRAME)).expect("perturbed arm")
+}
+
 /// The arm's own links are identified from static torque: a printed arm
 /// weighs what it weighs, and this recovers the difference from the
 /// table. Gravity fixes only part of the parameter set, so what has to
-/// come back right is the TORQUE the corrected model predicts, not every
-/// individual number — and the ones the poses cannot fix must say so
-/// rather than drift.
+/// come back right is the TORQUE the corrected model predicts at poses
+/// the fit never saw — with clean measurements, and with the friction
+/// that averaging two approach directions leaves behind — and the
+/// parameters the poses cannot fix must say so rather than drift.
 #[test]
 fn the_arms_own_links_are_identified_from_static_torque() {
-    let mut truth = Kin::load_arm(&assets_dir(), None).unwrap();
-    let bodies = truth.body_count();
-
-    // This arm is not the table: every link off by its own amount, the
-    // way parts printed to different slicer settings are.
-    let mut actual = vec![0.0; 4 * bodies];
-    for b in 0..bodies {
-        let off = 0.02 + 0.03 * (b as f64 / bodies as f64);
-        actual[4 * b] = off;
-        actual[4 * b + 1] = off * 0.01;
-        actual[4 * b + 3] = off * 0.05;
-    }
-    truth.set_gravity_correction(&actual).unwrap();
-
-    let poses = spread_poses(24);
-    let samples: Vec<GravitySample> = poses
-        .iter()
-        .map(|q| {
-            let mut tau = [0.0; NQ];
-            truth.gravity(q, &mut tau).unwrap();
-            GravitySample { q: *q, tau }
+    let mut truth = printed_arm();
+    let measured = |truth: &mut Kin, residual_nm: f64| -> Vec<GravitySample> {
+        spread_poses(24)
+            .iter()
+            .map(|q| {
+                let mut tau = [0.0; NQ];
+                truth.gravity(q, &mut tau).unwrap();
+                // What friction leaves after averaging opposes the load.
+                for t in &mut tau {
+                    *t += residual_nm * t.signum();
+                }
+                GravitySample { q: *q, tau }
+            })
+            .collect()
+    };
+    let unseen = spread_poses(40);
+    let worst_unseen = |truth: &mut Kin, model: &mut Kin| {
+        unseen.iter().skip(24).fold(0.0f64, |worst, q| {
+            let (mut want, mut got) = ([0.0; NQ], [0.0; NQ]);
+            truth.gravity(q, &mut want).unwrap();
+            model.gravity(q, &mut got).unwrap();
+            worst.max(max_abs_diff(&want, &got))
         })
-        .collect();
+    };
+    let mut plain = Kin::load_arm(&assets_dir(), None).unwrap();
+    let before = worst_unseen(&mut truth, &mut plain);
 
     let mut model = Kin::load_arm(&assets_dir(), None).unwrap();
-    let fit = gravity::fit_arm(&mut model, &samples, 1e-9).unwrap();
-
-    assert!(
-        fit.rms_nm < fit.rms_before_nm / 20.0,
-        "fit left {:.5} Nm against {:.5} Nm uncorrected",
-        fit.rms_nm,
-        fit.rms_before_nm
-    );
-
-    // Installed, the correction must reproduce the real arm's torque at
-    // poses the fit never saw.
+    let fit = gravity::fit_arm(&mut model, &measured(&mut truth, 0.0), 1e-9).unwrap();
     model.set_gravity_correction(&fit.correction).unwrap();
-    for q in spread_poses(40).iter().skip(24) {
-        let (mut want, mut got) = ([0.0; NQ], [0.0; NQ]);
-        truth.gravity(q, &mut want).unwrap();
-        model.gravity(q, &mut got).unwrap();
-        assert!(
-            max_abs_diff(&want, &got) < 0.01,
-            "unseen pose {q:?}: predicted {got:?} against {want:?}"
-        );
-    }
-
+    let clean = worst_unseen(&mut truth, &mut model);
+    assert!(
+        clean < before / 20.0,
+        "worst unseen-pose error {clean:.5} Nm against {before:.5} Nm uncorrected"
+    );
     // The base link turns about gravity, so no pose can weigh it. That
     // has to be reported, not quietly guessed at.
     assert!(
@@ -459,57 +489,17 @@ fn the_arms_own_links_are_identified_from_static_torque() {
         "too little was fixed: {:?}",
         fit.determined
     );
-}
 
-/// Friction is what limits this on real hardware. Averaging a pose's two
-/// approach directions cancels the symmetric part, but not all of it, so
-/// the fit has to stay useful under what is left rather than chase it.
-#[test]
-fn the_arm_fit_survives_the_friction_that_averaging_leaves_behind() {
-    let mut truth = Kin::load_arm(&assets_dir(), None).unwrap();
-    let bodies = truth.body_count();
-    let mut actual = vec![0.0; 4 * bodies];
-    for b in 0..bodies {
-        actual[4 * b] = 0.03;
-        actual[4 * b + 3] = 0.03 * 0.05;
-    }
-    truth.set_gravity_correction(&actual).unwrap();
-
-    // 0.05 Nm residual per joint: a twentieth of this arm's measured
-    // elbow friction, which is what is left when the two directions
-    // cancel to a few percent rather than exactly.
-    let mut noise = noise_seq();
-    let samples: Vec<GravitySample> = spread_poses(24)
-        .iter()
-        .map(|q| {
-            let mut tau = [0.0; NQ];
-            truth.gravity(q, &mut tau).unwrap();
-            for t in &mut tau {
-                *t += 0.05 * noise();
-            }
-            GravitySample { q: *q, tau }
-        })
-        .collect();
-
+    // 0.05 Nm per joint: a twentieth of this arm's measured elbow
+    // friction, what is left when the two directions cancel to a few
+    // percent rather than exactly.
     let mut model = Kin::load_arm(&assets_dir(), None).unwrap();
-    let fit = gravity::fit_arm(&mut model, &samples, 1e-6).unwrap();
+    let fit = gravity::fit_arm(&mut model, &measured(&mut truth, 0.05), 1e-6).unwrap();
     model.set_gravity_correction(&fit.correction).unwrap();
-
-    // What matters is the torque at poses it never saw, against the
-    // error it started with.
-    let mut worst_before = 0.0f64;
-    let mut worst_after = 0.0f64;
-    let mut plain = Kin::load_arm(&assets_dir(), None).unwrap();
-    for q in spread_poses(40).iter().skip(24) {
-        let (mut want, mut got, mut before) = ([0.0; NQ], [0.0; NQ], [0.0; NQ]);
-        truth.gravity(q, &mut want).unwrap();
-        model.gravity(q, &mut got).unwrap();
-        plain.gravity(q, &mut before).unwrap();
-        worst_after = worst_after.max(max_abs_diff(&want, &got));
-        worst_before = worst_before.max(max_abs_diff(&want, &before));
-    }
+    let rough = worst_unseen(&mut truth, &mut model);
     assert!(
-        worst_after < worst_before / 4.0,
-        "worst unseen-pose error {worst_after:.4} Nm against {worst_before:.4} Nm uncorrected"
+        rough < before / 4.0,
+        "with friction left over: worst unseen-pose error {rough:.4} Nm against \
+         {before:.4} Nm uncorrected"
     );
 }

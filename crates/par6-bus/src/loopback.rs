@@ -645,52 +645,6 @@ mod tests {
     }
 
     #[test]
-    fn boot_configure_passes_and_send_contracts() {
-        let mut bus = LoopbackBus::new();
-        // Nothing works before boot_configure.
-        assert_eq!(
-            bus.send_joint_commands(&[JointCommand::idle(); 6]),
-            Err(BusError::NotConfigured)
-        );
-        let (mut bus, _) = configured_bus();
-        // 3 passes × (6 joints + gripper) config passes recorded.
-        let passes = bus
-            .tx_log
-            .iter()
-            .filter(|(_, r)| matches!(r, TxRecord::ConfigPass { .. }))
-            .count();
-        assert_eq!(passes, 3 * 7);
-        assert_eq!(bus.connected_nodes(), 0b0000_0000_0111_1111);
-
-        bus.begin_tick(1);
-        let cmds = [
-            JointCommand::position(1000, 2000, 300),
-            JointCommand::velocity(-500, 250),
-            JointCommand::current(-150),
-            JointCommand::hall(4500, 2),
-            JointCommand::pd(10, 0, 50),
-            JointCommand::idle(),
-        ];
-        bus.send_joint_commands(&cmds).unwrap();
-
-        // Single-send-per-tick invariant.
-        assert!(matches!(
-            bus.send_joint_commands(&cmds),
-            Err(BusError::InvalidCommand { .. })
-        ));
-        // Wrong joint count is rejected.
-        bus.begin_tick(2);
-        assert!(matches!(
-            bus.send_joint_commands(&cmds[..5]),
-            Err(BusError::InvalidCommand { .. })
-        ));
-        // Gripper slot accepts every variant.
-        bus.send_gripper(&GripperCommand::Calibrate).unwrap();
-        bus.begin_tick(3);
-        bus.send_gripper(&GripperCommand::FirmwarePoll).unwrap();
-    }
-
-    #[test]
     fn drain_decodes_and_freshness_warns_then_latches() {
         let (mut bus, robot) = configured_bus();
         let mut state = BusState::new();
@@ -811,34 +765,6 @@ mod tests {
         );
         bus.drain_rx(&mut state).unwrap();
         assert_eq!(bus.freshness(0), Freshness::Fresh);
-    }
-
-    #[test]
-    fn drain_caps_frames_per_tick() {
-        let (mut bus, robot) = configured_bus();
-        let cap = robot.bus.rx_frames_per_tick_cap as usize; // 32
-        let mut state = BusState::new();
-        bus.begin_tick(1);
-        for i in 0..(cap + 8) {
-            bus.inject(
-                false,
-                Reply::Motion {
-                    node: (i % 6) as NodeId,
-                    position_ticks: i as i32,
-                    speed_ticks_s: 0,
-                    current_ma: 0,
-                },
-            );
-        }
-        assert_eq!(bus.drain_rx(&mut state).unwrap(), cap);
-        assert_eq!(state.frames_last_drain as usize, cap);
-        // The surplus clears on the next tick's drain (backlog recovery).
-        bus.begin_tick(2);
-        assert_eq!(bus.drain_rx(&mut state).unwrap(), 8);
-        assert_eq!(
-            state.frame_age_max_ticks, 1,
-            "backlogged frames aged one tick"
-        );
     }
 
     #[test]

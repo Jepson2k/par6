@@ -355,6 +355,32 @@ fn the_preview_runs_the_cartesian_pipeline() {
         "a 30 mm cartesian move is many ticks long"
     );
 
+    // A tool-frame pose is an offset in the tool frame the move starts
+    // in, whether or not `rel` is set: 20 mm along the tool's own z.
+    for rel in [false, true] {
+        let start = preview.pose().expect("FK");
+        let planned = preview.submit(Command::MoveL(MoveL {
+            key: 9,
+            pose: [0.0, 0.0, 20.0, 0.0, 0.0, 0.0],
+            frame: Frame::Trf,
+            duration: None,
+            speed: Some(0.5),
+            accel: None,
+            blend_radius: None,
+            rel,
+        }));
+        assert!(planned.valid(), "rel = {rel}: {planned:?}");
+        let end = preview.pose().expect("FK");
+        for (axis, (k, z)) in [(3, 2), (7, 6), (11, 10)].into_iter().enumerate() {
+            let want = start[k] + 0.020 * start[z];
+            assert!(
+                (end[k] - want).abs() < 0.002,
+                "rel = {rel}: axis {axis} ended at {:.4} m, the tool frame says {want:.4}",
+                end[k]
+            );
+        }
+    }
+
     // An unreachable pose is the runtime's structured refusal.
     let refused = preview.submit(Command::MoveL(MoveL {
         key: 8,
