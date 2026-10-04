@@ -12,7 +12,7 @@ use par6_client::{
     Ack, Client, ClientConfig, ClientError, Frame, StatusTransport, MIN_MTU, NUM_JOINTS,
 };
 use par6_proto::command as cmd;
-use par6_proto::{Command, ErrorCode, Shape};
+use par6_proto::{Command, ErrorCode, QueryResult, Shape};
 use par6d::Daemon;
 
 #[path = "../../par6d/tests/common/mod.rs"]
@@ -126,6 +126,10 @@ fn a_missing_complete_push_is_recovered_from_the_runtime() {
         let park = common::park_deg();
         settle_at(&client, park).await;
         client.drop_complete_pushes_for_test(true);
+        assert!(
+            !client.command_completion(999).await.expect("query").0,
+            "an index nothing ran under must read unfinished"
+        );
 
         let mut target = park;
         target[0] += 8.0;
@@ -134,6 +138,10 @@ fn a_missing_complete_push_is_recovered_from_the_runtime() {
             .await
             .expect("move_j accepted")
             .expect("move_j acked with an index");
+        assert!(
+            !client.command_completion(landed).await.expect("query").0,
+            "a running command must read unfinished"
+        );
         assert!(
             client
                 .wait_command(landed, BUDGET)
@@ -145,6 +153,14 @@ fn a_missing_complete_push_is_recovered_from_the_runtime() {
             client.command_completion(landed).await.expect("query"),
             (true, true, None, None)
         );
+        match client
+            .query(Command::CommandCompletion { index: landed })
+            .await
+            .expect("query")
+        {
+            QueryResult::CommandCompletion { index, .. } => assert_eq!(index, landed),
+            other => panic!("unexpected {other:?}"),
+        }
 
         let mut far = park;
         far[0] -= 30.0;
@@ -165,6 +181,13 @@ fn a_missing_complete_push_is_recovered_from_the_runtime() {
                 assert_eq!(e.code, ErrorCode::MotnCancelled as u16, "{e:?}")
             }
             other => panic!("the cancellation must be recovered without its push: {other:?}"),
+        }
+        // Read through the query itself, not settled from STATUS.
+        match client.command_completion(cancelled).await.expect("query") {
+            (true, false, Some(e), None) => {
+                assert_eq!(e.code, ErrorCode::MotnCancelled as u16, "{e:?}")
+            }
+            other => panic!("a cancelled command reads finished with its detail: {other:?}"),
         }
         client.drop_complete_pushes_for_test(false);
     });
@@ -403,7 +426,9 @@ fn a_retransmitted_queued_command_is_re_acked_with_its_original_index() {
 
 /// A move cancelled mid-flight completes in error: `wait_command`
 /// surfaces the runtime's MOTN_CANCELLED as a structured refusal (never
-/// `Ok(true)`), and there is no settle verdict to read off it.
+/// `Ok(true)`), and there is no settle verdict to read off it. The arm
+/// itself comes to rest short of the target and stays there: what the
+/// RT still held of the planned motion went with the cancel.
 #[test]
 fn a_cancelled_move_completes_in_error_with_no_verdict() {
     run_session("cancel", |client| async move {
@@ -436,6 +461,29 @@ fn a_cancelled_move_completes_in_error_with_no_verdict() {
             other => panic!("a cancelled move must complete in error, got {other:?}"),
         }
         assert_eq!(client.command_verdict(index), None);
+
+        assert!(
+            client
+                .wait_status(|s| s.speeds.iter().all(|v| v.abs() < 1e-3), BUDGET)
+                .await,
+            "the stopped arm comes to rest"
+        );
+        let rest = client.latest_status().expect("status").angles;
+        assert!(
+            far[0] - rest[0] > 5.0,
+            "the stop let the move run on to its target: J0 at {:.2}, target {:.2}",
+            rest[0],
+            far[0]
+        );
+        // Six seconds of planned motion were cut short; a ring that kept
+        // them would set the arm moving again within a few frames.
+        let resumed = client
+            .wait_status(
+                move |s| (s.angles[0] - rest[0]).abs() > 0.5,
+                Duration::from_secs(2),
+            )
+            .await;
+        assert!(!resumed, "the arm resumed the cancelled move after resting");
     })
 }
 

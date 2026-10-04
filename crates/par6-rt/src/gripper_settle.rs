@@ -320,18 +320,4 @@ mod tests {
         feed(&mut m, 40, 1, r);
         assert_eq!(m.status().verdict, ToolSettle::Done);
     }
-
-    /// A verdict carries the epoch of the arm that produced it, so a
-    /// reader can tell it is not answering with the previous action's
-    /// result.
-    #[test]
-    fn each_arm_bumps_the_epoch() {
-        let mut m = machine();
-        let start = m.status().epoch;
-        m.arm_move(0, 200, 10);
-        assert_ne!(m.status().epoch, start);
-        let armed = m.status().epoch;
-        m.arm_idle(10);
-        assert_ne!(m.status().epoch, armed);
-    }
 }

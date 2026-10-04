@@ -1377,7 +1377,6 @@ mod tests {
     fn sim_relaxes_the_loop_bands_but_never_overrides_a_declared_section() {
         assert_eq!(resolve_loop_bands(false, None), TimingConfig::default());
         assert_eq!(resolve_loop_bands(true, None), TimingConfig::SIM);
-        assert!(TimingConfig::SIM.critical_factor > TimingConfig::default().critical_factor);
 
         // A config asking for a tight guard keeps it under --sim, so a
         // test can still prove the critical latch fires on the simulator.

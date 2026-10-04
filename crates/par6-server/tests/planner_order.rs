@@ -14,7 +14,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use par6_proto::command::Shape;
 use par6_proto::command::{Command, MoveJ};
@@ -25,16 +25,19 @@ use par6_server::{
     PlanRequest, Planner, QueuedCommand, ShapeLayer,
 };
 
-/// Records which trait methods ran, in order.
+/// Records which trait methods ran, in order, and counts loop passes.
 #[derive(Clone, Default)]
-struct Calls(Arc<Mutex<Vec<&'static str>>>);
+struct Calls(Arc<Mutex<(Vec<&'static str>, u64)>>);
 
 impl Calls {
     fn push(&self, what: &'static str) {
-        self.0.lock().unwrap().push(what);
+        self.0.lock().unwrap().0.push(what);
     }
     fn seen(&self) -> Vec<&'static str> {
-        self.0.lock().unwrap().clone()
+        self.0.lock().unwrap().0.clone()
+    }
+    fn passes(&self) -> u64 {
+        self.0.lock().unwrap().1
     }
 }
 
@@ -46,6 +49,7 @@ impl Planner for Recorder {
         Ok(batch.len().max(1))
     }
     fn poll(&mut self) -> Option<CommandOutcome> {
+        self.0 .0.lock().unwrap().1 += 1;
         None
     }
     fn cancel(&mut self, _halt_tool: bool) {
@@ -89,70 +93,68 @@ fn a_move(index: u64) -> OwnedQueued {
     }
 }
 
-#[test]
-fn a_cancel_sent_after_a_start_cancels_that_start() {
+/// Every request in the channel before the loop first runs, serviced to
+/// the end: the loop is run until the calls stop growing for two full
+/// passes, so a request it dropped or reordered cannot hide behind a
+/// short wait.
+fn service(requests: Vec<PlanRequest>) -> Vec<&'static str> {
     let calls = Calls::default();
     let (_writer, snapshots) = snapshot_channel::<StateSnapshot>();
     let shutdown = Arc::new(AtomicBool::new(false));
     let (handle, run) = planner_plane(
         Recorder(calls.clone()),
         snapshots,
-        Duration::from_millis(5),
+        Duration::from_millis(1),
         shutdown.clone(),
     );
-
-    // Both are in the channel before the loop runs, so one drain sees the
-    // pair — which is the case that reordered.
-    handle.send(PlanRequest::Start {
-        batch: vec![a_move(1)],
-    });
-    handle.send(PlanRequest::Cancel { halt_tool: true });
-
+    let expected = requests.len();
+    for r in requests {
+        handle.send(r);
+    }
     let worker = std::thread::spawn(run);
-    std::thread::sleep(Duration::from_millis(80));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while calls.seen().len() < expected {
+        assert!(Instant::now() < deadline, "stalled at {:?}", calls.seen());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let settled = calls.passes() + 2;
+    while calls.passes() < settled {
+        assert!(Instant::now() < deadline, "the loop stopped passing");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     shutdown.store(true, Ordering::SeqCst);
     worker.join().expect("planner thread");
-
-    assert_eq!(
-        calls.seen(),
-        vec!["start", "cancel"],
-        "the planner must see the start before the cancel that followed it; \
-         reversed, the cancel applies to a previous motion and this one is \
-         planned and rung after the operator cancelled it"
-    );
+    calls.seen()
 }
 
+/// One drain sees `[Start, Cancel]` — the case that reordered — and the
+/// planner sees the start before the cancel that followed it; reversed,
+/// the cancel applies to a previous motion and this one is planned and
+/// rung after the operator cancelled it. With two expensive requests
+/// ahead of it the cancel is still serviced, in order, across as many
+/// passes as it takes: the loop takes one expensive request per pass,
+/// and the cancel must not be stranded behind the second.
 #[test]
-fn a_second_expensive_request_does_not_strand_what_came_after_it() {
-    let calls = Calls::default();
-    let (_writer, snapshots) = snapshot_channel::<StateSnapshot>();
-    let shutdown = Arc::new(AtomicBool::new(false));
-    let (handle, run) = planner_plane(
-        Recorder(calls.clone()),
-        snapshots,
-        Duration::from_millis(5),
-        shutdown.clone(),
-    );
-
-    // Two starts and a cancel behind them. The loop takes one expensive
-    // request per pass; the cancel must not be stranded behind the second.
-    handle.send(PlanRequest::Start {
-        batch: vec![a_move(1)],
-    });
-    handle.send(PlanRequest::Start {
-        batch: vec![a_move(2)],
-    });
-    handle.send(PlanRequest::Cancel { halt_tool: true });
-
-    let worker = std::thread::spawn(run);
-    std::thread::sleep(Duration::from_millis(120));
-    shutdown.store(true, Ordering::SeqCst);
-    worker.join().expect("planner thread");
-
+fn requests_are_serviced_in_the_order_they_were_sent() {
     assert_eq!(
-        calls.seen(),
-        vec!["start", "start", "cancel"],
-        "every request must be serviced, in order, across as many passes as \
-         it takes"
+        service(vec![
+            PlanRequest::Start {
+                batch: vec![a_move(1)],
+            },
+            PlanRequest::Cancel { halt_tool: true },
+        ]),
+        ["start", "cancel"]
+    );
+    assert_eq!(
+        service(vec![
+            PlanRequest::Start {
+                batch: vec![a_move(1)],
+            },
+            PlanRequest::Start {
+                batch: vec![a_move(2)],
+            },
+            PlanRequest::Cancel { halt_tool: true },
+        ]),
+        ["start", "start", "cancel"]
     );
 }

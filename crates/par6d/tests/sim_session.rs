@@ -15,8 +15,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    EnterFlashing, JogJ, MoveJ, SaveConfig, SelectProfile, SelectTool, SetCanId,
-    SetCompletionPolicy, Stop, Teleport, ToolAction, ToolParam,
+    EnterFlashing, JogJ, MoveJ, Pause, SaveConfig, SelectProfile, SelectTool, SetCanId,
+    SetCompletionPolicy, SetGravityComp, Stop, Teleport, ToolAction, ToolParam, WriteIo,
 };
 use par6_proto::{
     ActionState, Command, CompletionPolicy, ControllerMode, ErrorCode, FlashingAssertion, Frame,
@@ -180,6 +180,126 @@ fn other_driven_tool(boot: &str) -> String {
         .expect("the config carries a second driven tool")
         .name
         .to_uppercase()
+}
+
+/// A copy of the boot tool under a name the vendor prefix rule reads as
+/// the bare flange, keyed to the MSG tree: which model the runtime runs
+/// says whether the `urdf_variant` key was read. Its drive id is dropped,
+/// since two tools may not claim one.
+const KEYED_TOOL: &str = "WIDGET";
+
+/// The 50 Hz config booting [`KEYED_TOOL`].
+fn keyed_tool_config() -> PathBuf {
+    let dst = common::retimed_config("keyed-tool", 0.02);
+    let boot = par6_config::RobotConfig::load(&dst)
+        .expect("test config")
+        .robot
+        .active_tool;
+    let grippers = dst.parent().unwrap().join("grippers");
+    let src =
+        std::fs::read_to_string(grippers.join(format!("{boot}.toml"))).expect("boot tool toml");
+    assert!(
+        src.contains("urdf_variant = \"msg\""),
+        "the boot tool is keyed to the MSG tree"
+    );
+    assert_eq!(
+        par6_kin::GripperVariant::by_name_prefix(KEYED_TOOL),
+        par6_kin::GripperVariant::Flange,
+        "the name alone must point at a different tree than the key"
+    );
+    let keyed: String = src
+        .lines()
+        .filter(|l| !l.starts_with("can_tool_id"))
+        .map(|l| {
+            if l.starts_with("name = ") {
+                format!("name = \"{KEYED_TOOL}\"\n")
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    std::fs::write(grippers.join(format!("{KEYED_TOOL}.toml")), keyed).expect("keyed tool");
+    let robot = std::fs::read_to_string(&dst).expect("read test config");
+    let patched = robot.replace(
+        &format!("active_tool = \"{boot}\""),
+        &format!("active_tool = \"{KEYED_TOOL}\""),
+    );
+    assert_ne!(patched, robot, "active_tool patch point must exist");
+    std::fs::write(&dst, patched).expect("write keyed config");
+    dst
+}
+
+/// What the runtime must run for `tool` at `angles_deg`: the TCP \[mm\]
+/// of the URDF variant its config keys, and the gravity of the model
+/// built from its `[kinematics]`.
+fn tool_model(
+    bundle: &par6_config::ConfigBundle,
+    tool: &str,
+    angles_deg: &[f64; NUM_JOINTS],
+) -> ([f64; 3], [f64; NUM_JOINTS]) {
+    let cfg = bundle
+        .tools
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case(tool))
+        .expect("a configured tool");
+    let key = cfg
+        .urdf_variant
+        .as_deref()
+        .expect("shipped tools are keyed");
+    let variant = par6_kin::GripperVariant::from_key(key).expect("a known key");
+    let q = angles_deg.map(f64::to_radians);
+    let mut fk = par6_kin::Kin::load(&common::assets_dir(), variant).expect("FK model");
+    let mut pose = [0.0; 16];
+    fk.fk(&q, &mut pose).expect("FK");
+    let mut gravity =
+        par6d::kin::load_gravity_kin(&common::assets_dir(), Some(cfg)).expect("gravity model");
+    gravity
+        .set_gravity_correction(&bundle.robot.gravity_correction)
+        .expect("gravity correction");
+    let mut g = [0.0; NUM_JOINTS];
+    gravity.gravity(&q, &mut g).expect("gravity");
+    for (g, scale) in g.iter_mut().zip(bundle.robot.gravity_scale) {
+        *g *= scale;
+    }
+    ([pose[3] * 1e3, pose[7] * 1e3, pose[11] * 1e3], g)
+}
+
+fn distance_mm(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// `tool` is what the runtime runs: STATUS names it, puts the TCP where
+/// its own model does, and implies its gravity — filtered torque minus
+/// external torque is the model's G(q).
+fn assert_fitted(rig: &Rig, bundle: &par6_config::ConfigBundle, tool: &str) -> Status {
+    rig.drain_status();
+    rig.wait_status("the tool reaches STATUS", |s| {
+        s.tool_status
+            .as_ref()
+            .is_some_and(|t| t.key.eq_ignore_ascii_case(tool))
+    });
+    // The swap lands inside one tick; the frame it lands in can still
+    // carry that tick's pre-swap pose.
+    let s = frames_later(rig, 2);
+    let (tcp, g) = tool_model(bundle, tool, &s.angles);
+    let at = [s.pose[3], s.pose[7], s.pose[11]];
+    let off = distance_mm(tcp, at);
+    assert!(
+        off < 0.05,
+        "{tool}: STATUS puts the TCP {off:.3} mm from its model's ({at:?} vs {tcp:?})"
+    );
+    for (j, want) in g.iter().enumerate() {
+        let got = s.torques[j] - s.torques_ext[j];
+        assert!(
+            (got - want).abs() < 1e-3,
+            "{tool}: J{j} runs gravity {got:.4} Nm, its model says {want:.4}"
+        );
+    }
+    s
 }
 
 fn select_tool(key: u64, tool: &str, variant: Option<&str>) -> Command {
@@ -641,6 +761,39 @@ fn hardware_mode_and_bad_config_fail_with_clear_errors() {
         err.to_string().contains("/nonexistent/par6.toml"),
         "names the missing path: {err}"
     );
+
+    // A declared `[timing]` section rules under --sim too: one whose
+    // sustain the percentile recompute cannot resolve is refused, where
+    // the simulator's own bands would have started.
+    let dt = 0.02;
+    let config = common::retimed_config("declared-timing", dt);
+    let text = std::fs::read_to_string(&config).expect("read test config");
+    assert!(
+        !text.contains("[timing]"),
+        "the shipped config leaves the bands to the runtime"
+    );
+    let sustain = par6_rt::timing::sustain_resolution_s(dt) / 2.0;
+    std::fs::write(
+        &config,
+        format!(
+            "{text}\n[timing]\ndegraded_factor = 1.05\ncritical_factor = 1.10\n\
+             critical_sustain_s = {sustain}\n"
+        ),
+    )
+    .expect("write timing config");
+    let opts = Options {
+        sim: true,
+        config: Some(config),
+        assets: Some(common::assets_dir()),
+        ..Options::default()
+    };
+    let err = Daemon::start(&opts)
+        .err()
+        .expect("a declared sustain under the recompute must refuse startup");
+    assert!(
+        err.to_string().contains("critical_sustain_s"),
+        "the refusal names the declared field: {err}"
+    );
 }
 
 /// Issue #15 regression: a `stop` immediately followed by a queued move.
@@ -758,6 +911,122 @@ fn a_stop_brakes_the_arm_and_then_holds_it() {
     rig.shutdown();
 }
 
+/// The `n`th STATUS frame broadcast after this call: a bound measured in
+/// the runtime's own ticks for checks that something did NOT happen.
+fn frames_later(rig: &Rig, n: u64) -> Status {
+    rig.drain_status();
+    let first = rig.wait_status("a fresh frame", |_| true).seq;
+    rig.wait_status("frames later", |s| s.seq >= first + n)
+}
+
+fn pause(c: &mut Client, on: bool) {
+    c.ok(&Command::Pause(Pause { on }));
+}
+
+/// The execution and I/O switches over the wire, read back from what the
+/// runtime does with them:
+/// - the runtime enables itself once out of BOOTING, unasked;
+/// - gravity compensation follows SET_GRAVITY_COMP both ways;
+/// - `write_io` drives the addressed output to the written level and
+///   leaves the others;
+/// - a pause reaches the RT on a disabled arm, which cannot plan motion
+///   but can still be told to hold it;
+/// - a stop that keeps the queue keeps the pause holding it, and only the
+///   resume starts the kept move;
+/// - a clearing stop, `reset_state` and an e-stop each drop the pause, so
+///   the next queued move runs without a resume.
+#[test]
+fn pause_io_and_gravity_switches_act_on_the_runtime() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    // No reset: the runtime enables itself once the core is out of BOOTING.
+    rig.wait_status("enabled from boot", |s| s.enabled);
+    let park = park_deg();
+    teleport_home(&rig, &mut c, park);
+
+    for on in [false, true] {
+        c.ok(&Command::SetGravityComp(SetGravityComp { on }));
+        rig.wait_status("the compensation follows the switch", |s| {
+            s.gravity_comp == on
+        });
+    }
+
+    let cfg = par6_config::RobotConfig::load(&common::shipped_config()).expect("PAR6 config");
+    let outputs_at = cfg.io.inputs.len();
+    let outputs = |s: &Status| s.io[outputs_at..outputs_at + 3].to_vec();
+    let mut write_io = |key: u64, port: u8, value: u8| {
+        let i = c.ok_index(&Command::WriteIo(WriteIo { key, port, value }));
+        let (ok, detail) = c.wait_complete(i);
+        assert!(
+            ok,
+            "write_io({port}, {value}) must complete, got {detail:?}"
+        );
+    };
+    write_io(7091, 2, 1);
+    rig.wait_status("the third output is driven high", |s| {
+        outputs(s) == [0, 0, 1]
+    });
+    write_io(7092, 0, 1);
+    write_io(7093, 2, 0);
+    rig.wait_status("the first output high, the third low again", |s| {
+        outputs(s) == [1, 0, 0]
+    });
+    write_io(7094, 0, 0);
+
+    // Disabled by the e-stop: the pause still reaches the RT.
+    c.ok(&Command::Estop);
+    rig.wait_status("disabled", |s| !s.enabled);
+    pause(&mut c, true);
+    rig.wait_status("the disabled arm's RT holds the pause", |s| s.paused);
+    pause(&mut c, false);
+    rig.wait_status("and lets it go", |s| !s.paused);
+    c.ok(&Command::Reset);
+    rig.wait_status("enabled again", |s| s.enabled);
+
+    // A stop that keeps the queue keeps the pause holding it.
+    pause(&mut c, true);
+    let held_at = rig.wait_status("paused", |s| s.paused).angles[0];
+    let kept = c.ok_index(&move_j(7101, with_j0(park, 5.0), 0.5));
+    c.ok(&Command::Stop(Stop { clear_queue: false }));
+    let s = frames_later(&rig, 5);
+    assert!(s.paused, "a stop that keeps the queue dropped the pause");
+    assert!(
+        s.executing_index < 0 && (s.angles[0] - held_at).abs() < 0.05,
+        "the kept move ran without a resume: executing {}, J0 {} from {held_at}",
+        s.executing_index,
+        s.angles[0]
+    );
+    pause(&mut c, false);
+    let (ok, detail) = c.wait_complete(kept);
+    assert!(ok, "the resume runs the kept move, got {detail:?}");
+
+    // Each of these drops the pause, so the next move needs no resume.
+    let mut key = 7110;
+    for clear in [
+        Command::Stop(Stop { clear_queue: true }),
+        Command::ResetState,
+        Command::Estop,
+    ] {
+        pause(&mut c, true);
+        rig.wait_status("paused", |s| s.paused);
+        c.ok(&clear);
+        rig.wait_status("the pause is dropped", |s| !s.paused);
+        if matches!(clear, Command::Estop) {
+            c.ok(&Command::Reset);
+            rig.wait_status("enabled again", |s| s.enabled);
+        }
+        teleport_home(&rig, &mut c, park);
+        key += 1;
+        let i = c.ok_index(&move_j(key, with_j0(park, 3.0), 0.3));
+        let (ok, detail) = c.wait_complete(i);
+        assert!(
+            ok,
+            "after {clear:?} a queued move runs without a resume, got {detail:?}"
+        );
+    }
+    rig.shutdown();
+}
+
 /// Move size for the profile probe: short enough that the whole move is
 /// ramping, where a jerk limit costs the most against a profile without
 /// one (long moves are cruise-dominated and converge).
@@ -811,9 +1080,11 @@ fn flashing_window_over_protocol_v2() {
     // the silent bus reads as a stale link — the wire really is handed
     // to the flasher.
     c.ok(&enter);
-    rig.wait_status("the mode is FLASHING", |s| {
-        s.mode == ControllerMode::Flashing
-    });
+    assert_eq!(
+        frames_later(&rig, 1).mode,
+        ControllerMode::Flashing,
+        "the entry was acked before the mode changed"
+    );
     rig.wait_status("the silent bus reads stale", |s| s.link_ok == 0);
 
     // A referencing seek would start by requesting IDLE, ending the
@@ -1082,10 +1353,18 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         "a settled move leaves the jaws holding, not released"
     );
 
+    // Completion means arrival: the close's verdict is still standing
+    // when the open is sent, and must not answer for it.
     let i = c.ok_index(&tool_action(6004, &tool, "move", &[0.0, 0.5, 0.3]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "gripper open must complete, got {detail:?}");
-    rig.wait_status("the jaw reaches the open command", |s| jaw(s) < 0.05);
+    rig.drain_status();
+    let s = rig.wait_status("a status after the open completed", |_| true);
+    assert!(
+        jaw(&s) < 0.1,
+        "the open completed with the jaws still at {:.3}",
+        jaw(&s)
+    );
 
     // ---- the release verb drops the standing command, and only then
     // does the tool report itself idle.
@@ -1235,6 +1514,91 @@ fn a_tool_action_runs_in_queue_order_between_moves() {
         "a stop must halt the jaws, not release the grip"
     );
 
+    // Tool stops back to back while the jaws travel: the planner holds
+    // one stop at a time, and every one sent is still answered.
+    let closing = c.ok_index(&tool_action(8006, &tool, "move", &[1.0, 0.1, 0.3]));
+    rig.wait_status("the jaws start closing", |s| jaw(s) > jaw(last) + 0.05);
+    let stops = c.ok_indices(&[
+        tool_action(8007, &tool, "stop", &[]),
+        tool_action(8008, &tool, "stop", &[]),
+    ]);
+    for stop in stops {
+        let (ok, detail) = c.wait_complete(stop);
+        assert!(ok, "tool stop {stop} must be answered ok, got {detail:?}");
+    }
+    let (ok, detail) = c.wait_complete(closing);
+    assert!(
+        !ok && detail
+            .as_ref()
+            .is_some_and(|e| e.code == ErrorCode::MotnCancelled as u16),
+        "the stopped close must report its cancellation: ok={ok} {detail:?}"
+    );
+
+    rig.shutdown();
+}
+
+/// A clearing stop answers every command it drops — the one executing,
+/// the ones blended into it and any still queued — each with its own
+/// MOTN_CANCELLED, and the arm stops short of where the chain ends.
+#[test]
+fn a_stop_cancels_a_blended_chain_command_by_command() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let park = park_deg();
+    teleport_home(&rig, &mut c, park);
+
+    let blended = |key: u64, delta: f64| {
+        Command::MoveJ(MoveJ {
+            key,
+            angles: with_j0(park, delta),
+            duration: Some(3.0),
+            speed: None,
+            accel: None,
+            blend_radius: Some(10.0),
+            rel: false,
+        })
+    };
+    let ids = c.ok_indices(&[
+        blended(9001, 20.0),
+        blended(9002, 40.0),
+        move_j(9003, with_j0(park, 60.0), 3.0),
+    ]);
+    rig.wait_status("the chain's head is executing", |s| {
+        s.executing_index == ids[0] as i64
+    });
+    // The successor has been folded into the running motion: it is no
+    // longer waiting in the queue.
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        match c.query(&Command::Queue) {
+            QueryResult::Queue { queue, .. } if queue.len() <= 1 => break,
+            other => assert!(
+                Instant::now() < deadline,
+                "the blend never formed: {other:?}"
+            ),
+        }
+    }
+
+    c.ok(&Command::Stop(Stop { clear_queue: true }));
+    for index in &ids {
+        let (ok, detail) = c.wait_complete(*index);
+        assert!(
+            !ok && detail
+                .as_ref()
+                .is_some_and(|e| e.code == ErrorCode::MotnCancelled as u16),
+            "command {index} must complete cancelled, got ok={ok} {detail:?}"
+        );
+    }
+    let rest = rig.wait_status("at rest after the stop", |s| {
+        s.speeds.iter().all(|v| v.abs() < 1e-3)
+    });
+    assert!(
+        rest.angles[0] < park[0] + 55.0,
+        "the stop let the chain run to its end: J0 at {:.2}",
+        rest.angles[0]
+    );
     rig.shutdown();
 }
 
@@ -2413,20 +2777,32 @@ fn a_move_sent_right_behind_a_teleport_is_not_refused_as_unhomed() {
 /// A real swap moves together: the load the gravity feedforward carries,
 /// the frame FK resolves at, the collision geometry, the home offsets on
 /// the joints whose reference is tool-dependent, and whether the tool has
-/// a jaw to actuate at all. The last of those is what this observes from
-/// outside — a passive tool refuses the actions a driven one accepts.
+/// a jaw to actuate at all. This observes the FK frame and the gravity
+/// load through STATUS at every step, and the jaw through its actions.
+/// The boot tool's name and its `urdf_variant` key point at different
+/// URDF trees, so both the boot fit and a swap back must read the key.
 #[test]
 fn select_tool_fits_a_different_tool() {
-    let rig = Rig::boot(test_config());
+    let config = keyed_tool_config();
+    let bundle = par6_config::ConfigBundle::load(&config).expect("keyed config");
+    let rig = Rig::boot(config);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
     rig.wait_status("enabled", |s| s.enabled);
-    let boot = boot_tool();
-    rig.wait_status("tool status reaches STATUS", |s| s.tool_status.is_some());
 
-    // A tool this runtime does not carry is refused, and naming one it
-    // does is not enough on its own to be a no-op.
+    // Booted on the key: the prefix rule would have fitted the flange.
+    let s = assert_fitted(&rig, &bundle, KEYED_TOOL);
+    let (keyed_tcp, keyed_g) = tool_model(&bundle, KEYED_TOOL, &s.angles);
+    let (flange_tcp, flange_g) = tool_model(&bundle, "Flange", &s.angles);
+    assert!(
+        distance_mm(keyed_tcp, flange_tcp) > 20.0 && (keyed_g[1] - flange_g[1]).abs() > 0.1,
+        "the two tools' models must differ at this posture for the checks to tell them \
+         apart: TCP {keyed_tcp:?} vs {flange_tcp:?}, shoulder {:.3} vs {:.3} Nm",
+        keyed_g[1],
+        flange_g[1]
+    );
+
     let err = c.expect_error(&select_tool(7001, "NO_SUCH_TOOL", None));
     assert_eq!(
         err.code,
@@ -2434,19 +2810,15 @@ fn select_tool_fits_a_different_tool() {
         "an unknown tool must be refused, got {err:?}"
     );
 
-    // Fit the bare flange. It is genuinely fitted: STATUS reports it, and
-    // it has no jaw, so the actions the boot tool accepts are now refused.
+    // The bare flange has no jaw, so the actions a driven tool accepts
+    // are now refused.
     let i = c.ok_index(&select_tool(7002, "FLANGE", None));
     let (ok, detail) = c.wait_complete(i);
     assert!(
         ok,
         "selecting the bare flange must complete, got {detail:?}"
     );
-    rig.wait_status("the bare flange reaches STATUS", |s| {
-        s.tool_status
-            .as_ref()
-            .is_some_and(|t| t.key.eq_ignore_ascii_case("FLANGE"))
-    });
+    assert_fitted(&rig, &bundle, "Flange");
     let err = c.expect_error(&tool_action(7003, "FLANGE", "calibrate", &[]));
     assert_eq!(
         err.code,
@@ -2454,41 +2826,30 @@ fn select_tool_fits_a_different_tool() {
         "a passive tool must refuse an action, got {err:?}"
     );
 
-    // And back. The swap is not one-way, and the jaw comes back with it.
-    let i = c.ok_index(&select_tool(7004, &boot, None));
+    // And back, through the key again; the jaw comes back with it.
+    let i = c.ok_index(&select_tool(7004, KEYED_TOOL, None));
     let (ok, detail) = c.wait_complete(i);
     assert!(
         ok,
-        "selecting the boot tool back must complete, got {detail:?}"
+        "selecting the keyed tool back must complete, got {detail:?}"
     );
-    rig.wait_status("the boot tool is fitted again", |s| {
-        s.tool_status
-            .as_ref()
-            .is_some_and(|t| t.key.to_uppercase() == boot)
-    });
-    let i = c.ok_index(&tool_action(7005, &boot, "calibrate", &[]));
+    assert_fitted(&rig, &bundle, KEYED_TOOL);
+    let i = c.ok_index(&tool_action(7005, KEYED_TOOL, "calibrate", &[]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "the driven tool's jaw must work again, got {detail:?}");
 
-    // A different DRIVEN tool: the jaw itself changes, so the gripper node
-    // is re-tuned to the new tool's limits and the reference it homed
-    // against the old jaw is dropped. What this observes is the visible
-    // half — the tool is fitted and its jaw still drives. The re-tune
-    // itself is not observable here: the simulated driver keeps its own
-    // calibrated flag across the swap, so only hardware shows the
-    // difference.
-    let other = other_driven_tool(&boot);
+    // A different DRIVEN tool: the jaw itself changes. The gripper
+    // node's re-tune is not observable here — the simulated driver keeps
+    // its own calibrated flag across the swap — so what is checked is
+    // the model and a jaw that still drives.
+    let other = other_driven_tool(KEYED_TOOL);
     let i = c.ok_index(&select_tool(7006, &other, None));
     let (ok, detail) = c.wait_complete(i);
     assert!(
         ok,
         "selecting another driven tool must complete, got {detail:?}"
     );
-    rig.wait_status("the second driven tool is fitted", |s| {
-        s.tool_status
-            .as_ref()
-            .is_some_and(|t| t.key.to_uppercase() == other)
-    });
+    assert_fitted(&rig, &bundle, &other);
     let i = c.ok_index(&tool_action(7007, &other, "calibrate", &[]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "the second driven tool's jaw must work, got {detail:?}");

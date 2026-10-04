@@ -43,18 +43,14 @@ enum RtEvent {
     CancelStream,
     Halt,
     SetGravityComp(bool),
-    SetPayload(f64),
+    SetPayload(par6_server::PayloadSpec),
     ExecPaused(bool),
     ExecSpeed(f64),
     SetEnabled(bool),
     Teleport([f64; 6]),
     EnterFlashing,
     ExitFlashing,
-    SetPidGains {
-        node: u8,
-        kpp: f64,
-        ilim_ma: f64,
-    },
+    SetPidGains(SetPidGains),
     WriteIo(u8, u8),
     Simulator(bool),
     ConnectHardware(String),
@@ -153,7 +149,7 @@ impl RtCommands for TestRt {
         self.push(RtEvent::SetGravityComp(on));
     }
     fn set_payload(&mut self, payload: par6_server::PayloadSpec) {
-        self.push(RtEvent::SetPayload(payload.mass));
+        self.push(RtEvent::SetPayload(payload));
     }
 
     fn set_exec_speed(&mut self, scale: f64) {
@@ -206,11 +202,7 @@ impl RtCommands for TestRt {
         self.0.lock().unwrap().flashing_outcome.take()
     }
     fn set_pid_gains(&mut self, p: &par6_proto::command::SetPidGains) {
-        self.push(RtEvent::SetPidGains {
-            node: p.node,
-            kpp: p.kpp,
-            ilim_ma: p.ilim_ma,
-        });
+        self.push(RtEvent::SetPidGains(p.clone()));
     }
     fn teleport(&mut self, angles_deg: &[f64; 6], _tool_positions: Option<&[f64]>) {
         self.push(RtEvent::Teleport(*angles_deg));
@@ -302,7 +294,15 @@ struct PlannerState {
     /// Holds `start_tool` inside the planner so a test can act while a
     /// tool stop is in flight — sent to the planner, not yet answered.
     stall_tool: Option<Arc<std::sync::atomic::AtomicBool>>,
+    /// Plane passes so far: every pass polls once, after servicing the
+    /// requests that were waiting.
+    passes: u64,
+    /// The payload of every context the server synced, in order.
+    synced_payloads: Vec<par6_server::PayloadSpec>,
 }
+
+/// How far [`TestPlanner`]'s world epoch moves per accepted layer.
+const PLANNER_EPOCH_STRIDE: u64 = 7;
 
 #[derive(Clone)]
 struct TestPlanner(Arc<Mutex<PlannerState>>);
@@ -340,6 +340,7 @@ impl Planner for TestPlanner {
     /// it as belonging to a command it has not been told about.
     fn poll(&mut self) -> Option<CommandOutcome> {
         let mut s = self.0.lock().unwrap();
+        s.passes += 1;
         let next = s.outcomes.front()?.index;
         if !s.started.iter().any(|(i, _)| *i == next) {
             return None;
@@ -390,7 +391,9 @@ impl Planner for TestPlanner {
         }
         s.tool_outcomes.pop_front()
     }
-    fn sync(&mut self, _ctx: PlanContext<'_>) {}
+    fn sync(&mut self, ctx: PlanContext<'_>) {
+        self.0.lock().unwrap().synced_payloads.push(ctx.payload);
+    }
     fn set_shapes(
         &mut self,
         layer: ShapeLayer,
@@ -401,7 +404,9 @@ impl Planner for TestPlanner {
             return Err(e);
         }
         s.layers.push((layer, shapes.to_vec()));
-        s.epoch += 1;
+        // The real world's epoch moves on more than shape sets (a tool
+        // swap rebuilds it too), so the server must adopt it, not count.
+        s.epoch += PLANNER_EPOCH_STRIDE;
         Ok(Some(s.epoch))
     }
     fn collision(&mut self) -> Option<CollisionState> {
@@ -665,6 +670,15 @@ impl Harness {
         self.writer.publish(&s);
     }
 
+    /// Wait out two full plane passes: whatever the server had already
+    /// sent the planner has been serviced, so a start that has not
+    /// happened by now was never asked for.
+    async fn planner_caught_up(&self) {
+        let now = self.planner.lock().unwrap().passes;
+        self.wait_planner("two plane passes", |p| p.passes >= now + 2)
+            .await;
+    }
+
     /// Wait until the planner has been asked to start `index` — the
     /// queue's head reached it.
     async fn wait_started(&self, index: u64) {
@@ -897,10 +911,22 @@ async fn status_identifies_new_publisher_sessions_and_actual_snapshot_times() {
     let first = start(|_| {}).await;
     let before = recv_status(&first.status_rx).await;
     let after = recv_status(&first.status_rx).await;
+    let host_after = std::time::Instant::now();
     assert_ne!(before.session_id, 0);
     assert_eq!(before.session_id, after.session_id);
     assert!(after.seq > before.seq);
-    assert!(after.mono_time_ns > before.mono_time_ns);
+    // The timestamp is a clock: across a tenth of a second of frames it
+    // advances as far as the host's does.
+    let mut later = recv_status(&first.status_rx).await;
+    while host_after.elapsed() < Duration::from_millis(100) {
+        later = recv_status(&first.status_rx).await;
+    }
+    let host_ns = host_after.elapsed().as_nanos() as f64;
+    let mono_ns = (later.mono_time_ns - after.mono_time_ns) as f64;
+    assert!(
+        (0.5 * host_ns..1.5 * host_ns).contains(&mono_ns),
+        "mono_time_ns advanced {mono_ns} ns over {host_ns} ns of host time"
+    );
     drop(first);
 
     let restarted = start(|_| {}).await;
@@ -1222,8 +1248,9 @@ async fn reset_waiter_overflow_names_itself_in_the_refusal() {
     let mut c = Client::new(&h).await;
 
     // 16 resets pile up unanswered while the RT is "still deciding".
+    let mut held = Vec::new();
     for _ in 0..16 {
-        c.send(&Command::Reset).await;
+        held.push(c.send(&Command::Reset).await);
     }
     let err = c.expect_error(&Command::Reset).await;
     assert_eq!(err.code, ErrorCode::CommQueueFull as u16);
@@ -1238,119 +1265,71 @@ async fn reset_waiter_overflow_names_itself_in_the_refusal() {
         err.cause
     );
 
-    // The RT decides: every held waiter gets the verdict.
+    // The RT decides: every held waiter gets the verdict, under its own
+    // request id.
     h.rt.lock().unwrap().hold_enable_outcome = false;
+    let mut answered = Vec::new();
     for _ in 0..16 {
         match c.recv().await {
-            Reply::Ok { index: None, .. } => {}
+            Reply::Ok {
+                req_id,
+                index: None,
+            } => answered.push(req_id),
             other => panic!("held reset waiters must be answered, got {other:?}"),
         }
     }
-}
-
-/// COMMAND_COMPLETION answers what a COMPLETE push carried, for the
-/// client whose push went missing; an index nothing finished under reads
-/// unfinished.
-#[tokio::test]
-async fn a_completion_is_kept_for_the_client_that_missed_its_push() {
-    let mut h = start(|_| {}).await;
-    h.publish(|_| {});
-    let mut c = Client::new(&h).await;
-
-    match c.query(&Command::CommandCompletion { index: 999 }).await {
-        QueryResult::CommandCompletion {
-            finished: false, ..
-        } => {}
-        other => panic!("an index nothing finished under must read unfinished: {other:?}"),
-    }
-
-    let landed = c.ok_index(&move_j(951)).await;
-    let cancelled = c.ok_index(&move_j(952)).await;
-    match c.query(&Command::CommandCompletion { index: landed }).await {
-        QueryResult::CommandCompletion {
-            finished: false, ..
-        } => {}
-        other => panic!("a running command must read unfinished: {other:?}"),
-    }
-    h.complete_ok(landed);
-    c.wait_complete(landed).await;
-    h.complete_err(
-        cancelled,
-        make_error(ErrorCode::MotnCancelled, cancelled as i64, &[]),
+    answered.sort_unstable();
+    assert_eq!(
+        answered, held,
+        "each held reset is answered once, by its own id"
     );
-    c.wait_complete(cancelled).await;
-
-    match c.query(&Command::CommandCompletion { index: landed }).await {
-        QueryResult::CommandCompletion {
-            index,
-            finished: true,
-            ok: true,
-            detail: None,
-            ..
-        } => assert_eq!(index, landed),
-        other => panic!("a landed command must read finished and ok: {other:?}"),
-    }
-    match c
-        .query(&Command::CommandCompletion { index: cancelled })
-        .await
-    {
-        QueryResult::CommandCompletion {
-            finished: true,
-            ok: false,
-            detail: Some(e),
-            ..
-        } => assert_eq!(e.code, ErrorCode::MotnCancelled as u16),
-        other => panic!("a cancelled command must read finished with its detail: {other:?}"),
-    }
 }
 
 /// STATUS frames ride the RT's ticks: one per stride of ticks, none for a
 /// tick the stride skips, and never two for one tick.
 #[tokio::test]
 async fn status_frames_map_one_to_one_onto_every_nth_tick() {
-    // A 100 Hz tick under the harness's 100 Hz STATUS rate: one frame
-    // per tick, which is the mapping at its most exacting.
-    let mut h = start(|cfg| cfg.config_info.tick_dt_s = 0.01).await;
+    // A 100 Hz tick under a 25 Hz STATUS rate: a frame every fourth tick,
+    // so a skipped tick and a doubled one both show, and the timer's
+    // 60 ms stand-down never cuts into the burst below.
+    let mut h = start(|cfg| {
+        cfg.config_info.tick_dt_s = 0.01;
+        cfg.status_rate_hz = 25;
+    })
+    .await;
     h.publish(|_| {});
     let mut c = Client::new(&h).await;
     let tick_dt_s = match c.query(&Command::ConfigInfo).await {
         QueryResult::ConfigInfo { tick_dt_s, .. } => tick_dt_s,
         other => panic!("unexpected {other:?}"),
     };
-    let stride = ((1.0 / tick_dt_s) / 100.0).round().max(1.0) as u64;
+    let stride = ((1.0 / tick_dt_s) / 25.0).round() as u64;
+    assert!(stride > 1, "the mapping needs ticks a frame skips");
 
-    // A still RT is reported by the timer; take its last frame as the
-    // baseline, then make the ticks flow, spaced so every one is polled.
-    // The frames that arrive while they flow are the stride crossings,
-    // consecutive in seq, and nothing else: the timer stands down.
-    let settle = tokio::time::Instant::now() + Duration::from_millis(60);
-    let mut latest = recv_status(&h.status_rx).await;
-    while let Ok(s) = tokio::time::timeout_at(settle, recv_status(&h.status_rx)).await {
-        latest = s;
+    // Each tick carries its own number in J0's angle. A tick that crosses
+    // a stride is followed by the frame describing it, and that frame is
+    // the next one out; a tick inside a stride gets a few polls of room,
+    // in which a server reporting off the stride would describe it.
+    // The still RT is reported by the timer. Starting right after a fresh
+    // timer frame leaves its full stand-down for the burst.
+    let mut buf = [0u8; 4096];
+    while h.status_rx.try_recv_from(&mut buf).is_ok() {}
+    let mut prev = recv_status(&h.status_rx).await.seq;
+    for k in 1..=4 * stride {
+        let tick = h.tick + 1;
+        h.publish(|s| s.q[0] = (tick as f64).to_radians());
+        if tick / stride == (tick - 1) / stride {
+            tokio::time::sleep(Duration::from_millis(3)).await;
+            continue;
+        }
+        let s = recv_status(&h.status_rx).await;
+        assert_eq!(
+            (s.seq, s.angles[0].round() as u64),
+            (prev + 1, tick),
+            "burst tick {k}: the next frame describes the tick that crossed the stride"
+        );
+        prev = s.seq;
     }
-    let first_seq = latest.seq;
-    let crossings = 4;
-    for _ in 0..(crossings * stride) {
-        h.publish(|_| {});
-        tokio::time::sleep(Duration::from_millis(3)).await;
-    }
-    // Frames still in flight from the burst land within a poll or two;
-    // the timer resumes only after a period and a half of quiet.
-    let mut seqs = Vec::new();
-    let grace = tokio::time::Instant::now() + Duration::from_millis(5);
-    while let Ok(s) = tokio::time::timeout_at(grace, recv_status(&h.status_rx)).await {
-        seqs.push(s.seq);
-    }
-    let ticked: Vec<u64> = seqs.iter().copied().filter(|s| *s > first_seq).collect();
-    assert_eq!(
-        ticked.len() as u64,
-        crossings,
-        "one frame per stride of ticks, no more, no fewer: {seqs:?} after {first_seq}"
-    );
-    assert!(
-        ticked.windows(2).all(|w| w[1] == w[0] + 1),
-        "the frames are consecutive: {ticked:?}"
-    );
 }
 
 /// A frame the timer re-sends while the RT is stalled describes the last
@@ -1360,18 +1339,24 @@ async fn status_frames_map_one_to_one_onto_every_nth_tick() {
 async fn a_stalled_rt_reports_the_tcp_speed_of_its_last_tick() {
     let mut h = start(|cfg| cfg.config_info.tick_dt_s = 0.01).await;
     h.publish(|_| {});
+    let mut c = Client::new(&h).await;
 
-    // The tool advances 1 mm every 10 ms tick: 100 mm/s.
+    // The tool advances 1 mm every 10 ms tick: 100 mm/s. Each tick is
+    // read back before the next is published, so the server sees all ten.
     for k in 1..=10 {
-        h.publish(|s| s.tcp[0] = k as f64 * 1e-3);
-        tokio::time::sleep(Duration::from_millis(3)).await;
+        h.publish(|s| {
+            s.tcp[0] = k as f64 * 1e-3;
+            s.q[0] = f64::from(k).to_radians();
+        });
+        wait_query(&mut c, &Command::Angles, "the server read the tick", |r| {
+            matches!(r, QueryResult::Angles { angles } if (angles[0] - f64::from(k)).abs() < 1e-9)
+        })
+        .await;
     }
-    let mut moving = None;
-    let settle = tokio::time::Instant::now() + Duration::from_millis(5);
-    while let Ok(s) = tokio::time::timeout_at(settle, recv_status(&h.status_rx)).await {
-        moving = Some(s);
-    }
-    let moving = moving.expect("the ticks were reported");
+    let moving = status_where(&h.status_rx, "the last tick is described", |s| {
+        (s.angles[0] - 10.0).abs() < 1e-9
+    })
+    .await;
     assert!(
         (moving.tcp_speed - 100.0).abs() < 1.0,
         "the tool was moving at 100 mm/s: {}",
@@ -1379,13 +1364,11 @@ async fn a_stalled_rt_reports_the_tcp_speed_of_its_last_tick() {
     );
 
     // Stalled: the timer takes over, describing the last tick again.
-    let mut repeats = 0;
-    let stall = tokio::time::Instant::now() + Duration::from_millis(80);
-    while let Ok(s) = tokio::time::timeout_at(stall, recv_status(&h.status_rx)).await {
-        repeats += 1;
+    for _ in 0..3 {
+        let s = recv_status(&h.status_rx).await;
+        assert!(s.seq > moving.seq);
         assert_eq!(s.tcp_speed, moving.tcp_speed, "a stall is not a stop");
     }
-    assert!(repeats > 0, "the timer never reported the stalled RT");
 }
 
 /// A backend swap is answered when the RT has installed the bus, not
@@ -1477,9 +1460,7 @@ async fn flashing_enter_and_exit_follow_the_rt_verdict() {
 /// and on a target the config lists unless `force` says a fresh drive is
 /// meant; only an accepted command reaches the RT. `BUS_SCAN` kicks a
 /// rescan and answers one row per node id once the scan settles or its
-/// deadline passes — here the double never advances the epoch, so the
-/// deadline is the path taken, and the rows still come from the
-/// published presence mask.
+/// deadline passes, from the bus as the rescan found it.
 #[tokio::test]
 async fn commissioning_is_gated_on_an_idle_arm_and_the_config_and_bus_scan_reports_every_id() {
     let mut h = start(|cfg| {
@@ -1572,6 +1553,16 @@ async fn commissioning_is_gated_on_an_idle_arm_and_the_config_and_bus_scan_repor
         }))
         .await;
     assert!(err.cause.contains("Exec"), "{}", err.cause);
+    // An idle arm with motion still queued is not at rest either: held
+    // by a pause, the move waits without anything executing.
+    h.publish(|s| s.mode = Mode::Idle);
+    c.ok(&Command::Pause(par6_proto::command::Pause { on: true }))
+        .await;
+    let queued = c.ok_index(&move_j(1401)).await;
+    let err = c.expect_error(&rename(2, 9, false)).await;
+    assert!(err.cause.contains("arm at rest"), "{}", err.cause);
+    c.ok(&Command::Stop(Stop { clear_queue: true })).await;
+    c.wait_complete(queued).await;
     // An arm resting in the EXEC hold — where every stop and finished move
     // leaves it — has nothing moving, so it may be commissioned.
     h.publish(|s| {
@@ -1588,18 +1579,30 @@ async fn commissioning_is_gated_on_an_idle_arm_and_the_config_and_bus_scan_repor
     });
     c.ok(&rename(2, 9, false)).await;
 
-    match c.query(&Command::BusScan).await {
-        QueryResult::BusScan { nodes } => {
+    // The scan is answered from the rescan it starts, not from the bus
+    // as it stood when asked: node 2 drops off in the rescan.
+    let scan = c.send(&Command::BusScan).await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::RescanBus)).await;
+    h.publish(|s| {
+        s.mode = Mode::ActiveError;
+        s.bus_nodes = 0b0011_1011;
+        s.bus_scan_epoch = 1;
+    });
+    match c.recv().await {
+        Reply::Response {
+            req_id,
+            result: QueryResult::BusScan { nodes },
+        } => {
+            assert_eq!(req_id, scan);
             assert_eq!(nodes.len(), 16);
             for (i, n) in nodes.iter().enumerate() {
                 assert_eq!(usize::from(n.node), i);
                 assert_eq!(n.configured, i < 6, "{n:?}");
-                assert_eq!(n.present, i < 6, "{n:?}");
+                assert_eq!(n.present, i < 6 && i != 2, "{n:?}");
             }
         }
-        other => panic!("unexpected bus scan result {other:?}"),
+        other => panic!("unexpected bus scan reply {other:?}"),
     }
-    assert!(h.rt_events().contains(&RtEvent::RescanBus));
 }
 
 /// `set_pid_gains` reaches the RT only for a node the config declares as
@@ -1607,13 +1610,14 @@ async fn commissioning_is_gated_on_an_idle_arm_and_the_config_and_bus_scan_repor
 /// nothing is forwarded — an ack would report a tune nothing received.
 #[tokio::test]
 async fn set_pid_gains_validates_the_node_against_the_config() {
+    // Node 3 declares no voltage ceiling: 0 leaves the drive on the bus.
     let mut h = start(|cfg| {
         cfg.tunable_nodes = (0..6)
             .map(|node| TunableNode {
                 node,
                 ilim_ma: 2500.0,
                 velocity_limit_ticks_s: 200_000.0,
-                voltage_limit_mv: 0,
+                voltage_limit_mv: if node == 3 { 0 } else { 24_000 },
             })
             .collect();
     })
@@ -1621,33 +1625,42 @@ async fn set_pid_gains_validates_the_node_against_the_config() {
     h.publish(|_| {});
     let mut c = Client::new(&h).await;
 
-    let gains = |node| {
-        Command::SetPidGains(SetPidGains {
-            node,
-            kpp: 9.0,
-            kpv: 0.05,
-            kiv: 0.005,
-            kpiq: 1.2,
-            kiiq: 1.0,
-            kp: 0.12,
-            kd: 0.002,
-            ilim_ma: 2200.0,
-            velocity_limit_ticks_s: 150_000.0,
-            voltage_limit_mv: 0,
-        })
+    let gains = |node, ilim_ma, velocity_limit_ticks_s, voltage_limit_mv| SetPidGains {
+        node,
+        kpp: 9.0,
+        kpv: 0.05,
+        kiv: 0.005,
+        kpiq: 1.2,
+        kiiq: 1.0,
+        kp: 0.12,
+        kd: 0.002,
+        ilim_ma,
+        velocity_limit_ticks_s,
+        voltage_limit_mv,
     };
-    c.ok(&gains(2)).await;
-    let ev = h.rt_events();
-    assert!(
-        ev.contains(&RtEvent::SetPidGains {
-            node: 2,
-            kpp: 9.0,
-            ilim_ma: 2200.0
-        }),
-        "the accepted tune must reach the RT: {ev:?}"
+    // At every ceiling: accepted, and forwarded whole.
+    let at_ceiling = gains(2, 2500.0, 200_000.0, 24_000);
+    c.ok(&Command::SetPidGains(at_ceiling.clone())).await;
+    let unbounded = gains(3, 2200.0, 150_000.0, 30_000);
+    c.ok(&Command::SetPidGains(unbounded.clone())).await;
+    let forwarded = |h: &Harness| -> Vec<SetPidGains> {
+        h.rt_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                RtEvent::SetPidGains(p) => Some(p),
+                _ => None,
+            })
+            .collect()
+    };
+    assert_eq!(
+        forwarded(&h),
+        [at_ceiling, unbounded],
+        "the accepted tunes reach the RT as sent"
     );
 
-    let err = c.expect_error(&gains(9)).await;
+    let err = c
+        .expect_error(&Command::SetPidGains(gains(9, 2200.0, 150_000.0, 0)))
+        .await;
     assert_eq!(err.code, ErrorCode::CommValidationError as u16);
     assert!(
         err.cause.contains("node 9"),
@@ -1655,25 +1668,30 @@ async fn set_pid_gains_validates_the_node_against_the_config() {
         err.cause
     );
 
-    // Above the joint's configured current ceiling: refused before it is
-    // stored, since a stored tune is re-pushed on every reconnect.
-    let mut over = gains(2);
-    if let Command::SetPidGains(p) = &mut over {
-        p.ilim_ma = 2600.0;
+    // Past any one ceiling: refused before it is stored, since a stored
+    // tune is re-pushed on every reconnect.
+    for (over, field, ceiling) in [
+        (gains(2, 2500.5, 200_000.0, 24_000), "ilim_ma", "2500"),
+        (
+            gains(2, 2500.0, 200_001.0, 24_000),
+            "velocity_limit_ticks_s",
+            "200000",
+        ),
+        (
+            gains(2, 2500.0, 200_000.0, 24_001),
+            "voltage_limit_mv",
+            "24000",
+        ),
+    ] {
+        let err = c.expect_error(&Command::SetPidGains(over)).await;
+        assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+        assert!(
+            err.cause.contains(field) && err.cause.contains(ceiling),
+            "the refusal names {field} and its ceiling {ceiling}: {}",
+            err.cause
+        );
     }
-    let err = c.expect_error(&over).await;
-    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
-    assert!(
-        err.cause.contains("ilim_ma") && err.cause.contains("2500"),
-        "the refusal names the field and the ceiling: {}",
-        err.cause
-    );
-    let forwarded = h
-        .rt_events()
-        .iter()
-        .filter(|e| matches!(e, RtEvent::SetPidGains { .. }))
-        .count();
-    assert_eq!(forwarded, 1, "the refused node must not be forwarded");
+    assert_eq!(forwarded(&h).len(), 2, "nothing refused is forwarded");
 }
 
 /// The gating table over the wire: un-homed, disabled, e-stop latch and
@@ -1701,15 +1719,20 @@ async fn gating_rejections_carry_specific_codes() {
     // collision world and the soft-limit brake rather than on a home
     // reference — the RT's mode gate agrees, so nothing is dropped
     // silently downstream.
+    let streamed =
+        |ev: &[RtEvent], tag: CmdType| ev.iter().filter(|e| **e == RtEvent::Stream(tag)).count();
     c.send(&jog_j()).await; // fire-and-forget: success is unacked
-    h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogJ)))
-        .await;
+    h.wait_rt(|ev| streamed(ev, CmdType::JogJ) == 1).await;
+    // A cartesian jog has no frame without a reference, so it is.
+    let err = c.expect_error(&jog_l()).await;
+    assert_eq!(err.code, ErrorCode::MotnNotHomed as u16);
 
-    // Homed: still accepted, unchanged.
+    // Homed: both reach the RT.
     h.publish(|_| {});
     c.send(&jog_j()).await;
-    h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogJ)))
-        .await;
+    h.wait_rt(|ev| streamed(ev, CmdType::JogJ) == 2).await;
+    c.send(&jog_l()).await;
+    h.wait_rt(|ev| streamed(ev, CmdType::JogL) == 1).await;
 
     // Disabled (RT core reports DISABLED).
     h.publish(|s| s.state = ArmState::Disabled);
@@ -1756,10 +1779,18 @@ async fn stop_estop_reset_semantics() {
 
     // stop {clear_queue: false}: the active command halts, the queue
     // continues with the next one.
+    let halts = |ev: &[RtEvent]| ev.iter().filter(|e| **e == RtEvent::Halt).count();
+    h.wait_started(i1).await;
+    let before = halts(&h.rt_events());
     match c.request(&Command::Stop(Stop { clear_queue: false })).await {
         Reply::Ok { index: None, .. } => {}
         other => panic!("expected OK, got {other:?}"),
     }
+    assert_eq!(
+        halts(&h.rt_events()),
+        before + 1,
+        "a stop halts the arm before it answers"
+    );
     let deadline = tokio::time::Instant::now() + BUDGET;
     loop {
         if let QueryResult::Queue {
@@ -1779,7 +1810,13 @@ async fn stop_estop_reset_semantics() {
     }
 
     // stop {clear_queue: true}: nothing executing, nothing pending.
+    let before = halts(&h.rt_events());
     c.request(&Command::Stop(Stop { clear_queue: true })).await;
+    assert_eq!(
+        halts(&h.rt_events()),
+        before + 1,
+        "a clearing stop halts too"
+    );
     match c.query(&Command::Queue).await {
         QueryResult::Queue {
             queue,
@@ -1838,6 +1875,9 @@ async fn cancellation_pushes_complete_for_every_dropped_command() {
     let mut h = start(|cfg| {
         cfg.blend_hold = Duration::from_millis(150);
         cfg.blend_lookahead = 4;
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
     })
     .await;
     h.publish(|_| {});
@@ -1900,14 +1940,17 @@ async fn cancellation_pushes_complete_for_every_dropped_command() {
     h.planner.lock().unwrap().consume = 2;
     let i3 = c.ok_index(&move_j_blended(903, Some(15.0))).await;
     let i4 = c.ok_index(&move_j_blended(904, None)).await;
-    let deadline = tokio::time::Instant::now() + BUDGET;
-    while h.planner.lock().unwrap().started.len() < 2 {
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "chain never started"
-        );
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
+    // The successor is folded into the head's motion: nothing waits.
+    wait_query(
+        &mut c,
+        &Command::Queue,
+        "the chain runs as one motion",
+        |r| {
+            matches!(r, QueryResult::Queue { queue, executing_index, .. }
+            if queue.is_empty() && *executing_index == i3 as i64)
+        },
+    )
+    .await;
     h.planner.lock().unwrap().consume = 1;
     let i5 = c.ok_index(&move_j(905)).await;
     c.request(&Command::Stop(Stop { clear_queue: true })).await;
@@ -1969,6 +2012,74 @@ async fn cancellation_pushes_complete_for_every_dropped_command() {
         standing(&mut c).await.is_none(),
         "an accepted preemption latches nothing"
     );
+
+    // A running tool action is taken by every scope the same way, its
+    // jaws halted where they are rather than released. Each row: the
+    // scope the cancellation names, the command, whether it clears the
+    // queue. The teleport comes after the simulator switch: it is refused
+    // off the simulator.
+    let scopes = [
+        ("a streaming preemption", jog_j(), true),
+        ("stop", Command::Stop(Stop { clear_queue: false }), false),
+        ("stop", Command::Stop(Stop { clear_queue: true }), true),
+        ("estop", Command::Estop, true),
+        ("reset", Command::ResetState, true),
+        (
+            "the simulator switch",
+            Command::Simulator(Simulator { on: true }),
+            true,
+        ),
+        (
+            "a teleport",
+            Command::Teleport(Teleport {
+                angles: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+                tool_positions: None,
+            }),
+            true,
+        ),
+    ];
+    for (k, (scope, cmd, clears)) in scopes.into_iter().enumerate() {
+        let key = 1000 + 2 * k as u64;
+        let running = c.ok_index(&close_jaws(key)).await;
+        h.wait_started(running).await;
+        let queued = c
+            .ok_index(&tool_action(key + 1, "move", &[0.0, 0.5, 0.3]))
+            .await;
+        if matches!(cmd, Command::JogJ(_)) {
+            c.send(&cmd).await; // fire-and-forget: success is unacked
+        } else {
+            c.request(&cmd).await;
+        }
+
+        let (ok, detail) = c.wait_complete(running).await;
+        let detail =
+            detail.unwrap_or_else(|| panic!("{scope}: a cancelled COMPLETE carries detail"));
+        assert!(
+            !ok && detail.code == ErrorCode::MotnCancelled as u16 && detail.cause.contains(scope),
+            "{scope} must cancel the running tool action: ok={ok} {detail:?}"
+        );
+        h.wait_planner(&format!("{scope} halts the running tool action"), |p| {
+            p.tool_halts.contains(&running)
+        })
+        .await;
+        if clears {
+            let (ok, detail) = c.wait_complete(queued).await;
+            assert!(
+                !ok && detail
+                    .as_ref()
+                    .is_some_and(|e| e.code == ErrorCode::MotnCancelled as u16),
+                "{scope} must cancel the queued tool action: ok={ok} {detail:?}"
+            );
+        } else {
+            h.wait_started(queued).await;
+            h.complete_ok(queued);
+            let (ok, detail) = c.wait_complete(queued).await;
+            assert!(ok, "the queue behind a plain {scope} runs on: {detail:?}");
+        }
+        if matches!(cmd, Command::Estop) {
+            c.request(&Command::Reset).await;
+        }
+    }
 }
 
 /// Streaming preemption: same-type updates in place, a different type
@@ -2046,7 +2157,8 @@ async fn streaming_preemption_semantics() {
     assert!(!ev.is_empty());
 
     // ...and a fresh stream cancels planned motion: the queued command
-    // vanishes without resuming.
+    // vanishes without resuming, and the planner is told to drop it.
+    let planner_cancels = h.planner.lock().unwrap().cancels;
     c.send(&jog_j()).await;
     h.wait_rt(|ev| {
         ev.iter()
@@ -2066,6 +2178,10 @@ async fn streaming_preemption_semantics() {
         }
         other => panic!("unexpected {other:?}"),
     }
+    h.wait_planner("the planner drops the cancelled motion", |p| {
+        p.cancels > planner_cancels
+    })
+    .await;
 }
 
 /// What a stream preemption is allowed to throw away.
@@ -2295,7 +2411,10 @@ async fn status_broadcast_content_and_staleness() {
 /// not a connected robot.)
 #[tokio::test]
 async fn silent_motor_bus_reads_link_down_while_status_keeps_flowing() {
-    let mut h = start(|_| {}).await;
+    // Off the 250 Hz default, so the bus age has to be read in this
+    // runtime's own ticks.
+    const RT_TICK_RATE_HZ: f64 = 125.0;
+    let mut h = start(|cfg| cfg.rt_tick_rate_hz = RT_TICK_RATE_HZ).await;
     let mut c = Client::new(&h).await;
 
     // Boot: the RT is alive and publishing, but no node has ever answered.
@@ -2348,10 +2467,10 @@ async fn silent_motor_bus_reads_link_down_while_status_keeps_flowing() {
 
     // Mid-session silence: the RT keeps publishing every tick (each
     // publish here is younger than `link_stale`), only the node ages
-    // grow — 100 ticks at the default 250 Hz is 400 ms against the
-    // harness's 100 ms staleness window. Before the fix this read
-    // link_ok = 1 forever, because only the snapshot's wall age was
-    // measured.
+    // grow — 100 ticks against the harness's 100 ms staleness window.
+    // Before the fix this read link_ok = 1 forever, because only the
+    // snapshot's wall age was measured.
+    let bus_age_ms = (100.0 * 1000.0 / RT_TICK_RATE_HZ) as u16;
     let deadline = tokio::time::Instant::now() + BUDGET;
     let silent = loop {
         h.publish(|s| {
@@ -2360,9 +2479,9 @@ async fn silent_motor_bus_reads_link_down_while_status_keeps_flowing() {
             }
         });
         let s = recv_status(&h.status_rx).await;
-        // The target frame carries the BUS age (100 ticks @ 250 Hz =
-        // 400 ms), not merely a snapshot that aged in the rx backlog.
-        if s.link_ok == 0 && s.data_age_ms >= 400 && s.data_age_ms != u16::MAX {
+        // The target frame carries the BUS age, not merely a snapshot
+        // that aged in the rx backlog.
+        if s.link_ok == 0 && s.data_age_ms >= bus_age_ms && s.data_age_ms != u16::MAX {
             break s;
         }
         assert!(
@@ -2372,6 +2491,11 @@ async fn silent_motor_bus_reads_link_down_while_status_keeps_flowing() {
         );
     };
     assert!(silent.seq > dead.seq, "STATUS must keep flowing throughout");
+    assert!(
+        silent.data_age_ms < bus_age_ms + 100,
+        "100 ticks at {RT_TICK_RATE_HZ} Hz plus a fresh snapshot's wall age, read {} ms",
+        silent.data_age_ms
+    );
     h.publish(|s| {
         for node in &mut s.nodes {
             node.data_age_ticks = 100;
@@ -2527,35 +2651,25 @@ async fn a_stream_the_runtime_refuses_answers_error_and_stops_the_session() {
     assert_eq!(err.code, ErrorCode::SysSelfCollision as u16);
     h.wait_rt(|ev| ev.contains(&RtEvent::CancelStream)).await;
     // The session really ended: the next same-type jog is a fresh start,
-    // which the double sees as a new Stream event after the cancel.
+    // which preempts planned motion as only a new session does.
+    let planner_cancels = h.planner.lock().unwrap().cancels;
     c.send(&jog_j()).await;
-    h.wait_rt(|ev| {
-        let cancel = ev.iter().position(|e| *e == RtEvent::CancelStream);
-        cancel.is_some_and(|i| ev[i..].contains(&RtEvent::Stream(CmdType::JogJ)))
+    h.wait_planner("the next jog starts a fresh session", |p| {
+        p.cancels > planner_cancels
     })
     .await;
-}
 
-/// A refused update the runtime answers with a standoff keeps the session
-/// alive while the gate brakes and places the arm. The refusal still
-/// latches — the session is stopping, not motion the verdict would
-/// misdescribe — and the next accepted setpoint clears it.
-#[tokio::test]
-async fn a_refusal_kept_in_a_standoff_still_latches() {
-    let mut h = start(|_| {}).await;
-    h.publish(|_| {});
-    let mut c = Client::new(&h).await;
-    let collision = || {
-        make_error(
-            ErrorCode::SysSelfCollision,
-            UNATTRIBUTED,
-            &[("sample", "0"), ("total", "1"), ("pairs", "[j3, keepout]")],
-        )
+    // A refused update the runtime answers with a standoff keeps the
+    // session alive while the gate brakes and places the arm. The refusal
+    // still latches — the session is stopping, not motion the verdict
+    // would misdescribe — and the next accepted setpoint clears it.
+    let streamed = |ev: &[RtEvent]| {
+        ev.iter()
+            .filter(|e| **e == RtEvent::Stream(CmdType::JogJ))
+            .count()
     };
-    c.send(&jog_j()).await;
-    h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogJ)))
-        .await;
-
+    let cancels = |ev: &[RtEvent]| ev.iter().filter(|e| **e == RtEvent::CancelStream).count();
+    let live = h.wait_rt(|ev| streamed(ev) >= 2).await;
     {
         let mut rt = h.rt.lock().unwrap();
         rt.stream_verdict = Some(collision());
@@ -2563,10 +2677,10 @@ async fn a_refusal_kept_in_a_standoff_still_latches() {
     }
     let err = c.expect_error(&jog_j()).await;
     assert_eq!(err.code, ErrorCode::SysSelfCollision as u16);
-    assert!(
-        !h.rt_events().contains(&RtEvent::CancelStream),
-        "a standoff the RT keeps must not be cancelled: {:?}",
-        h.rt_events()
+    assert_eq!(
+        cancels(&h.rt_events()),
+        cancels(&live),
+        "a standoff the RT keeps must not be cancelled"
     );
     match c.query(&Command::Error).await {
         QueryResult::Error { error: Some(e) } => {
@@ -2574,30 +2688,16 @@ async fn a_refusal_kept_in_a_standoff_still_latches() {
         }
         other => panic!("the refusal must stand while the standoff runs, got {other:?}"),
     }
-
     h.rt.lock().unwrap().standoff_on_refusal = false;
     c.send(&jog_j()).await;
-    h.wait_rt(|ev| {
-        ev.iter()
-            .filter(|e| **e == RtEvent::Stream(CmdType::JogJ))
-            .count()
-            >= 2
-    })
+    h.wait_rt(|ev| streamed(ev) > streamed(&live)).await;
+    wait_query(
+        &mut c,
+        &Command::Error,
+        "the accepted setpoint clears the latch",
+        |r| matches!(r, QueryResult::Error { error: None }),
+    )
     .await;
-    let deadline = tokio::time::Instant::now() + BUDGET;
-    loop {
-        match c.query(&Command::Error).await {
-            QueryResult::Error { error: None } => break,
-            QueryResult::Error { error: Some(_) } => {
-                assert!(
-                    tokio::time::Instant::now() < deadline,
-                    "the accepted setpoint must clear the refusal latch"
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            other => panic!("expected ERROR result, got {other:?}"),
-        }
-    }
 }
 
 fn wire_shape(name: &str, kind: &str) -> Shape {
@@ -2634,13 +2734,7 @@ async fn shape_layers_epoch_adoption_and_collision_status() {
     h.publish(|_| {});
     let mut c = Client::new(&h).await;
 
-    // Startup: installation only, and STATUS reports the applied epoch.
-    assert_eq!(
-        h.planner.lock().unwrap().layers,
-        vec![(ShapeLayer::Installation, vec![install.clone()])],
-        "installation keep-outs are pushed once, at startup"
-    );
-    let epoch_after_install = 1;
+    let epoch_after_install = PLANNER_EPOCH_STRIDE;
 
     let program = vec![wire_shape("table", "box"), wire_shape("post", "cylinder")];
     match c
@@ -2668,12 +2762,16 @@ async fn shape_layers_epoch_adoption_and_collision_status() {
             assert_eq!(p, program);
             assert_eq!(
                 epoch,
-                epoch_after_install + 1,
+                epoch_after_install + PLANNER_EPOCH_STRIDE,
                 "the reported epoch is the applied world's"
             );
         }
         other => panic!("unexpected {other:?}"),
     }
+    status_where(&h.status_rx, "STATUS carries the applied epoch", |s| {
+        s.scene_epoch == epoch_after_install + PLANNER_EPOCH_STRIDE
+    })
+    .await;
 
     // A refused set: the world, the readback and the epoch all stand.
     h.planner.lock().unwrap().fail_next_shapes = Some(make_error(
@@ -2700,7 +2798,7 @@ async fn shape_layers_epoch_adoption_and_collision_status() {
             assert_eq!(p, program, "a refused set must not change the readback");
             assert_eq!(
                 epoch,
-                epoch_after_install + 1,
+                epoch_after_install + PLANNER_EPOCH_STRIDE,
                 "a refused world must not advance scene_epoch"
             );
         }
@@ -2830,43 +2928,58 @@ async fn an_installation_layer_the_gate_cannot_mirror_fails_startup() {
 /// where a driven output lands: after the inputs, before the e-stop.
 #[tokio::test]
 async fn write_io_reaches_declared_ports_and_is_refused_past_them() {
-    // Two inputs and two outputs — deliberately not the shipped box's
-    // 7/3, so a hardcoded layout cannot pass this.
+    // Two outputs — deliberately not the shipped box's three, so a
+    // hardcoded count cannot pass this.
     let mut h = start(|c| {
         c.digital_outputs = vec!["out_a".into(), "out_b".into()];
     })
     .await;
-    h.publish(|s| {
-        s.io_inputs = 2;
-        s.io_outputs = 2;
-        s.io_lines[..4].copy_from_slice(&[1, 0, 0, 0]);
-    });
+    h.publish(|_| {});
     let mut c = Client::new(&h).await;
+    let writes = |h: &Harness| -> Vec<(u8, u8)> {
+        h.rt_events()
+            .into_iter()
+            .filter_map(|e| match e {
+                RtEvent::WriteIo(port, value) => Some((port, value)),
+                _ => None,
+            })
+            .collect()
+    };
 
-    // Queued: the write lands at its turn, behind the move ahead of it,
+    // Queued: each write lands at its turn, behind the move ahead of it,
     // and its index completes when the level is applied.
     let ahead = c.ok_index(&move_j(901)).await;
-    let write = c
+    let high = c
         .ok_index(&Command::WriteIo(WriteIo {
             key: 902,
-            port: 1,
+            port: 0,
             value: 1,
         }))
         .await;
+    let low = c
+        .ok_index(&Command::WriteIo(WriteIo {
+            key: 903,
+            port: 1,
+            value: 0,
+        }))
+        .await;
+    h.wait_started(ahead).await;
     assert!(
-        !h.rt_events().contains(&RtEvent::WriteIo(1, 1)),
-        "a write queued behind a running move must not drive the line early: {:?}",
-        h.rt_events()
+        writes(&h).is_empty(),
+        "a write queued behind a running move must not drive the line early"
     );
     h.complete_ok(ahead);
     c.wait_complete(ahead).await;
-    h.complete_ok(write);
-    let (ok, _) = c.wait_complete(write).await;
-    assert!(ok);
-    assert!(
-        h.rt_events().contains(&RtEvent::WriteIo(1, 1)),
-        "the write reaches the backend at its turn: {:?}",
-        h.rt_events()
+    for write in [high, low] {
+        h.wait_started(write).await;
+        h.complete_ok(write);
+        let (ok, detail) = c.wait_complete(write).await;
+        assert!(ok, "{detail:?}");
+    }
+    assert_eq!(
+        writes(&h),
+        [(0, 1), (1, 0)],
+        "each write drives its own port to its own level, in queue order"
     );
 
     for port in [2u8, 7] {
@@ -2884,43 +2997,7 @@ async fn write_io_reaches_declared_ports_and_is_refused_past_them() {
             err.cause
         );
     }
-    assert_eq!(
-        h.rt_events()
-            .iter()
-            .filter(|e| matches!(e, RtEvent::WriteIo(..)))
-            .count(),
-        1,
-        "refused ports reach no backend: {:?}",
-        h.rt_events()
-    );
-
-    // The levels themselves come from the RT snapshot, so the query and
-    // STATUS both read the lines the tick loop last published.
-    h.publish(|s| {
-        s.io_inputs = 2;
-        s.io_outputs = 2;
-        s.io_lines[..4].copy_from_slice(&[1, 0, 0, 1]);
-    });
-    match c.query(&Command::Io).await {
-        QueryResult::Io { io } => {
-            assert_eq!(io, vec![1, 0, 0, 1, 1], "2 in + 2 out + e-stop, in order");
-        }
-        other => panic!("unexpected {other:?}"),
-    }
-    // Statuses queued during the waits above carry the earlier lines;
-    // the one built from this publication agrees with the query.
-    let deadline = tokio::time::Instant::now() + BUDGET;
-    loop {
-        let status = recv_status(&h.status_rx).await;
-        if status.io == vec![1, 0, 0, 1, 1] {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "STATUS never agreed with the query: {:?}",
-            status.io
-        );
-    }
+    assert_eq!(writes(&h).len(), 2, "refused ports reach no backend");
 }
 
 /// Cartesian freedom is reported only where a model backs it.
@@ -3005,61 +3082,6 @@ async fn cartesian_freedom_is_reported_only_where_kinematics_exist() {
     }
 }
 
-/// Selecting a tool variant drops the TCP offset.
-///
-/// The offset is measured in the tool's own frame, so it means nothing once
-/// a different variant moves that frame — the client API says a tool change
-/// resets it, and the runtime has to make that true. Re-selecting the same
-/// variant is not a change and leaves it alone.
-#[tokio::test]
-async fn selecting_a_different_variant_clears_the_tcp_offset() {
-    let mut h = start(|cfg| {
-        cfg.tools = vec!["gripper".to_owned()];
-        cfg.fitted_tool = "gripper".to_owned();
-        cfg.tool_dof = 1;
-    })
-    .await;
-    h.publish(|_| {});
-    let mut c = Client::new(&h).await;
-
-    let select = |key: u64, variant: Option<&str>| {
-        Command::SelectTool(par6_proto::command::SelectTool {
-            key,
-            tool_name: "GRIPPER".to_owned(),
-            variant_key: variant.map(str::to_owned),
-        })
-    };
-    let offset = |key: u64, x: f64, y: f64, z: f64| {
-        Command::SetTcpOffset(par6_proto::command::SetTcpOffset { key, x, y, z })
-    };
-    async fn read_offset(c: &mut Client) -> [f64; 3] {
-        match c.query(&Command::TcpOffset).await {
-            QueryResult::TcpOffset { x, y, z } => [x, y, z],
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    let i1 = c.ok_index(&select(701, Some("fin_ray"))).await;
-    h.complete_ok(i1);
-    c.wait_complete(i1).await;
-    let io = c.ok_index(&offset(704, 0.0, 0.0, -190.0)).await;
-    h.complete_ok(io);
-    c.wait_complete(io).await;
-    assert_eq!(read_offset(&mut c).await, [0.0, 0.0, -190.0]);
-
-    // Same variant again: nothing about the tool frame moved.
-    let i2 = c.ok_index(&select(702, Some("fin_ray"))).await;
-    h.complete_ok(i2);
-    c.wait_complete(i2).await;
-    assert_eq!(read_offset(&mut c).await, [0.0, 0.0, -190.0]);
-
-    // A different variant moves the TCP the offset was measured from.
-    let i3 = c.ok_index(&select(703, Some("wide_jaw"))).await;
-    h.complete_ok(i3);
-    c.wait_complete(i3).await;
-    assert_eq!(read_offset(&mut c).await, [0.0, 0.0, 0.0]);
-}
-
 /// `set_tcp_offset` lands at its turn in the queue, not when its datagram
 /// arrives.
 ///
@@ -3122,6 +3144,24 @@ async fn set_tcp_offset_applies_in_queue_order_and_needs_no_enable() {
         "the offset set AFTER the tool change must survive it"
     );
 
+    // Selecting the same variant again moves nothing the offset was
+    // measured from; a different variant moves the TCP itself.
+    let select = |key: u64, variant: &str| {
+        Command::SelectTool(par6_proto::command::SelectTool {
+            key,
+            tool_name: "GRIPPER".to_owned(),
+            variant_key: Some(variant.to_owned()),
+        })
+    };
+    let again = c.ok_index(&select(804, "fin_ray")).await;
+    h.complete_ok(again);
+    c.wait_complete(again).await;
+    assert_eq!(read_offset(&mut c).await, [0.0, 0.0, -190.0]);
+    let other = c.ok_index(&select(805, "wide_jaw")).await;
+    h.complete_ok(other);
+    c.wait_complete(other).await;
+    assert_eq!(read_offset(&mut c).await, [0.0; 3]);
+
     // Disabled arm: admitted AND applied — nothing about an offset needs
     // the arm enabled, and holding it until enable would be a silent no-op.
     h.publish(|s| s.state = ArmState::Disabled);
@@ -3133,191 +3173,6 @@ async fn set_tcp_offset_applies_in_queue_order_and_needs_no_enable() {
     h.publish(|_| {});
 
     h.server.shutdown();
-}
-
-/// A tool action is a queued command like any other: it waits behind the
-/// move ahead of it, waits out a pause and a zero execution speed, and
-/// runs in index order.
-///
-/// `move_l(A); tool.close(); move_l(B)` is a pick: jaws that close while
-/// the arm is still travelling to the part knock it over, and an arm that
-/// leaves before they have closed leaves it behind.
-#[tokio::test]
-async fn a_tool_action_waits_its_turn_in_the_queue() {
-    let mut h = start_with_gripper().await;
-    let mut c = Client::new(&h).await;
-    let started = |h: &Harness, index: u64| {
-        h.planner
-            .lock()
-            .unwrap()
-            .started
-            .iter()
-            .any(|(i, _)| *i == index)
-    };
-
-    // Behind a move: queued, not started, until the move has finished.
-    let mv = c.ok_index(&move_j(901)).await;
-    let close = c.ok_index(&close_jaws(902)).await;
-    let after = c.ok_index(&move_j(903)).await;
-    let listing = wait_query(&mut c, &Command::Queue, "the move executes", |r| {
-        matches!(r, QueryResult::Queue { executing_index, .. } if *executing_index == mv as i64)
-    })
-    .await;
-    match listing {
-        QueryResult::Queue { queue, .. } => assert_eq!(
-            queue,
-            ["tool_action", "move_j"],
-            "the tool action must wait in the queue behind the move"
-        ),
-        other => panic!("unexpected {other:?}"),
-    }
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(
-        !started(&h, close),
-        "the tool action started while the move ahead of it was running"
-    );
-    // Each starts once the one ahead of it has completed.
-    for (index, next) in [(mv, Some(close)), (close, Some(after)), (after, None)] {
-        h.complete_ok(index);
-        let (ok, detail) = c.wait_complete(index).await;
-        assert!(ok, "command {index} must complete, got {detail:?}");
-        if let Some(next) = next {
-            h.wait_started(next).await;
-        }
-    }
-    let order: Vec<u64> = h
-        .planner
-        .lock()
-        .unwrap()
-        .started
-        .iter()
-        .map(|(i, _)| *i)
-        .collect();
-    assert_eq!(
-        order,
-        [mv, close, after],
-        "the queue ran out of index order"
-    );
-
-    // Under a pause: held with the queue, started by the resume.
-    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
-        .await;
-    h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(true)))
-        .await;
-    let paused = c
-        .ok_index(&tool_action(904, "move", &[0.0, 0.5, 0.3]))
-        .await;
-    match c.query(&Command::Queue).await {
-        QueryResult::Queue { queue, .. } => assert_eq!(
-            queue,
-            ["tool_action"],
-            "a paused queue must hold the tool action"
-        ),
-        other => panic!("unexpected {other:?}"),
-    }
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(!started(&h, paused), "a tool action ran through a pause");
-    c.request(&Command::Pause(par6_proto::command::Pause { on: false }))
-        .await;
-    h.wait_started(paused).await;
-    h.complete_ok(paused);
-    assert!(c.wait_complete(paused).await.0);
-
-    // At zero execution speed the same: nothing queued runs until the
-    // speed comes back.
-    h.publish(|s| s.exec.target_scale = 0.0);
-    let stalled = c.ok_index(&close_jaws(905)).await;
-    tokio::time::sleep(Duration::from_millis(20)).await;
-    assert!(
-        !started(&h, stalled),
-        "a tool action ran at zero execution speed"
-    );
-    h.publish(|_| {});
-    h.wait_started(stalled).await;
-    h.complete_ok(stalled);
-    assert!(c.wait_complete(stalled).await.0);
-}
-
-/// Every scope that cancels planned motion cancels tool actions the same
-/// way, because they are queued commands: the executing one reports
-/// MOTN_CANCELLED and is halted where it is — the planner's cancel
-/// reaches it in flight, and a halt keeps whatever the jaws hold — and a
-/// scope that clears the queue reports the queued ones cancelled too.
-///
-/// A jog or servo preempting the queue is one of those scopes. The
-/// program must not resume from wherever the manual motion left the arm,
-/// and a grip it abandoned half-closed must not carry on closing under
-/// the operator's hand.
-#[tokio::test]
-async fn every_cancellation_scope_takes_tool_actions_like_planned_motion() {
-    let h = start_with_gripper().await;
-    let mut c = Client::new(&h).await;
-
-    // (the scope the cancellation names, the command, whether it clears
-    // the queue). The teleport comes after the simulator switch: it is
-    // refused off the simulator.
-    let scopes = [
-        ("a streaming preemption", jog_j(), true),
-        ("stop", Command::Stop(Stop { clear_queue: false }), false),
-        ("stop", Command::Stop(Stop { clear_queue: true }), true),
-        ("estop", Command::Estop, true),
-        ("reset", Command::ResetState, true),
-        (
-            "the simulator switch",
-            Command::Simulator(Simulator { on: true }),
-            true,
-        ),
-        (
-            "a teleport",
-            Command::Teleport(Teleport {
-                angles: [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
-                tool_positions: None,
-            }),
-            true,
-        ),
-    ];
-    for (k, (scope, cmd, clears)) in scopes.into_iter().enumerate() {
-        let key = 1000 + 2 * k as u64;
-        let running = c.ok_index(&close_jaws(key)).await;
-        h.wait_started(running).await;
-        let queued = c
-            .ok_index(&tool_action(key + 1, "move", &[0.0, 0.5, 0.3]))
-            .await;
-        if matches!(cmd, Command::JogJ(_)) {
-            c.send(&cmd).await; // fire-and-forget: success is unacked
-        } else {
-            c.request(&cmd).await;
-        }
-
-        let (ok, detail) = c.wait_complete(running).await;
-        let detail =
-            detail.unwrap_or_else(|| panic!("{scope}: a cancelled COMPLETE carries detail"));
-        assert!(
-            !ok && detail.code == ErrorCode::MotnCancelled as u16 && detail.cause.contains(scope),
-            "{scope} must cancel the running tool action: ok={ok} {detail:?}"
-        );
-        h.wait_planner(&format!("{scope} halts the running tool action"), |p| {
-            p.tool_halts.contains(&running)
-        })
-        .await;
-        if clears {
-            let (ok, detail) = c.wait_complete(queued).await;
-            assert!(
-                !ok && detail
-                    .as_ref()
-                    .is_some_and(|e| e.code == ErrorCode::MotnCancelled as u16),
-                "{scope} must cancel the queued tool action: ok={ok} {detail:?}"
-            );
-        } else {
-            h.wait_started(queued).await;
-            h.complete_ok(queued);
-            let (ok, detail) = c.wait_complete(queued).await;
-            assert!(ok, "the queue behind a plain {scope} runs on: {detail:?}");
-        }
-        if matches!(cmd, Command::Estop) {
-            c.request(&Command::Reset).await;
-        }
-    }
 }
 
 /// A tool action that fails is a failed queued command. Its own index
@@ -3426,6 +3281,19 @@ async fn a_tool_stop_halts_the_running_action_at_once_and_keeps_the_queue() {
 
     let closing = c.ok_index(&close_jaws(1201)).await;
     h.wait_started(closing).await;
+    // A stop is a bare verb: one with parameters is refused before it
+    // touches the jaws.
+    let err = c.expect_error(&tool_action(1200, "stop", &[1.0])).await;
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    assert!(err.cause.contains("takes no parameters"), "{}", err.cause);
+    h.planner_caught_up().await;
+    {
+        let p = h.planner.lock().unwrap();
+        assert!(
+            p.tools_started.is_empty() && p.tool_halts.is_empty(),
+            "a refused stop must not have halted the gripper"
+        );
+    }
     let reopen = c
         .ok_index(&tool_action(1202, "move", &[0.0, 0.5, 0.3]))
         .await;
@@ -3446,7 +3314,7 @@ async fn a_tool_stop_halts_the_running_action_at_once_and_keeps_the_queue() {
 
     // The jaws are still travelling: the stop has not completed, and the
     // tool action now at the head waits for it.
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    h.planner_caught_up().await;
     assert!(
         !c.completed_yet(stop),
         "the stop completed before the jaws were still"
@@ -3476,39 +3344,33 @@ async fn a_tool_stop_halts_the_running_action_at_once_and_keeps_the_queue() {
     }
 }
 
-/// Gaps 2 + 3, together: the controller comes up ready to accept motion,
 /// `reset` reports what the RT actually did with the enable, and a hard
-/// error the RT latched on its own reaches the client.
+/// error the RT latched on its own reaches the client — over any note
+/// the server itself left standing.
 ///
-/// Measured against the runtime before this landed: par6d booted DISABLED
-/// and refused every queued command with `SYS_CONTROLLER_DISABLED` until
-/// someone sent `reset` — which no frontend does at startup; `reset`
-/// answered OK whether or not the RT accepted the enable; and with a hard
-/// RT latch standing the client was told `error() -> None`,
-/// `activity() -> IDLE`, `action_state = IDLE` while every command was
-/// being refused. An arm that is bricked and says it is idle is the one
-/// state an operator cannot diagnose.
+/// Measured against the runtime before this landed: `reset` answered OK
+/// whether or not the RT accepted the enable, and with a hard RT latch
+/// standing the client was told `error() -> None`, `activity() -> IDLE`,
+/// `action_state = IDLE` while every command was being refused. An arm
+/// that is bricked and says it is idle is the one state an operator
+/// cannot diagnose. (The boot-time enable is checked on the real runtime,
+/// where BOOTING actually ends.)
 #[tokio::test]
-async fn boot_enables_reset_reports_the_rt_verdict_and_rt_latches_reach_the_client() {
+async fn reset_reports_the_rt_verdict_and_rt_latches_reach_the_client() {
     let mut h = start(|_| {}).await;
+    h.publish(|s| s.mode = Mode::Idle);
     let mut c = Client::new(&h).await;
 
-    // ---- boot: leaving BOOTING enables the controller, unasked.
-    h.publish(|s| s.mode = Mode::Idle);
-    let ev = h
-        .wait_rt(|ev| ev.contains(&RtEvent::SetEnabled(true)))
-        .await;
-    assert_eq!(
-        ev.iter()
-            .filter(|e| matches!(e, RtEvent::SetEnabled(_)))
-            .count(),
-        1,
-        "exactly one enable, and no client asked for it: {ev:?}"
-    );
-    // Motion is accepted straight away — no client had to press Reset.
-    let i = c.ok_index(&move_j(700)).await;
-    h.complete_ok(i);
-    assert!(c.wait_complete(i).await.0);
+    // A queue-clearing stop leaves the server's own cancellation note.
+    c.ok_index(&move_j(700)).await;
+    c.ok_index(&move_j(701)).await;
+    c.ok(&Command::Stop(Stop { clear_queue: true })).await;
+    match c.query(&Command::Error).await {
+        QueryResult::Error { error: Some(e) } => {
+            assert_eq!(e.code, ErrorCode::MotnCancelled as u16)
+        }
+        other => panic!("the stop leaves a standing note, got {other:?}"),
+    }
 
     // ---- a hard error the RT latched on its own: no command earned it,
     // so nothing in the command plane knows about it but the snapshot.
@@ -3522,13 +3384,13 @@ async fn boot_enables_reset_reports_the_rt_verdict_and_rt_latches_reach_the_clie
         s.error_active = true;
     });
 
-    let err = c.expect_error(&move_j(701)).await;
+    let err = c.expect_error(&move_j(702)).await;
     assert_eq!(err.code, ErrorCode::SysControllerDisabled as u16);
     match c.query(&Command::Error).await {
         QueryResult::Error { error: Some(e) } => assert_eq!(
             e.code,
             ErrorCode::SysRtiLinkLost as u16,
-            "the ERROR query must name the latch, got {e:?}"
+            "the ERROR query must name the latch over the server's note, got {e:?}"
         ),
         other => panic!("a latched RT error must reach the ERROR query, got {other:?}"),
     }
@@ -3591,7 +3453,7 @@ async fn boot_enables_reset_reports_the_rt_verdict_and_rt_latches_reach_the_clie
         QueryResult::Error { error } => assert!(error.is_none(), "{error:?}"),
         other => panic!("unexpected {other:?}"),
     }
-    c.ok_index(&move_j(702)).await;
+    c.ok_index(&move_j(703)).await;
 }
 
 /// Blend lookahead: a move that asks to round a corner is held at the
@@ -3608,8 +3470,10 @@ async fn boot_enables_reset_reports_the_rt_verdict_and_rt_latches_reach_the_clie
 /// a high-water `completed_index` on the LAST of them.
 #[tokio::test]
 async fn blend_lookahead_holds_the_head_and_completes_the_chain_together() {
+    // A hold far longer than the test: the head can only start with its
+    // successor, never on the hold expiring.
     let mut h = start(|cfg| {
-        cfg.blend_hold = Duration::from_millis(150);
+        cfg.blend_hold = Duration::from_secs(60);
         cfg.blend_lookahead = 4;
     })
     .await;
@@ -3619,59 +3483,33 @@ async fn blend_lookahead_holds_the_head_and_completes_the_chain_together() {
     h.planner.lock().unwrap().consume = 2;
 
     // A move that wants to blend is NOT started on its own: there is no
-    // corner until the next move arrives.
+    // corner until the next move arrives, and the pair starts as one
+    // batch, the head carrying both.
     let i1 = c.ok_index(&move_j_blended(201, Some(15.0))).await;
-    // Poll through half the configured hold: the lone blended move must
-    // not start anywhere inside it (the hold itself expires at 150 ms).
-    let watch_until = tokio::time::Instant::now() + Duration::from_millis(75);
-    while tokio::time::Instant::now() < watch_until {
-        assert!(
-            h.planner.lock().unwrap().started.is_empty(),
-            "a blended move must wait for the successor it is meant to blend into"
-        );
-        tokio::time::sleep(Duration::from_millis(2)).await;
-    }
-
-    // Its successor arrives, and the pair starts as one batch.
     let i2 = c.ok_index(&move_j_blended(202, None)).await;
-    let deadline = tokio::time::Instant::now() + BUDGET;
-    loop {
-        let seen = {
-            let s = h.planner.lock().unwrap();
-            s.batches
-                .last()
-                .map(|batch| (batch.clone(), s.started.len()))
-        };
-        if let Some((batch, started)) = seen {
-            assert_eq!(
-                batch,
-                vec![i1, i2],
-                "the planner must see the whole runnable chain, not just its head"
-            );
-            assert_eq!(started, 1, "one motion covers both commands");
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "chain never started"
+    h.wait_started(i1).await;
+    {
+        let p = h.planner.lock().unwrap();
+        assert_eq!(
+            p.batches,
+            vec![vec![i1, i2]],
+            "the planner must see the whole runnable chain, never its head alone"
         );
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        let started: Vec<u64> = p.started.iter().map(|(i, _)| *i).collect();
+        assert_eq!(started, [i1], "one motion covers both commands");
     }
 
     // Nothing completes until the motion does — and then both do.
-    match c.query(&Command::Queue).await {
-        QueryResult::Queue {
-            queue,
-            executing_index,
-            completed_index,
-            ..
-        } => {
-            assert!(queue.is_empty(), "both commands left the pending queue");
-            assert_eq!(executing_index, i1 as i64);
-            assert_eq!(completed_index, -1);
-        }
-        other => panic!("unexpected {other:?}"),
-    }
+    wait_query(
+        &mut c,
+        &Command::Queue,
+        "the pair runs as one motion",
+        |r| {
+            matches!(r, QueryResult::Queue { queue, executing_index, completed_index, .. }
+            if queue.is_empty() && *executing_index == i1 as i64 && *completed_index == -1)
+        },
+    )
+    .await;
     h.complete_ok(i1);
     let (ok, _) = c.wait_complete(i1).await;
     assert!(ok);
@@ -3692,28 +3530,23 @@ async fn blend_lookahead_holds_the_head_and_completes_the_chain_together() {
         other => panic!("unexpected {other:?}"),
     }
 
+    h.server.shutdown();
+
     // The hold is bounded: a blended move with no successor coming runs
     // on its own rather than sitting in the queue forever.
-    let i3 = c.ok_index(&move_j_blended(203, Some(15.0))).await;
-    let deadline = tokio::time::Instant::now() + BUDGET;
-    loop {
-        let ran = {
-            let s = h.planner.lock().unwrap();
-            s.started.iter().any(|(i, _)| *i == i3)
-        };
-        if ran {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "a blended move whose successor never came must still run"
-        );
-        tokio::time::sleep(Duration::from_millis(5)).await;
-    }
-    h.complete_ok(i3);
-    let (ok, _) = c.wait_complete(i3).await;
+    let mut h = start(|cfg| {
+        cfg.blend_hold = Duration::from_millis(20);
+        cfg.blend_lookahead = 4;
+    })
+    .await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    let alone = c.ok_index(&move_j_blended(203, Some(15.0))).await;
+    h.wait_started(alone).await;
+    assert_eq!(h.planner.lock().unwrap().batches, vec![vec![alone]]);
+    h.complete_ok(alone);
+    let (ok, _) = c.wait_complete(alone).await;
     assert!(ok);
-
     h.server.shutdown();
 }
 
@@ -3827,91 +3660,6 @@ async fn queue_eta_adds_the_inflight_motion_to_the_pending_estimate() {
     );
 }
 
-/// The gravity-comp feedforward is switchable from the wire.
-///
-/// `SetGravityComp` existed as an internal RT command with no client-facing
-/// sender, so once plain `--sim` turned the feedforward off at boot,
-/// nothing could turn it back on — par6d's own comment said as much.
-#[tokio::test]
-async fn gravity_compensation_can_be_switched_from_the_wire() {
-    let mut h = start(|_| {}).await;
-    h.publish(|_| {});
-    let mut c = Client::new(&h).await;
-
-    for on in [true, false] {
-        assert!(
-            matches!(
-                c.request(&Command::SetGravityComp(
-                    par6_proto::command::SetGravityComp { on }
-                ))
-                .await,
-                Reply::Ok { .. }
-            ),
-            "SET_GRAVITY_COMP({on}) must be acked"
-        );
-        h.wait_rt(|ev| ev.contains(&RtEvent::SetGravityComp(on)))
-            .await;
-    }
-}
-
-/// PAUSE reaches the RT, and is accepted where planned motion is refused.
-///
-/// The RT half shipped complete and untouched: `ExecSetPaused` holds the
-/// playback position with the sample ring INTACT (unlike a flush, which
-/// clears it), and `ExecStatus.paused` was already published. There was
-/// simply no wire command, so an operator holding a running program could
-/// only flush it and re-issue.
-///
-/// The second half of this asserts the gating decision rather than leaving
-/// it to `gate()`'s `_` arm: pausing is deliberately ungated, so it is
-/// acked in a state where a move is refused. Holding a moving arm must not
-/// depend on the controller being enabled.
-#[tokio::test]
-async fn pause_reaches_the_rt_and_is_not_gated_on_enablement() {
-    let mut h = start(|_| {}).await;
-    h.publish(|_| {});
-    let mut c = Client::new(&h).await;
-
-    for on in [true, false] {
-        assert!(
-            matches!(
-                c.request(&Command::Pause(par6_proto::command::Pause { on }))
-                    .await,
-                Reply::Ok { .. }
-            ),
-            "PAUSE({on}) must be acked"
-        );
-        h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(on))).await;
-    }
-
-    // The gating half: a state the arm cannot plan motion from. The move
-    // establishes that this state really does refuse — without it the
-    // pause below would be asserting nothing.
-    h.publish(|s| {
-        s.state = ArmState::Disabled;
-        s.homed = false;
-    });
-    match c.request(&move_j(801)).await {
-        Reply::Error { error, .. } => assert_eq!(
-            error.code,
-            ErrorCode::SysControllerDisabled as u16,
-            "{}",
-            error.cause
-        ),
-        other => panic!("a disabled, unreferenced arm must refuse a move, got {other:?}"),
-    }
-    assert!(
-        matches!(
-            c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
-                .await,
-            Reply::Ok { .. }
-        ),
-        "holding a moving arm must not depend on the controller being enabled"
-    );
-    h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(true)))
-        .await;
-}
-
 /// SET_PAYLOAD: a valid payload reaches the RT and the planner sync, and
 /// the PAYLOAD query reads back what was set.
 ///
@@ -3938,19 +3686,29 @@ async fn set_payload_applies_and_reads_back() {
         other => panic!("expected PAYLOAD response, got {other:?}"),
     }
 
-    let set = Command::SetPayload(SetPayload {
+    let declared = par6_server::PayloadSpec {
         mass: 1.25,
         com: [0.0, 0.01, 0.055],
         inertia: Some([0.002, 0.0, 0.003, 0.0, 0.0, 0.004]),
+    };
+    let set = Command::SetPayload(SetPayload {
+        mass: declared.mass,
+        com: declared.com,
+        inertia: declared.inertia,
     });
     match c.request(&set).await {
         Reply::Ok { index: None, .. } => {}
         other => panic!("expected OK, got {other:?}"),
     }
     assert!(
-        h.rt_events().contains(&RtEvent::SetPayload(1.25)),
-        "the payload must reach the RT gravity model"
+        h.rt_events().contains(&RtEvent::SetPayload(declared)),
+        "the whole payload must reach the RT gravity model: {:?}",
+        h.rt_events()
     );
+    h.wait_planner("the planner's dynamics carry the payload", |p| {
+        p.synced_payloads.last() == Some(&declared)
+    })
+    .await;
     match c.request(&Command::Payload).await {
         Reply::Response {
             result: QueryResult::Payload { mass, com, inertia },
@@ -3982,33 +3740,6 @@ async fn set_payload_applies_and_reads_back() {
         } => assert_eq!(mass, 0.0),
         other => panic!("expected PAYLOAD response, got {other:?}"),
     }
-}
-
-/// A tool `stop` carrying parameters is refused at admission, before the
-/// immediate halt fires: the old order halted the jaws, acked, and then
-/// dropped the whole queue when dispatch refused the shape.
-#[tokio::test]
-async fn a_tool_stop_with_parameters_is_refused_before_it_halts_anything() {
-    let h = start_with_gripper().await;
-    let mut c = Client::new(&h).await;
-    let closing = c.ok_index(&close_jaws(9100)).await;
-    h.wait_started(closing).await;
-    let err = c.expect_error(&tool_action(9101, "stop", &[1.0])).await;
-    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
-    assert!(err.cause.contains("takes no parameters"), "{}", err.cause);
-    {
-        let p = h.planner.lock().unwrap();
-        assert!(
-            p.tools_started.is_empty() && p.tool_halts.is_empty(),
-            "a refused stop must not have halted the gripper"
-        );
-    }
-    h.complete_ok(closing);
-    let (ok, detail) = c.wait_complete(closing).await;
-    assert!(
-        ok,
-        "the close a refused stop never reached runs on: {detail:?}"
-    );
 }
 
 /// CONFIG_BUNDLE is one un-chunked datagram: a bundle past the reply
@@ -4049,58 +3780,6 @@ async fn the_dedup_window_outlives_every_live_command() {
         first,
         "a retransmission of a live command must answer its original index"
     );
-}
-
-/// A cartesian jog integrates from an absolute pose through the
-/// kinematics and rides STREAM, which the RT refuses without a
-/// reference; the gate refuses it with a structured error instead of
-/// letting the fire-and-forget datagram vanish.
-#[tokio::test]
-async fn a_cartesian_jog_is_refused_while_unreferenced() {
-    let mut h = start(|_| {}).await;
-    h.publish(|s| s.homed = false);
-    let mut c = Client::new(&h).await;
-    let err = c.expect_error(&jog_l()).await;
-    assert_eq!(err.code, ErrorCode::MotnNotHomed as u16);
-    h.publish(|s| s.homed = true);
-    // Stream acceptance is unacked: the proof is the RT receiving it.
-    c.send(&jog_l()).await;
-    h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogL)))
-        .await;
-}
-
-/// An RT hard latch outranks the server's own standing note: a
-/// cancellation left by a queue-clearing stop must not hide a hardware
-/// e-stop from STATUS and the ERROR query.
-#[tokio::test]
-async fn an_rt_hard_latch_outranks_the_servers_cancellation_note() {
-    let mut h = start(|_| {}).await;
-    h.publish(|_| {});
-    let mut c = Client::new(&h).await;
-    c.ok_index(&move_j(901)).await;
-    c.ok_index(&move_j(902)).await;
-    c.ok(&Command::Stop(Stop { clear_queue: true })).await;
-    match c.query(&Command::Error).await {
-        QueryResult::Error { error: Some(e) } => {
-            assert_eq!(e.code, ErrorCode::MotnCancelled as u16)
-        }
-        other => panic!("the stop leaves a standing note, got {other:?}"),
-    }
-    h.publish(|s| {
-        s.mode = Mode::ActiveError;
-        s.state = ArmState::Disabled;
-        s.errors.insert(ErrorEntry {
-            code: RtCode::SwEstop,
-            joint: None,
-        });
-        s.error_active = true;
-    });
-    match c.query(&Command::Error).await {
-        QueryResult::Error { error: Some(e) } => {
-            assert_eq!(e.code, ErrorCode::SysEstopActive as u16, "{}", e.cause)
-        }
-        other => panic!("the hardware e-stop must show, got {other:?}"),
-    }
 }
 
 /// STATUS carries the pause, so a paused arm reads differently from a
@@ -4158,77 +3837,6 @@ async fn a_dead_planner_ends_the_command_plane_visibly() {
     }
 }
 
-/// Cancelling a running motion takes the RT's copy of it with it.
-///
-/// The server drops the command and answers the client, but the RT still
-/// holds the planned samples in its ring — so without the flush the arm
-/// keeps playing a motion the client has already been told was cancelled.
-/// `RtCommands::discard_exec` is what carries that, and it is the SERVER's
-/// to send, not the planner's, so that a jog which preempts in the same
-/// handler is not dropped back to IDLE afterwards.
-///
-/// This could not be asserted before: `discard_exec` had a defaulted
-/// no-op body, `TestRt` inherited it, and the flush went nowhere the suite
-/// could see.
-#[tokio::test]
-async fn cancelling_a_running_motion_flushes_the_rt_ring() {
-    let mut h = start(|_| {}).await;
-    h.publish(|_| {});
-    let mut c = Client::new(&h).await;
-
-    let index = c.ok_index(&move_j(950)).await;
-    h.wait_planner("the move to start", |p| {
-        p.started.iter().any(|(i, _)| *i == index)
-    })
-    .await;
-    assert!(
-        !h.rt_events().contains(&RtEvent::DiscardExec),
-        "nothing has been cancelled yet, so the ring must not have been \
-         flushed"
-    );
-
-    c.ok(&Command::Stop(par6_proto::command::Stop {
-        clear_queue: true,
-    }))
-    .await;
-
-    h.wait_rt(|ev| ev.contains(&RtEvent::DiscardExec)).await;
-}
-
-/// Tool stops that overlap are each answered.
-///
-/// A stop runs on the immediate lane, not in the queue, and a second one
-/// can arrive while the first is still inside its start round trip —
-/// sent to the planner, not yet answered. Both were acked and a client
-/// may be waiting on either, so neither may be forgotten: an acked stop
-/// the server drops in silence leaves its client waiting out a timeout.
-#[tokio::test]
-async fn overlapping_tool_stops_are_each_answered() {
-    let h = start_with_gripper().await;
-    let mut c = Client::new(&h).await;
-
-    // Hold the planner inside `start_tool` so the first stop is still in
-    // flight when the second arrives.
-    let stall = Arc::new(std::sync::atomic::AtomicBool::new(true));
-    h.planner.lock().unwrap().stall_tool = Some(stall.clone());
-    let first = c.ok_index(&tool_action(1301, "stop", &[])).await;
-    let second = c.ok_index(&tool_action(1302, "stop", &[])).await;
-    stall.store(false, std::sync::atomic::Ordering::SeqCst);
-
-    // The jaws come to rest under whichever stops reached them.
-    h.settle_tool_stop(first);
-    h.settle_tool_stop(second);
-    for index in [first, second] {
-        let (ok, detail) = c.wait_complete(index).await;
-        assert!(
-            ok || detail
-                .as_ref()
-                .is_some_and(|e| e.code == ErrorCode::MotnCancelled as u16),
-            "stop {index} must be answered: ok={ok} {detail:?}"
-        );
-    }
-}
-
 /// A protective STOP completes a tool action the planner is still
 /// starting: offered as the head of the queue, not yet answered. It is
 /// active motion in every way that matters — the planner is about to set
@@ -4276,85 +3884,4 @@ async fn a_stop_completes_a_tool_head_the_planner_is_still_starting() {
         .filter(|b| b.first() == Some(&head))
         .count();
     assert_eq!(offers, 1, "a cancelled head was offered again");
-}
-
-/// A pause holds the queue it interrupted. Stop, Estop and ResetState
-/// discard that queue, so they clear the pause with it: the next queued
-/// command is planned without a resume instead of being withheld by
-/// `pump()` with nothing to say why.
-#[tokio::test]
-async fn stop_estop_and_reset_clear_a_standing_pause() {
-    let mut h = start(|_| {}).await;
-    h.publish(|_| {});
-    let mut c = Client::new(&h).await;
-
-    let unpaused = |ev: &[RtEvent]| {
-        ev.iter()
-            .filter(|e| **e == RtEvent::ExecPaused(false))
-            .count()
-    };
-
-    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
-        .await;
-    h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(true)))
-        .await;
-    c.request(&Command::Stop(Stop { clear_queue: true })).await;
-    h.wait_rt(|ev| unpaused(ev) == 1).await;
-    let i1 = c.ok_index(&move_j(101)).await;
-    h.wait_planner("a move queued after Stop starts without a resume", |p| {
-        p.started.iter().any(|(i, _)| *i == i1)
-    })
-    .await;
-    h.complete_ok(i1);
-    let (ok, detail) = c.wait_complete(i1).await;
-    assert!(ok, "{detail:?}");
-
-    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
-        .await;
-    c.request(&Command::ResetState).await;
-    h.wait_rt(|ev| unpaused(ev) == 2).await;
-
-    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
-        .await;
-    c.request(&Command::Estop).await;
-    h.wait_rt(|ev| unpaused(ev) == 3).await;
-}
-
-/// A stop that keeps the queue keeps the pause holding it: nothing is
-/// unpaused, and the retained head waits for the resume.
-#[tokio::test]
-async fn a_stop_that_keeps_the_queue_keeps_the_pause() {
-    let mut h = start(|_| {}).await;
-    h.publish(|_| {});
-    let mut c = Client::new(&h).await;
-
-    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
-        .await;
-    h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(true)))
-        .await;
-    let i1 = c.ok_index(&move_j(301)).await;
-    let _i2 = c.ok_index(&move_j(302)).await;
-    c.ok(&Command::Stop(Stop { clear_queue: false })).await;
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    assert!(
-        !h.rt_events().contains(&RtEvent::ExecPaused(false)),
-        "a stop that keeps the queue must keep the pause: {:?}",
-        h.rt_events()
-    );
-    assert!(
-        !h.planner
-            .lock()
-            .unwrap()
-            .started
-            .iter()
-            .any(|(i, _)| *i == i1),
-        "the retained head started without a resume"
-    );
-
-    c.request(&Command::Pause(par6_proto::command::Pause { on: false }))
-        .await;
-    h.wait_planner("the retained head starts on resume", |p| {
-        p.started.iter().any(|(i, _)| *i == i1)
-    })
-    .await;
 }

@@ -768,9 +768,13 @@ mod tests {
             0.0,
             std::f64::consts::PI,
         ];
+        let (cond_max, sigma_min) = (
+            bundle.robot.motion.singularity_cond_max,
+            bundle.robot.motion.singularity_sigma_min,
+        );
         let (sigma, cond) = cart.singularity(&singular).expect("metrics");
         assert!(
-            cond > 1000.0 || sigma < 1e-4,
+            cond > cond_max || sigma < sigma_min,
             "the straight wrist must read singular: sigma {sigma:.6}, cond {cond:.0}"
         );
 
@@ -778,7 +782,7 @@ mod tests {
         let healthy = [0.3, -1.2, 2.4, 0.4, -0.9, 2.0];
         let (sigma, cond) = cart.singularity(&healthy).expect("metrics");
         assert!(
-            cond <= 1000.0 && sigma >= 1e-4,
+            cond <= cond_max && sigma >= sigma_min,
             "a bent pose must read healthy: sigma {sigma:.6}, cond {cond:.0}"
         );
     }

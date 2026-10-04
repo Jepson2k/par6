@@ -351,13 +351,14 @@ fn cartesian_surface_over_protocol_v2() {
         rel: false,
     });
     let i = c.ok_index(&move_l);
-    let path: Vec<[f64; 3]> = rig
-        .collect_status(Duration::from_secs_f64(MOVE_S + 1.0))
-        .iter()
-        .map(tcp_mm)
-        .collect();
+    let frames = rig.collect_status(Duration::from_secs_f64(MOVE_S + 1.0));
+    let path: Vec<[f64; 3]> = frames.iter().map(tcp_mm).collect();
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "move_l must complete ok, got {detail:?}");
+    assert!(
+        !frames.iter().any(near_singular),
+        "a line through a healthy region crossed the shipped singularity thresholds"
+    );
 
     let moving: Vec<[f64; 3]> = path
         .into_iter()
@@ -705,61 +706,122 @@ fn a_full_speed_move_lands_cleanly() {
     rig.shutdown();
 }
 
+fn near_singular(s: &Status) -> bool {
+    s.warnings
+        .iter()
+        .any(|w| w.code == ErrorCode::TrajNearSingularity as u16)
+}
+
+/// The near-singularity warning reads the config's thresholds and stands
+/// while the path that crossed them runs. A condition limit of 1, which
+/// every jacobian exceeds, flags a line through the same healthy region
+/// the shipped thresholds pass; the move still runs, and the warning
+/// clears once it lands.
+#[test]
+fn a_path_past_the_singularity_thresholds_warns_while_it_runs() {
+    let config = test_config("singular");
+    let text = std::fs::read_to_string(&config).expect("read test config");
+    let patched = text.replace(
+        "singularity_cond_max = 1000.0",
+        "singularity_cond_max = 1.0",
+    );
+    assert_ne!(patched, text, "singularity_cond_max patch point must exist");
+    std::fs::write(&config, patched).expect("write singular config");
+    let rig = Rig::boot_with(config);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    enable_and_teleport(&rig, &mut c, CART_START_DEG);
+    let s = rig.wait_status("start pose", |_| true);
+    assert!(!near_singular(&s), "nothing has run yet");
+    let start = tcp_mm(&s);
+    let target = [start[0] + 60.0, start[1], start[2] + 60.0];
+    let i = c.ok_index(&move_l_to(1101, wire_pose_at(&s.pose, target), MOVE_S));
+    let warned = rig.wait_status("the warning while the path runs", near_singular);
+    assert!(
+        distance(tcp_mm(&warned), target) > 1.0,
+        "the warning must stand while the move is still under way"
+    );
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "a warning, not a refusal: {detail:?}");
+    rig.wait_status("the warning clears once the path lands", |s| {
+        !near_singular(s)
+    });
+    rig.shutdown();
+}
+
 // ---- gravity reads the gripper config --------------------------------------
 
-/// The gravity model reads the gripper CONFIG, not just the URDF.
+/// The gravity model reads the gripper CONFIG, not just the URDF, and
+/// carries a declared payload whole.
 ///
 /// Boot plain `--sim` twice; the only difference is the active gripper's
 /// `[kinematics] mass_kg` (0.37 kg stock vs 2.37 kg — a tool two kilos
-/// heavier). At the same teleported posture the published external
-/// torque must shift by the extra tool weight: about 6.7 Nm at the
-/// shoulder and 0.3 Nm at the wrist pitch for these numbers.
+/// heavier). At the same posture the model's G(q) must shift by the extra
+/// tool weight: about 6.7 Nm at the shoulder and 0.3 Nm at the wrist
+/// pitch for these numbers. On the stock arm a SET_PAYLOAD with an
+/// offset centre of mass and an inertia then has to land in the model as
+/// declared, every term of it, and read back as declared.
 ///
-/// STATUS publishes `torques_ext = measured − G(q)`, and the kinematic
-/// plant measures no torque, so what arrives is the model's own gravity
-/// with the sign flipped — which is why the magnitudes below are read
-/// off `torques_ext` directly.
-///
-/// Failing before the wiring landed, twice over: par6d built its gravity
-/// model with `tool: None`, so `mass_kg` was parsed, validated and read
-/// by nothing — the promised "masses/COM/inertia from config" was false —
-/// and plain `--sim` installed `ZeroGravity`, so the same field
-/// published all-zero torques no matter the model. (The feedforward is
-/// still never APPLIED on the kinematic plant: comp is disabled at boot,
-/// publish-only.)
+/// STATUS carries the filtered measured torque and `torques_ext` = that
+/// minus G(q) from the same tick, so their difference is the model's own
+/// G(q) whatever the plant is doing.
 #[test]
 fn gripper_config_mass_changes_published_gravity_torque() {
-    fn published_gravity(tag: &str, mass_kg: f64) -> ([f64; NUM_JOINTS], [f64; NUM_JOINTS]) {
-        let rig = Rig::boot_with(test_config_with_tool_mass(tag, mass_kg));
+    let model_g = |s: &Status| -> [f64; NUM_JOINTS] {
+        std::array::from_fn(|j| s.torques[j] - s.torques_ext[j])
+    };
+    let payload = SetPayload {
+        mass: 1.2,
+        com: [0.02, -0.01, 0.06],
+        inertia: Some([2e-3, 1e-4, 3e-3, -2e-4, 1e-4, 2.5e-3]),
+    };
+    let run = |tag: &str, mass_kg: f64, declare: bool| {
+        let config = test_config_with_tool_mass(tag, mass_kg);
+        let rig = Rig::boot_with(config.clone());
         let mut c = Client::new(rig.addr());
         rig.wait_status("link_ok", |s| s.link_ok == 1);
         c.ok(&Command::Reset);
         enable_and_teleport(&rig, &mut c, CART_START_DEG);
+        // G(q) is exact on any tick; the heavy tool's wrist cannot hold
+        // this posture for long, so it is read on landing.
         let at = rig.wait_status("at the probe posture", |s| {
             angles_close(&s.angles, &CART_START_DEG, 0.1)
-                && s.torques_ext.iter().any(|t| t.abs() > 1e-9)
+        });
+        let loaded = declare.then(|| {
+            c.ok(&Command::SetPayload(payload.clone()));
+            let readback = match c.query(&Command::Payload) {
+                QueryResult::Payload { mass, com, inertia } => (mass, com, inertia),
+                other => panic!("unexpected {other:?}"),
+            };
+            let s = rig.wait_status("the payload reaches the model", |s| {
+                (model_g(s)[1] - model_g(&at)[1]).abs() > 1.0
+            });
+            (config, readback, s)
         });
         rig.shutdown();
-        (at.angles, at.torques_ext)
-    }
+        (at, loaded)
+    };
 
-    let (q_stock, g_stock) = published_gravity("grav-stock", 0.37);
-    let (q_heavy, g_heavy) = published_gravity("grav-heavy", 2.37);
+    let (stock, loaded) = run("grav-stock", 0.37, true);
+    let (heavy, _) = run("grav-heavy", 2.37, false);
+    let (q_stock, g_stock) = (stock.angles, model_g(&stock));
+    let (q_heavy, g_heavy) = (heavy.angles, model_g(&heavy));
     assert!(
         angles_close(&q_stock, &q_heavy, 0.2),
         "the two runs must be compared at the same posture: {q_stock:?} vs {q_heavy:?}"
     );
 
-    // Plain --sim publishes the real model, not placeholder zeros: the
+    // Plain --sim runs the real model, not placeholder zeros: the
     // shoulder carries most of the arm at this posture.
     assert!(
         g_stock[1].abs() > 2.0,
-        "published shoulder gravity torque is {:.3} Nm — the kinematic-sim \
-         runtime is publishing a placeholder, not G(q)",
+        "the shoulder's model gravity torque is {:.3} Nm — the runtime is \
+         running a placeholder, not G(q)",
         g_stock[1]
     );
-    // The config knob reaches the published torque, at the joints the
-    // extra tool mass actually loads.
+    // The config knob reaches the model, at the joints the extra tool
+    // mass actually loads.
     let d_shoulder = (g_heavy[1] - g_stock[1]).abs();
     let d_wrist = (g_heavy[4] - g_stock[4]).abs();
     assert!(
@@ -774,13 +836,45 @@ fn gripper_config_mass_changes_published_gravity_torque() {
          {d_wrist:.3} Nm (expected ~0.3): the tool attaches to the wrong link \
          or not at all"
     );
-    // And J0 stays gravity-free: its axis is vertical, so a value here
-    // means the tool was attached in the wrong frame.
+    // J0's axis is vertical, so a value here means the tool was attached
+    // in the wrong frame.
     assert!(
         g_heavy[0].abs() < 1e-6,
         "J0 is on the vertical axis and must carry no gravity torque, got {:.6}",
         g_heavy[0]
     );
+
+    // The declared payload, every term, is what the runtime's model holds.
+    let (config, readback, s) = loaded.expect("the stock run declared a payload");
+    assert_eq!(
+        readback,
+        (
+            payload.mass,
+            payload.com,
+            payload.inertia.expect("declared")
+        ),
+        "the payload reads back as declared"
+    );
+    let bundle = par6_config::ConfigBundle::load(&config).expect("test config");
+    let mut kin = par6d::kin::load_gravity_kin(&common::assets_dir(), bundle.active_tool())
+        .expect("gravity model");
+    kin.set_gravity_correction(&bundle.robot.gravity_correction)
+        .expect("gravity correction");
+    kin.set_tool(payload.mass, payload.com, payload.inertia)
+        .expect("payload");
+    let mut want = [0.0; NUM_JOINTS];
+    kin.gravity(&s.angles.map(f64::to_radians), &mut want)
+        .expect("gravity");
+    let got = model_g(&s);
+    for j in 0..NUM_JOINTS {
+        let want = want[j] * bundle.robot.gravity_scale[j];
+        assert!(
+            (got[j] - want).abs() < 1e-3,
+            "J{j}: the runtime's model holds {:.4} Nm under the payload, the \
+             declared payload gives {want:.4}",
+            got[j]
+        );
+    }
 }
 
 // ---- collision enforcement -------------------------------------------------
