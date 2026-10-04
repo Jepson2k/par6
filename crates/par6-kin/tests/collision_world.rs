@@ -341,6 +341,22 @@ fn verdicts_follow_the_world_on_every_variant() {
             pair_set(&mut col, &REACH).is_empty(),
             "{variant:?}: a margin short of the gap must not"
         );
+
+        // A shape with no margin of its own stands off by the model's
+        // clearance instead, the same way.
+        for (clearance, want_hit) in [(gap - 0.01, false), (gap + 0.01, true)] {
+            let mut cleared = load(variant, clearance);
+            assert_eq!(cleared.clearance(), clearance);
+            cleared
+                .set_layer(Layer::Program, std::slice::from_ref(&standoff))
+                .unwrap();
+            let pairs = pair_set(&mut cleared, &REACH);
+            assert_eq!(
+                involves(&pairs, "standoff"),
+                want_hit,
+                "{variant:?}: clearance {clearance} against a shape {gap:.3} m away: {pairs:?}"
+            );
+        }
     }
 }
 
@@ -426,33 +442,6 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
         involves(&names, "keepout"),
         "a refused SET_SHAPES must leave the previous world enforced: {names:?}"
     );
-}
-
-/// A shape without its own margin inherits the model-wide clearance — the
-/// "robot's global clearance applies" half of waldoctl's margin contract.
-#[test]
-fn model_clearance_applies_to_shapes_without_a_margin() {
-    let variant = GripperVariant::Flange;
-    let standoff = standoff_sphere(variant);
-    assert!(standoff.margin.is_none());
-    let gap = {
-        let mut col = load(variant, 0.0);
-        col.set_layer(Layer::Program, std::slice::from_ref(&standoff))
-            .unwrap();
-        col.world_distance(&REACH).unwrap()
-    };
-    assert!(gap > 0.02, "the standoff must stand clear, gap {gap} m");
-    for (clearance, want_hit) in [(0.0, false), (gap + 0.01, true)] {
-        let mut col = load(variant, clearance);
-        assert_eq!(col.clearance(), clearance);
-        col.set_layer(Layer::Program, std::slice::from_ref(&standoff))
-            .unwrap();
-        assert_eq!(
-            col.check(&REACH, false).unwrap().active(),
-            want_hit,
-            "clearance {clearance} against a shape {gap:.3} m away"
-        );
-    }
 }
 
 /// The planner's per-segment question: does the straight joint-space path
@@ -765,17 +754,33 @@ fn the_srdf_silences_rest_contact_and_permanent_overlap_and_nothing_else() {
         );
         // The arm-only check API holds the jaws still, so a pair the jaw
         // sweep put in rest contact cannot be reproduced here; every
-        // other silenced pair has to be one the meshes actually touch.
-        let over: Vec<_> = srdf
-            .iter()
-            .filter(|(a, b)| !a.contains("jaw") && !b.contains("jaw"))
-            .filter(|p| !ever.contains(p))
-            .collect();
+        // other silenced pair has to be one the arm cannot help — in
+        // contact at park, or in overlap across the window.
+        let unavoidable: BTreeSet<(String, String)> = rest.union(&always).cloned().collect();
+        let overreach = |silenced: &BTreeSet<(String, String)>| -> Vec<(String, String)> {
+            silenced
+                .iter()
+                .filter(|(a, b)| !a.contains("jaw") && !b.contains("jaw"))
+                .filter(|p| !unavoidable.contains(*p))
+                .cloned()
+                .collect()
+        };
+        let over = overreach(&srdf);
         assert!(
             over.is_empty(),
-            "{variant:?}: the SRDF silences {over:?}, which never touched in {SAMPLES} \
-             soft-window samples or at park: a real contact there would go unreported"
+            "{variant:?}: the SRDF silences {over:?}, which only touch in some poses: \
+             a real contact there would go unreported"
         );
+        // The control: silencing a pair that touches only in some folds
+        // is exactly what that check reports.
+        let intermittent = ever
+            .iter()
+            .find(|p| !unavoidable.contains(*p) && !p.0.contains("jaw") && !p.1.contains("jaw"))
+            .expect("the window has folds that are contact only some of the time")
+            .clone();
+        let mut too_much = srdf.clone();
+        too_much.insert(intermittent.clone());
+        assert_eq!(overreach(&too_much), [intermittent]);
 
         // And the consequence the runtime depends on: with the SRDF
         // applied, the pose the config declares valid checks clean.

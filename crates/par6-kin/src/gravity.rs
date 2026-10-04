@@ -162,6 +162,14 @@ pub fn fit_payload(
             samples.len()
         )));
     }
+    if let Some(k) = samples
+        .iter()
+        .position(|s| s.q.iter().chain(&s.tau).any(|v| !v.is_finite()))
+    {
+        return Err(KinError::Load(format!(
+            "payload fit sample {k} carries a non-finite angle or torque"
+        )));
+    }
     let nb = kin.body_count();
     let cols = 4 * nb;
     // The payload body is the last in the chain, so its parameters are

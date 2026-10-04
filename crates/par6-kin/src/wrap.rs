@@ -66,11 +66,15 @@ pub fn wrap_to_window(value: f64, seed: f64, min: f64, max: f64) -> f64 {
 mod tests {
     use super::*;
 
-    /// The reported failures: a solution outside its window whose own
-    /// 2π family has a member inside it must come back as that member.
+    /// A solution outside its window comes back as the member of its 2π
+    /// family inside it, on the branch nearest the seed when several fit;
+    /// one with no member inside is still normalized, to the nearest
+    /// miss, so the refusal downstream names the angle the arm would have
+    /// to reach; and what the solver cannot have meant passes through.
     #[test]
-    fn brings_a_turned_solution_back_into_its_window() {
-        // J4: solved 5.366 rad against [-2.6147335, 2.5547335].
+    fn wraps_into_the_window_on_the_branch_nearest_the_seed() {
+        // The reported failures. J4: solved 5.366 rad against
+        // [-2.6147335, 2.5547335].
         let wrapped = wrap_to_window(5.366_112_773_926_797, 0.0, -2.6147335, 2.5547335);
         assert!((wrapped - (5.366_112_773_926_797 - TAU)).abs() < 1e-12);
         assert!((-2.6147335..=2.5547335).contains(&wrapped));
@@ -79,53 +83,33 @@ mod tests {
         let wrapped = wrap_to_window(7.434_264_594_195_476, 0.0, -2.8647335, 2.8647335);
         assert!((-2.8647335..=2.8647335).contains(&wrapped), "{wrapped}");
         assert!((wrapped - (7.434_264_594_195_476 - TAU)).abs() < 1e-12);
-    }
 
-    /// Many turns out AND out of range: normalizing still has to happen,
-    /// so the refusal downstream names the angle the arm would actually
-    /// have to reach rather than the turn count the solver integrated.
-    #[test]
-    fn normalizes_before_giving_up_on_an_out_of_range_solution() {
-        // J1: solved 84.75 rad — 13 turns out, and 84.75 - 13·2π = 3.07
-        // still misses [-2.8647335, 2.8647335].
+        // Many turns out AND out of range: 84.75 rad is 13 turns out, and
+        // 84.75 - 13·2π = 3.07 still misses J1's window.
         let wrapped = wrap_to_window(84.75, 0.0, -2.8647335, 2.8647335);
         assert!((wrapped - (84.75 - 13.0 * TAU)).abs() < 1e-12, "{wrapped}");
         assert!(wrapped > 2.8647335);
-    }
 
-    /// A window wider than 2π (PAR6's J6 spans 7.99 rad) admits several
-    /// branches; the one that does not spin the joint away from where
-    /// it already is has to win, or wrapping would manufacture the very
-    /// branch flip the caller's continuity guard exists to catch.
-    #[test]
-    fn picks_the_branch_nearest_the_seed_when_several_fit() {
+        // A window wider than 2π (PAR6's J6 spans 7.99 rad) admits several
+        // branches; the one that does not spin the joint away from where it
+        // already is has to win, or wrapping would manufacture the very
+        // branch flip the caller's continuity guard exists to catch.
         let (min, max) = (-0.85, 7.14);
         assert!((wrap_to_window(0.5, 6.2, min, max) - (0.5 + TAU)).abs() < 1e-12);
         assert!((wrap_to_window(0.5 + TAU, 0.1, min, max) - 0.5).abs() < 1e-12);
-        // Already the nearest branch: unchanged, not spun by a turn.
         assert!((wrap_to_window(3.0, 3.1, min, max) - 3.0).abs() < 1e-12);
-    }
 
-    /// Out of range is out of range at every turn count: the value must
-    /// survive as the nearest miss so the caller can refuse it and say
-    /// by how much.
-    #[test]
-    fn leaves_a_genuinely_unreachable_angle_outside() {
-        // J5: [-1.73, 1.6]; 2.0 rad misses, and every branch misses more.
-        let wrapped = wrap_to_window(2.0, 0.0, -1.73, 1.6);
-        assert!((wrapped - 2.0).abs() < 1e-12, "{wrapped}");
-        // A narrow window still yields the nearest branch, not a wild one.
-        let wrapped = wrap_to_window(2.0 + 3.0 * TAU, 0.0, -1.73, 1.6);
-        assert!((wrapped - 2.0).abs() < 1e-12, "{wrapped}");
-    }
+        // Out of range at every turn count: the nearest miss survives. J5:
+        // [-1.73, 1.6]; 2.0 rad misses, and every branch misses more.
+        assert!((wrap_to_window(2.0, 0.0, -1.73, 1.6) - 2.0).abs() < 1e-12);
+        assert!((wrap_to_window(2.0 + 3.0 * TAU, 0.0, -1.73, 1.6) - 2.0).abs() < 1e-12);
 
-    /// The seam feeds this whatever the solver produced, including the
-    /// NaN a failed solve can carry.
-    #[test]
-    fn passes_non_finite_and_degenerate_windows_through() {
+        // The NaN a failed solve can carry, a seed that is not one, and an
+        // empty window all come back untouched — even where a turn would
+        // otherwise have brought the value inside.
         assert!(wrap_to_window(f64::NAN, 0.0, -1.0, 1.0).is_nan());
         assert_eq!(wrap_to_window(f64::INFINITY, 0.0, -1.0, 1.0), f64::INFINITY);
-        assert_eq!(wrap_to_window(3.0, f64::NAN, -1.0, 1.0), 3.0);
-        assert_eq!(wrap_to_window(3.0, 0.0, 1.0, -1.0), 3.0);
+        assert_eq!(wrap_to_window(5.0, f64::NAN, -1.0, 1.0), 5.0);
+        assert_eq!(wrap_to_window(7.0, 0.0, 1.0, -1.0), 7.0);
     }
 }

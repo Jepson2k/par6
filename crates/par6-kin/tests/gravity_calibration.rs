@@ -229,16 +229,43 @@ fn an_empty_hand_identifies_as_empty_and_a_still_wrist_says_so() {
     );
 }
 
+/// The fit refuses what it cannot use — no samples, a ridge that is not
+/// a non-negative number, a torque that is not one — on a pose set it
+/// otherwise identifies a payload from.
 #[test]
 fn the_payload_fit_refuses_what_it_cannot_use() {
     let mut kin = Kin::load_arm(&assets_dir(), None).unwrap();
+    kin.set_tool(0.8, [0.01, -0.02, 0.05], None).unwrap();
+    let samples: Vec<GravitySample> = wrist_poses([-2.007, -0.698, 3.491, 0.0, 1.047, 3.1416], 0.5)
+        .into_iter()
+        .map(|q| {
+            let mut tau = [0.0; NQ];
+            kin.gravity(&q, &mut tau).unwrap();
+            GravitySample { q, tau }
+        })
+        .collect();
+    kin.set_tool(0.0, [0.0; 3], None).unwrap();
+    let fit = gravity::fit_payload(&mut kin, &samples, 1e-6).expect("the control fits");
+    assert!(
+        (fit.mass - 0.8).abs() < 0.01,
+        "the control: {} kg",
+        fit.mass
+    );
+
     assert!(gravity::fit_payload(&mut kin, &[], 0.01).is_err());
-    let one = [GravitySample {
-        q: [0.0, -1.5708, 3.1416, 0.0, 0.0, 3.1416],
-        tau: [0.0; NQ],
-    }];
-    assert!(gravity::fit_payload(&mut kin, &one, -1.0).is_err());
-    assert!(gravity::fit_payload(&mut kin, &one, f64::NAN).is_err());
+    // A negative ridge too small to break the solve is still refused.
+    for ridge in [-1e-12, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(
+            gravity::fit_payload(&mut kin, &samples, ridge).is_err(),
+            "ridge {ridge}"
+        );
+    }
+    let mut torn = samples.clone();
+    torn[3].tau[1] = f64::NAN;
+    assert!(
+        gravity::fit_payload(&mut kin, &torn, 1e-6).is_err(),
+        "a NaN torque is no measurement"
+    );
 }
 
 #[test]
@@ -317,14 +344,31 @@ fn arm_correction_changes_gravity_without_corrupting_payload_or_dynamics() {
             .unwrap();
         assert!(max_abs_diff(&a, &b) < 1e-10);
     }
+    // A correction that is not one is refused and leaves the installed
+    // one — and the payload — standing.
+    let mut before = [0.; NQ];
+    fitted.gravity(&CASES[0], &mut before).unwrap();
+    let n = fitted.body_count() * 4;
+    let mut nan = vec![0.0; n];
+    nan[5] = f64::NAN;
+    let mut huge = vec![0.0; n];
+    huge[5] = 11.0;
+    for (what, bad) in [("NaN", nan), ("huge", huge), ("short", vec![0.0; 4])] {
+        assert!(fitted.set_gravity_correction(&bad).is_err(), "{what}");
+        let mut after = [0.; NQ];
+        fitted.gravity(&CASES[0], &mut after).unwrap();
+        assert!(
+            max_abs_diff(&before, &after) < 1e-12,
+            "a refused {what} correction changed gravity"
+        );
+    }
+
     fitted.set_gravity_correction(&[]).unwrap();
     let mut a = [0.; NQ];
     let mut b = [0.; NQ];
     nominal.gravity(&CASES[0], &mut a).unwrap();
     fitted.gravity(&CASES[0], &mut b).unwrap();
     assert!(max_abs_diff(&a, &b) < 1e-10);
-    assert!(fitted.set_gravity_correction(&[f64::NAN; 28]).is_err());
-    assert!(fitted.set_gravity_correction(&[0.; 4]).is_err());
 }
 
 /// The two calibrations compose: a one-time fit of this arm's own
@@ -348,8 +392,17 @@ fn a_payload_fit_does_not_reabsorb_an_installed_arm_correction() {
     const COM: [f64; 3] = [0.01, -0.02, 0.05];
     let start = [-2.007, -0.698, 3.491, 0.0, 1.047, 3.1416];
 
-    // Measured torque: the corrected arm, carrying the part.
+    // Measured torque: the corrected arm, carrying the part. The
+    // correction is real: it moves the arm's gravity on its own.
+    let mut bare = [0.0; NQ];
+    kin.gravity(&start, &mut bare).unwrap();
     kin.set_gravity_correction(&correction).unwrap();
+    let mut corrected = [0.0; NQ];
+    kin.gravity(&start, &mut corrected).unwrap();
+    assert!(
+        max_abs_diff(&bare, &corrected) > 1e-3,
+        "the installed correction must change gravity"
+    );
     kin.set_tool(MASS, COM, None).unwrap();
     let samples: Vec<GravitySample> = wrist_poses(start, 0.5)
         .into_iter()
