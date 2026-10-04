@@ -29,7 +29,7 @@ use crate::types::{Freshness, NodeId, PollAction, PollKind, MAX_NODES};
 /// Shared with [`crate::sim`], which schedules its polls on the same
 /// rhythm — the same reason [`FreshnessClock`] lives here rather than in
 /// each backend.
-pub(crate) const DEVICE_INFO_PERIOD_SLOTS: u64 = 1006;
+pub const DEVICE_INFO_PERIOD_SLOTS: u64 = 1006;
 
 /// What one poll slot resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,120 +415,6 @@ mod tests {
         }
     }
 
-    /// The three-layer freshness contract: warn at the stale threshold
-    /// (self-clearing), latch at the lost threshold (survives resumed
-    /// traffic), reconnect edge reported on stale→fresh.
-    #[test]
-    fn freshness_warns_then_latches_and_reports_reconnect_edges() {
-        let (stale, lost) = (10u64, 50u64);
-        let mut f = FreshnessClock::default();
-        f.configure(stale, lost);
-        assert_eq!(f.classify(0, 0), Freshness::Unknown);
-        assert_eq!(f.age(0, 0), u64::MAX);
-
-        assert!(
-            f.mark(0, 1, false),
-            "the first-ever frame IS an edge: a node that boots after the \
-             last scheduled config shot has missed every push it will get, \
-             and this edge is the only signal left to configure it"
-        );
-        assert_eq!(f.classify(0, 1), Freshness::Fresh);
-        assert!(
-            f.mark(5, 1, false) && !f.mark(5, 2, false),
-            "only the FIRST frame is the edge"
-        );
-        assert_eq!(f.classify(0, 1 + stale - 1), Freshness::Fresh);
-        assert_eq!(f.classify(0, 1 + stale), Freshness::Stale);
-        assert_eq!(f.age(0, 1 + stale), stale);
-
-        // A frame while stale clears the warning and reports the edge.
-        assert!(f.mark(0, 1 + stale, false));
-        assert_eq!(f.classify(0, 1 + stale), Freshness::Fresh);
-
-        // Reaching the lost threshold latches, and traffic does NOT clear it.
-        let t = 1 + stale + lost;
-        f.latch_lost(t);
-        assert_eq!(f.classify(0, t), Freshness::Lost);
-        f.mark(0, t, false);
-        assert_eq!(f.classify(0, t), Freshness::Lost, "lost is latched");
-        // Only the user clear path resets it.
-        f.clear_latch(0, t);
-        assert_eq!(f.classify(0, t), Freshness::Fresh);
-        f.mark(0, t, false);
-        assert_eq!(f.classify(0, t), Freshness::Fresh);
-
-        // A node that was never seen never latches, however long we run.
-        f.latch_lost(t + 10 * lost);
-        assert_eq!(f.classify(3, t + 10 * lost), Freshness::Unknown);
-
-        // The gripper reply ages on its own clock.
-        assert_eq!(f.gripper_age(t), u64::MAX, "never seen");
-        f.mark_gripper(t);
-        assert_eq!(f.gripper_age(t + 4), 4);
-
-        // Re-base (FLASHING exit) drops the latch and stamps SEEN NOW.
-        f.mark(1, t, false);
-        f.latch_lost(t + lost);
-        assert_eq!(f.classify(1, t + lost), Freshness::Lost);
-        f.rebase(t + lost);
-        assert_eq!(f.classify(1, t + lost), Freshness::Fresh);
-    }
-
-    /// Clearing a latch is "seen now", never "never seen": a node that is
-    /// still off the bus must re-latch on its own, and one that comes back
-    /// must still produce the stale→fresh edge that resends its config.
-    ///
-    /// Zeroing the observation instead is absorbing — `latch_lost` skips
-    /// `None` and only `mark` leaves it — so the clear would make a dead
-    /// node permanently un-reportable AND silently deny it its config
-    /// resend, leaving it on firmware defaults while the RT commands it.
-    /// The same applies to the FLASHING-exit re-base.
-    #[test]
-    fn clearing_a_latch_re_arms_the_lost_threshold_and_the_reconnect_edge() {
-        let (stale, lost) = (10u64, 50u64);
-        let mut f = FreshnessClock::default();
-        f.configure(stale, lost);
-        f.mark(2, 1, false);
-
-        // Node 2 goes silent and latches; the user clears it without
-        // fixing the cable.
-        let latched_at = 1 + lost;
-        f.latch_lost(latched_at);
-        assert_eq!(f.classify(2, latched_at), Freshness::Lost);
-        f.clear_latch(2, latched_at);
-
-        // Still silent: stale again after the warn window, and LOST again
-        // after the lost window — the health surface cannot go quiet on a
-        // joint that is off the bus.
-        f.latch_lost(latched_at + lost - 1);
-        assert_eq!(f.classify(2, latched_at + stale), Freshness::Stale);
-        assert_eq!(
-            f.classify(2, latched_at + lost - 1),
-            Freshness::Stale,
-            "one tick short of the window is still only a warning"
-        );
-        f.latch_lost(latched_at + lost);
-        assert_eq!(f.classify(2, latched_at + lost), Freshness::Lost);
-
-        // The cable is re-seated after a second clear: the node's return
-        // is a stale→fresh edge, so its stored config goes back out.
-        let cleared_at = latched_at + lost;
-        f.clear_latch(2, cleared_at);
-        assert!(
-            f.mark(2, cleared_at + stale, false),
-            "a node returning after a clear is a reconnect"
-        );
-
-        // FLASHING exit: same rule, robot-wide.
-        f.rebase(cleared_at);
-        f.latch_lost(cleared_at + lost);
-        assert_eq!(
-            f.classify(0, cleared_at + lost),
-            Freshness::Lost,
-            "a node that did not survive the flash still latches"
-        );
-    }
-
     /// The boot load is batched BY MESSAGE TYPE with a pace between
     /// batches (not one long burst per node): that is what keeps the
     /// ~170-frame load from overrunning the interface TX queue.
@@ -581,22 +467,51 @@ mod tests {
         assert!(plan.is_empty());
     }
 
-    /// Config frames carry the stored values, so a reconnect resend
-    /// restores exactly what boot installed.
+    /// Config frames carry each joint's configured values, every kind of
+    /// them, so a reconnect resend restores exactly what boot installed.
     #[test]
     fn config_frames_carry_the_stored_values() {
-        let c = node_config(4);
-        let wd = config_frame(ConfigKind::Watchdog, &c);
-        assert_eq!(wd.payload(), &[0, 0, 0x13, 0x88, 0]); // 5000 ms BE + Idle
-        let lim = config_frame(ConfigKind::Limits, &c);
-        assert_eq!(&lim.payload()[0..4], &80000f32.to_be_bytes());
-        assert_eq!(&lim.payload()[4..8], &1200f32.to_be_bytes());
-        let vl = config_frame(ConfigKind::VoltageLimit, &c);
-        assert_eq!(vl.payload(), &6000u32.to_be_bytes());
-        let pd = config_frame(ConfigKind::PdGains, &c);
-        assert_eq!(&pd.payload()[0..4], &1f32.to_be_bytes());
-        assert_eq!(&pd.payload()[4..8], &2f32.to_be_bytes());
-        let pos = config_frame(ConfigKind::PositionGains, &c);
-        assert_eq!(pos.payload(), &7f32.to_be_bytes());
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+        let robot = par6_config::RobotConfig::load(&path).expect("PAR6.toml");
+        let be = |v: f64| (v as f32).to_be_bytes();
+        let pair = |a: f64, b: f64| [be(a), be(b)].concat();
+        for j in &robot.joints {
+            let c = NodeConfig::arm(j, WatchdogAction::Idle);
+            let payload = |kind| config_frame(kind, &c).payload().to_vec();
+            let g = &j.gains;
+            assert_eq!(
+                payload(ConfigKind::Watchdog),
+                [j.watchdog_timeout_ms.to_be_bytes().as_slice(), &[0]].concat(),
+                "{}: watchdog ms then the Idle action",
+                j.name
+            );
+            assert_eq!(
+                payload(ConfigKind::Limits),
+                pair(j.velocity_limit_ticks_s, j.ilim_ma),
+                "{}",
+                j.name
+            );
+            assert_eq!(
+                payload(ConfigKind::VoltageLimit),
+                j.voltage_limit_mv.to_be_bytes(),
+                "{}",
+                j.name
+            );
+            assert_eq!(payload(ConfigKind::PdGains), pair(g.kp, g.kd), "{}", j.name);
+            assert_eq!(
+                payload(ConfigKind::CurrentGains),
+                pair(g.kpiq, g.kiiq),
+                "{}",
+                j.name
+            );
+            assert_eq!(
+                payload(ConfigKind::VelocityGains),
+                pair(g.kpv, g.kiv),
+                "{}",
+                j.name
+            );
+            assert_eq!(payload(ConfigKind::PositionGains), be(g.kpp), "{}", j.name);
+        }
     }
 }

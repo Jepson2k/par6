@@ -118,25 +118,24 @@ mod tests {
             "just under the reported ceiling must fit"
         );
         assert!(!at(1.0 / (ceiling * 1.01)).fits(), "just over it must not");
-    }
 
-    /// Fewer joints and a faster bus both buy tick rate, which is what
-    /// makes this a property of the hardware rather than a constant.
-    #[test]
-    fn the_ceiling_tracks_the_hardware() {
-        let classic = bus_budget(6, true, 1_000_000, 0.004);
-        let fewer = bus_budget(3, false, 1_000_000, 0.004);
-        let faster = bus_budget(6, true, 5_000_000, 0.004);
+        // Fewer joints and a faster bus both buy tick rate, which is what
+        // makes this a property of the hardware rather than a constant.
+        {
+            let classic = bus_budget(6, true, 1_000_000, 0.004);
+            let fewer = bus_budget(3, false, 1_000_000, 0.004);
+            let faster = bus_budget(6, true, 5_000_000, 0.004);
 
-        assert!(fewer.max_tick_rate_hz > classic.max_tick_rate_hz);
-        assert!(faster.max_tick_rate_hz > classic.max_tick_rate_hz);
-        // A 5x bit rate is a 5x ceiling: the exchange is pure wire time.
-        assert!((faster.max_tick_rate_hz / classic.max_tick_rate_hz - 5.0).abs() < 1e-9);
-        // And a faster bus is what puts a kilohertz tick in reach at all.
-        assert!(
-            !bus_budget(6, true, 1_000_000, 0.001).fits(),
-            "1 kHz on classic CAN must not fit"
-        );
-        assert!(bus_budget(6, true, 5_000_000, 0.001).fits());
+            assert!(fewer.max_tick_rate_hz > classic.max_tick_rate_hz);
+            assert!(faster.max_tick_rate_hz > classic.max_tick_rate_hz);
+            // A 5x bit rate is a 5x ceiling: the exchange is pure wire time.
+            assert!((faster.max_tick_rate_hz / classic.max_tick_rate_hz - 5.0).abs() < 1e-9);
+            // And a faster bus is what puts a kilohertz tick in reach at all.
+            assert!(
+                !bus_budget(6, true, 1_000_000, 0.001).fits(),
+                "1 kHz on classic CAN must not fit"
+            );
+            assert!(bus_budget(6, true, 5_000_000, 0.001).fits());
+        }
     }
 }

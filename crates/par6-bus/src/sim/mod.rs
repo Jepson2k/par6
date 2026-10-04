@@ -179,9 +179,6 @@ pub struct SimBus {
     /// Mirror of the gripper front end's latched firmware command, used
     /// to drive the scene's jaw DOF (see [`mujoco::JawDrive`]).
     mj_jaw_cmd: Option<FirmwareGripperCommand>,
-    /// Test-declared jaw obstructions `(closing at, opening at)`; `None`
-    /// leaves them to the scene physics.
-    gripper_object_override: Option<(Option<u8>, Option<u8>)>,
     /// A teleport landed and no joint frames have re-commanded the arm
     /// since: the plant clamps the landed pose meanwhile.
     landed_unheld: bool,
@@ -238,7 +235,6 @@ impl SimBus {
             world_dirty: false,
             mailbox: WorldMailbox::default(),
             mj_jaw_cmd: None,
-            gripper_object_override: None,
             landed_unheld: false,
         }
     }
@@ -359,30 +355,6 @@ impl SimBus {
         };
         g.teleport(closed);
         Ok(())
-    }
-
-    /// Declare an object between the jaws: closing jams at this position
-    /// byte. This overrides what the scene physics reports; with neither
-    /// direction declared jammed (`None` here and for opening) the
-    /// physics decides again.
-    pub fn set_gripper_object_closing(&mut self, at: Option<u8>) {
-        let (_, open) = self.gripper_object_override.unwrap_or((None, None));
-        self.set_gripper_object_override(at, open);
-    }
-
-    /// Declare an object jamming the opening direction at this position
-    /// byte (same override semantics as
-    /// [`set_gripper_object_closing`](Self::set_gripper_object_closing)).
-    pub fn set_gripper_object_opening(&mut self, at: Option<u8>) {
-        let (close, _) = self.gripper_object_override.unwrap_or((None, None));
-        self.set_gripper_object_override(close, at);
-    }
-
-    fn set_gripper_object_override(&mut self, close: Option<u8>, open: Option<u8>) {
-        self.gripper_object_override = (close.is_some() || open.is_some()).then_some((close, open));
-        if let Some(g) = &mut self.gripper {
-            (g.object_close_at, g.object_open_at) = (close, open);
-        }
     }
 
     /// Replace one world layer. The scene is rebuilt on the next tick
@@ -681,13 +653,10 @@ impl SimBus {
                 supply_scale: self.scenario.supply_scale(self.tick),
             },
         );
-        // The scene owns the object positions unless a test declared them:
-        // whatever physically jammed the jaws becomes the front end's
+        // Whatever physically jammed the jaws becomes the front end's
         // obstruction.
         if let Some(g) = &mut self.gripper {
-            (g.object_close_at, g.object_open_at) = self
-                .gripper_object_override
-                .unwrap_or_else(|| plant.jaw_obstruction());
+            (g.object_close_at, g.object_open_at) = plant.jaw_obstruction();
         }
         if let Some(g) = &mut self.gripper {
             g.step(dt);
@@ -1449,7 +1418,6 @@ impl DriverBus for SimBus {
             .clone_from(&robot.gravity_correction);
         self.plant = Some(self.make_plant(robot, &q0));
         self.mj_jaw_cmd = None;
-        self.gripper_object_override = None;
 
         let has_can_gripper = gripper.is_some_and(|g| g.driver.is_some());
         self.gripper = if has_can_gripper {

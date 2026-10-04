@@ -33,7 +33,8 @@ use std::time::{Duration, Instant};
 
 use par6_bus::spectral::{pack_can_id, pack_f32, pack_i16, pack_i24, pack_i32, CommandId};
 use par6_bus::{
-    BusState, DriverBus, Freshness, GripperCommand, JointCommand, NodeId, PollKind, SocketCanBus,
+    BusError, BusState, DriverBus, Freshness, GripperCommand, JointCommand, NodeId,
+    ObjectDetection, PollKind, SocketCanBus,
 };
 use par6_config::{ConfigBundle, KtSource, RobotConfig, ToolConfig};
 use socketcan::{CanSocket, EmbeddedFrame, Frame, Socket};
@@ -91,12 +92,13 @@ static ALLOC: CountingAlloc = CountingAlloc;
 /// frames neither sent.
 ///
 /// Holding this for the body of each test is what lets plain `cargo test`
-/// pass. It costs the ~2 s these six take end to end; every other test binary
-/// in the workspace still runs in parallel with them and with each other.
+/// pass, at the cost of running them one after another; every other test
+/// binary in the workspace still runs in parallel with them and with each
+/// other.
 ///
 /// The alternative — one vcan interface per test — is real isolation rather
 /// than queuing, but it needs `ip link add` per interface on every machine
-/// that runs the suite, which is a worse trade for two seconds.
+/// that runs the suite, which is a worse trade for a few seconds.
 static VCAN_BUS: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The interface name, holding the bus lock for as long as it is alive.
@@ -187,14 +189,7 @@ impl Wire {
     fn drain(&self) -> Vec<Seen> {
         let mut out = Vec::new();
         while let Ok(f) = self.0.read_frame() {
-            let id = f.raw_id() as u16;
-            out.push(Seen {
-                node: ((id >> 7) & 0xF) as u8,
-                cmd: ((id >> 1) & 0x3F) as u8,
-                err: id & 1 == 1,
-                rtr: f.is_remote_frame(),
-                data: f.data().to_vec(),
-            });
+            out.push(seen(&f));
         }
         out
     }
@@ -203,6 +198,46 @@ impl Wire {
         let frame = socketcan::CanFrame::from_raw_id(u32::from(id), data).expect("classic frame");
         self.0.write_frame(&frame).expect("inject reply");
     }
+}
+
+fn seen(f: &socketcan::CanFrame) -> Seen {
+    let id = f.raw_id() as u16;
+    Seen {
+        node: ((id >> 7) & 0xF) as u8,
+        cmd: ((id >> 1) & 0x3F) as u8,
+        err: id & 1 == 1,
+        rtr: f.is_remote_frame(),
+        data: f.data().to_vec(),
+    }
+}
+
+/// Run `f`, and stamp every frame put on `iface` meanwhile as it arrives:
+/// a reader blocked on its own socket, so the gaps between stamps are the
+/// gaps on the wire.
+fn stamped_during<T>(iface: &str, f: impl FnOnce() -> T) -> (T, Vec<(Instant, Seen)>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let sock = CanSocket::open(iface).expect("open stamping socket");
+    sock.set_read_timeout(Duration::from_millis(2))
+        .expect("read timeout");
+    let _ = sock.as_raw_socket().set_recv_buffer_size(4 * 1024 * 1024);
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            loop {
+                match sock.read_frame() {
+                    Ok(frame) => out.push((Instant::now(), seen(&frame))),
+                    Err(_) if stop.load(Ordering::Acquire) => return out,
+                    Err(_) => {}
+                }
+            }
+        })
+    };
+    let result = f();
+    stop.store(true, Ordering::Release);
+    (result, reader.join().expect("stamping reader"))
 }
 
 fn configs(iface: &str) -> (RobotConfig, ToolConfig) {
@@ -219,6 +254,9 @@ fn configs(iface: &str) -> (RobotConfig, ToolConfig) {
         .clone();
     let mut robot = bundle.robot;
     robot.bus.interface = iface.to_string();
+    // Nothing on a vcan answers unless a test injects it, so every boot
+    // probe waits out its reply window: keep that window short.
+    robot.bus.kt_fetch.timeout_s = 0.02;
     (robot, gripper)
 }
 
@@ -268,6 +306,20 @@ fn quiet_bus(iface: &str) -> (SocketCanBus, RobotConfig, ToolConfig) {
     (bus, robot, gripper)
 }
 
+/// Drain until `want` frames have been decoded (or a second passes):
+/// injected frames reach the bus's socket asynchronously.
+fn drain_frames(bus: &mut SocketCanBus, state: &mut BusState, want: usize) -> usize {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut got = 0;
+    loop {
+        got += bus.drain_rx(state).expect("drain");
+        if got >= want || Instant::now() > deadline {
+            return got;
+        }
+        std::thread::yield_now();
+    }
+}
+
 /// The boot config load must reach the wire batched BY MESSAGE TYPE with
 /// a real pause between batches: ~190 frames enqueue in microseconds
 /// against a ~10 frames/ms drain, and the interface TX queue drops the
@@ -289,12 +341,12 @@ fn boot_config_load_is_paced_and_ordered_on_the_wire() {
         .map(|j| j.node_id)
         .chain(std::iter::once(robot.bus.gripper_node))
         .collect();
-    let started = Instant::now();
-    bus.boot_configure(&robot, Some(&gripper), repeats)
-        .expect("boot_configure");
-    let elapsed = started.elapsed();
-
-    let seen = wire.drain();
+    let ((), stamped) = stamped_during(&iface, || {
+        bus.boot_configure(&robot, Some(&gripper), repeats)
+            .expect("boot_configure");
+    });
+    let _ = wire.drain();
+    let seen: Vec<Seen> = stamped.iter().map(|(_, s)| s.clone()).collect();
     let batches = usize::from(repeats) * 7;
     // The encoder seed sweep follows the config load.
     let config_frames = batches * nodes.len();
@@ -322,13 +374,18 @@ fn boot_config_load_is_paced_and_ordered_on_the_wire() {
         assert!(chunk.iter().all(|s| !s.rtr && !s.err));
     }
 
-    // Pacing is real time on the wire, not a comment: one pause per
-    // batch, so the whole load cannot outrun the TX queue.
-    let want_pace = Duration::from_secs_f64(robot.bus.config_pace_s) * batches as u32;
-    assert!(
-        elapsed >= want_pace,
-        "boot took {elapsed:?}, less than the {want_pace:?} of batch pacing"
-    );
+    // Pacing is real time on the wire, not a comment: every batch waits
+    // for the pause after the one before it, so the whole load cannot
+    // outrun the TX queue. Half the pause is the bound — scheduling only
+    // ever lengthens the gap the reader sees.
+    let pace = Duration::from_secs_f64(robot.bus.config_pace_s);
+    for b in 1..batches {
+        let gap = stamped[b * nodes.len()].0 - stamped[b * nodes.len() - 1].0;
+        assert!(
+            gap >= pace / 2,
+            "batch {b} followed the one before it after {gap:?}; the pace is {pace:?}"
+        );
+    }
 
     // The telemetry probe asks every node for the combined reply (cmd 37)
     // — `retries` times here, since nothing on a vcan answers; a drive
@@ -371,17 +428,17 @@ fn boot_scan_and_kt_fetch_reach_the_first_bus_state() {
     let iface = require_vcan!();
     let (mut robot, gripper) = configs(&iface);
     robot.robot.kt_source = KtSource::Auto;
-    // Keep the no-reply retry ladder short: this test is about the
-    // frames, not about waiting out 0.35 s × retries × rounds.
-    robot.bus.kt_fetch.timeout_s = 0.02;
     let wire = Wire::open(&iface);
     let mut bus = SocketCanBus::open(&robot.bus).expect("open SocketCanBus");
     let _ = wire.drain();
 
     // Queue a kt reply for J6 as if node 5's driver had answered
-    // (0.151 Nm/A). It waits in the bus socket until the fetch drains it.
+    // (0.151 Nm/A), and a garbage (negative) one for node 1 — the
+    // out-of-family shape a mis-flashed driver produces. They wait in the
+    // bus socket until the fetch drains them.
     let (kt_id, kt_data) = kt_reply(5, 0.151);
     wire.send(kt_id, &kt_data);
+    wire.send(pack_can_id(1, CommandId::RespondKt, false), &pack_f32(-0.5));
 
     bus.boot_configure(&robot, Some(&gripper), 0)
         .expect("boot_configure");
@@ -413,24 +470,50 @@ fn boot_scan_and_kt_fetch_reach_the_first_bus_state() {
             .any(|s| s.cmd == CommandId::RespondKt.raw() && s.rtr),
         "kt is fetched with RTRs to cmd 33"
     );
-    assert!(
-        !seen
-            .iter()
-            .any(|s| s.node == 5 && s.cmd == CommandId::RespondKt.raw() && s.rtr),
-        "a node whose kt is already known must not be re-asked"
+    let asks = kt_asks(&seen);
+    assert_eq!(
+        asks[5], 0,
+        "a node whose kt is already known is never asked"
     );
+    assert_eq!(
+        asks[1], 0,
+        "even a garbage answer ends the asking — rejection is the RT \
+         core's job, re-asking would just re-fetch the same garbage"
+    );
+    let per_node = usize::from(robot.bus.kt_fetch.retries) * usize::from(robot.bus.kt_fetch.rounds);
+    for n in configured_nodes(&robot) {
+        if n != 1 && n != 5 {
+            assert_eq!(
+                asks[usize::from(n)],
+                per_node,
+                "node {n}: silent ⇒ the full ladder"
+            );
+        }
+    }
     assert_eq!(
         bus.connected_nodes() & (1 << 5),
         1 << 5,
         "the node that answered is connected"
     );
 
-    // The boot reply is not lost between boot and the first tick.
+    // The boot replies are not lost between boot and the first tick, and
+    // they are published as said, garbage included, so the RT layer can
+    // see and reject it.
     let mut state = BusState::new();
     bus.begin_tick(0);
     bus.drain_rx(&mut state).expect("drain");
     assert_eq!(state.nodes[5].kt_nm_a, Some(0.151));
+    assert_eq!(state.nodes[1].kt_nm_a, Some(-0.5));
     assert_eq!(state.nodes[4].kt_nm_a, None, "silent nodes stay unknown");
+
+    // An answer after the whole fetch window is still decoded and
+    // published — late kt is telemetry provenance; only the RT core's
+    // one-shot boot resolution decides what the torque factor was built
+    // from.
+    wire.send(pack_can_id(0, CommandId::RespondKt, false), &pack_f32(0.2));
+    bus.begin_tick(1);
+    assert_eq!(drain_frames(&mut bus, &mut state, 1), 1);
+    assert_eq!(state.nodes[0].kt_nm_a, Some(0.2));
 }
 
 /// One steady-state tick end to end: the frame budget on the wire, the
@@ -485,27 +568,75 @@ fn tick_exchange_frame_budget_and_freshness_ladder() {
     let (temp_id, temp) = temperature_reply(4, -5);
     wire.send(temp_id, &temp);
     let motion_node = ((motion_id >> 7) & 0xF) as NodeId;
+    let m = usize::from(motion_node);
     bus.begin_tick(2);
-    let n = bus.drain_rx(&mut state).expect("drain");
+    let n = drain_frames(&mut bus, &mut state, 2);
     assert_eq!(n, 2);
-    assert_eq!(state.frames_last_drain, 2);
-    assert_eq!(
-        state.nodes[usize::from(motion_node)].position_ticks,
-        Some(100_000)
-    );
+    assert_eq!(state.nodes[m].position_ticks, Some(100_000));
+    assert_eq!(state.nodes[m].speed_ticks_s, Some(-50));
+    assert_eq!(state.nodes[m].current_ma, Some(-300));
     assert!(
-        state.nodes[usize::from(motion_node)].live_error_bit,
+        state.nodes[m].live_error_bit,
         "the arbitration-id err bit is harvested per frame"
     );
-    assert_eq!(state.nodes[usize::from(motion_node)].data_age_ticks, 0);
+    assert_eq!(state.nodes[m].data_age_ticks, 0);
     assert_eq!(bus.freshness(motion_node), Freshness::Fresh);
     let temp_node = ((temp_id >> 7) & 0xF) as NodeId;
+    assert_eq!(state.nodes[usize::from(temp_node)].temperature_c, Some(-5));
     assert_eq!(
         state.reconnected_mask,
         (1 << motion_node) | (1 << temp_node),
         "a node's first-ever frame is the reconnect edge that configures a late boot"
     );
     assert!(bus.link_health().rx_frames >= 2);
+    // A node that has never spoken reads Unknown, not Fresh or Lost.
+    assert_eq!(bus.freshness(3), Freshness::Unknown);
+
+    // Each telemetry reply lands in its own field and leaves the motion
+    // fields alone; Iq is a current refresh; a clean frame clears the
+    // live bit; the gripper reply lands in the gripper slot, not in the
+    // node table.
+    let g = robot.bus.gripper_node;
+    for (id, data) in [
+        (
+            pack_can_id(motion_node, CommandId::Voltage, false),
+            pack_i16(24123).to_vec(),
+        ),
+        (
+            pack_can_id(motion_node, CommandId::StateOfErrors, false),
+            vec![0xa1, 0xe0],
+        ),
+        (
+            pack_can_id(motion_node, CommandId::RespondKt, false),
+            pack_f32(0.151).to_vec(),
+        ),
+        (
+            pack_can_id(motion_node, CommandId::IqData, false),
+            pack_i16(-1200).to_vec(),
+        ),
+        (
+            pack_can_id(g, CommandId::RespondGripperData, true),
+            vec![0xfc, 0xff, 0x88, 0xa1],
+        ),
+    ] {
+        wire.send(id, &data);
+    }
+    assert_eq!(drain_frames(&mut bus, &mut state, 5), 5);
+    let node = &state.nodes[m];
+    assert_eq!(node.voltage_mv, Some(24123));
+    let flags = node.error_flags.expect("cmd 26 decoded");
+    assert!(flags.error && flags.encoder && flags.estop);
+    assert!(flags.calibrated && flags.activated);
+    assert_eq!(node.kt_nm_a, Some(0.151));
+    assert_eq!(node.current_ma, Some(-1200));
+    assert_eq!(node.position_ticks, Some(100_000));
+    assert!(!node.live_error_bit, "the last frame's clean id wins");
+    let reply = state.gripper.reply.expect("cmd 60 decoded");
+    assert_eq!((reply.position, reply.current_ma), (252, -120));
+    assert_eq!(reply.object_detection, ObjectDetection::DetectedClosing);
+    assert!(reply.activated && reply.calibrated);
+    assert!(state.gripper.live_error_bit);
+    assert_eq!(state.nodes[usize::from(g)].position_ticks, None);
 
     // Age past the stale threshold: a live, self-clearing warning.
     bus.begin_tick(2 + stale);
@@ -515,8 +646,7 @@ fn tick_exchange_frame_budget_and_freshness_ladder() {
     // A frame while stale clears it and reports the reconnect edge, which
     // is what drives the config resend.
     wire.send(motion_id, &motion);
-    std::thread::sleep(Duration::from_millis(2));
-    bus.drain_rx(&mut state).expect("drain");
+    assert_eq!(drain_frames(&mut bus, &mut state, 1), 1);
     assert_eq!(state.reconnected_mask, 1 << motion_node);
     assert_eq!(bus.freshness(motion_node), Freshness::Fresh);
 
@@ -525,14 +655,19 @@ fn tick_exchange_frame_budget_and_freshness_ladder() {
     bus.drain_rx(&mut state).expect("drain");
     assert_eq!(bus.freshness(motion_node), Freshness::Lost);
     wire.send(motion_id, &motion);
-    std::thread::sleep(Duration::from_millis(2));
-    bus.drain_rx(&mut state).expect("drain");
+    assert_eq!(drain_frames(&mut bus, &mut state, 1), 1);
     assert_eq!(bus.freshness(motion_node), Freshness::Lost);
     // The clear drops the latch and re-arms the clock at "seen now": a
-    // node that is still off the bus re-latches on its own rather than
-    // going permanently un-reportable.
+    // node that is still off the bus warns, then re-latches on its own,
+    // rather than going permanently un-reportable.
     bus.clear_lost_latch(motion_node);
     assert_eq!(bus.freshness(motion_node), Freshness::Fresh);
+    bus.begin_tick(2 + stale + 2 * lost - 1);
+    assert_eq!(
+        bus.freshness(motion_node),
+        Freshness::Stale,
+        "one tick short of the window is still only a warning"
+    );
     bus.begin_tick(2 + stale + 2 * lost);
     assert_eq!(bus.freshness(motion_node), Freshness::Lost);
     bus.clear_lost_latch(motion_node);
@@ -541,18 +676,24 @@ fn tick_exchange_frame_budget_and_freshness_ladder() {
     // but never decoded (bootloader page frames alias application ids).
     let _ = wire.drain();
     bus.set_silent(true);
+    assert!(bus.is_silent());
     bus.begin_tick(3 + stale + 2 * lost);
-    assert!(bus.send_joint_commands(&joints).is_err());
-    assert!(bus.send_gripper(&GripperCommand::FirmwarePoll).is_err());
+    assert!(matches!(
+        bus.send_joint_commands(&joints),
+        Err(BusError::InvalidCommand { .. })
+    ));
+    assert!(matches!(
+        bus.send_gripper(&GripperCommand::FirmwarePoll),
+        Err(BusError::InvalidCommand { .. })
+    ));
     bus.poll_step().expect("polls are suppressed, not an error");
     assert_eq!(bus.tx_frames_this_tick(), 0);
     assert!(wire.drain().is_empty(), "a silent bus transmits nothing");
     let (enc_id, enc) = encoder_reply(2, -123_456, 2_000_000);
     wire.send(enc_id, &enc);
-    std::thread::sleep(Duration::from_millis(2));
     let enc_node = ((enc_id >> 7) & 0xF) as usize;
     let before = state.nodes[enc_node].position_ticks;
-    assert_eq!(bus.drain_rx(&mut state).expect("drain"), 1);
+    assert_eq!(drain_frames(&mut bus, &mut state, 1), 1);
     assert_eq!(
         state.nodes[enc_node].position_ticks, before,
         "silent drains discard undecoded"
@@ -615,13 +756,15 @@ fn kt_fetch_with_no_replies_exhausts_the_ladder_and_publishes_unknown() {
     let mut bus = SocketCanBus::open(&robot.bus).expect("open SocketCanBus");
     let _ = wire.drain();
 
-    let started = Instant::now();
-    bus.boot_configure(&robot, Some(&gripper), 0)
-        .expect("a bus with no drivers answering must still boot");
-    let elapsed = started.elapsed();
+    let ((), stamped) = stamped_during(&iface, || {
+        bus.boot_configure(&robot, Some(&gripper), 0)
+            .expect("a bus with no drivers answering must still boot");
+    });
+    let _ = wire.drain();
 
     let nodes = configured_nodes(&robot);
-    let asks = kt_asks(&wire.drain());
+    let all: Vec<Seen> = stamped.iter().map(|(_, s)| s.clone()).collect();
+    let asks = kt_asks(&all);
     let per_node = usize::from(robot.bus.kt_fetch.retries) * usize::from(robot.bus.kt_fetch.rounds);
     for n in &nodes {
         assert_eq!(
@@ -630,18 +773,23 @@ fn kt_fetch_with_no_replies_exhausts_the_ladder_and_publishes_unknown() {
             "node {n}: the full retry ladder must reach the wire"
         );
     }
-    // Each unanswered ask waits out its reply timeout: the ladder is a
-    // real wall-clock budget, not a burst — and it is bounded.
-    let floor = Duration::from_secs_f64(robot.bus.kt_fetch.timeout_s)
-        .mul_f64((per_node * nodes.len()) as f64 * 0.9);
-    assert!(
-        elapsed >= floor,
-        "ladder finished in {elapsed:?}, under its {floor:?} wait budget"
-    );
-    assert!(
-        elapsed < Duration::from_secs(5),
-        "the no-reply ladder must stay bounded, took {elapsed:?}"
-    );
+    // Each unanswered ask waits out its reply timeout before the next one
+    // goes to the same node: the ladder is a real wait, not a burst.
+    let timeout = Duration::from_secs_f64(robot.bus.kt_fetch.timeout_s);
+    for n in &nodes {
+        let times: Vec<Instant> = stamped
+            .iter()
+            .filter(|(_, s)| s.node == *n && s.cmd == CommandId::RespondKt.raw() && s.rtr)
+            .map(|(t, _)| *t)
+            .collect();
+        for w in times.windows(2) {
+            assert!(
+                w[1] - w[0] >= timeout.mul_f64(0.9),
+                "node {n}: asked again after {:?}; the reply timeout is {timeout:?}",
+                w[1] - w[0]
+            );
+        }
+    }
 
     let mut state = BusState::new();
     bus.begin_tick(0);
@@ -653,82 +801,6 @@ fn kt_fetch_with_no_replies_exhausts_the_ladder_and_publishes_unknown() {
             "node {n}: no reply must publish UNKNOWN, never a default"
         );
     }
-}
-
-/// Boot kt fetch, failure shapes 2 and 3: a node that answers GARBAGE,
-/// and a reply that arrives after the fetch window is over.
-///
-/// The bus is the provenance transport, not the policy. It must publish
-/// exactly what each driver said — a non-positive kt included — and stop
-/// asking any node that answered; the adopt-or-reject policy (a
-/// non-finite or non-positive reply is REJECTED and the config factor
-/// stays in effect) is `RtCore::adopt_driver_kt` in par6-rt. Likewise
-/// "an answer after the timeout is not applied": the transport keeps
-/// publishing kt whenever the frame lands, so the snapshot provenance
-/// stays truthful, while the torque factor is rebuilt exactly once at
-/// the RT core's boot resolve tick and never re-adopted afterwards.
-#[test]
-fn kt_fetch_garbage_and_late_replies_are_provenance_not_re_asks() {
-    let iface = require_vcan!();
-    let (mut robot, gripper) = configs(&iface);
-    robot.robot.kt_source = KtSource::Auto;
-    robot.bus.scan.rounds = 0;
-    robot.bus.kt_fetch.timeout_s = 0.02;
-    robot.bus.kt_fetch.retries = 2;
-    robot.bus.kt_fetch.rounds = 2;
-    let wire = Wire::open(&iface);
-    let mut bus = SocketCanBus::open(&robot.bus).expect("open SocketCanBus");
-    let _ = wire.drain();
-
-    // Queued before boot, so both replies land in the ladder's first wait
-    // window: a plausible kt for node 5, and a garbage (negative) kt for
-    // node 1 — the out-of-family shape a mis-flashed driver produces.
-    let (kt_id, kt_data) = kt_reply(5, 0.151);
-    wire.send(kt_id, &kt_data);
-    wire.send(pack_can_id(1, CommandId::RespondKt, false), &pack_f32(-0.5));
-
-    bus.boot_configure(&robot, Some(&gripper), 0)
-        .expect("boot_configure");
-
-    let asks = kt_asks(&wire.drain());
-    let per_node = usize::from(robot.bus.kt_fetch.retries) * usize::from(robot.bus.kt_fetch.rounds);
-    assert_eq!(asks[5], 0, "an answered node is never asked again");
-    assert_eq!(
-        asks[1], 0,
-        "even a garbage answer ends the asking — rejection is the RT \
-         core's job, re-asking would just re-fetch the same garbage"
-    );
-    for n in configured_nodes(&robot) {
-        if n != 1 && n != 5 {
-            assert_eq!(
-                asks[usize::from(n)],
-                per_node,
-                "node {n}: silent ⇒ full ladder"
-            );
-        }
-    }
-
-    // The first drain publishes the verbatim answers next to the silence.
-    let mut state = BusState::new();
-    bus.begin_tick(0);
-    bus.drain_rx(&mut state).expect("drain");
-    assert_eq!(state.nodes[5].kt_nm_a, Some(0.151));
-    assert_eq!(
-        state.nodes[1].kt_nm_a,
-        Some(-0.5),
-        "garbage is published as said, so the RT layer can see and reject it"
-    );
-    assert_eq!(state.nodes[0].kt_nm_a, None);
-
-    // Shape 3: an answer arriving after the whole fetch window. The
-    // transport still decodes and publishes it on the next tick drain —
-    // late kt is telemetry provenance; only the RT core's one-shot boot
-    // resolution decides what the torque factor was built from.
-    wire.send(pack_can_id(0, CommandId::RespondKt, false), &pack_f32(0.2));
-    std::thread::sleep(Duration::from_millis(2));
-    bus.begin_tick(1);
-    bus.drain_rx(&mut state).expect("drain");
-    assert_eq!(state.nodes[0].kt_nm_a, Some(0.2));
 }
 
 /// The RT tick path allocates NOTHING after init (CLAUDE.md Rust rules),
@@ -898,23 +970,43 @@ fn polls_reach_every_node_in_its_dialect_and_overrides_take_their_slots() {
 
     // An override owns exactly its slots; the round robin then resumes at
     // its own cursor.
+    let clears = |seen: &[Seen], node: NodeId| {
+        seen.iter()
+            .filter(|s| !s.rtr && s.node == node && s.cmd == CommandId::ClearError.raw())
+            .count()
+    };
     let next = step(&mut bus, 1);
     bus.queue_poll_override(par6_bus::PollAction::ClearError { node: 2 }, 3);
     let preempted = step(&mut bus, 4);
-    let clears = preempted
-        .iter()
-        .filter(|s| !s.rtr && s.node == 2 && s.cmd == CommandId::ClearError.raw())
-        .count();
-    assert_eq!(clears, 3, "the override takes its three slots");
+    assert_eq!(
+        clears(&preempted, 2),
+        3,
+        "the override takes its three slots"
+    );
     assert_eq!(rtrs(&next), vec![polled[0]], "the second cycle starts over");
     assert_eq!(
         rtrs(&preempted),
         vec![polled[1]],
         "the round robin resumes at its own cursor after the override"
     );
+    // The override slot is single: a second one replaces what is left of
+    // the first.
+    bus.queue_poll_override(par6_bus::PollAction::ClearError { node: 2 }, 3);
+    let first = step(&mut bus, 1);
+    bus.queue_poll_override(par6_bus::PollAction::ClearError { node: 3 }, 2);
+    let replaced = step(&mut bus, 3);
+    assert_eq!(clears(&first, 2) + clears(&replaced, 2), 1);
+    assert_eq!(clears(&replaced, 3), 2);
+    assert_eq!(rtrs(&replaced), vec![polled[2]]);
+    let round_robin_before = cycle + 3;
 
-    // The device-info sweep: one RTR per node, contiguous.
-    let long = rtrs(&step(&mut bus, 1100));
+    // The device-info sweep: it replaces the round robin once every
+    // DEVICE_INFO_PERIOD_SLOTS of its slots, one RTR per node in one
+    // contiguous run, and the round robin then carries on where it was.
+    let long = rtrs(&step(
+        &mut bus,
+        par6_bus::DEVICE_INFO_PERIOD_SLOTS as usize + 20,
+    ));
     let sweep: Vec<usize> = long
         .iter()
         .enumerate()
@@ -926,11 +1018,26 @@ fn polls_reach_every_node_in_its_dialect_and_overrides_take_their_slots() {
         sweep.windows(2).all(|w| w[1] == w[0] + 1),
         "one contiguous sweep"
     );
+    assert_eq!(
+        round_robin_before + sweep[0],
+        par6_bus::DEVICE_INFO_PERIOD_SLOTS as usize,
+        "the sweep follows the period's last round-robin slot"
+    );
     let mut swept: Vec<NodeId> = sweep.iter().map(|&i| long[i].0).collect();
     swept.sort_unstable();
     let mut all = nodes.clone();
     all.sort_unstable();
     assert_eq!(swept, all);
+    let before = long[sweep[0] - 1];
+    let at = polled
+        .iter()
+        .position(|p| *p == before)
+        .expect("a round-robin poll");
+    assert_eq!(
+        long[sweep[sweep.len() - 1] + 1],
+        polled[(at + 1) % polled.len()],
+        "the round robin resumes at the poll after the one the sweep cut in on"
+    );
 }
 
 /// The backend's own contracts: nothing goes out before it is configured,

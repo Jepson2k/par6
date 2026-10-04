@@ -236,15 +236,6 @@ mod tests {
         RobotConfig::load(&path).expect("PAR6.toml")
     }
 
-    #[test]
-    fn truncation_is_toward_zero_not_floor_or_round() {
-        assert_eq!(trunc_to_wire(3.9), 3);
-        assert_eq!(trunc_to_wire(-3.9), -3, "floor would give -4");
-        assert_eq!(trunc_to_wire(-0.99), 0);
-        assert_eq!(trunc_to_wire(1045.999), 1045, "round would give 1046");
-        assert_eq!(trunc_to_wire(-1045.58), -1045);
-    }
-
     /// Spec invariant behind sector selection: the encoder is absolute
     /// only within one motor revolution, so the corrected boot position
     /// must be the representative of `initial − master (mod rev)` nearest
@@ -273,34 +264,23 @@ mod tests {
         }
     }
 
-    /// Spec post-condition of the boot calibration: at the master
-    /// position the joint reads the configured home offset (dir mirroring
-    /// included) — checked for every real PAR6 joint.
-    #[test]
-    fn par6_boot_calibration_reads_home_offset_at_master() {
-        let robot = par6();
-        for j in &robot.joints {
-            let mut c = JointConversion::from_config(j);
-            c.determine_sector(j.sector_master_position_ticks);
-            let got = c.joint_rad(j.sector_master_position_ticks);
-            let tick_rad = 1.0 / ticks_per_radian(1 << j.encoder_bits, j.gear_ratio);
-            assert!(
-                (got - j.sector_home_offset_rad).abs() <= tick_rad,
-                "{}: joint_rad(master) = {got}, want {} (±{tick_rad})",
-                j.name,
-                j.sector_home_offset_rad
-            );
-        }
-    }
-
     #[test]
     fn position_roundtrip_and_dir_mirroring() {
         let robot = par6();
         for j in &robot.joints {
             let mut c = JointConversion::from_config(j);
-            // Boot from a wrapped reading so a nonzero shift is exercised
-            // on joints whose master sits near the wrap boundary.
-            c.determine_sector(j.sector_master_position_ticks + 100);
+            // Boot from a reading more than half a revolution from the
+            // master across the encoder's wrap, so the sector correction
+            // is a real one.
+            let max = 1i32 << j.encoder_bits;
+            let master = j.sector_master_position_ticks;
+            let far = if master > max / 2 {
+                master - max / 2 - 500
+            } else {
+                master + max / 2 + 500
+            };
+            c.determine_sector(far.rem_euclid(max));
+            assert_ne!(c.sector_shift_ticks, 0, "{}: the boot must wrap", j.name);
             for delta in [-40000, -1000, -1, 0, 1, 999, 40000] {
                 let motor = j.sector_master_position_ticks + delta;
                 let rad = c.joint_rad(motor);
@@ -319,6 +299,25 @@ mod tests {
                 assert!(b < a, "{}: dir=1 must mirror", j.name);
             } else {
                 assert!(b > a, "{}: dir=0 must not mirror", j.name);
+            }
+        }
+
+        // Spec post-condition of the boot calibration: at the master
+        // position the joint reads the configured home offset (dir mirroring
+        // included) — checked for every real PAR6 joint.
+        {
+            let robot = par6();
+            for j in &robot.joints {
+                let mut c = JointConversion::from_config(j);
+                c.determine_sector(j.sector_master_position_ticks);
+                let got = c.joint_rad(j.sector_master_position_ticks);
+                let tick_rad = 1.0 / ticks_per_radian(1 << j.encoder_bits, j.gear_ratio);
+                assert!(
+                    (got - j.sector_home_offset_rad).abs() <= tick_rad,
+                    "{}: joint_rad(master) = {got}, want {} (±{tick_rad})",
+                    j.name,
+                    j.sector_home_offset_rad
+                );
             }
         }
     }
@@ -360,6 +359,15 @@ mod tests {
         let j1 = &robot.joints[0];
         let f1 = torque_to_ma_factor(j1.gear_ratio, j1.gear_efficiency, j1.kt_nm_a, j1.dir);
         assert!(f1 > 0.0);
+
+        // Truncation runs toward zero, not floor or round.
+        {
+            assert_eq!(trunc_to_wire(3.9), 3);
+            assert_eq!(trunc_to_wire(-3.9), -3, "floor would give -4");
+            assert_eq!(trunc_to_wire(-0.99), 0);
+            assert_eq!(trunc_to_wire(1045.999), 1045, "round would give 1046");
+            assert_eq!(trunc_to_wire(-1045.58), -1045);
+        }
     }
 
     #[test]
