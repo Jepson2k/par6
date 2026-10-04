@@ -48,7 +48,10 @@ mod sample;
 mod stream;
 
 pub use error::MotionError;
-pub use jog::{JogDirection, JogEngine, JogTick, MIN_ACCEL_TIME_S, MIN_JERK_FACTOR};
+pub use jog::{
+    ramp_rates, stopping_distance, JogDirection, JogEngine, JogTick, MIN_ACCEL_TIME_S,
+    MIN_JERK_FACTOR,
+};
 pub use limits::MotionLimits;
 pub use path::{JointLinePath, PathSampler};
 pub use plan::{

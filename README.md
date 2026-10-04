@@ -452,9 +452,10 @@ may not **add** one. Planned paths are walked at 0.02 rad joint pitch along the
 same interpolant used for fractional-speed playback, including every joint
 turning point. Soft limits are checked at those extrema as well as the stored
 samples. World changes recheck the remaining interpolated path, including while
-paused. Streams are
-projected one velocity-scaled lookahead ahead, so a faster jog stops further from
-contact.
+paused. A stream is refused once where it would come to rest, if released now,
+reaches the clearance; the arm is then braked and placed on the clearance, so a
+refused jog rests on it at any speed, and a jog held toward the keep-out leaves it
+there.
 
 Colliding geometry is reported in waldoctl's vocabulary: bare URDF link names for the
 arm and tool, `shape:<name>` for a program keep-out, `install:<name>` for an

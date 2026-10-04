@@ -359,6 +359,7 @@ impl Daemon {
         let stream_gate = Arc::new(Mutex::new(crate::bridge::StreamGate::new(
             gate_collision,
             &jog_limits,
+            &robot.jog,
             position_loop_gains(robot),
             robot.robot.tick_dt_s,
         )));

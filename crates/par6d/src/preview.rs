@@ -376,6 +376,7 @@ impl Preview {
             gate: StreamGate::new(
                 stack.gate_collision,
                 &jog_limits,
+                &robot.jog,
                 crate::daemon::position_loop_gains(robot),
                 robot.robot.tick_dt_s,
             ),
@@ -1235,10 +1236,10 @@ impl Preview {
         fractions[..NUM_JOINTS].copy_from_slice(&speeds);
         // The runtime admits a jog only if where it will be one lookahead
         // horizon ahead clears the world (`RtBridge`'s jog admission).
-        if let Some(error) = self.jog_blocked(&fractions) {
+        let scale = accel.unwrap_or(1.0);
+        if let Some(error) = self.jog_blocked(&fractions, scale) {
             return self.refuse(error);
         }
-        let scale = accel.unwrap_or(1.0);
         self.jog.set_accel_scale(scale);
         self.jog_accel_scale = scale;
         // The RT ramps from rest on JOG mode ENTRY, not per datagram: a
@@ -1253,12 +1254,48 @@ impl Preview {
         let ticks = ((duration_s / self.dt).round() as usize).max(1);
         let mut q = self.snap.q;
         let mut trajectory = Vec::with_capacity(ticks);
+        let mut refused = None;
         for _ in 0..ticks {
             let mut q_out = [0.0; MAX_JOINTS];
             let mut qd_out = [0.0; MAX_JOINTS];
             self.jog.tick(&q, &mut q_out, &mut qd_out);
             q = q_out;
             trajectory.push(q);
+            // The runtime's per-tick re-check, from the motion the jog has.
+            if let Ok((la, Some(pairs))) = self.gate.jog_verdict(&q, &q, &qd_out, &fractions, scale)
+            {
+                refused = Some((pairs, la));
+                break;
+            }
+        }
+        if let Some((pairs, goal)) = refused {
+            // Braked, then placed on the standoff, as the runtime does;
+            // the stop latches the verdict STATUS reports.
+            self.gate.refuse(pairs);
+            self.jog.release();
+            for _ in 0..((10.0 / self.dt) as usize) {
+                let mut q_out = [0.0; MAX_JOINTS];
+                let mut qd_out = [0.0; MAX_JOINTS];
+                self.jog.tick(&q, &mut q_out, &mut qd_out);
+                q = q_out;
+                trajectory.push(q);
+                if qd_out.iter().all(|v| *v == 0.0) {
+                    break;
+                }
+            }
+            self.jog_streaming = false;
+            if let Ok(stop) = self.gate.standoff(&q, &goal) {
+                while q
+                    .iter()
+                    .zip(stop.iter())
+                    .any(|(a, b)| (a - b).abs() > crate::bridge::STANDOFF_ARRIVED_RAD)
+                {
+                    q = crate::bridge::creep_toward(&q, &stop);
+                    trajectory.push(q);
+                }
+            }
+            let rows = trajectory.len();
+            return self.finish_stream(trajectory, trajectory_duration(rows, self.dt));
         }
         self.finish_stream(trajectory, trajectory_duration(ticks, self.dt))
     }
@@ -1389,12 +1426,12 @@ impl Preview {
     /// The runtime's jog admission check: where the commanded speeds put
     /// the arm one lookahead horizon from here must not collide, or from
     /// inside a keep-out must not deepen it.
-    fn jog_blocked(&mut self, fractions: &[f64; MAX_JOINTS]) -> Option<WireError> {
+    fn jog_blocked(&mut self, fractions: &[f64; MAX_JOINTS], accel: f64) -> Option<WireError> {
         let q = self.snap.q;
-        let la = self.gate.jog_lookahead(&q, fractions);
-        match self.gate.blocked(&q, &la) {
-            Ok(Some(pairs)) => Some(self.gate.refuse(pairs)),
-            Ok(None) => None,
+        let qd = crate::bridge::jog_velocity(&self.snap);
+        match self.gate.jog_verdict(&q, &q, &qd, fractions, accel) {
+            Ok((_, Some(pairs))) => Some(self.gate.refuse(pairs)),
+            Ok((_, None)) => None,
             Err(e) => Some(e),
         }
     }

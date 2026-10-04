@@ -159,6 +159,11 @@ const STOP_PIPELINE_TICKS: f64 = 4.0;
 /// about half its coast.
 const STOP_SETTLE_LAGS: f64 = 2.0;
 
+/// RT ticks between housekeeping deciding to release a jog and the jog
+/// engine ramping down on it: the command crosses to the RT, which
+/// drains it at the start of its next tick.
+const JOG_RELEASE_TICKS: f64 = 2.0;
+
 /// Signed joint travel between "moving at `v_rad_s`" and "stopped"
 /// \[rad\]: [`STOP_PIPELINE_TICKS`] of `tick_dt_s` before anything
 /// happens, then the arm settling out of its own tracking error.
@@ -187,6 +192,49 @@ pub fn stream_stopping_travel(v_rad_s: f64, position_loop_hz: f64, tick_dt_s: f6
     pipeline + STOP_SETTLE_LAGS * v_rad_s / position_loop_hz
 }
 
+/// How long a released jog carries on before its ramp-down starts \[s\]:
+/// [`JOG_RELEASE_TICKS`] for the release to reach the RT, and the tick
+/// until the next re-check.
+fn jog_reaction_s(tick_dt_s: f64) -> f64 {
+    (JOG_RELEASE_TICKS + 1.0) * tick_dt_s
+}
+
+/// The jog engine's ramp acceleration and jerk for a joint jogging at up
+/// to `v_full` under `a_limit`, at acceleration fraction `accel`.
+fn jog_ramp_rates(
+    v_full: f64,
+    a_limit: f64,
+    ramp: &par6_config::JogDefaults,
+    accel: f64,
+) -> (f64, f64) {
+    par6_motion::ramp_rates(
+        v_full,
+        a_limit,
+        ramp.accel_time_s / accel.clamp(0.01, 1.0),
+        ramp.jerk_factor,
+    )
+}
+
+/// Where a joint jog held at `v_rad_s` comes to rest if it is released
+/// now \[rad\]: the reaction at speed, then the jog engine's own ramp to
+/// rest. `v_full` and `a_limit` are the joint's JOG-mode limits.
+///
+/// This is what the streaming collision gate projects a held jog with,
+/// so a caller choosing a jog speed that must stop at a known distance
+/// inverts this rather than restating it.
+pub fn held_jog_travel(
+    v_rad_s: f64,
+    v_full: f64,
+    a_limit: f64,
+    ramp: &par6_config::JogDefaults,
+    accel: f64,
+    tick_dt_s: f64,
+) -> f64 {
+    let (a, jerk) = jog_ramp_rates(v_full, a_limit, ramp, accel);
+    v_rad_s * jog_reaction_s(tick_dt_s)
+        + par6_motion::stopping_distance(ramp.profile, v_rad_s, 0.0, a, jerk)
+}
+
 /// Joint speed above which a stream counts as MOVING and is re-tested
 /// against its projection every period \[rad/s\]. Below it the arm is
 /// settling on a held target and the projection would be noise.
@@ -213,7 +261,7 @@ const STREAM_MOVING_RAD_S: f64 = 0.01;
 /// arrived \[rad\]. Half a millimetre at the arm's reach, an order below
 /// the standoff itself, so "arrived" is a statement about the geometry
 /// rather than about the executor's last increment.
-const STANDOFF_ARRIVED_RAD: f64 = 2.0e-3;
+pub(crate) const STANDOFF_ARRIVED_RAD: f64 = 2.0e-3;
 
 /// How far short of the solved boundary the placement is commanded
 /// \[rad\], on the fastest joint.
@@ -286,20 +334,76 @@ fn standoff_budget_ticks(tick_dt_s: f64) -> u64 {
     (STANDOFF_TRAVEL_BUDGET_S / tick_dt_s).round() as u64
 }
 
-/// `from` advanced toward `to` by at most [`STANDOFF_CREEP_RAD`] on each
-/// joint; exactly `to` once within reach of it.
-fn creep_toward(from: &[f64; MAX_JOINTS], to: &[f64; MAX_JOINTS]) -> [f64; MAX_JOINTS] {
+/// The travel budget for placing the arm from `from` onto `stop`: the
+/// standing budget plus twice the time the span takes at the
+/// placement's speed on the slowest joint — a brake from speed can leave
+/// the arm further out than the standing budget covers.
+fn placement_budget_ticks(
+    from: &[f64; MAX_JOINTS],
+    stop: &[f64; MAX_JOINTS],
+    limits: &MotionLimits,
+    tick_dt_s: f64,
+) -> u64 {
+    let span = (0..par6_kin::NQ)
+        .map(|j| (stop[j] - from[j]).abs())
+        .fold(0.0, f64::max);
+    let slowest = limits.velocity[..par6_kin::NQ]
+        .iter()
+        .fold(f64::INFINITY, |m, v| m.min(*v));
+    let travel_s = span / (STANDOFF_PLACEMENT_SCALE.0 * slowest);
+    standoff_budget_ticks(tick_dt_s) + (2.0 * travel_s / tick_dt_s).ceil() as u64
+}
+
+/// How far short of a standoff a placement stops travelling at its own
+/// speed and starts creeping \[rad\], on the joint with the most to go.
+const PLACEMENT_APPROACH_RAD: f64 = 10.0 * STANDOFF_CREEP_RAD;
+
+/// The next placement setpoint from `from` onto `stop`: while there is
+/// further than [`PLACEMENT_APPROACH_RAD`] to go, a point half that short
+/// of the standoff, travelled to at the placement's own speed; the creep
+/// (see [`creep_toward`]) for the last stretch, which is the one that
+/// must not overshoot. Aimed past the switch, not at it: an arm that
+/// settles a hair short of the point it was sent to must still cross
+/// into the creep, or the setpoint becomes the pose and it stays there.
+pub(crate) fn placement_setpoint(
+    from: &[f64; MAX_JOINTS],
+    stop: &[f64; MAX_JOINTS],
+) -> [f64; MAX_JOINTS] {
+    let span = (0..par6_kin::NQ)
+        .map(|j| (stop[j] - from[j]).abs())
+        .fold(0.0, f64::max);
+    if span <= PLACEMENT_APPROACH_RAD {
+        return creep_toward(from, stop);
+    }
+    let k = 0.5 * PLACEMENT_APPROACH_RAD / span;
+    let mut short = *stop;
+    for j in 0..par6_kin::NQ {
+        short[j] = stop[j] - k * (stop[j] - from[j]);
+    }
+    short
+}
+
+/// `from` advanced along the straight line to `to`, the joint with the
+/// most to go by at most [`STANDOFF_CREEP_RAD`]; exactly `to` once within
+/// reach of it. On the line, because the standoff was solved along one:
+/// a joint that arrived ahead of the rest bent the path, and measured on
+/// the sim rig the bend passed 4.2 mm from a keep-out whose standoff was
+/// 5.2.
+pub(crate) fn creep_toward(from: &[f64; MAX_JOINTS], to: &[f64; MAX_JOINTS]) -> [f64; MAX_JOINTS] {
+    let span = (0..par6_kin::NQ)
+        .map(|j| (to[j] - from[j]).abs())
+        .fold(0.0, f64::max);
+    if span <= STANDOFF_CREEP_RAD {
+        return *to;
+    }
+    let k = STANDOFF_CREEP_RAD / span;
     let mut next = *from;
     for j in 0..par6_kin::NQ {
-        let step = to[j] - from[j];
-        next[j] = if step.abs() <= STANDOFF_CREEP_RAD {
-            to[j]
-        } else {
-            from[j] + step.signum() * STANDOFF_CREEP_RAD
-        };
+        next[j] = from[j] + k * (to[j] - from[j]);
     }
     next
 }
+
 /// Escape-depth tolerance \[m\]: a min-distance drop smaller than this
 /// counts as "no deeper" (absorbs signed-distance jitter between two
 /// nearby configurations; parol6's escape tolerance). Used by the
@@ -400,6 +504,12 @@ pub(crate) struct StreamGate {
     /// fraction of ±1 commands, and therefore what the lookahead
     /// projects with.
     jog_vel: [f64; MAX_JOINTS],
+    /// Per-joint JOG-mode acceleration limits \[rad/s²\], which cap the
+    /// jog engine's ramp.
+    jog_accel: [f64; MAX_JOINTS],
+    /// The jog engine's ramp: its shape, full-speed ramp time \[s\] and
+    /// jerk factor — what a released jog stops under.
+    jog_ramp: par6_config::JogDefaults,
     /// Per-joint drive position-loop gains \[1/s\] (the config `kpp`
     /// pushed to each driver) — the reciprocal of the time constant the
     /// arm takes to settle out of its tracking error, and so most of how
@@ -432,6 +542,7 @@ impl StreamGate {
     pub(crate) fn new(
         collision: par6_kin::Collision,
         jog_limits: &par6_motion::MotionLimits,
+        jog_ramp: &par6_config::JogDefaults,
         position_loop_hz: [f64; MAX_JOINTS],
         tick_dt_s: f64,
     ) -> Self {
@@ -439,6 +550,8 @@ impl StreamGate {
             collision,
             shape_names: ShapeNames::default(),
             jog_vel: jog_limits.velocity,
+            jog_accel: jog_limits.acceleration,
+            jog_ramp: *jog_ramp,
             position_loop_hz,
             tick_dt_s,
             soft_min: jog_limits.soft_min,
@@ -563,6 +676,29 @@ impl StreamGate {
             .into_iter()
             .filter(|p| is_world_name(&p.0) || is_world_name(&p.1))
             .collect())
+    }
+
+    /// Where a refused motion from `current` toward `goal` is placed:
+    /// the [`Self::stop_point`] on the clearance, backed off it by the
+    /// settle margin along the line it was solved on, away from what
+    /// refused it.
+    pub(crate) fn standoff(
+        &mut self,
+        current: &[f64; MAX_JOINTS],
+        goal: &[f64; MAX_JOINTS],
+    ) -> Result<[f64; MAX_JOINTS], WireError> {
+        let stop = self.stop_point(current, goal)?;
+        let mut back = stop;
+        let span = (0..par6_kin::NQ)
+            .map(|j| (goal[j] - stop[j]).abs())
+            .fold(0.0, f64::max);
+        if span > 0.0 {
+            let k = STANDOFF_SETTLE_MARGIN_RAD / span;
+            for j in 0..par6_kin::NQ {
+                back[j] = stop[j] - k * (goal[j] - stop[j]);
+            }
+        }
+        Ok(back)
     }
 
     /// Where a refused motion should come to rest: the configuration on
@@ -779,6 +915,27 @@ impl StreamGate {
             if d_target < reach && d_target <= d_current + STREAM_ESCAPE_TOL_M {
                 return Ok(Some(if tgt.is_empty() { cur } else { tgt }));
             }
+            // Nor THROUGH it to a clear far side: from the clearance, short
+            // of the shape, the endpoint alone admits a long projection that
+            // crosses the keep-out, so no sample on the way may be nearer
+            // than the start. Not from inside the shape: there the reported
+            // depth is a contact-patch estimate over several bodies, and on
+            // the way out a trailing one reads deeper for a while.
+            let steps = if d_current >= 0.0 {
+                self.segment_steps(current, target)
+            } else {
+                0
+            };
+            for i in 1..steps {
+                let t = i as f64 / steps as f64;
+                let mut q = *current;
+                for j in 0..par6_kin::NQ {
+                    q[j] = current[j] + t * (target[j] - current[j]);
+                }
+                if self.world_distance(&q)? < d_current - STREAM_ESCAPE_TOL_M {
+                    return Ok(Some(cur));
+                }
+            }
         }
         Ok(None)
     }
@@ -789,18 +946,124 @@ impl StreamGate {
         self.collision.scene_epoch()
     }
 
-    /// Where a `jog_j` on `joint` at `signed_pct` will be one lookahead
-    /// horizon from `q`, clamped into the soft window so a pose at the
-    /// stop cannot phantom-trip the gate.
-    pub(crate) fn jog_lookahead(
+    /// Whether `q` sits inside the world's clearance.
+    pub(crate) fn inside_world(&mut self, q: &[f64; MAX_JOINTS]) -> Result<bool, WireError> {
+        Ok(!self.world_offenders(q)?.is_empty())
+    }
+
+    /// The gate's verdict on a `jog_j` from the measured pose `q`, and
+    /// the configuration it was reached on: where the jog comes to rest
+    /// if it is released now, from `seed` moving at `qd` (see
+    /// [`Self::jog_lookahead`]).
+    ///
+    /// From inside a keep-out the verdict is on the ground the jog asks
+    /// for, held at its own speed, instead. Inside, a move has to earn
+    /// measurable distance (see [`Self::blocked`]), and an arm at rest
+    /// stops a few milliradians on: every direction, the way out
+    /// included, reads as no farther, and the refusal's placement takes
+    /// the arm out by the nearest side whichever way it was jogged.
+    pub(crate) fn jog_verdict(
+        &mut self,
+        q: &[f64; MAX_JOINTS],
+        seed: &[f64; MAX_JOINTS],
+        qd: &[f64; MAX_JOINTS],
+        speeds: &[f64; MAX_JOINTS],
+        accel: f64,
+    ) -> Result<GateVerdict, WireError> {
+        let la = self.jog_lookahead(seed, qd, speeds, accel);
+        let pairs = self.blocked(q, &la)?;
+        if pairs.is_none() || !self.inside_world(q)? {
+            return Ok((la, pairs));
+        }
+        let held = self.held_jog_lookahead(q, speeds, accel);
+        let pairs = self.blocked(q, &held)?;
+        Ok((held, pairs))
+    }
+
+    /// [`Self::jog_lookahead`] for a jog already at the speed it asks for.
+    pub(crate) fn held_jog_lookahead(
         &self,
         q: &[f64; MAX_JOINTS],
         speeds: &[f64; MAX_JOINTS],
+        accel: f64,
     ) -> [f64; MAX_JOINTS] {
+        let qd = std::array::from_fn(|j| speeds[j] * self.jog_vel[j]);
+        self.jog_lookahead(q, &qd, speeds, accel)
+    }
+
+    /// Where a `jog_j` driving `speeds` at acceleration fraction `accel`
+    /// comes to rest if it is released now, from `q` moving at `qd`.
+    ///
+    /// The release takes [`JOG_RELEASE_TICKS`] to reach the RT, and the
+    /// next re-check is a tick after this one, so the ramp carries on
+    /// toward its target for that long; then the jog engine ramps to rest
+    /// under its own profile
+    /// — the stopping model it stops at the soft limits with. The drive's
+    /// lag is not added: a jog commands the velocity it wants, and the
+    /// drive tracks it on feedforward rather than trailing on position
+    /// error. Clamped into the soft window so a pose at the stop cannot
+    /// phantom-trip the gate.
+    pub(crate) fn jog_lookahead(
+        &self,
+        q: &[f64; MAX_JOINTS],
+        qd: &[f64; MAX_JOINTS],
+        speeds: &[f64; MAX_JOINTS],
+        accel: f64,
+    ) -> [f64; MAX_JOINTS] {
+        let reaction = jog_reaction_s(self.tick_dt_s);
         let mut la = *q;
-        for (j, pct) in speeds.iter().enumerate() {
-            let v = pct * self.jog_vel[j];
-            la[j] = (la[j] + self.stopping_travel(j, v)).clamp(self.soft_min[j], self.soft_max[j]);
+        for j in 0..MAX_JOINTS {
+            let target = speeds[j] * self.jog_vel[j];
+            let sgn = if qd[j] != 0.0 {
+                qd[j].signum()
+            } else {
+                target.signum()
+            };
+            if sgn == 0.0 {
+                continue;
+            }
+            let (a, jerk) =
+                jog_ramp_rates(self.jog_vel[j], self.jog_accel[j], &self.jog_ramp, accel);
+            let speed = (qd[j] * sgn).max(0.0);
+            let wanted = (target * sgn).max(0.0);
+            // Still ramping up, it keeps accelerating through the reaction.
+            // The snapshot carries no acceleration, so it is taken as the
+            // most the ramp can have: what a ramp from rest builds by this
+            // speed, and no more than it can still shed before reaching
+            // its target — the ramp never overshoots the speed it wants.
+            if speed >= wanted {
+                let travel = held_jog_travel(
+                    speed,
+                    self.jog_vel[j],
+                    self.jog_accel[j],
+                    &self.jog_ramp,
+                    accel,
+                    self.tick_dt_s,
+                );
+                la[j] = (q[j] + sgn * travel).clamp(self.soft_min[j], self.soft_max[j]);
+                continue;
+            }
+            let (reacting, speed, a0) = match self.jog_ramp.profile {
+                par6_config::JogProfile::Trapezoid => (
+                    speed * reaction + 0.5 * a * reaction * reaction,
+                    (speed + a * reaction).min(wanted),
+                    0.0,
+                ),
+                par6_config::JogProfile::Scurve => {
+                    let room = |v: f64| (2.0 * jerk * (wanted - v).max(0.0)).sqrt();
+                    let a_now = (2.0 * jerk * speed).sqrt().min(room(speed)).min(a);
+                    let v =
+                        (speed + a_now * reaction + 0.5 * jerk * reaction * reaction).min(wanted);
+                    let a_end = (a_now + jerk * reaction).min(room(v)).min(a);
+                    let d = speed * reaction
+                        + 0.5 * a_now * reaction * reaction
+                        + jerk * reaction.powi(3) / 6.0;
+                    (d, v, a_end)
+                }
+            };
+            let travel = reacting
+                + par6_motion::stopping_distance(self.jog_ramp.profile, speed, a0, a, jerk);
+            la[j] = (q[j] + sgn * travel).clamp(self.soft_min[j], self.soft_max[j]);
         }
         la
     }
@@ -1209,6 +1472,19 @@ fn projection_seed(snap: &StateSnapshot) -> [f64; MAX_JOINTS] {
     }
 }
 
+/// The velocity a jog's stop is projected from: what the jog engine is
+/// commanding, which leads the measurement by the drive's tracking, or
+/// the measurement where nothing is commanded.
+pub(crate) fn jog_velocity(snap: &StateSnapshot) -> [f64; MAX_JOINTS] {
+    if snap.qd_commanded.iter().all(|v| v.is_finite()) {
+        snap.qd_commanded
+    } else if snap.qd_filtered.iter().all(|v| v.is_finite()) {
+        snap.qd_filtered
+    } else {
+        snap.qd
+    }
+}
+
 /// The velocity a stopping projection starts from.
 ///
 /// The RT's filtered measurement, not the raw one. The projection prices
@@ -1299,6 +1575,25 @@ impl Standoff {
             | Standoff::Placing { until_tick, .. }
             | Standoff::Settling { until_tick, .. } => *until_tick,
         }
+    }
+}
+
+/// A projected configuration and the pairs that refuse it, if any.
+type GateVerdict = ([f64; MAX_JOINTS], Option<Vec<(String, String)>>);
+
+/// Where a jog arriving while a refusal owns the arm is tested from: the
+/// standoff it is being placed on or is parked on, or — still braking,
+/// before the standoff is solved — where the arm is. A jog held at its
+/// own speed reaches from there past anything the brake stops short of.
+/// Not from the refused goal: a fast refusal projects that into the
+/// keep-out, where a mesh's penetration depth reads flat and a jog
+/// driving deeper looks like no change.
+fn placement_target(a: &ActiveStream, q: &[f64; MAX_JOINTS]) -> Option<[f64; MAX_JOINTS]> {
+    match a.standoff {
+        Some(Standoff::Braking { .. }) => Some(*q),
+        Some(Standoff::Placing { stop, .. } | Standoff::Settling { stop, .. }) => Some(stop),
+        None if a.parked => a.servo_target,
+        None => None,
     }
 }
 
@@ -1511,22 +1806,94 @@ impl RtCommands for RtBridge {
                 }
                 let moving = speeds.iter().any(|v| *v != 0.0);
                 let mut sh = self.shared.lock().unwrap();
-                // Admission gate: where this jog will be one lookahead
-                // horizon ahead must not collide (or, from inside a
-                // keep-out, must not deepen it). The commanded velocity
-                // bounds the RT integrator's ramp from above, so a jog
-                // this projection clears cannot outrun it. Every driven
-                // joint is projected at once, so the configuration under
-                // test is the one the arm will actually be in — a
-                // per-joint check would clear two axes that only collide
-                // together.
+                // Admission gate: where this jog comes to rest if it is
+                // released at once must not collide (or, from inside a
+                // keep-out, must not deepen it). It is projected from the
+                // motion the arm already has, so a jog from rest is
+                // admitted up to the keep-out and the per-tick re-check
+                // stops it as it gathers speed. Every driven joint is
+                // projected at once, so the configuration under test is
+                // the one the arm will actually be in — a per-joint check
+                // would clear two axes that only collide together.
+                //
+                // A refused jog is placed on the standoff rather than left
+                // where it was refused: a jog toward a keep-out asks for
+                // the ground up to it, and the projection reaches the
+                // boundary before the arm has covered it.
+                //
+                // A placement in progress, or the standoff it parked on,
+                // owns the arm against a jog that would be refused from
+                // that standoff, held at its own speed — tested from the
+                // arm as it brakes, the same jog projects short and would
+                // restart the approach every time it was re-sent. Holding
+                // such a jog keeps the arm parked. A jog clear from there
+                // is the operator steering away, and takes over.
+                //
+                // The gate is queried with the shared state released:
+                // housekeeping feeds STREAM under that lock every tick, and
+                // a held key re-sends faster than the queries return, so
+                // holding it across them starved the feed until the RT's
+                // link watchdog tripped mid-placement on the sim rig.
                 if moving {
-                    let q = self.cart.snapshots.latest().q;
+                    let snap = self.cart.snapshots.latest();
+                    let accel = p.accel.unwrap_or(1.0);
+                    let grace = self.servo_grace();
+                    let owner = sh
+                        .stream
+                        .as_ref()
+                        .and_then(|a| placement_target(a, &snap.q));
+                    drop(sh);
                     let mut gate = self.cart.gate.lock().unwrap();
-                    let la = gate.jog_lookahead(&q, &speeds);
-                    if let Some(pairs) = gate.blocked(&q, &la)? {
-                        return Err(gate.refuse(pairs));
+                    if let Some(to) = owner {
+                        let held = gate.held_jog_lookahead(&to, &speeds, accel);
+                        if gate.blocked(&to, &held)?.is_some() {
+                            let refusal = gate.standing_refusal();
+                            drop(gate);
+                            if let Some(a) = self.shared.lock().unwrap().stream.as_mut() {
+                                a.deadline = Instant::now() + grace;
+                            }
+                            return Err(refusal);
+                        }
                     }
+                    let (la, refused) = gate.jog_verdict(
+                        &snap.q,
+                        &projection_seed(&snap),
+                        &jog_velocity(&snap),
+                        &speeds,
+                        accel,
+                    )?;
+                    if let Some(pairs) = refused {
+                        let refusal = gate.refuse(pairs);
+                        let world_epoch = gate.epoch();
+                        let until_tick = snap.tick + standoff_budget_ticks(gate.tick_dt_s());
+                        drop(gate);
+                        // Brakes whichever stream is running; each mode
+                        // ignores the release that is not its own.
+                        self.link.send(RtCommand::JogRelease);
+                        self.link.send(RtCommand::StreamRelease);
+                        self.shared.lock().unwrap().stream = Some(ActiveStream {
+                            releasing: false,
+                            kind: StreamKind::Servo,
+                            deadline: Instant::now() + self.servo_grace(),
+                            servo_target: None,
+                            standoff: Some(Standoff::Braking {
+                                goal: la,
+                                until_tick,
+                            }),
+                            jog: [0.0; MAX_JOINTS],
+                            world_epoch,
+                            cart: None,
+                            servo: None,
+                            parked: false,
+                            still: 0,
+                            still_tick: 0,
+                            stepped_tick: 0,
+                            scale: (1.0, accel),
+                        });
+                        return Err(refusal);
+                    }
+                    drop(gate);
+                    sh = self.shared.lock().unwrap();
                 }
                 let active = match sh.stream {
                     Some(ActiveStream {
@@ -1883,7 +2250,7 @@ impl RtCommands for RtBridge {
             // through the jacobian each period until the watchdog
             // duration elapses.
             Command::JogL(p) => {
-                let mut sh = self.shared.lock().unwrap();
+                let sh = self.shared.lock().unwrap();
                 let q = match &sh.stream {
                     Some(ActiveStream {
                         kind: StreamKind::CartJog,
@@ -1918,19 +2285,65 @@ impl RtCommands for RtBridge {
                     soft_min: self.cart.soft_min,
                     soft_max: self.cart.soft_max,
                 };
-                let reaction_s = self.cart.gate.lock().unwrap().reaction_s();
-                if let Ok((mut la, qd)) =
-                    project_cart_jog(&mut self.cart.kin, &mut probe, reaction_s)
-                {
-                    let mut gate = self.cart.gate.lock().unwrap();
-                    for (j, v) in la.iter_mut().enumerate() {
-                        *v = (*v + gate.braking_travel(j, qd[j]))
-                            .clamp(probe.soft_min[j], probe.soft_max[j]);
-                    }
-                    if let Some(pairs) = gate.blocked(&q, &la)? {
-                        return Err(gate.refuse(pairs));
+                //
+                // As for a joint jog, a refusal is placed on the standoff, a
+                // placement or the standoff it parked on owns the arm against
+                // a twist that would be refused from there, and the gate is
+                // queried with the shared state released.
+                let grace = self.servo_grace();
+                let snap_q = self.cart.snapshots.latest().q;
+                let owner = sh
+                    .stream
+                    .as_ref()
+                    .and_then(|a| placement_target(a, &snap_q));
+                drop(sh);
+                if let Some(to) = owner {
+                    let mut held = CartJogProbe { q: to, ..probe };
+                    if let Ok(la) = cart_jog_stop(&mut self.cart.kin, &self.cart.gate, &mut held) {
+                        let mut gate = self.cart.gate.lock().unwrap();
+                        if gate.blocked(&to, &la)?.is_some() {
+                            let refusal = gate.standing_refusal();
+                            drop(gate);
+                            if let Some(a) = self.shared.lock().unwrap().stream.as_mut() {
+                                a.deadline = Instant::now() + grace;
+                            }
+                            return Err(refusal);
+                        }
                     }
                 }
+                if let Ok(la) = cart_jog_stop(&mut self.cart.kin, &self.cart.gate, &mut probe) {
+                    let mut gate = self.cart.gate.lock().unwrap();
+                    if let Some(pairs) = gate.blocked(&q, &la)? {
+                        let refusal = gate.refuse(pairs);
+                        let world_epoch = gate.epoch();
+                        let until_tick = self.cart.snapshots.latest().tick
+                            + standoff_budget_ticks(gate.tick_dt_s());
+                        drop(gate);
+                        self.link.send(RtCommand::JogRelease);
+                        self.link.send(RtCommand::StreamRelease);
+                        self.shared.lock().unwrap().stream = Some(ActiveStream {
+                            releasing: false,
+                            kind: StreamKind::Servo,
+                            deadline: Instant::now() + self.servo_grace(),
+                            servo_target: None,
+                            standoff: Some(Standoff::Braking {
+                                goal: la,
+                                until_tick,
+                            }),
+                            jog: [0.0; MAX_JOINTS],
+                            world_epoch,
+                            cart: None,
+                            servo: None,
+                            parked: false,
+                            still: 0,
+                            still_tick: 0,
+                            stepped_tick: 0,
+                            scale: (1.0, p.accel.unwrap_or(1.0)),
+                        });
+                        return Err(refusal);
+                    }
+                }
+                let mut sh = self.shared.lock().unwrap();
                 // A jog already running keeps its limiter: the ramp it
                 // is on is the state that makes the next twist smooth,
                 // and rebuilding it would restart from rest.
@@ -2016,10 +2429,12 @@ impl RtCommands for RtBridge {
             .unwrap()
             .stream
             .as_ref()
-            .is_some_and(|a| a.standoff.is_some());
+            .is_some_and(|a| a.standoff.is_some() || a.parked);
         if in_standoff {
-            // The collision gate owns braking and placement. Cancelling it
-            // on a late datagram would abandon the configured standoff.
+            // The collision gate owns braking, placement and the park on
+            // the standoff. Cancelling it on a late datagram would abandon
+            // the standoff, and the next one would start the jog again
+            // from there.
             return true;
         }
         self.cancel_stream();
@@ -2653,10 +3068,18 @@ pub(crate) fn housekeeping_loop(
                                             0
                                         };
                                 }
-                                if a.still < STANDOFF_STILL_TICKS && !expired {
+                                // Or the RT has handed the release to its
+                                // hold, which it does only once the arm stops
+                                // travelling — judged by displacement, so a
+                                // drive ringing around the hold, which the
+                                // speed count reads as motion for as long as
+                                // it lasts, still counts as stopped.
+                                let rested = a.still >= STANDOFF_STILL_TICKS
+                                    || matches!(snap.mode, Mode::Exec | Mode::Idle);
+                                if !rested && !expired {
                                     break 'stream;
                                 }
-                                if a.still < STANDOFF_STILL_TICKS {
+                                if !rested {
                                     log::warn!(
                                         "the arm did not come to rest after a refusal; idling"
                                     );
@@ -2669,29 +3092,17 @@ pub(crate) fn housekeeping_loop(
                                 // refusal, past it and inside the keep-out
                                 // after a fast one. `stop_point` answers
                                 // both, forwards and backwards.
-                                let stop = gate.lock().unwrap().stop_point(&snap.q, &goal);
+                                let stop = gate.lock().unwrap().standoff(&snap.q, &goal);
                                 let Ok(stop) = stop else {
                                     log::error!("the gate could not solve a standoff; idling");
                                     link.send(RtCommand::SetMode(Mode::Idle));
                                     sh.stream = None;
                                     break 'stream;
                                 };
-                                // Backed off the boundary by the settle
-                                // margin, along the line the standoff was
-                                // solved on and away from what refused it.
-                                let stop = {
-                                    let mut back = stop;
-                                    let span = (0..par6_kin::NQ)
-                                        .map(|j| (goal[j] - stop[j]).abs())
-                                        .fold(0.0, f64::max);
-                                    if span > 0.0 {
-                                        let k = STANDOFF_SETTLE_MARGIN_RAD / span;
-                                        for j in 0..par6_kin::NQ {
-                                            back[j] = stop[j] - k * (goal[j] - stop[j]);
-                                        }
-                                    }
-                                    back
-                                };
+                                // Already on it: parked there, as a placement
+                                // that landed is, so a jog still held toward
+                                // the keep-out stays refused rather than
+                                // nudging the arm off it and back.
                                 if snap
                                     .q
                                     .iter()
@@ -2699,18 +3110,27 @@ pub(crate) fn housekeeping_loop(
                                     .all(|(q, s)| (q - s).abs() <= STANDOFF_ARRIVED_RAD)
                                 {
                                     link.send(RtCommand::SetMode(Mode::Idle));
-                                    sh.stream = None;
+                                    a.standoff = None;
+                                    a.parked = true;
+                                    a.servo_target = Some(stop);
+                                    a.deadline = now + servo_grace;
                                     break 'stream;
                                 }
                                 // Resumed in place when the RT is still in
                                 // STREAM from the release, entered afresh if
                                 // it has already dropped to IDLE. Not bounced
-                                // through IDLE: that re-seeds the tracker at
-                                // the measured pose, a step off what the
-                                // drive was holding that it rings on.
+                                // through IDLE otherwise: that re-seeds the
+                                // tracker at the measured pose, a step off
+                                // what the drive was holding that it rings
+                                // on. A released jog rests in EXEC's hold,
+                                // though, and a working mode leaves only for
+                                // IDLE, so that one does pass through it.
+                                if !matches!(snap.mode, Mode::Stream | Mode::Idle) {
+                                    link.send(RtCommand::SetMode(Mode::Idle));
+                                }
                                 link.send(RtCommand::SetMode(Mode::Stream));
                                 stream_input.lock().unwrap().send(&StreamSetpoint {
-                                    q: creep_toward(&snap.q, &stop),
+                                    q: placement_setpoint(&snap.q, &stop),
                                     speed: STANDOFF_PLACEMENT_SCALE.0,
                                     accel: STANDOFF_PLACEMENT_SCALE.1,
                                     shaped: false,
@@ -2718,7 +3138,13 @@ pub(crate) fn housekeeping_loop(
                                 a.standoff = Some(Standoff::Placing {
                                     stop,
                                     tries: 1,
-                                    until_tick: snap.tick + standoff_budget_ticks(dt),
+                                    until_tick: snap.tick
+                                        + placement_budget_ticks(
+                                            &snap.q,
+                                            &stop,
+                                            &stream_limits,
+                                            dt,
+                                        ),
                                 });
                                 a.still = 0;
                                 a.still_tick = 0;
@@ -2785,7 +3211,7 @@ pub(crate) fn housekeeping_loop(
                                     break 'stream;
                                 }
                                 stream_input.lock().unwrap().send(&StreamSetpoint {
-                                    q: creep_toward(&snap.q, &stop),
+                                    q: placement_setpoint(&snap.q, &stop),
                                     speed: STANDOFF_PLACEMENT_SCALE.0,
                                     accel: STANDOFF_PLACEMENT_SCALE.1,
                                     shaped: false,
@@ -2830,7 +3256,7 @@ pub(crate) fn housekeeping_loop(
                                 // and from nearer than the last one started.
                                 link.send(RtCommand::SetMode(Mode::Stream));
                                 stream_input.lock().unwrap().send(&StreamSetpoint {
-                                    q: creep_toward(&snap.q, &stop),
+                                    q: placement_setpoint(&snap.q, &stop),
                                     speed: STANDOFF_PLACEMENT_SCALE.0,
                                     accel: STANDOFF_PLACEMENT_SCALE.1,
                                     shaped: false,
@@ -2914,20 +3340,39 @@ pub(crate) fn housekeeping_loop(
                     }
                     // The moving-jog re-check: the admission gate saw the
                     // configuration the jog STARTED at, and the arm has
-                    // moved since. Every period the lookahead is projected
-                    // from the measured pose and re-tested — against the
-                    // world as it is NOW, so a keep-out dropped onto a
-                    // running jog stops it too.
+                    // moved since. Every tick the stop is projected from
+                    // the motion the arm has now and re-tested — against
+                    // the world as it is NOW, so a keep-out dropped onto a
+                    // running jog stops it too. A blocked jog is braked
+                    // and then placed on the standoff, as a refused servo
+                    // stream is: where the brake alone leaves the arm is
+                    // whatever margin the projection carried, not the
+                    // clearance.
                     Some(a) if a.kind == StreamKind::Jog && a.jog.iter().any(|v| *v != 0.0) => {
                         let speeds = a.jog;
                         let mut g = gate.lock().unwrap();
-                        let la = g.jog_lookahead(&snap.q, &speeds);
-                        match g.blocked(&snap.q, &la) {
-                            Ok(None) => {}
-                            Ok(Some(pairs)) => {
+                        let verdict = g.jog_verdict(
+                            &snap.q,
+                            &projection_seed(&snap),
+                            &jog_velocity(&snap),
+                            &speeds,
+                            a.scale.1,
+                        );
+                        match verdict {
+                            Ok((_, None)) => {}
+                            Ok((la, Some(pairs))) => {
                                 drop(g);
                                 collision_stop(&link, &gate, "jog_j", pairs);
-                                sh.stream = None;
+                                a.kind = StreamKind::Servo;
+                                a.jog = [0.0; MAX_JOINTS];
+                                a.releasing = false;
+                                a.servo_target = None;
+                                a.standoff = Some(Standoff::Braking {
+                                    goal: la,
+                                    until_tick: snap.tick + standoff_budget_ticks(dt),
+                                });
+                                a.deadline = now + servo_grace;
+                                continue 'housekeeping;
                             }
                             Err(e) => {
                                 // A world the gate cannot query gates
@@ -3040,6 +3485,7 @@ pub(crate) fn housekeeping_loop(
                         if owed == 0 {
                             continue 'housekeeping;
                         }
+                        let mut refused_at = None;
                         if let Some(st) = &mut a.cart {
                             let before = st.commanded();
                             match step_up_to(owed, || {
@@ -3053,7 +3499,7 @@ pub(crate) fn housekeeping_loop(
                                     // step turns out to be the last one
                                     // admitted.
                                     let mut la = target;
-                                    let verdict = {
+                                    let mut verdict = {
                                         let mut g = gate.lock().unwrap();
                                         for (j, v) in la.iter_mut().enumerate() {
                                             *v = (*v + g.stopping_travel(j, qd[j])).clamp(
@@ -3063,6 +3509,30 @@ pub(crate) fn housekeeping_loop(
                                         }
                                         g.blocked(&before, &la)
                                     };
+                                    // From inside a keep-out, judged on the
+                                    // twist the client asked for, as
+                                    // `StreamGate::jog_verdict` judges a joint
+                                    // jog: a ramp from rest earns no
+                                    // measurable distance in a step.
+                                    if matches!(verdict, Ok(Some(_)))
+                                        && matches!(
+                                            gate.lock().unwrap().inside_world(&before),
+                                            Ok(true)
+                                        )
+                                    {
+                                        let mut held = CartJogProbe {
+                                            twist: st.twist,
+                                            frame: st.frame,
+                                            q: before,
+                                            soft_min: stream_limits.soft_min,
+                                            soft_max: stream_limits.soft_max,
+                                        };
+                                        if let Ok(stop) = cart_jog_stop(&mut kin, &gate, &mut held)
+                                        {
+                                            la = stop;
+                                            verdict = gate.lock().unwrap().blocked(&before, &la);
+                                        }
+                                    }
                                     match verdict {
                                         Ok(None) => {
                                             stream_input.lock().unwrap().send(&StreamSetpoint {
@@ -3083,8 +3553,7 @@ pub(crate) fn housekeeping_loop(
                                         }
                                         Ok(Some(pairs)) => {
                                             collision_stop(&link, &gate, "jog_l", pairs);
-                                            sh.stream = None;
-                                            continue 'housekeeping;
+                                            refused_at = Some(la);
                                         }
                                         Err(e) => {
                                             // Stop without a collision verdict:
@@ -3110,6 +3579,20 @@ pub(crate) fn housekeeping_loop(
                                     });
                                 }
                             }
+                        }
+                        // Braked, then placed on the standoff, as a joint
+                        // jog is.
+                        if let Some(goal) = refused_at {
+                            a.kind = StreamKind::Servo;
+                            a.cart = None;
+                            a.releasing = false;
+                            a.servo_target = None;
+                            a.standoff = Some(Standoff::Braking {
+                                goal,
+                                until_tick: snap.tick + standoff_budget_ticks(dt),
+                            });
+                            a.deadline = now + servo_grace;
+                            continue 'housekeeping;
                         }
                     }
                     Some(a) if a.kind == StreamKind::CartServo => {
@@ -3515,6 +3998,22 @@ pub(crate) fn step_cart_servo(
             Ok((st.q_commanded, step.finished))
         }
     }
+}
+
+/// Where a `jog_l` from `probe` comes to rest if it is refused now: the
+/// twist carried through the gate's reaction, then braked.
+fn cart_jog_stop(
+    kin: &mut crate::kin::CartKin,
+    gate: &Mutex<StreamGate>,
+    probe: &mut CartJogProbe,
+) -> Result<[f64; MAX_JOINTS], String> {
+    let reaction_s = gate.lock().unwrap().reaction_s();
+    let (mut la, qd) = project_cart_jog(kin, probe, reaction_s)?;
+    let gate = gate.lock().unwrap();
+    for (j, v) in la.iter_mut().enumerate() {
+        *v = (*v + gate.braking_travel(j, qd[j])).clamp(probe.soft_min[j], probe.soft_max[j]);
+    }
+    Ok(la)
 }
 
 /// Where a twist would put the arm `dt_s` from here: resolve it into

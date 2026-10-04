@@ -23,7 +23,7 @@ use par6_proto::command::{
     JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetPayload, SetShapes, SetTcpOffset,
     Shape, Stop, Teleport,
 };
-use par6_proto::{Command, ErrorCode, Frame, QueryResult, Status, NUM_JOINTS};
+use par6_proto::{Command, ControllerMode, ErrorCode, Frame, QueryResult, Status, NUM_JOINTS};
 
 use par6d::options::StatusTransport;
 use par6d::{Daemon, Options};
@@ -1214,29 +1214,22 @@ fn tcp_at_m(angles_deg: [f64; NUM_JOINTS]) -> [f64; 3] {
     [pose[3], pose[7], pose[11]]
 }
 
-/// The J0 jog `speeds` fraction whose stopping projection covers
-/// `travel_rad` — the inverse of [`par6d::stream_stopping_travel`],
-/// found by bisection rather than by restating the gate's arithmetic
-/// here (a test that recomputes the projection cannot catch it being
-/// wrong).
+/// The J0 jog `speeds` fraction whose stop, held at that speed, is
+/// `travel_rad` on — the inverse of [`par6d::held_jog_travel`], found by
+/// bisection rather than by restating the gate's arithmetic here (a test
+/// that recomputes the projection cannot catch it being wrong).
 fn j0_speed_reaching(travel_rad: f64) -> f64 {
     let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
     let lim = cfg.joints[0].limits.for_mode(par6_config::LimitMode::Jog);
-    // The rig's period, not the shipped one: the projection is counted
-    // in ticks, so a helper that inverts it against a different tick
-    // rate asks for a speed whose lookahead lands somewhere else
-    // entirely.
-    // The settling term the gate projects is `v / kpp`, the position loop's
-    // own gain -- not an acceleration. Inverting it against the jog
-    // acceleration limit (an order larger) asks for a speed whose real
-    // projection is many times the travel, so the helper's contract ("the
-    // speed whose stop covers `travel_rad`") would not hold.
-    let kpp = cfg.joints[0].gains.kpp;
+    // The rig's period, not the shipped one: the reaction is counted in
+    // ticks.
     let (v_max, dt) = (lim.velocity_rad_s, TEST_TICK_DT_S);
+    let travel =
+        |v: f64| par6d::held_jog_travel(v, v_max, lim.acceleration_rad_s2, &cfg.jog, 1.0, dt);
     let (mut lo, mut hi) = (0.0, v_max);
     for _ in 0..60 {
         let mid = 0.5 * (lo + hi);
-        if par6d::stream_stopping_travel(mid, kpp, dt) < travel_rad {
+        if travel(mid) < travel_rad {
             lo = mid;
         } else {
             hi = mid;
@@ -1249,10 +1242,12 @@ fn j0_speed_reaching(travel_rad: f64) -> f64 {
 /// motion (issue #19 gap 1 + gap 2), over the real protocol against the
 /// real coal world and the real RT jog engine:
 ///
-/// - a jog TOWARD a keep-out stops short of it: the gate's velocity-
-///   scaled lookahead predicts the contact, the stream is stopped, and
-///   STATUS latches `collision_active` with the keep-out named — the arm
-///   never reaches the box;
+/// - a jog held TOWARD a keep-out, joint or cartesian, slow or at full
+///   speed, comes to rest on the keep-out's clearance and stays there:
+///   braked when the projection of its stop reaches the clearance, then
+///   placed on it, with STATUS latching `collision_active` and the
+///   keep-out named — never inside the clearance, never more than 5 mm
+///   out of it;
 /// - from INSIDE the keep-out (dropped over the arm), a jog moving
 ///   OUTWARD is permitted — the arm demonstrably escapes;
 /// - from a SHALLOW penetration, a jog driving DEEPER is refused with a
@@ -1275,57 +1270,164 @@ fn streaming_is_gated_by_the_collision_world() {
     let keepout = keepout_at("keepout", [mid_m[0] * 1e3, mid_m[1] * 1e3, mid_m[2] * 1e3]);
     c.ok(&set_shapes(vec![keepout.clone()]));
 
-    // --- a jog toward the keep-out stops short of it.
-    // Start with the TCP two box widths from the box centre, jog toward
-    // it at half speed, and let the periodic re-check catch the approach.
-    let start_deg = with_j0(mid_deg, -2.0 * KEEPOUT_M * deg_per_m);
-    enable_and_teleport(&rig, &mut c, start_deg);
-    rig.drain_status();
-    c.send(&jog_j(0, 0.5, 10.0));
-    let s = rig.wait_status("the jog is blocked and latched", |s| s.collision_active);
-    assert!(
-        s.collision_pairs
-            .iter()
-            .any(|(a, b)| a == "shape:keepout" || b == "shape:keepout"),
-        "the latched pairs must name the keep-out as a program shape: {:?}",
-        s.collision_pairs
-    );
-    rig.drain_status();
-    let s = rig.wait_status("the blocked jog comes to rest", |s| {
-        s.speeds.iter().all(|v| v.abs() < 0.05)
-    });
-    assert!(
-        s.angles[0] < mid_deg[0] - 5.0,
-        "the jog drove to the keep-out it was stopped for: j0 = {} deg toward {}",
-        s.angles[0],
-        mid_deg[0]
-    );
+    // --- a jog held toward the keep-out comes to rest on its clearance
+    // and stays there, at any speed, joint or cartesian. The clearance is
+    // the stop the operator is owed. The placement is commanded a
+    // milliradian short of it and accepted within two of that, so it may
+    // finish half a millimetre inside at the gripper's reach, and a
+    // millimetre covers its settle; resting more than 5 mm out of it is
+    // ground the gate took from them — where the arm stopped before it
+    // was placed.
+    let clearance_mm = par6d::COLLISION_CLEARANCE_M * 1e3;
+    let mut world = keepout_world(mid_m);
+    let start_deg = with_j0(mid_deg, -4.0 * KEEPOUT_M * deg_per_m);
+    let start_m = tcp_at_m(start_deg);
+    let (dx, dy) = (mid_m[0] - start_m[0], mid_m[1] - start_m[1]);
+    let toward = [dx / dx.hypot(dy), dy / dx.hypot(dy)];
+    let held = [
+        ("jog_j at 10 %", jog_j(0, 0.1, 0.2)),
+        ("jog_j at full speed", jog_j(0, 1.0, 0.2)),
+        (
+            "jog_l at full speed",
+            Command::JogL(JogL {
+                velocities: [toward[0], toward[1], 0.0, 0.0, 0.0, 0.0],
+                duration: 0.2,
+                frame: Frame::Wrf,
+                accel: None,
+            }),
+        ),
+    ];
+    for (what, jog) in &held {
+        c.ok(&Command::Reset);
+        enable_and_teleport(&rig, &mut c, start_deg);
+        rig.drain_status();
+        // Re-sent once a frame, as a held key is, and the replies drained.
+        // Placed means at rest in IDLE for two seconds still holding it.
+        let (mut closest, mut still_since, mut latched) = (f64::INFINITY, None, None);
+        let (mut closest_at, mut closest_mode) = (0, ControllerMode::Idle);
+        let mut first_ns: Option<u64> = None;
+        let deadline = Instant::now() + 2 * BUDGET;
+        let s = loop {
+            assert!(
+                Instant::now() < deadline,
+                "{what}: never came to rest on the clearance"
+            );
+            let Some(s) = rig.recv_status() else { continue };
+            c.send(jog);
+            c.drain();
+            let t0 = *first_ns.get_or_insert(s.mono_time_ns);
+            let gap = world_gap_m(&mut world, s.angles) * 1e3;
+            if gap < closest {
+                (closest, closest_at, closest_mode) = (gap, s.mono_time_ns - t0, s.mode);
+            }
+            if latched.is_none() && s.collision_active {
+                latched = Some(s.collision_pairs.clone());
+            }
+            let still = latched.is_some()
+                && s.mode == ControllerMode::Idle
+                && s.speeds.iter().all(|v| v.abs() < 0.01);
+            still_since = if still {
+                still_since.or(Some(s.mono_time_ns))
+            } else {
+                None
+            };
+            if still_since.is_some_and(|t| s.mono_time_ns - t >= 2_000_000_000) {
+                break s;
+            }
+        };
+        let pairs = latched.expect("latched before resting");
+        assert!(
+            pairs
+                .iter()
+                .any(|(a, b)| a == "shape:keepout" || b == "shape:keepout"),
+            "{what}: the latched pairs must name the keep-out as a program shape: {pairs:?}"
+        );
+        let rest = world_gap_m(&mut world, s.angles) * 1e3;
+        assert!(
+            closest >= clearance_mm - 1.0,
+            "{what}: came within {closest:.1} mm of the keep-out, inside its \
+             {clearance_mm:.0} mm clearance, {:.2} s in, in {closest_mode:?}",
+            closest_at as f64 * 1e-9
+        );
+        assert!(
+            rest <= clearance_mm + 5.0,
+            "{what}: rests {rest:.1} mm from the keep-out, more than 5 mm out of its \
+             {clearance_mm:.0} mm clearance"
+        );
+    }
 
-    // --- from inside the keep-out, an escaping jog is permitted.
-    // Teleport into the box (a keep-out dropped over the arm) and jog
-    // back out: refusing this would trap the arm, which is exactly what
-    // the escape rule exists to prevent.
-    enable_and_teleport(&rig, &mut c, mid_deg);
+    // --- from inside the keep-out, an escaping jog is permitted, joint
+    // or cartesian. Teleport into the box (a keep-out dropped over the
+    // arm) and jog back out: refusing this would trap the arm, which is
+    // exactly what the escape rule exists to prevent — and the refusal's
+    // placement would take it out by the nearest side, whichever way it
+    // was jogged.
+    let away = [-0.3 * toward[0], -0.3 * toward[1], 0.0, 0.0, 0.0, 0.0];
+    let escapes = [
+        ("jog_j", jog_j(0, -0.3, 5.0)),
+        (
+            "jog_l",
+            Command::JogL(JogL {
+                velocities: away,
+                duration: 5.0,
+                frame: Frame::Wrf,
+                accel: None,
+            }),
+        ),
+    ];
+    for (what, jog) in &escapes {
+        enable_and_teleport(&rig, &mut c, mid_deg);
+        rig.drain_status();
+        c.send(jog);
+        rig.wait_status(&format!("the escaping {what} moves the arm out"), |s| {
+            s.angles[0] < mid_deg[0] - 3.0
+        });
+        // Stopped and at rest BEFORE the next teleport: its 5 s duration
+        // outlives the wait above, and the release ramp of a live jog
+        // would drag the freshly teleported pose back out of the box.
+        c.ok(&Command::Stop(Stop { clear_queue: false }));
+        rig.drain_status();
+        rig.wait_status("the stopped escape jog comes to rest", |s| {
+            s.speeds.iter().all(|v| v.abs() < 0.05)
+        });
+    }
+
+    // --- from inside the clearance, short of the box, a jog fast enough
+    // to stop beyond its far side is refused: its stop is clear, but the
+    // way there goes through the keep-out.
+    let face_start = start_deg[0];
+    let (mut lo, mut hi) = (face_start, mid_deg[0]);
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if world_gap_m(&mut world, with_j0(start_deg, mid - face_start)) * 1e3 > clearance_mm / 2.0
+        {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let band_deg = with_j0(start_deg, lo - face_start);
+    enable_and_teleport(&rig, &mut c, band_deg);
     rig.drain_status();
-    c.send(&jog_j(0, -0.3, 5.0));
-    rig.wait_status("the escaping jog moves the arm out", |s| {
-        s.angles[0] < mid_deg[0] - 3.0
+    rig.wait_status("the arm rests inside the clearance", |s| {
+        s.speeds.iter().all(|v| v.abs() < 0.05) && (s.angles[0] - band_deg[0]).abs() < 0.1
+    });
+    let err = c.expect_error(&jog_j(0, 1.0, 5.0));
+    assert_eq!(
+        err.code,
+        ErrorCode::SysSelfCollision as u16,
+        "a jog through the keep-out must be refused: {err:?}"
+    );
+    c.ok(&Command::Stop(Stop { clear_queue: false }));
+    rig.drain_status();
+    rig.wait_status("the refused jog comes to rest", |s| {
+        s.speeds.iter().all(|v| v.abs() < 0.05)
     });
 
     // --- from a shallow penetration, driving deeper is refused.
     // The TCP sits inside the box near its face; a slow jog toward the
     // centre goes DEEPER through the same colliding pair, and only the
     // min-distance half of the escape rule can see that.
-    // Stop the still-running escape jog and let it decelerate to rest
-    // BEFORE teleporting: its 5 s duration outlives the wait above, and
-    // the release ramp of a live jog would drag the freshly teleported
-    // pose back out of the box — the gate would then be right to ACCEPT
-    // the inward jog.
-    c.ok(&Command::Stop(Stop { clear_queue: false }));
-    rig.drain_status();
-    rig.wait_status("the stopped escape jog comes to rest", |s| {
-        s.speeds.iter().all(|v| v.abs() < 0.05)
-    });
     let shallow_deg = with_j0(mid_deg, -0.8 * (KEEPOUT_M / 2.0) * deg_per_m);
     enable_and_teleport(&rig, &mut c, shallow_deg);
     rig.drain_status();
@@ -1333,7 +1435,7 @@ fn streaming_is_gated_by_the_collision_world() {
         s.speeds.iter().all(|v| v.abs() < 0.05) && (s.angles[0] - shallow_deg[0]).abs() < 1.0
     });
     assert!(s.homed, "teleport must leave the arm referenced");
-    // A speed whose lookahead lands AT the box centre. coal's penetration
+    // A speed whose held stop lands AT the box centre. coal's penetration
     // depth for a mesh-vs-box pair is a local contact-patch estimate,
     // nearly flat in the true depth (measured on this rig: ~5 mm of
     // reported deepening across the full 40 mm face-to-centre travel),

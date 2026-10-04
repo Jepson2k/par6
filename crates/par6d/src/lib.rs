@@ -40,7 +40,7 @@ pub mod preview;
 pub mod ripple;
 pub mod vitals;
 
-pub use bridge::stream_stopping_travel;
+pub use bridge::{held_jog_travel, stream_stopping_travel};
 pub use daemon::{Daemon, DaemonError};
 pub use kin::{mat_mul, matrix_to_xyzrpy};
 pub use options::Options;
