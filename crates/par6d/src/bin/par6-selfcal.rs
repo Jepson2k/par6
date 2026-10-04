@@ -6271,11 +6271,7 @@ fn run(args: Args) -> Result<()> {
         }
         Ok(candidate)
     };
-    let candidates = args
-        .verify_gains
-        .as_ref()
-        .map(&load_candidate)
-        .transpose()?;
+    let candidates = args.verify_gains.as_ref().map(load_candidate).transpose()?;
     let sim = bundle.robot.sim.clone();
     // Resolved the way the daemon resolves it: a lexical step up from the
     // config directory, never `config/..` through the filesystem, which
