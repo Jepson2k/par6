@@ -1,4 +1,6 @@
-//! G3 — the homed reference against the sim plant's ground truth.
+//! G3 — the homed reference against the sim plant's ground truth, on the
+//! suite's one nominal run of the shipped sequence (its ordering, current
+//! limits and retune hand-back are checked on the same runs).
 //!
 //! Every other homing assertion in the suite reads positions through the
 //! same `JointConversion` that `set_home` re-based, so it holds for
@@ -33,12 +35,15 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 
 use par6_bus::sim::SimBus;
+use par6_bus::spectral::codec::Readback;
+use par6_bus::{ConfigKind, DriveTune, DriverBus, NodeId, PollAction};
 use par6_config::HomingStrategy;
 use par6_rt::adapters::{MotionJog, MotionStream};
 use par6_rt::hooks::ClampStream;
 use par6_rt::{
-    sample_ring, CompletionPolicy, Mode, NoFk, RtCommand, RtCore, RtHandles, RtHooks,
-    SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity, MAX_JOINTS,
+    sample_ring, CompletionPolicy, HomingJointStatus, Mode, NoFk, RtCommand, RtCore, RtHandles,
+    RtHooks, SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity,
+    MAX_JOINTS,
 };
 
 /// J5's hall band is moved onto its approach path (the config default
@@ -83,37 +88,84 @@ fn boot_core(
     (core, handles, tx, line)
 }
 
-/// Boot at `q0`, run the full shipped sequence to completion, and return
-/// the per-joint frame delta `q_runtime − q_truth` at the final rest.
-fn home_and_measure(q0: &[f64; MAX_JOINTS]) -> [f64; MAX_JOINTS] {
+/// Boot at `q0`, push `retune` to its node first when given, run the full
+/// shipped sequence to completion, and return the per-joint frame delta
+/// `q_runtime − q_truth` at the final rest with the core still live.
+///
+/// Every tick checks the sequence's own ordering: J0 seeks at its homing
+/// current, and the gripper starts only once every arm joint is
+/// referenced and the arm stands at the ready pose the sequence's
+/// `move_to` targets name.
+fn home_and_measure(
+    q0: &[f64; MAX_JOINTS],
+    retune: Option<(NodeId, DriveTune)>,
+) -> ([f64; MAX_JOINTS], RtCore<SimBus>, RtHandles) {
+    let bundle = common::bundle();
+    let robot = &bundle.robot;
+    let mut ready = [None; MAX_JOINTS];
+    for m in robot.homing.sequence.iter().flat_map(|s| &s.move_to) {
+        ready[usize::from(m.joint)] = Some(m.position_rad);
+    }
+    let ready = ready.map(|r| r.expect("the sequence parks every joint"));
+
     let (mut core, mut handles, tx, _line) = boot_core(q0);
     let dt = core.tick_dt_s();
     for _ in 0..10 {
         core.tick(dt, false);
     }
     assert_eq!(handles.snapshots.latest().mode, Mode::Idle, "boot settles");
+    if let Some((node, tune)) = retune {
+        tx.send(RtCommand::RetuneNode { node, tune }).unwrap();
+        core.tick(dt, false);
+    }
     tx.send(RtCommand::Enable).unwrap();
     core.tick(dt, false);
     tx.send(RtCommand::SetMode(Mode::Homing)).unwrap();
     core.tick(dt, false);
     assert!(handles.snapshots.latest().homing.active, "homing started");
 
+    let j0_homing_ma = robot.homing.joints[0].current_ma as f32;
+    let mut j0_seeked_at_homing_current = false;
     let mut finished = false;
     for _ in 0..30_000 {
         core.tick(dt, false);
         let s = handles.snapshots.latest();
+        j0_seeked_at_homing_current |= s.homing.active
+            && s.homing.per_joint[0] == HomingJointStatus::Running
+            && s.homing.effective_current_limit_ma[0] == j0_homing_ma;
+        if s.homing.per_joint[MAX_JOINTS] == HomingJointStatus::Running {
+            assert!(
+                s.homing.per_joint[..MAX_JOINTS]
+                    .iter()
+                    .all(|st| *st == HomingJointStatus::Done),
+                "the gripper must not start until every arm reference is complete"
+            );
+            for (i, (q, want)) in s.q.iter().zip(ready).enumerate() {
+                assert!(
+                    (q - want).abs() < 0.01,
+                    "J{i} at {q} short of its ready pose {want} before gripper calibration"
+                );
+            }
+        }
         if !s.homing.active && s.mode == Mode::Idle {
             finished = true;
             break;
         }
     }
     assert!(finished, "the sequence must finish from boot pose {q0:?}");
+    assert!(
+        j0_seeked_at_homing_current,
+        "the effective current limit publishes the homing value while J0 seeks"
+    );
     let s = handles.snapshots.latest();
     assert!(s.homed, "sequence success sets homed ({q0:?})");
     assert!(!s.error_active, "clean sequence ({q0:?})");
+    for (i, st) in s.homing.per_joint.iter().enumerate() {
+        assert_eq!(*st, HomingJointStatus::Done, "actuator {i} done ({q0:?})");
+    }
 
     let truth = core.bus_mut().true_joint_rad();
-    std::array::from_fn(|i| s.q[i] - truth[i])
+    (std::array::from_fn(|i| s.q[i] - truth[i]), core, handles)
 }
 
 #[test]
@@ -170,11 +222,53 @@ fn the_latched_reference_matches_plant_ground_truth_from_any_boot_pose() {
     shifted_wrist[4] = 0.9;
     shifted_wrist[5] = -0.35;
 
-    let base_delta = home_and_measure(&base);
+    // The shipped config enables the post-homing reference check; under
+    // the placeholder gravity model it must stand aside, or none of these
+    // runs would count as homed.
+    assert_eq!(robot.homing.reference_check_nm.len(), MAX_JOINTS);
+
+    // The base boot carries a live retune of J0's current ceiling first:
+    // homing restores the limits it found, so the drive must end on the
+    // tuned ceiling, not the config-time one.
+    let j0 = &robot.joints[0];
+    let tune = DriveTune {
+        gains: j0.gains,
+        ilim_ma: j0.ilim_ma * 0.75,
+        velocity_limit_ticks_s: j0.velocity_limit_ticks_s,
+        voltage_limit_mv: j0.voltage_limit_mv,
+    };
+    let (base_delta, mut core, mut handles) = home_and_measure(&base, Some((j0.node_id, tune)));
+    let s = handles.snapshots.latest();
+    for (i, joint) in robot.joints.iter().enumerate() {
+        let normal = if i == 0 { tune.ilim_ma } else { joint.ilim_ma };
+        assert_eq!(
+            s.homing.effective_current_limit_ma[i], normal as f32,
+            "J{i} back on its normal Ilim after homing"
+        );
+    }
+    core.bus_mut().queue_poll_override(
+        PollAction::ConfigRead {
+            node: j0.node_id,
+            kind: ConfigKind::Limits,
+        },
+        1,
+    );
+    let dt = core.tick_dt_s();
+    for _ in 0..4 {
+        core.tick(dt, false);
+    }
+    match handles.snapshots.latest().nodes[usize::from(j0.node_id)].readback(ConfigKind::Limits) {
+        Some(Readback::Limits { current_ma, .. }) => assert_eq!(
+            current_ma, tune.ilim_ma as f32,
+            "the drive must hold the tuned Ilim after homing"
+        ),
+        other => panic!("no limits read back from J0: {other:?}"),
+    }
+
     let runs = [
         ("base", base_delta),
-        ("shifted_j0", home_and_measure(&shifted_j0)),
-        ("shifted_wrist", home_and_measure(&shifted_wrist)),
+        ("shifted_j0", home_and_measure(&shifted_j0, None).0),
+        ("shifted_wrist", home_and_measure(&shifted_wrist, None).0),
     ];
     for (name, delta) in &runs {
         for i in 0..MAX_JOINTS {

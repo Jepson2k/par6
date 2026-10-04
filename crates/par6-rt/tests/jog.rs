@@ -6,7 +6,7 @@
 mod common;
 
 use common::{bundle_at, SimCore};
-use par6_config::{ConfigBundle, JogProfile};
+use par6_config::{ConfigBundle, JogProfile, LimitMode};
 use par6_rt::{Mode, RtCommand, StateSnapshot, MAX_JOINTS};
 
 const HOME: [f64; MAX_JOINTS] = [0.0, -1.5, 3.0, 0.0, 0.0, 3.1];
@@ -36,8 +36,22 @@ fn jog(sim: &mut SimCore, speeds: [f64; MAX_JOINTS], accel: f64) -> StateSnapsho
 /// joint 0's soft maximum and that the commanded velocity never slews
 /// faster than the jog acceleration allows. Returns the last snapshot.
 fn run(sim: &mut SimCore, secs: f64, soft_max: f64, max_dv: f64) -> StateSnapshot {
+    run_until(sim, secs, soft_max, max_dv, |_| false)
+}
+
+/// [`run`], ending early on the first tick `done` holds.
+fn run_until(
+    sim: &mut SimCore,
+    secs: f64,
+    soft_max: f64,
+    max_dv: f64,
+    done: impl Fn(&StateSnapshot) -> bool,
+) -> StateSnapshot {
     let mut prev = sim.tick();
     for _ in 0..(secs / sim.dt) as u32 {
+        if done(&prev) {
+            break;
+        }
         let s = sim.tick();
         assert!(
             s.q_commanded[0] < soft_max,
@@ -56,10 +70,75 @@ fn run(sim: &mut SimCore, secs: f64, soft_max: f64, max_dv: f64) -> StateSnapsho
     prev
 }
 
-fn j0_jog_accel(b: &ConfigBundle) -> f64 {
-    let l = &b.robot.joints[0].limits;
+/// Joint `j`'s full jog speed \[rad/s\].
+fn jog_speed(b: &ConfigBundle, j: usize) -> f64 {
+    b.robot.joints[j]
+        .limits
+        .for_mode(LimitMode::Jog)
+        .velocity_rad_s
+}
+
+/// Joint `j`'s jog acceleration at the full-speed ramp time.
+fn jog_accel(b: &ConfigBundle, j: usize) -> f64 {
+    let l = b.robot.joints[j].limits.for_mode(LimitMode::Jog);
     let t = b.robot.jog.accel_time_s.max(par6_motion::MIN_ACCEL_TIME_S);
     (l.velocity_rad_s / t).min(l.acceleration_rad_s2)
+}
+
+fn j0_jog_accel(b: &ConfigBundle) -> f64 {
+    jog_accel(b, 0)
+}
+
+/// Several joints jog together, each on its own ramp: mixed directions,
+/// each first tick exactly ±a·dt of its own trapezoid, each cruising at
+/// its fraction of its own full speed, and the joints left out of the
+/// set commanded exactly nothing throughout.
+#[test]
+fn several_joints_jog_together_on_their_own_ramps() {
+    let mut b = bundle_at(0.004);
+    b.robot.jog.profile = JogProfile::Trapezoid;
+    let dt = b.robot.robot.tick_dt_s;
+    let mut speeds = [0.0; MAX_JOINTS];
+    speeds[0] = 0.2;
+    speeds[3] = -0.3;
+    speeds[5] = 0.25;
+    let mut sim = jogging_at(&b, &HOME);
+
+    let s = jog(&mut sim, speeds, 1.0);
+    for (j, pct) in speeds.iter().enumerate() {
+        let first = if *pct == 0.0 {
+            0.0
+        } else {
+            pct.signum() * jog_accel(&b, j) * dt
+        };
+        assert!(
+            (s.qd_commanded[j] - first).abs() < 1e-9,
+            "J{j}: first tick {} rad/s, its own ramp gives {first}",
+            s.qd_commanded[j]
+        );
+    }
+    let ramp_s = (0..MAX_JOINTS)
+        .map(|j| speeds[j].abs() * jog_speed(&b, j) / jog_accel(&b, j))
+        .fold(0.0, f64::max);
+    let mut s = s;
+    for _ in 0..((ramp_s + 0.1) / dt) as u32 {
+        s = sim.tick();
+        for j in [1, 2, 4] {
+            assert_eq!(
+                s.qd_commanded[j], 0.0,
+                "tick {}: undriven J{j} moved",
+                s.tick
+            );
+        }
+    }
+    for (j, pct) in speeds.iter().enumerate() {
+        let cruise = pct * jog_speed(&b, j);
+        assert!(
+            (s.qd_commanded[j] - cruise).abs() < 1e-9,
+            "J{j} cruises at {} rad/s, not {cruise}",
+            s.qd_commanded[j]
+        );
+    }
 }
 
 /// A jog stops the joint short of its soft limit and latches that
@@ -135,26 +214,32 @@ fn a_jog_stops_short_of_the_soft_limit_and_latches_that_joint_and_direction() {
     );
 }
 
-/// At any tick rate, profile and jog fraction, the lookahead stops the
-/// target short of the limit and the arm comes to rest short of it.
+/// At any tick rate, profile, acceleration and jog fraction, the
+/// lookahead stops the target short of the limit and the arm comes to
+/// rest short of it, and stays there.
 #[test]
 fn the_lookahead_stops_short_at_any_tick_rate_profile_and_fraction() {
-    for dt in [0.004, 0.02] {
+    for dt in [0.004, 0.008, 0.02, 0.05] {
         for profile in [JogProfile::Scurve, JogProfile::Trapezoid] {
-            for accel in [1.0, 0.25] {
-                let mut b = bundle_at(dt);
-                b.robot.jog.profile = profile;
-                let soft_max = b.robot.joints[0].limits.soft_max_rad;
-                let mut start = HOME;
-                start[0] = soft_max - 40f64.to_radians();
-                let case = format!("dt {dt} {profile:?} accel {accel}");
-                let mut sim = jogging_at(&b, &start);
-                jog(&mut sim, one(0, 1.0), accel);
-                let max_dv = j0_jog_accel(&b) * accel * dt;
-                let s = run(&mut sim, 6.0, soft_max, max_dv);
-                assert_eq!(s.qd_commanded[0], 0.0, "{case}: the jog comes to rest");
-                assert!(blocked(&s, 0, true), "{case}: the direction latches");
-                assert!(s.q[0] < soft_max, "{case}: the arm rests short: {}", s.q[0]);
+            for accel in [1.0, 0.5, 0.25] {
+                for pct in [1.0, 0.5] {
+                    let mut b = bundle_at(dt);
+                    b.robot.jog.profile = profile;
+                    let soft_max = b.robot.joints[0].limits.soft_max_rad;
+                    let mut start = HOME;
+                    start[0] = soft_max - 40f64.to_radians();
+                    let case = format!("dt {dt} {profile:?} accel {accel} speed {pct}");
+                    let mut sim = jogging_at(&b, &start);
+                    jog(&mut sim, one(0, pct), accel);
+                    let max_dv = j0_jog_accel(&b) * accel * dt;
+                    let s = run_until(&mut sim, 10.0, soft_max, max_dv, |s| {
+                        s.qd_commanded[0] == 0.0 && blocked(s, 0, true)
+                    });
+                    assert_eq!(s.qd_commanded[0], 0.0, "{case}: the jog comes to rest");
+                    assert!(blocked(&s, 0, true), "{case}: the direction latches");
+                    let s = run(&mut sim, 0.5, soft_max, max_dv);
+                    assert!(s.q[0] < soft_max, "{case}: the arm rests short: {}", s.q[0]);
+                }
             }
         }
     }

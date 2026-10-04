@@ -61,6 +61,7 @@ pub mod timing;
 
 pub use crate::core::{
     CoreError, ExecHeartbeat, GateRefusal, RtCore, RtHandles, RtHooks, StreamInput, StreamSetpoint,
+    EXEC_HEARTBEAT_TIMEOUT_S,
 };
 pub use drift_lock::DriftLockStatus;
 pub use gpio::{

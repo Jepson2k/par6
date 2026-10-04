@@ -52,7 +52,7 @@ use crate::{MAX_JOINTS, NUM_NODES};
 /// caps a sequence whose steps chain past that. The shipped sequence takes
 /// about 62 s at its configured speeds (simulator, 2026-09-23), so the
 /// vendor's 60 s would fail a healthy home.
-const SEQUENCE_TIMEOUT_S: f64 = 90.0;
+pub const SEQUENCE_TIMEOUT_S: f64 = 90.0;
 /// Final hold at the ready pose over which the reference-check residual
 /// is averaged \[s\].
 const REFERENCE_CHECK_S: f64 = 0.5;

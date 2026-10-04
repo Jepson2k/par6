@@ -128,7 +128,8 @@ fn a_stop_completes_when_travel_ends_with_the_action_still_asserted() {
 }
 
 /// A move with no verdict fails on its own window rather than hanging the
-/// queue.
+/// queue — and so does one sent to a gripper that has never answered at
+/// all, where there is no reply to judge.
 #[test]
 fn a_move_that_never_arrives_times_out_on_its_window() {
     let mut rig = closing_from(100);
@@ -140,6 +141,25 @@ fn a_move_that_never_arrives_times_out_on_its_window() {
     assert_eq!(
         feed(&mut rig, 3, ObjectDetection::Moving),
         ToolSettle::Timeout(ToolWait::Move)
+    );
+
+    let mut rig = Rig::new();
+    rig.skip_nodes = 1 << rig.gripper_node;
+    rig.ready();
+    rig.cmd(RtCommand::Gripper(FirmwareGripperCommand {
+        position: 200,
+        speed: 40,
+        current_ma: 400,
+        activate: true,
+        action: true,
+        estop: false,
+        release_dir: false,
+    }));
+    assert_eq!(rig.snap().tool.verdict, ToolSettle::Running);
+    assert_eq!(
+        feed(&mut rig, w.move_timeout + 1, ObjectDetection::Moving),
+        ToolSettle::Timeout(ToolWait::Move),
+        "a silent gripper's move times out on the same window"
     );
 }
 

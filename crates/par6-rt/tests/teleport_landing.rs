@@ -143,6 +143,14 @@ fn land_at(
     }
 }
 
+/// From the first tick after a teleport the plant, the runtime's `q` and
+/// the requested pose agree: unloaded from every pose; with the gravity
+/// feedforward live — the plant's own torques at the landing pose, since
+/// the phantom-pose kick, not the model, is under test — holding from the
+/// first tick; and under a tool heavy enough that the drivetrain's own
+/// friction cannot hold the wrist, so the drivers must already be holding
+/// the landed pose the tick after the re-seed (a re-seed that left them
+/// limp let the wrist back-drive a degree).
 #[test]
 fn a_teleport_lands_the_plant_on_the_reference_from_the_first_tick() {
     land_at(
@@ -152,13 +160,7 @@ fn a_teleport_lands_the_plant_on_the_reference_from_the_first_tick() {
         TOL_RAD,
         false,
     );
-}
 
-/// With the gravity feedforward live — the plant's own torques at the landing
-/// pose, since the phantom-pose kick, not the model, is under test — the
-/// landing at that pose holds from the first tick.
-#[test]
-fn a_teleport_lands_under_gravity_comp() {
     let bundle = common::bundle();
     let q: [f64; MAX_JOINTS] = std::array::from_fn(|i| POSES_DEG[0][i].to_radians());
     let tau = common::plant_gravity(&bundle, &q);
@@ -169,20 +171,7 @@ fn a_teleport_lands_under_gravity_comp() {
         TOL_RAD,
         true,
     );
-}
 
-/// A two-kilo tool puts well over a newton-metre on the wrist pitch — past
-/// the 0.5 Nm the drivetrain holds by itself, but under what J5 can make at
-/// its current limit. So the joint needs the drivers, and can still obey
-/// them. The tick after a teleport, before the runtime's next frames arrive,
-/// the drivers must already hold the landed pose: a re-seed that left them
-/// limp let the wrist back-drive a degree.
-///
-/// Ask for more than J5 can produce and it back-drives no matter how right
-/// the re-seed is, which tests nothing — so the load is asserted to stay
-/// under the joint's own ceiling rather than assumed to.
-#[test]
-fn a_teleport_under_a_load_past_the_holding_friction_is_held() {
     let mut bundle = common::bundle();
     let name = bundle.robot.robot.active_tool.clone();
     let gripper = bundle
@@ -193,18 +182,19 @@ fn a_teleport_under_a_load_past_the_holding_friction_is_held() {
     gripper.kinematics.mass_kg = 2.0;
     let q: [f64; MAX_JOINTS] = std::array::from_fn(|i| POSES_DEG[1][i].to_radians());
     let tau = common::plant_gravity(&bundle, &q);
-    // The premise of the case, checked rather than asserted in prose: the
-    // wrist carries a load, which a released drive does not hold (the plant
-    // gives it no support), and not more than its own current limit can
-    // produce.
+    // The premise, checked rather than asserted in prose: the wrist
+    // carries more than the drivetrain's friction holds unpowered, and
+    // not more than its own current limit can produce — past that it
+    // back-drives however right the re-seed is, which tests nothing.
     let wrist = tau[4].abs();
+    let unpowered = bundle.robot.sim.coulomb_nm[4];
     let ceiling = {
         let c = &bundle.robot.joints[4];
         c.kt_nm_a * (c.ilim_ma / 1000.0) * c.gear_ratio * c.gear_efficiency
     };
     assert!(
-        wrist > 0.01,
-        "J5 carries {wrist:.3} Nm: the case would pass with the drivers limp"
+        wrist > unpowered,
+        "J5 carries {wrist:.3} Nm, which its {unpowered:.3} Nm of friction holds limp"
     );
     assert!(
         wrist < ceiling,

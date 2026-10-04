@@ -11,7 +11,7 @@ mod common;
 use common::{bundle, Rig, SimCore};
 use par6_bus::Pack;
 use par6_config::{ConfigBundle, PreMove, SequenceStep};
-use par6_rt::{CompletionPolicy, Mode, RtCommand, ZeroGravity};
+use par6_rt::{CompletionPolicy, ErrorCode, HomingJointStatus, Mode, RtCommand, ZeroGravity};
 
 /// A homing sequence that only idles `joint` for `duration_s`.
 fn idle_only(joint: u8, duration_s: f64) -> ConfigBundle {
@@ -27,7 +27,8 @@ fn idle_only(joint: u8, duration_s: f64) -> ConfigBundle {
 }
 
 /// On the wire: cmd 12 exactly twice (the driver never acks it), then
-/// encoder polls for the rest of the window; no other joint is idled.
+/// encoder polls for the rest of the window; no other joint is idled,
+/// and the step completes rather than failing at its end.
 #[test]
 fn the_idle_pre_move_drops_the_driver_twice_then_polls_its_encoder() {
     let window_s = 0.2;
@@ -42,7 +43,21 @@ fn the_idle_pre_move_drops_the_driver_twice_then_polls_its_encoder() {
     rig.cmd(RtCommand::Enable);
     let start = rig.snap().tick;
     rig.cmd(RtCommand::SetMode(Mode::Homing));
-    rig.tick_until(1000, |s| !s.homing.active);
+    let s = rig.tick_until(1000, |s| !s.homing.active);
+    assert!(
+        !s.homing.per_joint.contains(&HomingJointStatus::Failed),
+        "the idle step completes: {:?}",
+        s.homing
+    );
+    rig.tick_n(1);
+    assert!(
+        !rig.snap()
+            .errors
+            .as_slice()
+            .iter()
+            .any(|e| e.code == ErrorCode::HomingFailed),
+        "no homing failure is reported"
+    );
 
     let frames = rig.joints_since(start);
     let packs: Vec<Pack> = frames.iter().map(|(_, f)| f[1].pack).collect();

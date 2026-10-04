@@ -142,20 +142,34 @@ fn steady_state_ticks_allocate_nothing() {
         "config re-send shots",
     );
 
-    // EXEC playback window: samples hold the measured pose; the ring was
-    // filled BEFORE the window (try_push is allocation-free, but the
-    // measurement isolates the tick itself).
+    // EXEC playback window: a program swinging J0 harder than its
+    // acceleration limit allows at full speed, so the clock is held back
+    // by the rate bisection throughout, and the speed and pause
+    // transitions below run through it too; the ring was filled BEFORE
+    // the window (try_push is allocation-free, but the measurement
+    // isolates the tick itself).
     core.set_homed(true);
     tx.send(RtCommand::Enable).unwrap();
     core.tick(dt, false);
     tx.send(RtCommand::SetMode(Mode::Exec)).unwrap();
     core.tick(dt, false);
     assert_eq!(handles.snapshots.latest().mode, Mode::Exec);
-    let q = handles.snapshots.latest().q;
-    for _ in 0..1000 {
+    let mut q = handles.snapshots.latest().q;
+    let a_lim = robot.joints[0]
+        .limits
+        .for_mode(par6_config::LimitMode::Exec)
+        .acceleration_rad_s2;
+    let omega = 2.5;
+    let (q0, amplitude) = (q[0], 1.5 * a_lim / (omega * omega));
+    let mut qd = [0.0; MAX_JOINTS];
+    let pushed = 3500;
+    for k in 0..pushed {
+        let t = k as f64 * dt;
+        q[0] = q0 + amplitude * (omega * t).sin();
+        qd[0] = amplitude * omega * (omega * t).cos();
         let s = Sample {
             q,
-            qd: [0.0; MAX_JOINTS],
+            qd,
             tau_ff: [0.0; MAX_JOINTS],
             inertia_velocity: [0.0; MAX_JOINTS],
             start: None,
@@ -174,7 +188,7 @@ fn steady_state_ticks_allocate_nothing() {
         "EXEC playback",
     );
     assert!(
-        handles.snapshots.latest().exec.samples_remaining < 1000,
+        handles.snapshots.latest().exec.samples_remaining < pushed,
         "playback actually consumed samples"
     );
 
@@ -187,16 +201,17 @@ fn steady_state_ticks_allocate_nothing() {
         tx.send(command).unwrap();
         assert_no_allocs(
             || {
-                for _ in 0..robot.ticks(robot.motion.execution_override_transition_s * 1.1) {
+                for _ in 0..robot.ticks(robot.motion.execution_override_transition_s * 2.0) {
                     hb.feed();
                     core.tick(dt, false);
                 }
             },
             "EXEC speed and pause transitions",
         );
-        assert_eq!(
-            handles.snapshots.latest().exec.applied_scale,
-            expected_scale
+        let applied = handles.snapshots.latest().exec.applied_scale;
+        assert!(
+            (applied - expected_scale).abs() < 1e-3,
+            "the transition ran: scale {applied} against {expected_scale}"
         );
     }
 

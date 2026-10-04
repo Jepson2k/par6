@@ -112,7 +112,7 @@ const LINK_RECOVERY_SETTLE_S: f64 = 0.5;
 const CLEAR_ERROR_REPEATS: u8 = 3;
 /// EXEC link watchdog: heartbeat silence while samples pending that
 /// latches `EXEC_LINK_LOST` \[s\].
-const EXEC_HEARTBEAT_TIMEOUT_S: f64 = 0.5;
+pub const EXEC_HEARTBEAT_TIMEOUT_S: f64 = 0.5;
 /// First-order EMA coefficient for the `*_filtered` measured-state
 /// mirrors (light smoothing for telemetry/external-torque estimation).
 const MEAS_FILTER_ALPHA: f64 = 0.2;

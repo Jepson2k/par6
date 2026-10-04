@@ -127,7 +127,8 @@ fn a_swapped_bus_starts_every_node_from_never_seen() {
 }
 
 /// The new bus is brought up with the core's own config — every arm
-/// node with its configured values, and the CAN gripper — and the core
+/// node with its configured values and repeat count, and the CAN
+/// gripper — and the core
 /// reads the new arm, not the old one.
 #[test]
 fn a_swapped_bus_is_configured_from_the_cores_own_config() {
@@ -145,6 +146,23 @@ fn a_swapped_bus_is_configured_from_the_cores_own_config() {
     sim.core
         .replace_bus(bus)
         .expect("the sim backend configures");
+
+    // Every pass of the bring-up reaches the wire: one lost frame on a
+    // real bus is covered only by the configured repeats.
+    let burst = |repeats: u8| {
+        let mut bus = SimBus::new(common::scene(&b));
+        bus.boot_configure(&b.robot, b.active_tool(), repeats)
+            .expect("the sim backend configures");
+        bus.peak_tx_frames_per_tick()
+    };
+    let repeats = b.robot.bus.boot_config_repeats;
+    assert!(repeats > 1, "a single pass cannot show the repeat count");
+    assert_eq!(
+        sim.core.bus_mut().peak_tx_frames_per_tick(),
+        burst(repeats),
+        "the swap must send the configured {repeats} config passes"
+    );
+
     let after = sim.tick_until_idle();
     let moved = after.q[0] - before.q[0];
     assert!(

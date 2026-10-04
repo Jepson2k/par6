@@ -201,32 +201,32 @@ fn arms_after_the_settle_window_holds_and_dissolves_on_the_first_tick_of_motion(
         "nothing toward the old pose"
     );
     assert_pd_hold(&mut rig, &s.q, &trimmed_gravity(), "re-armed");
-}
 
-#[test]
-fn the_integral_clamp_is_hit_exactly_and_never_exceeded() {
-    let mut rig = locked_rig();
-    tick_until_armed(&mut rig);
-    let limit = lock_cfg().integral_limit_nm;
+    // The integral clamp is hit exactly and never exceeded.
+    {
+        let mut rig = locked_rig();
+        tick_until_armed(&mut rig);
+        let limit = lock_cfg().integral_limit_nm;
 
-    // A full radian of error: ki·e·dt per tick reaches the clamp in a
-    // fraction of a second and must sit there.
-    rig.pose[1] -= 1.0;
-    let mut peak = 0.0f64;
-    for _ in 0..400 {
-        let s = rig.snap_after_tick();
-        peak = peak.max(s.drift_lock.integral_nm[1].abs());
+        // A full radian of error: ki·e·dt per tick reaches the clamp in a
+        // fraction of a second and must sit there.
+        rig.pose[1] -= 1.0;
+        let mut peak = 0.0f64;
+        for _ in 0..400 {
+            let s = rig.snap_after_tick();
+            peak = peak.max(s.drift_lock.integral_nm[1].abs());
+        }
+        let s = rig.snap();
+        assert_eq!(
+            s.drift_lock.integral_nm[1], limit,
+            "integral sits exactly on the clamp"
+        );
+        assert_eq!(peak, limit, "integral never exceeded the clamp");
+        // ... and the wire carries the hold with G(q) plus exactly the clamp.
+        let mut ff = trimmed_gravity();
+        ff[1] += limit;
+        assert_pd_hold(&mut rig, &s.drift_lock.hold_rad, &ff, "clamped");
     }
-    let s = rig.snap();
-    assert_eq!(
-        s.drift_lock.integral_nm[1], limit,
-        "integral sits exactly on the clamp"
-    );
-    assert_eq!(peak, limit, "integral never exceeded the clamp");
-    // ... and the wire carries the hold with G(q) plus exactly the clamp.
-    let mut ff = trimmed_gravity();
-    ff[1] += limit;
-    assert_pd_hold(&mut rig, &s.drift_lock.hold_rad, &ff, "clamped");
 }
 
 #[test]

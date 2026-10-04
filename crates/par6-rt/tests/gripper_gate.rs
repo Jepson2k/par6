@@ -204,71 +204,6 @@ fn an_uncalibrated_gripper_gets_polls_not_dlc5_frames() {
     );
 }
 
-/// `stop` with a live jaw byte re-targets it in place — the DLC-5
-/// stream continues at the reported position with the standing
-/// command's speed/current, byte 255 (fully closed, a thin part gripped
-/// at the end of the stroke) included. Only byte 0 is untrusted: an
-/// uncalibrated gripper reports 0, which the firmware maps to fully
-/// open, so there stop degrades to the release announcement instead of
-/// commanding a full-open travel.
-#[test]
-fn stop_retargets_the_reported_jaw_byte_or_degrades_to_release() {
-    for byte in [120u8, 255] {
-        let mut rig = common::Rig::new();
-        rig.gripper_reply.position = byte;
-        rig.ready();
-        rig.cmd(RtCommand::Gripper(close_cmd()));
-        rig.tick_n(2);
-
-        rig.clear_tx();
-        rig.cmd(RtCommand::GripperStop);
-        rig.tick_n(3);
-        let held = FirmwareGripperCommand {
-            position: byte,
-            ..close_cmd()
-        };
-        assert_eq!(
-            rig.gripper_sends(),
-            vec![GripperCommand::Firmware(held); 4],
-            "stop holds at reported byte {byte} with the standing speed/current \
-             — releasing at 255 would drop a part gripped at the stroke end"
-        );
-    }
-
-    // Same stop against a gripper whose byte cannot be trusted.
-    let mut rig = common::Rig::new();
-    rig.gripper_reply.calibrated = false;
-    rig.ready();
-    rig.cmd(RtCommand::Gripper(close_cmd()));
-    rig.tick_n(2);
-
-    rig.clear_tx();
-    rig.cmd(RtCommand::GripperStop);
-    rig.tick_n(5);
-    let sends = rig.gripper_sends();
-    let idle_frame = FirmwareGripperCommand {
-        action: false,
-        ..close_cmd()
-    };
-    assert_eq!(
-        &sends[..3],
-        &[GripperCommand::Firmware(idle_frame); 3],
-        "an untrusted byte degrades the stop to a release: {sends:?}"
-    );
-    assert!(
-        sends[3..]
-            .iter()
-            .all(|s| *s == GripperCommand::FirmwarePoll),
-        "and the announcement still ends in polls: {sends:?}"
-    );
-    assert!(
-        !sends
-            .iter()
-            .any(|s| matches!(s, GripperCommand::Firmware(f) if f.action)),
-        "a degraded stop never commands a travel: {sends:?}"
-    );
-}
-
 /// A homing sequence whose only work is a firmware gripper hold.
 fn gripper_hold_bundle(hold: FirmwareGripperCommand, duration_s: f64) -> ConfigBundle {
     let mut bundle = common::bundle();
@@ -292,120 +227,107 @@ fn gripper_hold_bundle(hold: FirmwareGripperCommand, duration_s: f64) -> ConfigB
 }
 
 /// Homing streams its own DLC-5 frames outside the gate (its park hold
-/// included), so on the sequence's exit the firmware is holding a grip
-/// the normal path never commanded. The hand-back must announce idle
-/// from the homing hold's own bytes — replaying the hold, or dropping
-/// straight to polls, both strand the jaws holding forever.
+/// included), so whenever HOMING ends the firmware is holding a grip the
+/// normal path never commanded. However it ends — the sequence
+/// completing, the user leaving it mid-hold, a hard error striking it —
+/// the hand-back must announce idle from the hold's own bytes and settle
+/// on the watchdog poll: replaying the hold, or dropping straight to
+/// polls, strands the jaws holding forever.
 #[test]
-fn homing_exit_hands_the_hold_back_as_a_release() {
-    let hold = FirmwareGripperCommand {
-        position: 200,
-        speed: 50,
-        current_ma: 500,
-        activate: true,
-        action: true,
-        estop: false,
-        release_dir: false,
-    };
-    let mut rig = common::Rig::build_bundle(
-        gripper_hold_bundle(hold, 0.1),
-        par6_rt::CompletionPolicy::Settled,
-        Box::new(par6_rt::ZeroGravity),
-        true,
-    );
-    rig.boot_to_idle();
-    rig.cmd(RtCommand::Enable);
-    rig.cmd(RtCommand::SetMode(Mode::Homing));
-    assert_eq!(rig.snap().mode, Mode::Homing);
+fn homing_hands_the_hold_back_as_a_release_however_it_ends() {
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum Exit {
+        Completes,
+        Aborted,
+        Estop,
+    }
+    for exit in [Exit::Completes, Exit::Aborted, Exit::Estop] {
+        let hold = FirmwareGripperCommand {
+            position: 200,
+            speed: 50,
+            current_ma: 500,
+            activate: true,
+            action: true,
+            estop: false,
+            release_dir: false,
+        };
+        let duration = if exit == Exit::Completes { 0.1 } else { 30.0 };
+        let mut rig = common::Rig::build_bundle(
+            gripper_hold_bundle(hold, duration),
+            par6_rt::CompletionPolicy::Settled,
+            Box::new(par6_rt::ZeroGravity),
+            true,
+        );
+        rig.boot_to_idle();
+        rig.cmd(RtCommand::Enable);
+        rig.cmd(RtCommand::SetMode(Mode::Homing));
+        assert_eq!(rig.snap().mode, Mode::Homing);
 
-    let done = rig.tick_until(1000, |s| !s.homing.active && s.mode == Mode::Idle);
-    assert!(!done.error_active, "the hold-only sequence exits cleanly");
-    assert!(
-        rig.gripper_sends()
-            .contains(&GripperCommand::Firmware(hold)),
-        "the sequence itself streamed the hold"
-    );
-
-    rig.clear_tx();
-    rig.tick_n(6);
-    let sends = rig.gripper_sends();
-    let released = FirmwareGripperCommand {
-        action: false,
-        ..hold
-    };
-    assert_eq!(
-        &sends[..3],
-        &[GripperCommand::Firmware(released); 3],
-        "the exit announces idle from the homing hold's own bytes: {sends:?}"
-    );
-    assert!(
-        sends[3..]
-            .iter()
-            .all(|s| *s == GripperCommand::FirmwarePoll),
-        "and settles on the watchdog poll: {sends:?}"
-    );
-}
-
-/// The same hand-back on the abort path: leaving HOMING mid-hold (a
-/// user-requested exit) must not leave the aborted hold standing.
-#[test]
-fn a_homing_abort_hands_the_hold_back_too() {
-    let hold = FirmwareGripperCommand {
-        position: 90,
-        speed: 40,
-        current_ma: 300,
-        activate: true,
-        action: true,
-        estop: false,
-        release_dir: false,
-    };
-    let mut rig = common::Rig::build_bundle(
-        gripper_hold_bundle(hold, 30.0),
-        par6_rt::CompletionPolicy::Settled,
-        Box::new(par6_rt::ZeroGravity),
-        true,
-    );
-    rig.boot_to_idle();
-    rig.cmd(RtCommand::Enable);
-    rig.cmd(RtCommand::SetMode(Mode::Homing));
-    rig.tick_n(20);
-    assert!(
-        rig.snap().homing.active,
-        "the long hold keeps the sequence up"
-    );
-    assert!(
-        rig.gripper_sends()
-            .contains(&GripperCommand::Firmware(hold)),
-        "the hold reached the bus before the abort"
-    );
-
-    rig.clear_tx();
-    rig.cmd(RtCommand::SetMode(Mode::Idle));
-    rig.tick_n(5);
-    let sends = rig.gripper_sends();
-    let released = FirmwareGripperCommand {
-        action: false,
-        ..hold
-    };
-    let announced = sends
-        .iter()
-        .filter(|s| **s == GripperCommand::Firmware(released))
-        .count();
-    assert_eq!(
-        announced, 3,
-        "the abort announces idle from the aborted hold's bytes: {sends:?}"
-    );
-    assert!(
-        !sends
-            .iter()
-            .any(|s| matches!(s, GripperCommand::Firmware(f) if f.action)),
-        "no frame after the abort re-commands the hold: {sends:?}"
-    );
-    assert_eq!(
-        sends.last(),
-        Some(&GripperCommand::FirmwarePoll),
-        "the announcement has already settled on polls: {sends:?}"
-    );
+        match exit {
+            Exit::Completes => {
+                let done = rig.tick_until(1000, |s| !s.homing.active && s.mode == Mode::Idle);
+                assert!(!done.error_active, "the hold-only sequence exits cleanly");
+                assert!(
+                    rig.gripper_sends()
+                        .contains(&GripperCommand::Firmware(hold)),
+                    "the sequence itself streamed the hold"
+                );
+                rig.clear_tx();
+            }
+            Exit::Aborted => {
+                rig.tick_n(20);
+                assert!(
+                    rig.snap().homing.active,
+                    "the long hold keeps the sequence up"
+                );
+                assert!(
+                    rig.gripper_sends()
+                        .contains(&GripperCommand::Firmware(hold)),
+                    "the hold reached the bus before the abort"
+                );
+                rig.clear_tx();
+                rig.cmd(RtCommand::SetMode(Mode::Idle));
+            }
+            Exit::Estop => {
+                rig.tick_n(20);
+                assert!(
+                    rig.gripper_sends()
+                        .contains(&GripperCommand::Firmware(hold)),
+                    "the hold is standing when the e-stop strikes"
+                );
+                rig.estop_line
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                let mut latched = false;
+                for _ in 0..50 {
+                    rig.clear_tx();
+                    rig.tick();
+                    if rig.snap().mode == Mode::ActiveError {
+                        latched = true;
+                        break;
+                    }
+                }
+                assert!(latched, "the e-stop must latch while homing runs");
+                assert!(!rig.snap().homing.active, "the sequence aborted");
+            }
+        }
+        rig.tick_n(6);
+        let sends = rig.gripper_sends();
+        let released = FirmwareGripperCommand {
+            action: false,
+            ..hold
+        };
+        assert_eq!(
+            &sends[..3],
+            &[GripperCommand::Firmware(released); 3],
+            "{exit:?}: the exit announces idle from the hold's own bytes: {sends:?}"
+        );
+        assert!(
+            sends[3..]
+                .iter()
+                .all(|s| *s == GripperCommand::FirmwarePoll),
+            "{exit:?}: and settles on the watchdog poll: {sends:?}"
+        );
+    }
 }
 
 /// A stop holds at the reported jaw byte when the gripper is calibrated

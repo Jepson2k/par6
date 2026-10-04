@@ -192,7 +192,8 @@ fn a_retreat_that_never_arrives_times_out_at_its_configured_window() {
 }
 
 /// Only a referenced, enabled, error-free arm retreats; the others go
-/// straight to the halt.
+/// straight to the halt where they stand — an errored arm without
+/// leaving ACTIVE_ERROR.
 #[test]
 fn an_unhomed_errored_or_unconfigured_arm_does_not_retreat() {
     let b = shipped(true);
@@ -205,15 +206,26 @@ fn an_unhomed_errored_or_unconfigured_arm_does_not_retreat() {
     errored.cmd(RtCommand::SetSoftEstop(true));
     let off = shipped(false);
     let mut unconfigured = SimCore::landed_at(&off, &away_from_rest(&off));
-    for (case, sim) in [
-        ("unhomed", &mut unhomed),
-        ("errored", &mut errored),
-        ("safe_park off", &mut unconfigured),
+    for (case, sim, halt) in [
+        ("unhomed", &mut unhomed, Mode::Idle),
+        ("errored", &mut errored, Mode::ActiveError),
+        ("safe_park off", &mut unconfigured, Mode::Idle),
     ] {
-        let (trace, _) = exit(sim);
+        let before = sim.tick().q;
+        let (trace, terminal) = exit(sim);
+        for s in trace.iter().filter(|s| s.mode != Mode::SafetyStop) {
+            assert_eq!(s.mode, halt, "{case}: tick {} left the halt", s.tick);
+        }
+        let moved = terminal
+            .q
+            .iter()
+            .zip(before)
+            .fold(0.0f64, |m, (q, q0)| m.max((q - q0).abs()));
+        // A retreat carries every joint the 0.3 rad to rest; a disabled
+        // arm only sags.
         assert!(
-            trace.iter().all(|s| s.mode != Mode::Stream),
-            "{case}: the arm must not retreat"
+            moved < 0.1,
+            "{case}: the arm must not retreat, but moved {moved} rad"
         );
     }
 }

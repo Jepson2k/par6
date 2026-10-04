@@ -314,55 +314,60 @@ mod tests {
     /// exactly `round(fault_latch_s / dt)` consecutive failures, and
     /// recover cleanly the moment a step succeeds again. The failure is
     /// the real one: a zeroed velocity ceiling that Ruckig refuses on
-    /// every update.
+    /// every update. The tick rates give a whole window, one whose
+    /// remainder rounds down and one whose remainder rounds up.
     #[test]
     fn a_failing_limiter_throttles_its_log_and_faults_after_the_window() {
         let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
         let limits = stream_limits();
-        let dt = 0.05;
-        let fault_latch_s = 0.5; // 10 ticks at this dt
-        let mut stream = MotionStream::new(
-            par6_motion::StreamingExecutor::new(dt, &limits).expect("executor"),
-            dt,
-            limits,
-            fault_latch_s,
-        );
-        let start = [0.0; MAX_JOINTS];
-        stream.activate(&start);
-        let mut target = start;
-        target[0] = 0.3;
-        stream.set_target(&target);
-        stream.set_scale(0.0, 0.0);
+        let fault_latch_s = 0.5;
+        for (dt, window) in [(0.05, 10), (0.06, 8), (0.03, 17)] {
+            let mut stream = MotionStream::new(
+                par6_motion::StreamingExecutor::new(dt, &limits).expect("executor"),
+                dt,
+                limits,
+                fault_latch_s,
+            );
+            let start = [0.0; MAX_JOINTS];
+            stream.activate(&start);
+            let mut target = start;
+            target[0] = 0.3;
+            stream.set_target(&target);
+            stream.set_scale(0.0, 0.0);
 
-        let mut q = [f64::NAN; MAX_JOINTS];
-        let mut qd = [f64::NAN; MAX_JOINTS];
-        STEP_FAIL_RECORDS.store(0, Ordering::Relaxed);
-        for tick in 1..10 {
+            let mut q = [f64::NAN; MAX_JOINTS];
+            let mut qd = [f64::NAN; MAX_JOINTS];
+            STEP_FAIL_RECORDS.store(0, Ordering::Relaxed);
+            for tick in 1..window {
+                stream.step(&mut q, &mut qd);
+                assert!(
+                    !stream.faulted(),
+                    "dt {dt}, tick {tick}: the latch window is {window} ticks"
+                );
+                assert_eq!(q[0], start[0], "a failing step holds, never emits garbage");
+                assert_eq!(qd[0], 0.0);
+            }
             stream.step(&mut q, &mut qd);
             assert!(
-                !stream.faulted(),
-                "tick {tick}: the latch window is {fault_latch_s} s = 10 ticks"
+                stream.faulted(),
+                "dt {dt}: {window} consecutive failures must fault"
             );
-            assert_eq!(q[0], start[0], "a failing step holds, never emits garbage");
-            assert_eq!(qd[0], 0.0);
-        }
-        stream.step(&mut q, &mut qd);
-        assert!(
-            stream.faulted(),
-            "10 consecutive failures = round(fault_latch_s / dt) must fault"
-        );
-        assert_eq!(
-            STEP_FAIL_RECORDS.load(Ordering::Relaxed),
-            1,
-            "one warn per streak, not one per 250 Hz tick"
-        );
+            assert_eq!(
+                STEP_FAIL_RECORDS.load(Ordering::Relaxed),
+                1,
+                "dt {dt}: one warn per streak, not one per tick"
+            );
 
-        // Recovery: a healthy scale makes the next step succeed and the
-        // fault reads clear again.
-        stream.set_scale(1.0, 1.0);
-        stream.step(&mut q, &mut qd);
-        assert!(!stream.faulted(), "a recovered limiter is healthy");
-        assert!(q[0] > start[0], "and it is tracking the target again");
+            // Recovery: a healthy scale makes the next step succeed and the
+            // fault reads clear again.
+            stream.set_scale(1.0, 1.0);
+            stream.step(&mut q, &mut qd);
+            assert!(!stream.faulted(), "dt {dt}: a recovered limiter is healthy");
+            assert!(
+                q[0] > start[0],
+                "dt {dt}: and it is tracking the target again"
+            );
+        }
     }
 
     #[test]
@@ -444,36 +449,39 @@ mod tests {
         let mut target = start;
         let mut q = [0.0; MAX_JOINTS];
         let mut qd = [0.0; MAX_JOINTS];
-        let mut ticks_advancing = 0usize;
 
-        for _ in 0..160 {
-            let previous = q[0];
-            target[0] += step_rad;
-            stream.set_target(&target);
-            stream.step(&mut q, &mut qd);
-            let advance = (q[0] - previous) / dt;
-            if advance.abs() > 0.0 {
-                ticks_advancing += 1;
-                assert!(
-                    qd[0].abs() + 1e-12 >= advance.abs(),
-                    "commanded velocity {:.6} rad/s under-feeds a position \
-                     channel advancing at {:.6} rad/s",
-                    qd[0],
-                    advance,
-                );
+        // Out and back: the feedforward is signed with the advance.
+        for direction in [1.0, -1.0] {
+            let from = target[0];
+            let mut ticks_advancing = 0usize;
+            for _ in 0..80 {
+                let previous = q[0];
+                target[0] += direction * step_rad;
+                stream.set_target(&target);
+                stream.step(&mut q, &mut qd);
+                let advance = (q[0] - previous) / dt;
+                if advance != 0.0 {
+                    ticks_advancing += 1;
+                    assert!(
+                        (qd[0] - advance).abs() < 1e-9,
+                        "commanded velocity {:.6} rad/s is not the position \
+                         channel's advance of {:.6} rad/s",
+                        qd[0],
+                        advance,
+                    );
+                }
             }
+            assert!(
+                ticks_advancing > 70,
+                "the position channel should track the stepped target on \
+                 essentially every tick, advanced on {ticks_advancing}/80"
+            );
+            assert!(
+                (target[0] - q[0]).abs() < 0.1 * (target[0] - from).abs(),
+                "the tracker fell behind the stepped target: {:.4} toward {:.4} rad",
+                q[0],
+                target[0]
+            );
         }
-
-        assert!(
-            ticks_advancing > 150,
-            "the position channel should track the stepped target on \
-             essentially every tick, advanced on {ticks_advancing}/160"
-        );
-        assert!(
-            q[0] > 0.9 * target[0],
-            "the tracker fell behind the stepped target: {:.4} of {:.4} rad",
-            q[0],
-            target[0]
-        );
     }
 }
