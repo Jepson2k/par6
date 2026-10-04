@@ -391,7 +391,10 @@ current_ma = 700.0
 timeout_s = 13.0
 backoff_s = 0.3
 two_pass = true
-two_pass_max_diff_ticks = 3500
+# A third of the 1350-tick backoff, 1.7 deg: J1/J2's tolerance as an
+# angle and J3/J4's as a share of the backoff. The vendor's 3500 is more
+# than the whole backoff and could reject nothing.
+two_pass_max_diff_ticks = 500
 home_offset_rad = 2.96279
 home_offset_gripper_dependent = false
 
@@ -658,24 +661,6 @@ velocity_limit_rad_s = 0.25
 # the arm up, and a joint that goes limp on its stop stays there. Same
 # rule as par6-selfcal's parking.
 endstop_joints = [1, 2]
-
-[freedrive]
-# Drift lock for freedrive (IDLE, homed, enabled, gravity comp on): once
-# the arm has been still for settle_s the pose is captured and held with
-# the drive's own impedance frame (the joints' gains.kp/kd, as the jog
-# PD pack uses) plus a slow clamped integral on the pose error, so a
-# slightly wrong gravity model no longer sags or lifts the arm. Any
-# joint moving faster than release_rad_s dissolves the lock on that tick
-# and zeroes the integral; stillness re-arms it at the new pose. Off by
-# default: it is a hold, and a hold must be asked for.
-drift_lock = false
-release_rad_s = 0.08
-settle_s = 0.3
-ki_nm_rad_s = 1.0
-# Sized above the gravity-model error measured on this arm at the ready
-# pose (0.55-0.85 Nm on J2/J3): a lock that cannot cancel the residual
-# only slows the drift it is there to stop.
-integral_limit_nm = 1.0
 
 [motion]
 # The runtime's motion "feel": sampling pitch, solver damping, jog

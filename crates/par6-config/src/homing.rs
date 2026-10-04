@@ -265,6 +265,23 @@ impl JointHoming {
         if self.backoff_s < 0.0 {
             return Err(invalid(f("backoff_s"), "must be >= 0"));
         }
+        // A second pass that stalls where it started is off the first by
+        // the whole backoff, so a tolerance that reaches it passes every
+        // second pass.
+        let backoff_ticks = self.speed_ticks_s * self.backoff_s;
+        if self.two_pass
+            && self.strategy == HomingStrategy::Stall
+            && f64::from(self.two_pass_max_diff_ticks) >= backoff_ticks
+        {
+            return Err(invalid(
+                f("two_pass_max_diff_ticks"),
+                format!(
+                    "must be below the backoff re-travel, speed_ticks_s x backoff_s = \
+                     {backoff_ticks:.0} ticks, or a second pass that stalls where it \
+                     started still passes"
+                ),
+            ));
+        }
         if let Some(r) = &self.release {
             if self.strategy == HomingStrategy::Hall {
                 return Err(invalid(

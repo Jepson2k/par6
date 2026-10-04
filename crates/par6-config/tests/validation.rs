@@ -124,3 +124,19 @@ fn every_joint_can_seek_across_its_whole_range() {
         );
     }
 }
+
+/// The two-pass check compares where the second pass stalled with the
+/// first, and the second pass starts a backoff away. A tolerance that
+/// reaches the backoff passes a second pass that stalled where it began
+/// — J0 shipped the vendor's 3500 ticks against a 1350-tick backoff.
+#[test]
+fn a_two_pass_tolerance_must_be_below_the_backoff_travel() {
+    let shipped = "two_pass_max_diff_ticks = 500";
+    // J0: 4500 ticks/s for 0.3 s.
+    let field = refused_field(
+        load_with(shipped, "two_pass_max_diff_ticks = 1350"),
+        "a tolerance equal to the backoff",
+    );
+    assert_eq!(field, "homing.joints[0].two_pass_max_diff_ticks");
+    load_with(shipped, "two_pass_max_diff_ticks = 1349").expect("a tolerance inside the backoff");
+}
