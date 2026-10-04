@@ -537,9 +537,17 @@ fn the_arms_own_links_are_identified_from_static_torque() {
         "the base link cannot be identified from gravity, got {}",
         fit.determined[0]
     );
+    // Each joint after the base sees gravity through two combined first
+    // moments — the components across its axis, lumped with everything
+    // beyond it — so the five that tilt fix ten directions of the 24: the
+    // trace of what the fit reports fixed, whatever basis it splits them
+    // over. Not a count above a threshold: a pair it cannot tell apart
+    // reads 0.5 each, which one platform's rounding counts and another's
+    // does not.
+    let fixed: f64 = fit.determined.iter().sum();
     assert!(
-        fit.determined.iter().filter(|d| **d > 0.5).count() >= 8,
-        "too little was fixed: {:?}",
+        (fixed - 10.0).abs() < 0.01,
+        "the poses fixed {fixed:.3} directions, not the arm's ten: {:?}",
         fit.determined
     );
 
