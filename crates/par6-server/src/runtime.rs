@@ -328,6 +328,13 @@ pub trait RtCommands: Send {
         false
     }
 
+    /// Whether the runtime is still bringing a refused stream to rest — a
+    /// stopping sequence it owns, which a later stop or queued motion has
+    /// to cancel. Changes nothing.
+    fn refusal_in_progress(&mut self) -> bool {
+        false
+    }
+
     /// Halt all motion now (stop/estop scope). Idempotent.
     fn halt(&mut self);
 

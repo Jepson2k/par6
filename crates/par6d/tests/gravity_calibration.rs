@@ -223,6 +223,55 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
     );
 }
 
+/// A payload is measured against the arm the daemon runs, its own gravity
+/// correction included: the torques of the corrected arm carrying nothing
+/// fit no payload.
+#[test]
+fn a_payload_fit_charges_nothing_to_the_arms_own_correction() {
+    // The last body's mass term: the correction a payload fit could most
+    // easily mistake for a load.
+    const CORRECTION_KG: f64 = 0.3;
+    let mut correction = [0.0; 4 * NQ];
+    correction[4 * (NQ - 1)] = CORRECTION_KG;
+    let corrected = common::retimed_config("payload-own-correction", 0.02);
+    std::fs::write(
+        corrected.with_file_name("local.toml"),
+        format!("gravity_correction = {correction:?}\n"),
+    )
+    .expect("write the overlay");
+    let model = |config: &PathBuf| {
+        par6d::kin::estimation_model(Some(config), Some(&assets_dir()), None)
+            .expect("estimation model")
+            .kin
+    };
+    let mut truth = model(&test_config());
+    truth
+        .set_gravity_correction(&correction)
+        .expect("the correction installs");
+
+    let bundle = par6_config::ConfigBundle::load(&shipped_config()).expect("config");
+    let samples: Vec<gravity::GravitySample> = (0..24)
+        .map(|k| {
+            let mut q = [0.0; NQ];
+            for (j, (q, joint)) in q.iter_mut().zip(&bundle.robot.joints).enumerate() {
+                let (lo, hi) = (joint.limits.soft_min_rad, joint.limits.soft_max_rad);
+                let phase = (k as f64 + 1.0) * (j as f64 + 1.0) * 0.7;
+                *q = 0.5 * (lo + hi) + 0.3 * (hi - lo) * phase.sin();
+            }
+            let mut tau = [0.0; NQ];
+            truth.gravity(&q, &mut tau).expect("gravity");
+            gravity::GravitySample { q, tau }
+        })
+        .collect();
+
+    let fit = gravity::fit_payload(&mut model(&corrected), &samples, 1e-6).expect("fit");
+    assert!(
+        fit.mass.abs() < 0.01 * CORRECTION_KG,
+        "the fit charged {:.3} kg of the arm's own {CORRECTION_KG} kg correction to the payload",
+        fit.mass
+    );
+}
+
 /// `plan_poses` refuses a pose whose APPROACH would leave the window,
 /// not merely one that leaves it itself.
 ///

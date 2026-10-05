@@ -3126,6 +3126,44 @@ async fn cartesian_freedom_is_reported_only_where_kinematics_exist() {
     }
 }
 
+/// A tool action is judged against the tool fitted at its turn in the
+/// queue: one queued behind the `select_tool` that fits its tool is
+/// admitted, one for the tool that selection takes off is refused.
+#[tokio::test]
+async fn a_tool_action_is_judged_against_the_tool_fitted_at_its_turn() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned(), "flange".to_owned()];
+        cfg.driven_tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "flange".to_owned();
+        cfg.tool_dof = 0;
+    })
+    .await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    let select = |key: u64, tool: &str| {
+        Command::SelectTool(par6_proto::command::SelectTool {
+            key,
+            tool_name: tool.to_owned(),
+            variant_key: None,
+        })
+    };
+
+    let fit = c.ok_index(&select(1201, "GRIPPER")).await;
+    let close = c.ok_index(&close_jaws(1202)).await;
+    let back = c.ok_index(&select(1203, "FLANGE")).await;
+    let err = c.expect_error(&close_jaws(1204)).await;
+    assert!(
+        err.cause.contains("not fitted") || err.cause.contains("passive"),
+        "an action for the tool a queued selection takes off must be refused: {err:?}"
+    );
+    for i in [fit, close, back] {
+        h.wait_started(i).await;
+        h.complete_ok(i);
+        let (ok, detail) = c.wait_complete(i).await;
+        assert!(ok, "command {i} must complete, got {detail:?}");
+    }
+}
+
 /// `set_tcp_offset` lands at its turn in the queue, not when its datagram
 /// arrives.
 ///

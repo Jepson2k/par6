@@ -333,7 +333,7 @@ const STANDOFF_TRAVEL_BUDGET_S: f64 = 3.0;
 /// so it disturbs the arm less than the one before and the landings
 /// converge. The cap is what stops a drive that cannot hold still from
 /// retrying for ever — it is spent, and the arm is left on the last
-/// landing, which is still outside the keep-out.
+/// landing.
 const STANDOFF_PLACEMENT_TRIES: u8 = 4;
 
 /// [`STANDOFF_TRAVEL_BUDGET_S`] in ticks of `tick_dt_s`.
@@ -539,11 +539,17 @@ impl StreamGate {
         &mut self.collision
     }
 
-    /// Adopt a collision world rebuilt for a newly selected tool. The
-    /// keep-out layers the operator applied ride on the world, so they are
-    /// carried across rather than dropped with the old geometry.
-    pub(crate) fn set_collision(&mut self, collision: par6_kin::Collision) {
-        self.collision = collision;
+    /// Adopt a collision world rebuilt for a newly selected tool, with the
+    /// keep-out layers the gate enforces now. A world that cannot take them
+    /// is not adopted: the old geometry with its keep-outs is the safer gate.
+    pub(crate) fn set_collision(&mut self, mut collision: par6_kin::Collision) {
+        match collision.adopt_layers(&self.collision) {
+            Ok(()) => self.collision = collision,
+            Err(e) => log::error!(
+                "select_tool: the stream gate keeps the previous tool's geometry; \
+                 the rebuilt world refused the keep-outs: {e}"
+            ),
+        }
     }
 
     pub(crate) fn new(
@@ -659,6 +665,18 @@ impl StreamGate {
             .active())
     }
 
+    /// Whether `q` is in a contact other than the `standing` ones.
+    fn collides_beyond(
+        &mut self,
+        q: &[f64; MAX_JOINTS],
+        standing: &[(String, String)],
+    ) -> Result<bool, WireError> {
+        if standing.is_empty() {
+            return self.collides(q);
+        }
+        Ok(self.offending(q)?.iter().any(|p| !standing.contains(p)))
+    }
+
     /// Colliding pairs at `q`, in reporting names.
     fn offending(&mut self, q: &[f64; MAX_JOINTS]) -> Result<Vec<(String, String)>, WireError> {
         let mut nq = [0.0; par6_kin::NQ];
@@ -671,9 +689,8 @@ impl StreamGate {
     /// The offending pairs at `q` that involve a world shape.
     ///
     /// Self pairs are excluded because a standing self contact is not a
-    /// thing the arm can back out of along a commanded path — the SRDF
-    /// leaves the park pose resting in some — while a world contact is
-    /// exactly what the standoff exists to hold.
+    /// thing the arm can back out of along a commanded path, while a world
+    /// contact is exactly what the standoff exists to hold.
     fn world_offenders(
         &mut self,
         q: &[f64; MAX_JOINTS],
@@ -727,10 +744,9 @@ impl StreamGate {
     /// Two directions, because a refusal can arrive either side of the
     /// boundary:
     ///
-    /// - Clear of the world: walk FORWARD and stop at the last admitted
-    ///   sample. [`blocked`] is the predicate, not a bare collision
-    ///   test, so a tolerated standing self contact does not read as
-    ///   "nowhere to go".
+    /// - Clear of the world: walk FORWARD and stop at the last sample
+    ///   with no contact the start was not already in, so a tolerated
+    ///   standing self contact does not read as "nowhere to go".
     /// - Already touching the world: walk BACKWARD down the same line
     ///   until the arm is off the shape, and stop there. This is the
     ///   case the escape-depth half of [`blocked`] cannot help with —
@@ -819,11 +835,12 @@ impl StreamGate {
         // the motion, walking the same line, did not.
         let steps =
             ((span / GATE_STEP_RAD).ceil() as usize).clamp(GATE_MIN_SAMPLES, GATE_MAX_STEPS);
+        let standing = self.offending(current)?;
         let mut clear = 0.0;
         let mut hit = None;
         for i in 1..=steps {
             let t = i as f64 / steps as f64;
-            if self.collides(&at(t))? {
+            if self.collides_beyond(&at(t), &standing)? {
                 hit = Some(t);
                 break;
             }
@@ -834,7 +851,7 @@ impl StreamGate {
         };
         for _ in 0..GATE_BISECT_ROUNDS {
             let mid = 0.5 * (clear + refused);
-            if self.collides(&at(mid))? {
+            if self.collides_beyond(&at(mid), &standing)? {
                 refused = mid;
             } else {
                 clear = mid;
@@ -1844,6 +1861,7 @@ impl RtCommands for RtBridge {
                 // a held key re-sends faster than the queries return, so
                 // holding it across them starved the feed until the RT's
                 // link watchdog tripped mid-placement on the sim rig.
+                let mut took_over = false;
                 if moving {
                     let snap = self.cart.snapshots.latest();
                     let accel = p.accel.unwrap_or(1.0);
@@ -1864,6 +1882,7 @@ impl RtCommands for RtBridge {
                             }
                             return Err(refusal);
                         }
+                        took_over = true;
                     }
                     let (la, refused) = gate.jog_verdict(
                         &snap.q,
@@ -1904,6 +1923,11 @@ impl RtCommands for RtBridge {
                     }
                     drop(gate);
                     sh = self.shared.lock().unwrap();
+                }
+                if !took_over {
+                    if let Some(refusal) = self.refusal_owns(&mut sh.stream) {
+                        return Err(refusal);
+                    }
                 }
                 let active = match sh.stream {
                     Some(ActiveStream {
@@ -2307,7 +2331,9 @@ impl RtCommands for RtBridge {
                     .as_ref()
                     .and_then(|a| placement_target(a, &snap_q));
                 drop(sh);
-                if let Some(to) = owner {
+                let twisting = twist.iter().any(|v| *v != 0.0);
+                let mut took_over = false;
+                if let Some(to) = owner.filter(|_| twisting) {
                     let mut held = CartJogProbe { q: to, ..probe };
                     if let Ok(la) = cart_jog_stop(&mut self.cart.kin, &self.cart.gate, &mut held) {
                         let mut gate = self.cart.gate.lock().unwrap();
@@ -2319,6 +2345,7 @@ impl RtCommands for RtBridge {
                             }
                             return Err(refusal);
                         }
+                        took_over = true;
                     }
                 }
                 if let Ok(la) = cart_jog_stop(&mut self.cart.kin, &self.cart.gate, &mut probe) {
@@ -2354,6 +2381,11 @@ impl RtCommands for RtBridge {
                     }
                 }
                 let mut sh = self.shared.lock().unwrap();
+                if !took_over {
+                    if let Some(refusal) = self.refusal_owns(&mut sh.stream) {
+                        return Err(refusal);
+                    }
+                }
                 // A jog already running keeps its limiter: the ramp it
                 // is on is the state that makes the next twist smooth,
                 // and rebuilding it would restart from rest.
@@ -2398,6 +2430,11 @@ impl RtCommands for RtBridge {
                     }
                 };
                 let mut sh = self.shared.lock().unwrap();
+                if !took_over {
+                    if let Some(refusal) = self.refusal_owns(&mut sh.stream) {
+                        return Err(refusal);
+                    }
+                }
                 self.enter_stream_mode(Mode::Stream);
                 sh.stream = Some(ActiveStream {
                     releasing: false,
@@ -2432,15 +2469,17 @@ impl RtCommands for RtBridge {
         self.release_stream_commands();
     }
 
-    fn stop_refused_stream(&mut self) -> bool {
-        let in_standoff = self
-            .shared
+    fn refusal_in_progress(&mut self) -> bool {
+        self.shared
             .lock()
             .unwrap()
             .stream
             .as_ref()
-            .is_some_and(|a| a.standoff.is_some() || a.parked);
-        if in_standoff {
+            .is_some_and(|a| a.standoff.is_some() || a.parked)
+    }
+
+    fn stop_refused_stream(&mut self) -> bool {
+        if self.refusal_in_progress() {
             // The collision gate owns braking, placement and the park on
             // the standoff. Cancelling it on a late datagram would abandon
             // the standoff, and the next one would start the jog again
@@ -2753,11 +2792,24 @@ impl RtCommands for RtBridge {
     }
 
     fn clear_collision(&mut self) {
-        *self.cart.gate.lock().unwrap().latch.lock().unwrap() = CollisionState::default();
+        *self.collision_latch.lock().unwrap() = CollisionState::default();
     }
 }
 
 impl RtBridge {
+    /// The standing refusal, when a refusal owns the arm — braking, placing
+    /// or parked on its standoff — and a jog did not steer clear of it: a
+    /// release, or a jog the arm's own housekeeping refused while the gate
+    /// was being queried. Replacing that record would pass the arm through
+    /// IDLE while it is still being put down.
+    fn refusal_owns(&self, stream: &mut Option<ActiveStream>) -> Option<WireError> {
+        let a = stream
+            .as_mut()
+            .filter(|a| a.standoff.is_some() || a.parked)?;
+        a.deadline = Instant::now() + self.servo_grace();
+        Some(self.cart.gate.lock().unwrap().standing_refusal())
+    }
+
     /// Swap the running bus for a fresh simulator, seeded at the pose
     /// the arm was last measured at.
     ///
@@ -3109,10 +3161,8 @@ pub(crate) fn housekeeping_loop(
                                     sh.stream = None;
                                     break 'stream;
                                 };
-                                // Already on it: parked there, as a placement
-                                // that landed is, so a jog still held toward
-                                // the keep-out stays refused rather than
-                                // nudging the arm off it and back.
+                                // Already on it: let go and see where it
+                                // lands, as a placement that arrived does.
                                 if snap
                                     .q
                                     .iter()
@@ -3120,10 +3170,13 @@ pub(crate) fn housekeeping_loop(
                                     .all(|(q, s)| (q - s).abs() <= STANDOFF_ARRIVED_RAD)
                                 {
                                     link.send(RtCommand::SetMode(Mode::Idle));
-                                    a.standoff = None;
-                                    a.parked = true;
-                                    a.servo_target = Some(stop);
-                                    a.deadline = now + servo_grace;
+                                    a.standoff = Some(Standoff::Settling {
+                                        stop,
+                                        tries: 1,
+                                        until_tick: snap.tick + standoff_budget_ticks(dt),
+                                    });
+                                    a.still = 0;
+                                    a.still_tick = 0;
                                     break 'stream;
                                 }
                                 // Resumed in place when the RT is still in
@@ -3148,7 +3201,9 @@ pub(crate) fn housekeeping_loop(
                                 a.standoff = Some(Standoff::Placing {
                                     stop,
                                     tries: 1,
-                                    best: f64::INFINITY,
+                                    best: (0..par6_kin::NQ)
+                                        .map(|j| (stop[j] - snap.q[j]).abs())
+                                        .fold(0.0, f64::max),
                                     until_tick: snap.tick
                                         + placement_budget_ticks(
                                             &snap.q,
@@ -3177,7 +3232,8 @@ pub(crate) fn housekeeping_loop(
                                         stop,
                                         tries,
                                         best: span,
-                                        until_tick: snap.tick + standoff_budget_ticks(dt),
+                                        until_tick: (snap.tick + standoff_budget_ticks(dt))
+                                            .max(phase.until_tick()),
                                     });
                                     false
                                 } else {
@@ -3195,6 +3251,10 @@ pub(crate) fn housekeeping_loop(
                                 // the standoff it was just placed on: measured
                                 // on the sim rig at 10.5 degrees of drift-back
                                 // after an otherwise exact placement.
+                                // Outside the clearance too: the tolerance
+                                // is wider than the settle margin, so an arm
+                                // coming back out of an overshoot is near
+                                // the standoff while still inside.
                                 let arrived = snap
                                     .q
                                     .iter()
@@ -3203,7 +3263,8 @@ pub(crate) fn housekeeping_loop(
                                     && snap
                                         .qd_filtered
                                         .iter()
-                                        .all(|v| v.abs() <= STREAM_MOVING_RAD_S);
+                                        .all(|v| v.abs() <= STREAM_MOVING_RAD_S)
+                                    && !gate.lock().unwrap().inside_world(&snap.q).unwrap_or(true);
                                 if arrived {
                                     // Let go, then look. The hold is what was
                                     // keeping the arm here, and dropping it
@@ -3272,7 +3333,8 @@ pub(crate) fn housekeeping_loop(
                                     .q
                                     .iter()
                                     .zip(stop.iter())
-                                    .all(|(q, s)| (q - s).abs() <= STANDOFF_ARRIVED_RAD);
+                                    .all(|(q, s)| (q - s).abs() <= STANDOFF_ARRIVED_RAD)
+                                    && !gate.lock().unwrap().inside_world(&snap.q).unwrap_or(true);
                                 if landed || expired || tries >= STANDOFF_PLACEMENT_TRIES {
                                     if !landed {
                                         log::warn!(
@@ -4120,5 +4182,55 @@ mod tests {
         let deadline = jog_deadline(0.1);
         assert!(deadline >= before + Duration::from_millis(100));
         assert!(deadline < before + Duration::from_millis(200));
+    }
+
+    /// From a pose resting in a self contact, a line that meets nothing new
+    /// is walked to its end, not read as blocked at its first sample.
+    #[test]
+    fn a_standing_self_contact_does_not_block_the_standoff_walk() {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+        let bundle = par6_config::ConfigBundle::load(&path).expect("config");
+        let robot = &bundle.robot;
+        let opts = crate::Options {
+            sim: true,
+            config: Some(path.clone()),
+            ..Default::default()
+        };
+        let stack = crate::daemon::load_kin_stack(&opts, &path, robot, bundle.active_tool())
+            .expect("kinematics");
+        let limits =
+            par6_motion::MotionLimits::from_config(robot, par6_config::LimitMode::Jog).unwrap();
+        let mut gate = StreamGate::new(
+            stack.gate_collision,
+            &limits,
+            &robot.jog,
+            crate::daemon::position_loop_gains(robot),
+            robot.robot.tick_dt_s,
+        );
+        // Folded from the park pose until the arm touches itself, inside
+        // the joint's hard range.
+        let park: [f64; MAX_JOINTS] = std::array::from_fn(|j| robot.robot.park_pose_rad[j]);
+        let folded = (1..par6_kin::NQ)
+            .flat_map(|j| [(j, 1.0), (j, -1.0)])
+            .find_map(|(j, dir)| {
+                let limits = &robot.joints[j].limits;
+                (1..400).find_map(|k| {
+                    let mut q = park;
+                    q[j] += dir * f64::from(k) * 0.01;
+                    let inside = (limits.hard_min_rad..=limits.hard_max_rad).contains(&q[j]);
+                    (inside && gate.collides(&q).unwrap()).then_some(q)
+                })
+            })
+            .expect("a fold that touches the arm to itself");
+        assert!(!gate.inside_world(&folded).unwrap(), "the world is empty");
+        // A turn of the base carries the whole arm, the contact with it.
+        let mut goal = folded;
+        goal[0] += 0.5;
+        let stop = gate.stop_point(&folded, &goal).expect("stop point");
+        assert_eq!(
+            stop, goal,
+            "the walk stopped at {stop:?}, short of {goal:?}"
+        );
     }
 }

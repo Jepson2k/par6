@@ -1358,7 +1358,10 @@ impl<R: RtCommands> Core<R> {
                 // queue's worth of COMPLETE writes.
                 let dropped = self.drop_planned(true);
                 let outcome = self.runtime.rt.stream(&cmd);
-                if outcome.is_ok() {
+                // A refusal the runtime is still bringing to rest is a
+                // stream too: a move queued behind it cancels it rather
+                // than running while it is put down.
+                if outcome.is_ok() || self.runtime.rt.refusal_in_progress() {
                     self.active_stream = Some(tag);
                 }
                 self.complete_cancelled("a streaming preemption", dropped)
@@ -1405,17 +1408,21 @@ impl<R: RtCommands> Core<R> {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
-        if let Some(error) = self
-            .validate_registries(&cmd)
-            .or_else(|| self.validate_supported(&cmd))
-        {
-            self.reply(addr, &Reply::Error { req_id, error }).await;
-            return;
-        }
         let tool_stop = match &cmd {
             Command::ToolAction(p) if p.action == "stop" => Some(p.clone()),
             _ => None,
         };
+        // A tool stop acts at once, on the tool fitted now.
+        let refused = if tool_stop.is_some() {
+            self.validate_registries(&cmd)
+                .or_else(|| self.validate_supported(&cmd))
+        } else {
+            self.validate_queued(&cmd)
+        };
+        if let Some(error) = refused {
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
         if tool_stop.is_none() && self.pending.len() >= self.cfg.queue_capacity {
             let error = make_error(
                 ErrorCode::CommQueueFull,
@@ -1601,6 +1608,37 @@ impl<R: RtCommands> Core<R> {
 
     fn validate_supported(&self, cmd: &Command) -> Option<WireError> {
         validate_supported(&self.cfg, cmd)
+    }
+
+    /// [`Self::validate_registries`] and [`Self::validate_supported`] for a
+    /// command queued now, against the tool fitted when its turn comes: the
+    /// last `select_tool` ahead of it in the queue, else the fitted one.
+    fn validate_queued(&self, cmd: &Command) -> Option<WireError> {
+        let ahead = self
+            .pending
+            .iter()
+            .rev()
+            .find_map(|p| match &p.cmd {
+                Command::SelectTool(s) => Some(s.tool_name.as_str()),
+                _ => None,
+            })
+            .or(match &self.executing {
+                Some(Executing {
+                    effect: PostEffect::SelectTool { tool, .. },
+                    ..
+                }) => Some(tool.as_str()),
+                _ => None,
+            });
+        let mut fitted;
+        let cfg = match ahead {
+            Some(tool) => {
+                fitted = self.cfg.clone();
+                fitted.fit_tool(tool);
+                &fitted
+            }
+            None => &self.cfg,
+        };
+        validate_registries(cfg, cmd).or_else(|| validate_supported(cfg, cmd))
     }
 
     // ---- queue engine ------------------------------------------------------

@@ -65,8 +65,7 @@ pub struct Report {
 ///
 /// The wrist is swung over `spread` either side of where it sits, in the
 /// three joints that give the payload a lever arm. A pose whose approach
-/// would collide is dropped rather than adjusted: with the arm below
-/// held still there is nothing to trade off.
+/// would collide is dropped rather than adjusted.
 pub fn plan_poses(
     collision: &mut Collision,
     start: &[f64; NQ],
@@ -90,7 +89,7 @@ pub fn plan_poses(
     for q in candidates {
         // The pose and both approach poses either side of it have to be
         // inside the window and clear of the world: a daemon refusing an
-        // approach mid-run has already had the payload cleared.
+        // approach mid-run ends the estimate with its sweeps half done.
         let mut usable = true;
         for dir in [0.0, 1.0, -1.0] {
             let probe = approach_pose(&q, dir * approach_rad);
@@ -358,9 +357,9 @@ pub async fn measure(
     {
         return Err("invalid calibration poses or sampling protocol".into());
     }
-    // The readings are the torques the arm holds a FINISHED move with, so
-    // the runtime has to be the one that decides a move is finished and
-    // settled — the policy is stated here rather than assumed. It is the
+    // Each sweep starts from an approach the runtime has finished and
+    // settled, so a sweep never begins inside the last move's transient —
+    // the policy is stated here rather than assumed. It is the
     // caller's session, though, so whatever they had is put back after,
     // on every exit: what they set, or the server's boot default if they
     // never did.

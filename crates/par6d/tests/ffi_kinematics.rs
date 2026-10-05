@@ -20,8 +20,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetPayload, SetShapes, SetTcpOffset,
-    Shape, Stop, Teleport,
+    JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SelectTool, SetPayload, SetShapes,
+    SetTcpOffset, Shape, Stop, Teleport,
 };
 use par6_proto::{Command, ControllerMode, ErrorCode, Frame, QueryResult, Status, NUM_JOINTS};
 
@@ -1358,20 +1358,33 @@ fn streaming_is_gated_by_the_collision_world() {
     let start_m = tcp_at_m(start_deg);
     let (dx, dy) = (mid_m[0] - start_m[0], mid_m[1] - start_m[1]);
     let toward = [dx / dx.hypot(dy), dy / dx.hypot(dy)];
+    let jog_l = |velocities: [f64; 6]| {
+        Command::JogL(JogL {
+            velocities,
+            duration: 0.2,
+            frame: Frame::Wrf,
+            accel: None,
+        })
+    };
+    let toward_l = jog_l([toward[0], toward[1], 0.0, 0.0, 0.0, 0.0]);
+    // Held, or let go the moment it is refused: a release while the refusal
+    // is still putting the arm down must not take the arm away from it.
     let held = [
-        ("jog_j at 10 %", jog_j(0, 0.1, 0.2)),
-        ("jog_j at full speed", jog_j(0, 1.0, 0.2)),
+        ("jog_j at 10 %", jog_j(0, 0.1, 0.2), None),
+        ("jog_j at full speed", jog_j(0, 1.0, 0.2), None),
+        ("jog_l at full speed", toward_l.clone(), None),
         (
-            "jog_l at full speed",
-            Command::JogL(JogL {
-                velocities: [toward[0], toward[1], 0.0, 0.0, 0.0, 0.0],
-                duration: 0.2,
-                frame: Frame::Wrf,
-                accel: None,
-            }),
+            "jog_j at full speed, let go when refused",
+            jog_j(0, 1.0, 0.2),
+            Some(jog_j(0, 0.0, 0.2)),
+        ),
+        (
+            "jog_l at full speed, let go when refused",
+            toward_l,
+            Some(jog_l([0.0; 6])),
         ),
     ];
-    for (what, jog) in &held {
+    for (what, jog, release) in &held {
         c.ok(&Command::Reset);
         enable_and_teleport(&rig, &mut c, start_deg);
         rig.drain_status();
@@ -1388,7 +1401,12 @@ fn streaming_is_gated_by_the_collision_world() {
                 "{what}: never came to rest on the clearance"
             );
             let Some(s) = rig.recv_status() else { continue };
-            c.send(jog);
+            c.send(
+                release
+                    .as_ref()
+                    .filter(|_| latched.is_some())
+                    .unwrap_or(jog),
+            );
             c.drain();
             let t0 = *first_ns.get_or_insert(s.mono_time_ns);
             let gap = world_gap_m(&mut world, s.angles) * 1e3;
@@ -1491,11 +1509,21 @@ fn streaming_is_gated_by_the_collision_world() {
         ErrorCode::SysSelfCollision as u16,
         "a jog through the keep-out must be refused: {err:?}"
     );
-    c.ok(&Command::Stop(Stop { clear_queue: false }));
-    rig.drain_status();
-    rig.wait_status("the refused jog comes to rest", |s| {
-        s.speeds.iter().all(|v| v.abs() < 0.05)
-    });
+    // A move queued while that refusal is still being put down cancels the
+    // placement instead of being cut short by it.
+    let away_deg = with_j0(band_deg, -10.0);
+    let i = c.ok_index(&move_j(7201, away_deg, 2.0));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "a move queued behind a refusal must run, got {detail:?}"
+    );
+    let s = wait_still(&rig);
+    assert!(
+        angles_close(&s.angles, &away_deg, 1.0),
+        "the move must reach its target: {:?}",
+        s.angles
+    );
 
     // --- from a shallow penetration, driving deeper is refused.
     // The TCP sits inside the box near its face; a slow jog toward the
@@ -1632,6 +1660,37 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
             .iter()
             .any(|(a, b)| a == "install:cage" || b == "install:cage"),
         "the latched pairs must name the cage as an installation shape: {:?}",
+        s.collision_pairs
+    );
+
+    // A tool change rebuilds both worlds for the new tool's geometry; the
+    // cage comes along into the planner's and the gate's alike.
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let i = c.ok_index(&Command::SelectTool(SelectTool {
+        key: 7103,
+        tool_name: "MSG_medium_motor_150mm_rail".to_owned(),
+        variant_key: None,
+    }));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "select_tool must complete, got {detail:?}");
+    let i = c.ok_index(&move_j(7104, end_deg, SWEEP_S));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(!ok, "a tool change dropped the planner's cage: {detail:?}");
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    rig.drain_status();
+    rig.wait_status("the refused move's verdict is cleared", |s| {
+        !s.collision_active
+    });
+    c.send(&jog_j(0, 0.5, 10.0));
+    let s = rig.wait_status(
+        "the jog toward the cage is blocked after the tool change",
+        |s| s.collision_active,
+    );
+    assert!(
+        s.collision_pairs
+            .iter()
+            .any(|(a, b)| a == "install:cage" || b == "install:cage"),
+        "a tool change dropped the stream gate's cage: {:?}",
         s.collision_pairs
     );
 

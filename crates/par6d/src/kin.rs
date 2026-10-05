@@ -731,7 +731,9 @@ pub fn estimation_model(
         &robot.robot.active_tool,
         gripper.and_then(|g| g.urdf_variant.as_deref()),
     );
-    let kin = load_gravity_kin(&assets_dir, gripper)?;
+    let mut kin = load_gravity_kin(&assets_dir, gripper)?;
+    kin.set_gravity_correction(&robot.gravity_correction)
+        .map_err(|e| e.to_string())?;
     let collision =
         load_collision(&assets_dir, variant, package_dir, 0.0).map_err(|e| e.to_string())?;
     Ok(crate::calibrate::EstimationModel {

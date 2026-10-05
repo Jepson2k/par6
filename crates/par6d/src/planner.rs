@@ -437,8 +437,11 @@ impl Par6Planner {
                 source.kin_fk(&self.tool_offset)?,
             ))
         })();
-        let (planner, bridge, housekeeping, collision, gate_collision, mut gravity, fk) =
+        let (planner, bridge, housekeeping, mut collision, gate_collision, mut gravity, fk) =
             rebuilt.map_err(|e| refused(format!("cannot load tool '{name}': {e}")))?;
+        collision
+            .adopt_layers(&self.collision)
+            .map_err(|e| refused(format!("tool '{name}': the keep-outs do not apply: {e}")))?;
         gravity
             .set_gravity_correction(&self.bundle.robot.gravity_correction)
             .map_err(|e| refused(format!("tool '{name}': gravity correction refused: {e}")))?;

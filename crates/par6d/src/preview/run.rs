@@ -208,14 +208,13 @@ impl Preview {
                 "must be finite and in (0, 3600]",
             ));
         }
-        let (mut bundle, _) = crate::options::load_config(
-            &self.config_path,
-            self.opts.local_config.as_deref(),
-            None,
-        )?;
         // The engine this run boots is fitted with the tool the session has
         // now, which a `select_tool` may have changed since startup.
-        bundle.robot.robot.active_tool.clone_from(&self.tool);
+        let (bundle, _) = crate::options::load_config(
+            &self.config_path,
+            self.opts.local_config.as_deref(),
+            Some(&self.tool),
+        )?;
         let stack = load_kin_stack(
             &self.opts,
             &self.config_path,
