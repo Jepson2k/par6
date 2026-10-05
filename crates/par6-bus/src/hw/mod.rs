@@ -277,6 +277,7 @@ impl SocketCanBus {
     fn apply_rx(&mut self, frame: &CanFrame, state: &mut BusState) {
         let node = match decode_frame(frame) {
             Ok(d) => {
+                state.nodes[usize::from(d.node)].live_error_bit = d.err_bit;
                 match d.payload {
                     Payload::Capture {
                         channel,
@@ -572,8 +573,8 @@ fn apply_payload(decoded: &DecodedFrame, state: &mut BusState) {
             s.current_ma = Some(ma);
             s.combined_telemetry = true;
         }
-        // Kept by the backend, not the shared state: see `SocketCanBus::captures`.
         Payload::Readback(r) => state.nodes[n].readback[r.kind().index()] = Some(r),
+        // Kept by the backend, not the shared state: see `SocketCanBus::captures`.
         Payload::Capture { .. } | Payload::CaptureStatus { .. } => {}
         Payload::DeviceInfo(info) => state.nodes[n].device_info = Some(info),
         Payload::Kt { nm_per_a } => state.nodes[n].kt_nm_a = Some(nm_per_a),
@@ -587,7 +588,9 @@ fn apply_payload(decoded: &DecodedFrame, state: &mut BusState) {
 }
 
 impl DriverBus for SocketCanBus {
-    fn fit_tool(&mut self, _robot: &RobotConfig, _tool: Option<&ToolConfig>) {}
+    fn fit_tool(&mut self, _robot: &RobotConfig, _tool: Option<&ToolConfig>) {
+        self.fresh.refit_gripper(self.gripper_node, self.tick);
+    }
 
     fn begin_tick(&mut self, tick: u64) {
         debug_assert!(tick >= self.tick, "tick must be non-decreasing");

@@ -987,8 +987,19 @@ impl<B: DriverBus> RtCore<B> {
         let dt = self.dt;
         self.boot.tool = gripper.cloned();
         self.bus.fit_tool(&self.boot.robot, gripper);
-        self.homing.set_gripper(gripper, dt);
-        if let Some(d) = gripper.and_then(|g| g.driver.as_ref()) {
+        self.homing.set_gripper(&self.boot.robot, gripper, dt);
+        let driver = gripper.and_then(|g| g.driver.as_ref());
+        // Whether there is a gripper node to keep fresh, drive and settle
+        // is the tool's, not the boot's.
+        self.has_can_gripper = driver.is_some();
+        self.homing_gcmd = if self.has_can_gripper {
+            GripperCommand::FirmwarePoll
+        } else {
+            GripperCommand::NoGripper
+        };
+        self.gripper_settle = GripperSettle::new(dt, &driver.map(|d| d.settle).unwrap_or_default());
+        self.gripper_gate = GripperGate::default();
+        if let Some(d) = driver {
             let tune = par6_bus::DriveTune {
                 gains: d.gains,
                 ilim_ma: d.ilim_ma,
@@ -1163,14 +1174,16 @@ impl<B: DriverBus> RtCore<B> {
     /// different joint angle under a different tool. The arm has not
     /// moved, so the reading stands and only its interpretation changes;
     /// the cached mirrors are refreshed from the live reading under the
-    /// new mapping. The caller re-seeds motion targets once it has done
-    /// every joint — leaving them aimed at pre-swap angles would drag the
-    /// arm to a pose that no longer means what it did.
+    /// new mapping, and the next home latches against the new offset. The
+    /// caller re-seeds motion targets once it has done every joint —
+    /// leaving them aimed at pre-swap angles would drag the arm to a pose
+    /// that no longer means what it did.
     pub fn set_tool_home_offset(&mut self, joint: usize, offset_rad: f64) {
         if joint >= MAX_JOINTS {
             return;
         }
         self.conv[joint].set_home_offset(offset_rad);
+        self.homing.set_home_offset(joint, offset_rad);
         let ticks = self.bus_state.nodes[usize::from(self.node_of[joint])].position_ticks;
         if let Some(ticks) = ticks {
             let rad = self.conv[joint].joint_rad(ticks);
@@ -1258,13 +1271,6 @@ impl<B: DriverBus> RtCore<B> {
             return false;
         }
         self.park.saved_scale = self.stream_scale;
-        // The retreat is a joint-space move to a fixed pose, so it runs
-        // on the rate limiter even if a cartesian stream was live: the
-        // mode request above is a no-op when STREAM is already the mode,
-        // and would leave the clamp-only tracker holding the path.
-        self.stream_is_shaped = false;
-        self.stream.activate(&self.q);
-        self.stream_commanded = self.q;
         let f = self.park.speed_fractions;
         self.stream.set_scale_per_joint(&f, 1.0);
         self.stream_scale = (f.iter().copied().fold(1.0, f64::min), 1.0);
@@ -1479,8 +1485,22 @@ impl<B: DriverBus> RtCore<B> {
         // backend swapped in at tick 90 000 needs the same selfcheck and
         // the same config re-sends a backend opened at boot got.
         let since_boot = self.tick - self.bus_booted_at;
-        if since_boot == self.boot_selfcheck_tick || self.rescan_at == Some(self.tick) {
+        let rescan = self.rescan_at == Some(self.tick);
+        if since_boot == self.boot_selfcheck_tick || rescan {
             self.rescan_at = None;
+            if rescan {
+                // The boot probes ran against a deaf bus — every node read
+                // as legacy, no kt answered — so the recovered link gets
+                // the whole bring-up again. Blocking, as the boot's own
+                // was, while nothing on the bus is being driven.
+                if let Err(e) = self.bus.boot_configure(
+                    &self.boot.robot,
+                    self.boot.tool.as_ref(),
+                    self.boot.config_repeats,
+                ) {
+                    log::error!("the bus bring-up after the link cycle failed: {e}");
+                }
+            }
             let connected = self.bus.connected_nodes();
             let arm_mask: u16 = self
                 .node_of

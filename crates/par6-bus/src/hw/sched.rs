@@ -282,6 +282,15 @@ impl FreshnessClock {
         self.last_rx_tick[n] = Some(tick);
     }
 
+    /// A different tool on the gripper node (`select_tool`): what was seen
+    /// of the old one, or its silence while a passive tool was fitted, says
+    /// nothing about the new one, which is SEEN NOW — it still latches
+    /// `lost_ticks` later if it never answers.
+    pub(crate) fn refit_gripper(&mut self, node: NodeId, tick: u64) {
+        self.clear_latch(node, tick);
+        self.last_gripper_rx_tick = Some(tick);
+    }
+
     /// Stamp every node SEEN NOW and drop every latch (FLASHING exit):
     /// the deliberately silent window must not read as a mass disconnect,
     /// while a node that did not survive the flash still latches

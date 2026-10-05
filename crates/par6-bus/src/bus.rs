@@ -204,16 +204,19 @@ pub trait DriverBus {
     /// sampled off the RT thread at ~1 Hz on hardware backends).
     fn link_health(&self) -> LinkHealth;
 
-    /// The arm's fitted tool changed (`select_tool`). Hardware has nothing
-    /// to do here — a driven jaw's limits arrive through
-    /// [`Self::retune_node`]; the simulator refits its plant so it swings
-    /// the tool the controller models.
+    /// The arm's fitted tool changed (`select_tool`): the gripper node's
+    /// freshness starts over for the new tool. A driven jaw's limits arrive
+    /// through [`Self::retune_node`]; the simulator also refits its plant
+    /// and gripper drive so it swings and answers as the tool the
+    /// controller models.
     fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>);
 
     /// Cycle the physical link once because the boot scan found NO node
     /// at all — the whole-bus silence of a controller that came up
     /// error-passive, not a missing drive. Returns whether a cycle was
-    /// performed; the caller re-runs its boot scan after a `true`.
+    /// performed; the caller re-runs [`Self::boot_configure`] once the
+    /// link has settled after a `true`. Blocks on netlink: called only
+    /// while no node answers, so nothing on the bus is being driven.
     /// Backends without a link to cycle answer `false`.
     fn recover_link(&mut self) -> bool {
         false

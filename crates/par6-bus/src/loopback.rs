@@ -544,14 +544,14 @@ impl DriverBus for LoopbackBus {
         self.ensure_ready()
     }
 
-    /// The loopback has no drive to record anything; the request is
-    /// accepted and nothing is ever read back.
     /// Nothing on the loopback records, so nothing streams; the request is
     /// accepted.
     fn capture_stream(&mut self, _node: NodeId) -> Result<(), BusError> {
         self.ensure_ready()
     }
 
+    /// The loopback has no drive to record anything; the request is
+    /// accepted and nothing is ever read back.
     fn capture_start(&mut self, _node: NodeId, _divisor: u8, _wanted: u16) -> Result<(), BusError> {
         self.ensure_ready()
     }

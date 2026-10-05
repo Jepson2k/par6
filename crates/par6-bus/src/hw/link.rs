@@ -3,7 +3,9 @@
 //!
 //! The sampler runs on its own thread because netlink round-trips
 //! allocate and block — the RT tick only ever does a relaxed atomic load
-//! ([`LinkMonitor::health`]). Without it, bus-off is invisible to the
+//! ([`LinkMonitor::health`]), except for the one [`cycle`] a silent boot
+//! asks for, when no drive answers and nothing is driven. Without the
+//! sampler, bus-off is invisible to the
 //! runtime: the kernel auto-restart (100 ms) lands between the 10-tick
 //! stale warning and the 50-tick disconnect latch, so freshness alone
 //! never sees the outage.
@@ -221,14 +223,14 @@ pub(super) fn ensure_up(cfg: &BusConfig) -> Result<(), OpenError> {
 }
 
 /// Raise the interface TX queue (the kernel drops silently once it is
-/// full). A tuning knob, not correctness: failure is logged, not fatal.
+/// full) and read it back, because setting it is best-effort and its
+/// failure is not visible until the bus is busy. A queue already at least
+/// as long is left alone.
 ///
 /// Set through `SIOCSIFTXQLEN` rather than sysfs: the sysfs file is
 /// root-owned, so an unprivileged service user is refused before its
 /// `CAP_NET_ADMIN` is even consulted, while the ioctl honours the
 /// capability — the same path `ifconfig txqueuelen` takes.
-/// Raise the TX queue and then read it back, because setting it is
-/// best-effort and its failure is not visible until the bus is busy.
 ///
 /// An interface someone else brought up carries whatever default they left,
 /// and a 10-frame queue drops the boot configuration burst outright. Setting
@@ -238,9 +240,12 @@ pub(super) fn ensure_up(cfg: &BusConfig) -> Result<(), OpenError> {
 fn ensure_txqueuelen(cfg: &BusConfig) -> Result<(), OpenError> {
     let want = cfg.txqueuelen;
     let iface = &cfg.interface;
-    let detail = match txqueuelen_ioctl(iface, want) {
-        Ok(()) => String::new(),
-        Err(e) => e.to_string(),
+    let detail = match txqueuelen_get(iface) {
+        Ok(found) if found >= want => String::new(),
+        _ => match txqueuelen_ioctl(iface, want) {
+            Ok(()) => String::new(),
+            Err(e) => e.to_string(),
+        },
     };
     match txqueuelen_get(iface) {
         Ok(found) if found >= want => {

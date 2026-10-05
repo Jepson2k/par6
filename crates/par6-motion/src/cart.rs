@@ -14,8 +14,8 @@
 //!
 //! Corner rounding ([`corner_trims`]) is shared by the cartesian and the
 //! joint-space blend paths: it is the ABB zone rule — a corner radius is
-//! clamped to half of each adjacent segment, and two adjacent zones that
-//! would overlap are scaled down together until they do not.
+//! clamped to half of each adjacent segment, which is also what keeps two
+//! adjacent zones from overlapping.
 
 use glam::{DMat3, DQuat, DVec3};
 

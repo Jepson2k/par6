@@ -304,13 +304,13 @@ impl VirtualDriver {
         self.written[kind.index()]
     }
 
-    /// cmd 39 reply payload: pair `chunk` of `channel`, zero past what
-    /// was recorded; the status for `CAPTURE_STATUS_CHANNEL`.
     /// Pairs recorded so far: what a stream sends per channel.
     pub fn capture_pairs(&self) -> u16 {
         self.capture_pos.div_ceil(2)
     }
 
+    /// cmd 39 reply payload: pair `chunk` of `channel`, zero past what
+    /// was recorded; the status for `CAPTURE_STATUS_CHANNEL`.
     pub fn capture_reply(&self, channel: u8, chunk: u16) -> [u8; 7] {
         let mut p = [0u8; 7];
         p[0] = channel;

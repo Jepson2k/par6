@@ -75,8 +75,8 @@ use map::JointMap;
 /// RX queue capacity \[frames\]. Replies past it are dropped, mirroring
 /// the silent kernel-queue drop of a saturated real interface.
 const RX_QUEUE_CAP: usize = 512;
-/// A streaming drive's frames per 4 ms host tick: one every 320 µs.
-const STREAM_FRAMES_PER_TICK: usize = 12;
+/// A streaming drive's frame period \[s\]: its loop sends one every 320 µs.
+const STREAM_FRAME_PERIOD_S: f64 = 320e-6;
 
 /// Where the runtime posts world layers for the simulator: one slot per
 /// layer, latest wins, taken by the bus on its own tick. Posting allocates
@@ -128,7 +128,6 @@ pub struct SimBus {
     /// Test hook: a cycle does not bring the link back (the drives are
     /// unpowered or the cable is cut).
     stays_deaf: bool,
-    tx_failure_after: Option<usize>,
     tx_frames_this_tick: usize,
     peak_tx_frames_per_tick: usize,
     configured: bool,
@@ -138,7 +137,7 @@ pub struct SimBus {
     captures: Vec<CaptureBuffer>,
     /// Per node, a capture stream in progress: the channel being sent and
     /// its next pair. Paced like the firmware's loop: one frame every
-    /// 320 µs, so `STREAM_FRAMES_PER_TICK` a tick.
+    /// [`STREAM_FRAME_PERIOD_S`].
     streams: Vec<Option<(u8, u16)>>,
     timing_dummy_node: NodeId,
     rx_cap: usize,
@@ -198,7 +197,6 @@ impl SimBus {
             silent: false,
             deaf: false,
             stays_deaf: false,
-            tx_failure_after: None,
             tx_frames_this_tick: 0,
             peak_tx_frames_per_tick: 0,
             configured: false,
@@ -466,14 +464,6 @@ impl SimBus {
         None
     }
 
-    /// Reject one per-tick send with `TxQueueFull` after this many successful
-    /// per-tick sends. Earlier joint commands still reach the native drivers.
-    /// Direct boot/configuration writes bypass this hook; scheduled writes
-    /// consume it through their poll slot.
-    pub fn fail_tx_after(&mut self, frames: usize) {
-        self.tx_failure_after = Some(frames);
-    }
-
     /// Maximum host frames in one tick since the last reset, including
     /// configuration writes and polls as well as motion commands.
     pub fn peak_tx_frames_per_tick(&self) -> usize {
@@ -488,21 +478,6 @@ impl SimBus {
     fn count_tx(&mut self) {
         self.tx_frames_this_tick += 1;
         self.peak_tx_frames_per_tick = self.peak_tx_frames_per_tick.max(self.tx_frames_this_tick);
-    }
-
-    fn admit_tick_tx(&mut self) -> Result<(), BusError> {
-        match self.tx_failure_after {
-            Some(0) => {
-                self.tx_failure_after = None;
-                self.health.tx_errors += 1;
-                Err(BusError::TxQueueFull)
-            }
-            Some(remaining) => {
-                self.tx_failure_after = Some(remaining - 1);
-                Ok(())
-            }
-            None => Ok(()),
-        }
     }
 
     fn ensure_ready(&self) -> Result<(), BusError> {
@@ -528,8 +503,11 @@ impl SimBus {
                 self.streams[node] = None;
                 continue;
             };
+            if self.scenario.supply_scale(self.tick) == 0.0 {
+                continue;
+            }
             let pairs = self.drivers[j].capture_pairs();
-            for _ in 0..STREAM_FRAMES_PER_TICK {
+            for _ in 0..(self.dt / STREAM_FRAME_PERIOD_S) as usize {
                 while chunk >= pairs {
                     channel += 1;
                     chunk = 0;
@@ -830,6 +808,9 @@ impl SimBus {
         let (node, raw_cmd, _) = unpack_can_id(frame.id);
         if let Some(kind) = CommandId::from_raw(raw_cmd).and_then(driver::config_kind) {
             self.count_tx();
+            if self.scenario.supply_scale(self.tick) == 0.0 {
+                return;
+            }
             let Some(j) = self.node_to_joint[usize::from(node)] else {
                 return;
             };
@@ -942,7 +923,7 @@ impl SimBus {
                 }
                 (CommandId::SetGripperId, 1) => {
                     g.driver.device.tool_id = d[0];
-                    None
+                    Some(ReplyKind::None)
                 }
                 (CommandId::GripperDataPack, 0) => {
                     g.on_empty_poll();
@@ -1092,8 +1073,8 @@ impl SimBus {
                 s.current_ma = Some(ma);
                 s.combined_telemetry = true;
             }
-            // Kept by the backend, not the shared state: see `SimBus::captures`.
             Payload::Readback(r) => state.nodes[n].readback[r.kind().index()] = Some(r),
+            // Kept by the backend, not the shared state: see `SimBus::captures`.
             Payload::Capture { .. } | Payload::CaptureStatus { .. } => {}
             Payload::DeviceInfo(info) => state.nodes[n].device_info = Some(info),
             Payload::Kt { nm_per_a } => state.nodes[n].kt_nm_a = Some(nm_per_a),
@@ -1120,19 +1101,41 @@ fn tool_inertial(g: &ToolConfig) -> scene::ToolInertial {
     }
 }
 
+/// The scene geometry a tool brings: its URDF variant's, or the bare
+/// flange's for a tool that names none.
+fn scene_tool(tool: Option<&ToolConfig>) -> scene::Tool {
+    tool.and_then(|g| g.urdf_variant.as_deref())
+        .and_then(scene::Tool::from_urdf_variant)
+        .unwrap_or(scene::Tool::Flange)
+}
+
 impl DriverBus for SimBus {
-    /// The plant takes the new tool's geometry and mass. The CAN nodes
-    /// stay the ones the bus was configured with, as the runtime's own
-    /// bookkeeping does.
+    /// The plant takes the new tool's geometry and mass, and the gripper
+    /// node is the new tool's: its drive answers with its own stroke and
+    /// id, or nothing answers when the tool has no driver. Objects in the
+    /// world start again from their spawn poses.
     fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>) {
         let q = self.true_joint_rad();
-        self.scene.tool = tool
-            .and_then(|g| g.urdf_variant.as_deref())
-            .and_then(scene::Tool::from_urdf_variant)
-            .unwrap_or(scene::Tool::Flange);
+        self.scene.tool = scene_tool(tool);
         self.tool = tool.map(tool_inertial);
         self.plant = Some(self.make_plant(robot, &q));
         self.mj_jaw_cmd = None;
+        let node = self.gripper_node;
+        self.fresh.refit_gripper(node, self.tick);
+        let driven = tool.filter(|g| g.driver.is_some());
+        self.gripper = driven.map(|g| GripperSim::new(self.dt, node, g));
+        self.node_configs.retain(|c| c.node != node);
+        let bit = 1u16 << u16::from(node);
+        match driven.and_then(|g| g.driver.as_ref()) {
+            Some(d) => {
+                self.node_configs
+                    .push(NodeConfig::gripper(node, d, robot.bus.watchdog_action));
+                if !self.deaf {
+                    self.connected |= bit;
+                }
+            }
+            None => self.connected &= !bit,
+        }
     }
 
     fn begin_tick(&mut self, tick: u64) {
@@ -1252,7 +1255,6 @@ impl DriverBus for SimBus {
                 }
             })?;
             if let Some(f) = frame {
-                self.admit_tick_tx()?;
                 self.deliver_frame(&f);
             }
         }
@@ -1268,7 +1270,6 @@ impl DriverBus for SimBus {
         let Some(f) = frame else {
             return Ok(());
         };
-        self.admit_tick_tx()?;
         self.deliver_frame(&f);
         Ok(())
     }
@@ -1280,7 +1281,6 @@ impl DriverBus for SimBus {
         if self.silent {
             return Ok(());
         }
-        self.admit_tick_tx()?;
         if let Some((action, repeats)) = self.override_slot.take() {
             match action {
                 PollAction::Poll { node, kind } => self.deliver_rtr(node, kind),
@@ -1413,6 +1413,7 @@ impl DriverBus for SimBus {
             })
             .collect();
 
+        self.scene.tool = scene_tool(gripper);
         self.tool = gripper.map(tool_inertial);
         self.gravity_correction
             .clone_from(&robot.gravity_correction);

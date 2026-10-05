@@ -102,9 +102,9 @@ impl<B: DriverBus> RtCore<B> {
         });
     }
 
-    /// [`Self::shutdown_stop`] with `pace` called after every tick but
-    /// the terminal one — the wall clock in production, nothing under a
-    /// virtual clock.
+    /// [`Self::shutdown_stop`] with `pace` called after each tick that
+    /// leaves the arm still moving — the wall clock in production, nothing
+    /// under a virtual clock.
     pub fn shutdown_stop_paced(&mut self, mut pace: impl FnMut()) {
         if self.mode() == crate::Mode::Flashing {
             return;

@@ -41,21 +41,19 @@ use par6_bus::{
     BusState, DriverBus, FirmwareGripperCommand, GripperCommand, JointCommand, NodeId, NodeState,
 };
 use par6_config::{
-    ConfigBundle, GripperHomeMode, HomingStrategy, JointHoming, PreMove, RobotConfig,
+    ConfigBundle, GripperHomeMode, HomingConfig, HomingStrategy, JointHoming, PreMove, RobotConfig,
 };
 
 use crate::state::{HomingJointStatus, HomingPhase, HomingStatus};
 use crate::{MAX_JOINTS, NUM_NODES};
 
-/// Whole-sequence deadline, including all seeks and trailing moves \[s\].
-/// Each step is bounded by its own seek timeouts and move durations; this
-/// caps a sequence whose steps chain past that. The shipped sequence takes
-/// about 62 s at its configured speeds (simulator, 2026-09-23), so the
-/// vendor's 60 s would fail a healthy home.
-pub const SEQUENCE_TIMEOUT_S: f64 = 90.0;
 /// Final hold at the ready pose over which the reference-check residual
 /// is averaged \[s\].
 const REFERENCE_CHECK_S: f64 = 0.5;
+/// What the whole-sequence deadline allows beyond the sum of its parts'
+/// own bounds \[s\]: the ticks spent passing between parts, so a part that
+/// times out reports its own failure rather than the deadline's.
+const SEQUENCE_SLACK_S: f64 = 1.0;
 /// Settling allowance after a pre/post positioning profile \[s\].
 const PRE_POST_TIMEOUT_S: f64 = 4.0;
 /// move_to failure timeout = duration + this \[s\].
@@ -72,9 +70,9 @@ const SETTLE_S: f64 = 0.08;
 /// 40 ms (J3 4.1 deg at 137 deg/s on the 2026-09-22 hardware run); stepping
 /// back out let a joint pressed into its stop snap loose the same way (J5
 /// 3.0 deg at 378 deg/s). Several times that spring-back time makes both
-/// changes gradual. Dropping the push to idle at the hit is the same step,
-/// and the backoff and the stop after a hall trigger jump the velocity
-/// target by the whole seek speed in one tick.
+/// changes gradual, as it does the backoff and the stop after a hall
+/// trigger, which would jump the velocity target by the whole seek speed in
+/// one tick. The push itself drops to idle at the hit.
 const RAMP_S: f64 = 0.25;
 /// Stall/current detection window \[s\].
 pub const DETECT_WINDOW_S: f64 = 0.08;
@@ -743,7 +741,6 @@ struct MoveToState {
     timeout_ticks: u32,
     elapsed: u32,
     done: bool,
-    warned: bool,
     start_ticks: Option<i32>,
     target_ticks: i32,
     streak: u32,
@@ -791,6 +788,59 @@ enum Part {
 struct CalRun {
     sent: bool,
     elapsed: u32,
+}
+
+/// The step plans of `homing`, and its trailing moves.
+fn plan_sequence(homing: &HomingConfig, dt: f64) -> (Vec<StepPlan>, Vec<MoveState>) {
+    let ticks = |s: f64| (s / dt).round() as u32;
+    let plan_move = |m: &PreMove| MoveState {
+        spec: *m,
+        dur_ticks: ticks(match m {
+            PreMove::Idle { duration_s, .. }
+            | PreMove::Nudge { duration_s, .. }
+            | PreMove::Position { duration_s, .. }
+            | PreMove::GripperMove { duration_s, .. } => *duration_s,
+        })
+        .max(1),
+        elapsed: 0,
+        done: false,
+        start_ticks: None,
+    };
+    let steps = homing
+        .sequence
+        .iter()
+        .map(|s| StepPlan {
+            pre: s.pre_moves.iter().map(plan_move).collect(),
+            home_joints: {
+                let mut mask = [false; MAX_JOINTS];
+                if let Some(h) = s.home.as_ref() {
+                    for j in &h.joints {
+                        mask[usize::from(*j)] = true;
+                    }
+                }
+                mask
+            },
+            home_gripper: s.home.as_ref().and_then(|h| h.gripper),
+            move_to: s
+                .move_to
+                .iter()
+                .map(|m| MoveToState {
+                    joint: usize::from(m.joint),
+                    position_rad: m.position_rad,
+                    dur_ticks: ticks(m.duration_s).max(1),
+                    timeout_ticks: ticks(m.duration_s + MOVE_TO_EXTRA_S),
+                    elapsed: 0,
+                    done: false,
+                    start_ticks: None,
+                    target_ticks: 0,
+                    streak: 0,
+                })
+                .collect(),
+            post: s.post_moves.iter().map(plan_move).collect(),
+        })
+        .collect();
+    let global_post = homing.post_moves.iter().map(plan_move).collect();
+    (steps, global_post)
 }
 
 /// The homing subsystem: owns the parsed sequence and all FSM state.
@@ -866,61 +916,13 @@ impl HomingSystem {
                 .map(Homer::new)
                 .unwrap_or_else(|| Homer::new(&params[0])),
         );
-        let plan_move = |m: &PreMove| MoveState {
-            spec: *m,
-            dur_ticks: ticks(match m {
-                PreMove::Idle { duration_s, .. }
-                | PreMove::Nudge { duration_s, .. }
-                | PreMove::Position { duration_s, .. }
-                | PreMove::GripperMove { duration_s, .. } => *duration_s,
-            })
-            .max(1),
-            elapsed: 0,
-            done: false,
-            start_ticks: None,
-        };
-        let steps = robot
-            .homing
-            .sequence
-            .iter()
-            .map(|s| StepPlan {
-                pre: s.pre_moves.iter().map(plan_move).collect(),
-                home_joints: {
-                    let mut mask = [false; MAX_JOINTS];
-                    if let Some(h) = s.home.as_ref() {
-                        for j in &h.joints {
-                            mask[usize::from(*j)] = true;
-                        }
-                    }
-                    mask
-                },
-                home_gripper: s.home.as_ref().and_then(|h| h.gripper),
-                move_to: s
-                    .move_to
-                    .iter()
-                    .map(|m| MoveToState {
-                        joint: usize::from(m.joint),
-                        position_rad: m.position_rad,
-                        dur_ticks: ticks(m.duration_s).max(1),
-                        timeout_ticks: ticks(m.duration_s + MOVE_TO_EXTRA_S),
-                        elapsed: 0,
-                        done: false,
-                        warned: false,
-                        start_ticks: None,
-                        target_ticks: 0,
-                        streak: 0,
-                    })
-                    .collect(),
-                post: s.post_moves.iter().map(plan_move).collect(),
-            })
-            .collect();
-        let global_post = robot.homing.post_moves.iter().map(plan_move).collect();
+        let (steps, global_post) = plan_sequence(&robot.homing.for_tool(active_tool), dt);
         let eff_offset = std::array::from_fn(|i| {
             bundle
                 .effective_home_offset(i)
                 .unwrap_or(robot.homing.joints[i].home_offset_rad)
         });
-        Self {
+        let mut system = Self {
             dt,
             params,
             gripper_homer_started: false,
@@ -937,7 +939,7 @@ impl HomingSystem {
             cal_min_wait: ticks(CAL_MIN_WAIT_S),
             active: false,
             elapsed_ticks: 0,
-            sequence_timeout_ticks: ticks(SEQUENCE_TIMEOUT_S).max(1),
+            sequence_timeout_ticks: 1,
             step_idx: 0,
             part: Part::Pre,
             statuses: [HomingJointStatus::Idle; NUM_NODES],
@@ -953,6 +955,72 @@ impl HomingSystem {
                 ticks(REFERENCE_CHECK_S).max(1)
             },
             check_left: 0,
+        };
+        system.sequence_timeout_ticks = system.sequence_budget_ticks();
+        system
+    }
+
+    /// The longest a healthy run of the planned sequence can take: each
+    /// step's moves to their own timeouts and its slowest homer to its
+    /// whole seek budget. The whole-sequence deadline is then a backstop
+    /// for a part that outlives its own bound, never a cut on a slow but
+    /// healthy home — a far-from-its-stops arm seeks for longer than any
+    /// fixed figure sized on a typical run.
+    fn sequence_budget_ticks(&self) -> u32 {
+        let pre_post = (PRE_POST_TIMEOUT_S / self.dt).round() as u32;
+        let moves = |ms: &[MoveState]| {
+            ms.iter()
+                .map(|m| m.dur_ticks.saturating_add(pre_post))
+                .fold(0u32, u32::saturating_add)
+        };
+        let homer = |p: &HomerParams| {
+            [
+                p.timeout_ticks,
+                p.backoff_ticks,
+                p.ramp_ticks.saturating_mul(4),
+                p.dwell_ticks,
+                p.pause_ticks,
+                p.settle_ticks,
+                p.release.map_or(0, |r| r.dur_ticks),
+                p.pre_post_timeout,
+            ]
+            .into_iter()
+            .fold(0u32, u32::saturating_add)
+        };
+        let mut total = moves(&self.global_post).saturating_add(self.check_ticks);
+        for step in &self.steps {
+            let joints = (0..MAX_JOINTS)
+                .filter(|&j| step.home_joints[j])
+                .map(|j| homer(&self.params[j]))
+                .max()
+                .unwrap_or(0);
+            let gripper = match step.home_gripper {
+                Some(GripperHomeMode::Motor) => self.gripper_params.as_ref().map_or(0, homer),
+                Some(GripperHomeMode::Firmware) => self.cal_timeout,
+                None => 0,
+            };
+            let move_to = step
+                .move_to
+                .iter()
+                .map(|m| m.timeout_ticks)
+                .fold(0u32, u32::saturating_add);
+            total = [
+                moves(&step.pre),
+                joints.max(gripper),
+                move_to,
+                moves(&step.post),
+            ]
+            .into_iter()
+            .fold(total, u32::saturating_add);
+        }
+        total.saturating_add((SEQUENCE_SLACK_S / self.dt).round() as u32)
+    }
+
+    /// Re-base `joint`'s home reference on a newly fitted tool's offset,
+    /// for the next sequence to latch.
+    pub fn set_home_offset(&mut self, joint: usize, offset_rad: f64) {
+        if let Some(o) = self.eff_offset.get_mut(joint) {
+            *o = offset_rad;
         }
     }
 
@@ -1027,8 +1095,14 @@ impl HomingSystem {
     /// `select_tool` has to move them. The reference latched against the
     /// jaw that came off is dropped with it: a different jaw has its own
     /// endstop, and `ticks_per_meter` derived from the old pinion would
-    /// report the new one's opening wrong.
-    pub fn set_gripper(&mut self, gripper: Option<&par6_config::ToolConfig>, dt: f64) {
+    /// report the new one's opening wrong. The sequence is re-planned for
+    /// it: a tool with no CAN driver runs it without the gripper work.
+    pub fn set_gripper(
+        &mut self,
+        robot: &RobotConfig,
+        gripper: Option<&par6_config::ToolConfig>,
+        dt: f64,
+    ) {
         let driver = gripper.and_then(|g| g.driver.as_ref());
         self.has_can_gripper = driver.is_some();
         self.gripper_gear_r_m = driver.map_or(0.0, |d| d.gear_r_m);
@@ -1050,6 +1124,8 @@ impl HomingSystem {
         self.endstop_ticks = None;
         self.ticks_per_meter = None;
         self.statuses[GRIPPER_SLOT] = HomingJointStatus::Idle;
+        (self.steps, self.global_post) = plan_sequence(&robot.homing.for_tool(gripper), dt);
+        self.sequence_timeout_ticks = self.sequence_budget_ticks();
     }
 
     fn apply_phase_limits<B: DriverBus>(&mut self, bus: &mut B) {
@@ -1132,7 +1208,6 @@ impl HomingSystem {
             for m in &mut step.move_to {
                 m.elapsed = 0;
                 m.done = false;
-                m.warned = false;
                 m.start_ticks = None;
                 m.streak = 0;
             }
@@ -1351,7 +1426,10 @@ impl HomingSystem {
         }
         self.elapsed_ticks += 1;
         if self.elapsed_ticks >= self.sequence_timeout_ticks {
-            log::warn!("homing exceeded its {SEQUENCE_TIMEOUT_S}s whole-sequence deadline");
+            log::warn!(
+                "homing exceeded its {:.1} s whole-sequence deadline",
+                f64::from(self.sequence_timeout_ticks) * self.dt
+            );
             for (homer, status) in self.homers.iter_mut().zip(self.statuses.iter_mut()) {
                 if *status == HomingJointStatus::Running {
                     homer.fail();
@@ -1588,10 +1666,7 @@ impl HomingSystem {
             }
         }
         if !m.done && m.elapsed > m.timeout_ticks {
-            if !m.warned {
-                log::warn!("homing move_to joint {j} timed out; clearance not established");
-                m.warned = true;
-            }
+            log::warn!("homing move_to joint {j} timed out; clearance not established");
             return Err(());
         }
         Ok(m.done)

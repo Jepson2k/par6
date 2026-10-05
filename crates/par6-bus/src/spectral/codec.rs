@@ -312,7 +312,6 @@ pub fn fold_bits_msb_first(bits: [bool; 8]) -> u8 {
     bits.iter().fold(0u8, |n, &b| (n << 1) | u8::from(b))
 }
 
-/// Unfold one byte into a bit list, MSB first: index 0 = bit 7.
 /// The two State_of_Errors bytes (cmd 26, and bytes 4–5 of cmd 37).
 fn unpack_error_flags(b0: u8, b1: u8) -> ErrorFlags {
     let b0 = unfold_bits_msb_first(b0);
@@ -332,6 +331,7 @@ fn unpack_error_flags(b0: u8, b1: u8) -> ErrorFlags {
     }
 }
 
+/// Unfold one byte into a bit list, MSB first: index 0 = bit 7.
 pub fn unfold_bits_msb_first(byte: u8) -> [bool; 8] {
     core::array::from_fn(|i| (byte >> (7 - i)) & 1 == 1)
 }

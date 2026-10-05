@@ -22,9 +22,7 @@ use par6_bus::{
 };
 use par6_config::{ConfigBundle, GripperHomeMode, HomeGroup, MoveTo, SequenceStep};
 use par6_rt::adapters::{MotionJog, MotionStream};
-use par6_rt::homing::{
-    HomingSystem, SeqStatus, DETECT_WINDOW_S, REHOME_SPEED_FACTOR, SEQUENCE_TIMEOUT_S,
-};
+use par6_rt::homing::{HomingSystem, SeqStatus, DETECT_WINDOW_S, REHOME_SPEED_FACTOR};
 use par6_rt::hooks::ClampStream;
 use par6_rt::{
     sample_ring, ArmState, CompletionPolicy, ErrorCode, GravityModel, HomingJointStatus,
@@ -105,6 +103,63 @@ fn start_homing(core: &mut RtCore<SimBus>, handles: &mut RtHandles, tx: &mpsc::S
     assert!(handles.snapshots.latest().homing.active);
 }
 
+/// A tool changed under a running core homes as that tool, exactly as one
+/// booted with it does: the same sequence (no gripper work for a tool with
+/// no CAN driver) and the same tool-dependent J4 reference, so the arm ends
+/// where it would have.
+#[test]
+fn a_home_after_a_tool_change_homes_as_the_tool_now_fitted() {
+    let driven = common::bundle();
+    assert!(
+        driven.active_tool().is_some_and(|t| t.driver.is_some()),
+        "the premise: the shipped tool is driven"
+    );
+    let mut flanged = driven.clone();
+    flanged.robot.robot.active_tool = "Flange".to_owned();
+    let flange = flanged.active_tool().expect("the flange").clone();
+    assert_ne!(
+        driven.effective_home_offset(4),
+        flanged.effective_home_offset(4),
+        "the premise: the two tools reference J4 differently"
+    );
+
+    // How far a home gets through its plan, and where J4 truly ends.
+    let home =
+        |core: &mut RtCore<SimBus>, handles: &mut RtHandles, tx: &mpsc::Sender<RtCommand>| {
+            let dt = core.tick_dt_s();
+            start_homing(core, handles, tx);
+            let mut steps = 0;
+            for _ in 0..(200.0 / dt) as usize {
+                core.tick(dt, false);
+                let s = handles.snapshots.latest();
+                steps = steps.max(s.homing.sequence_step);
+                if !s.homing.active {
+                    assert!(s.homed, "the home failed: {:?}", s.homing);
+                    return (steps, core.bus_mut().true_joint_rad()[4]);
+                }
+            }
+            panic!("the home never finished");
+        };
+    let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&flanged);
+    let booted = home(&mut core, &mut handles, &tx);
+
+    let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&driven);
+    core.set_gripper_tool(Some(&flange), driven.robot.bus.gripper_node, 1);
+    core.set_tool_home_offset(4, flanged.effective_home_offset(4).expect("J4 offset"));
+    let changed = home(&mut core, &mut handles, &tx);
+
+    assert_eq!(
+        changed.0, booted.0,
+        "the changed tool ran another tool's sequence"
+    );
+    assert!(
+        (changed.1 - booted.1).abs() < 0.01,
+        "J4 ends at {:.4} rad after the change, {:.4} rad booted with the flange",
+        changed.1,
+        booted.1
+    );
+}
+
 #[test]
 fn shoulder_reference_finishes_before_the_base_seek() {
     fn shoulder_done_when_base_starts(bundle: &ConfigBundle) -> bool {
@@ -138,20 +193,23 @@ fn shoulder_reference_finishes_before_the_base_seek() {
     assert!(!shoulder_done_when_base_starts(&base_first));
 }
 
-/// The whole-sequence deadline runs from the HOMING entry across step
-/// boundaries: step 0 nudges J0 for half of it, step 1 seeks J5 toward a
-/// sensor it never reaches with a seek budget of its own that outlasts
-/// the sequence. A short run aborted first proves each run starts a
-/// fresh budget.
+/// The whole-sequence deadline is the plan's own worst case, so it never
+/// cuts a slow but healthy home short: step 0 nudges J0, step 1 seeks J5
+/// toward a sensor it never reaches on a seek budget longer than any fixed
+/// deadline sized on a typical run, and the run ends on that budget, after
+/// both steps' time. A short run aborted first proves each run starts
+/// afresh.
 #[test]
-fn whole_sequence_deadline_stops_motion_across_step_boundaries() {
+fn the_sequence_deadline_leaves_every_step_its_own_budget() {
+    const NUDGE_S: f64 = 10.0;
+    const SEEK_S: f64 = 100.0;
     let mut bundle = common::bundle();
     bundle.robot.homing.sequence = vec![
         SequenceStep {
             pre_moves: vec![par6_config::PreMove::Nudge {
                 joint: 0,
                 speed_ticks_s: 500.0,
-                duration_s: SEQUENCE_TIMEOUT_S / 2.0,
+                duration_s: NUDGE_S,
             }],
             home: None,
             move_to: vec![],
@@ -168,11 +226,10 @@ fn whole_sequence_deadline_stops_motion_across_step_boundaries() {
         },
     ];
     bundle.robot.homing.post_moves.clear();
-    bundle.robot.homing.joints[5].timeout_s = 2.0 * SEQUENCE_TIMEOUT_S;
+    bundle.robot.homing.joints[5].timeout_s = SEEK_S;
     let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&bundle);
     core.bus_mut().set_hall_trigger(5, 3.0, 0.0);
     let dt = core.tick_dt_s();
-    let deadline = (SEQUENCE_TIMEOUT_S / dt).round() as u64;
 
     start_homing(&mut core, &mut handles, &tx);
     for _ in 0..(1.0 / dt).round() as usize {
@@ -184,34 +241,16 @@ fn whole_sequence_deadline_stops_motion_across_step_boundaries() {
 
     start_homing(&mut core, &mut handles, &tx);
     let started = handles.snapshots.latest().tick;
-    let mut last_active = handles.snapshots.latest();
     while handles.snapshots.latest().homing.active {
-        assert!(
-            last_active.tick - started <= deadline,
-            "the sequence outlived its {deadline}-tick deadline"
-        );
         core.tick(dt, false);
-        let s = handles.snapshots.latest();
-        if s.homing.active {
-            last_active = s;
-        }
     }
     let s = handles.snapshots.latest();
-    let ran = s.tick - started;
+    let ran_s = (s.tick - started) as f64 * dt;
     assert!(
-        ran + 1 >= deadline,
-        "stopped {ran} ticks in, short of the {deadline}-tick deadline"
-    );
-    assert_eq!(
-        last_active.homing.sequence_step, 1,
-        "the deadline outlived step 0"
+        ran_s >= NUDGE_S + SEEK_S - 1.0,
+        "the sequence was cut short {ran_s:.1} s in, before J5's own {SEEK_S} s seek ran out"
     );
     assert_eq!(s.homing.per_joint[5], HomingJointStatus::Failed);
-    assert_eq!(
-        s.homing.phase[5],
-        HomingPhase::Approach,
-        "J5 failed mid-seek, on the sequence deadline"
-    );
     assert_eq!(s.mode, Mode::Idle);
     assert!(!s.homed, "a timed-out sequence establishes no reference");
     for _ in 0..(0.5 / dt).round() as usize {
