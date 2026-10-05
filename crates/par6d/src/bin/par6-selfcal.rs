@@ -137,8 +137,9 @@ const DETECT_GUARD_S: f64 = 0.15;
 const DRAG_LEVELS: usize = 4;
 const DRAG_MIN_FRACTION: f64 = 0.15;
 const DRAG_MAX_FRACTION: f64 = 0.60;
-/// Arc one leg traverses. Both directions run over it, so the joint returns
-/// to where it started and six joints stay well inside their soft limits.
+/// Most arc one leg traverses. Both directions run over it, so the joint
+/// returns to where it started; a joint with less room than that, by its
+/// checked span, gets a share of the room it has.
 const DRAG_TRAVEL_RAD: f64 = 0.5;
 /// Time after the ramp for the velocity loop to settle at the commanded
 /// speed, then the window the current is averaged over.
@@ -208,6 +209,8 @@ const IDLE_MOTION_TICKS: i64 = 2;
 /// start of that a spinning-down joint may still read loud.
 const CALM_S: f64 = 0.5;
 const CALM_QUIET_S: f64 = 0.2;
+/// How far a joint may move with its loop open while it is calmed.
+const CALM_OPEN_TRAVEL_RAD: f64 = 5.0 * std::f64::consts::PI / 180.0;
 /// The ripple sweep's speed \[motor ticks/s\]: about two electrical cycles a
 /// second on the arm's 50-pole-pair steppers, slow enough that the velocity
 /// loop has the ripple in hand and the current it spends is what cancels it.
@@ -257,8 +260,6 @@ const STICTION_STILL_TIMEOUT_S: f64 = 5.0;
 /// No breakaway counts before the ramp has advanced this share of the
 /// current limit: whatever moves at the balance current is not friction.
 const STICTION_MIN_RAMP_ILIM: f64 = 0.01;
-/// Rest between breakaways, so the last one's motion has died.
-const STICTION_REST_S: f64 = 1.0;
 /// The belt chirp: J1 in current mode at the ready pose, a sine of this
 /// torque \[Nm, joint side\] about the held current sweeping
 /// `BELT_F_LO_HZ` to `BELT_F_HI_HZ` over `BELT_SECONDS`. The rotor's
@@ -1252,10 +1253,6 @@ struct Arm {
     seen: [u64; N],
     encoder_clock: Option<EncoderClock>,
     position_rx_ns: [u64; N],
-    /// Each joint's friction, joint side (viscous \[Nm·s/rad\], Coulomb
-    /// \[Nm\]): this run's once the mechanics stage measured it, the config's
-    /// until then.
-    friction: [(f64, f64); N],
     /// Positive point estimates can still be dominated by fit uncertainty.
     friction_fit_uncertain: [bool; N],
     /// The endstop this joint last touched: the one homing referenced it
@@ -1349,12 +1346,6 @@ impl Arm {
             bus.send_clear_error(j.node_id, 3)?;
         }
         let robot = &bundle.robot;
-        let friction = std::array::from_fn(|j| {
-            (
-                robot.sim.viscous_nm_s.get(j).copied().unwrap_or(0.0),
-                robot.sim.coulomb_nm.get(j).copied().unwrap_or(0.0),
-            )
-        });
         Ok(Self {
             conv: std::array::from_fn(|j| JointConversion::from_config(&robot.joints[j])),
             gains: std::array::from_fn(|j| robot.joints[j].gains),
@@ -1371,7 +1362,6 @@ impl Arm {
             seen: [0; N],
             encoder_clock: None,
             position_rx_ns: [0; N],
-            friction,
             friction_fit_uncertain: [false; N],
             endstop_guard: [None; N],
             sane_gains: [None; N],
@@ -2001,7 +1991,7 @@ impl Arm {
     }
 
     fn check_hold(&mut self, why: &'static str) -> Result<()> {
-        let held = self.measure_hold(why, None)?;
+        let held = self.measure_hold(why)?;
         for (j, (offset, speed)) in held.iter().enumerate() {
             if *offset > self.tolerance() || *speed > self.holding_limit(j) {
                 return Err(format!(
@@ -2017,11 +2007,7 @@ impl Arm {
     }
 
     /// Position RMS and speed RMS of every joint over the observation window.
-    fn measure_hold(
-        &mut self,
-        why: &'static str,
-        velocity_joint: Option<usize>,
-    ) -> Result<[(f64, f64); N]> {
+    fn measure_hold(&mut self, why: &'static str) -> Result<[(f64, f64); N]> {
         let mut rings: [Ring; N] = std::array::from_fn(|_| Ring::default());
         let mut sums = [(0.0_f64, 0.0_f64, 0u32); N];
         let mut generation = self.generation;
@@ -2034,7 +2020,7 @@ impl Arm {
         let mut loud = 0u32;
         let mut ran_away = None;
         'hold: for _ in 0..self.ticks(HOLD_OBSERVATION_S) {
-            self.frame(velocity_joint.map(|j| (j, JointCommand::velocity(0, 0))))?;
+            self.frame(None)?;
             for j in 0..N {
                 if generation[j] == self.generation[j] {
                     continue;
@@ -2335,7 +2321,7 @@ impl Arm {
         if toward_stop {
             self.retune(j, operating)?;
         }
-        let held = self.measure_hold("after move", None)?;
+        let held = self.measure_hold("after move")?;
         out.hold_rms_rad_s = held[j].1;
         // Where the joint is once it has held, not where it landed: a joint
         // that drifts through the hold has not settled.
@@ -2356,15 +2342,14 @@ impl Arm {
     }
 }
 
-/// Contact detection over a sliding window: the vendor's rule, which is that a
-/// joint drawing current while its encoder range stays under a quarter of the
-/// Contact detection for an ordinary move: a displacement plateau while the
+/// Contact detection for an ordinary move over a sliding window: a joint
+/// drawing current while its encoder range stays under a quarter of the
+/// commanded travel is against something — a displacement plateau while the
 /// drive is pulling current, which is how a move that jams reports itself.
 ///
 /// Not the homing stall detector -- `par6-rt`'s `Homer` owns that, with the
 /// vendor window and current-ratio rules, and this is the weaker predicate a
 /// move that is not approaching a stop needs.
-/// commanded travel is against something.
 struct ContactGuard {
     window: u64,
     start: u64,
@@ -2445,7 +2430,8 @@ impl Arm {
     /// Walk the configured homing sequence.
     fn home(&mut self) -> Result<()> {
         self.homing = true;
-        for step in self.bundle.robot.homing.sequence.clone() {
+        let plan = self.bundle.robot.homing.for_tool(self.bundle.active_tool());
+        for step in plan.sequence {
             for m in step.pre_moves {
                 self.premove(m)?;
             }
@@ -2468,7 +2454,7 @@ impl Arm {
                 self.premove(m)?;
             }
         }
-        for m in self.bundle.robot.homing.post_moves.clone() {
+        for m in plan.post_moves {
             self.premove(m)?;
         }
         self.homing = false;
@@ -2724,7 +2710,13 @@ impl Arm {
     ///   half diff: (I_f - I_r)/2k = b v + tc
     ///
     /// Two parameters, ordinary least squares over the speeds that held.
-    fn friction(&mut self, j: usize) -> Result<Option<(f64, f64)>> {
+    fn friction(&mut self, j: usize, span: (f64, f64)) -> Result<Option<(f64, f64)>> {
+        let home = self.angles()?[j];
+        let (up, down) = (span.1 - home, home - span.0);
+        // Out toward the wider side of the checked span, never past a share
+        // of its room: the legs have no contact abort of their own.
+        let budget = DRAG_TRAVEL_RAD.min(GAINS_ROOM_SHARE * up.max(down));
+        let outward = if up >= down { 1.0 } else { -1.0 } * self.per_tick(j).signum();
         let cfg = &self.bundle.robot.joints[j];
         let factor =
             torque_to_ma_factor(cfg.gear_ratio, cfg.gear_efficiency, cfg.kt_nm_a, cfg.dir).abs();
@@ -2737,10 +2729,10 @@ impl Arm {
         let span = 2.0 * DRAG_SETTLE_S + DRAG_AVERAGE_S;
         let travel = |v: f64| v * (span + self.speed_ramp(j, v).duration());
         let (mut lo, mut hi) = (0.0, cfg.limits.for_mode(LimitMode::Exec).velocity_rad_s);
-        if travel(hi) > DRAG_TRAVEL_RAD {
+        if travel(hi) > budget {
             for _ in 0..50 {
                 let mid = 0.5 * (lo + hi);
-                if travel(mid) > DRAG_TRAVEL_RAD {
+                if travel(mid) > budget {
                     hi = mid;
                 } else {
                     lo = mid;
@@ -2756,11 +2748,16 @@ impl Arm {
                     / (DRAG_LEVELS - 1).max(1) as f64;
             let ticks_s = fraction * fastest;
             let start = self.pos(j)?;
-            let forward = self.drag(j, ticks_s)?;
-            let reverse = if forward.is_some() {
-                self.drag(j, -ticks_s)?
+            let out = self.drag(j, outward * ticks_s)?;
+            let back = if out.is_some() {
+                self.drag(j, -outward * ticks_s)?
             } else {
                 None
+            };
+            let (forward, reverse) = if outward > 0.0 {
+                (out, back)
+            } else {
+                (back, out)
             };
             // Every speed starts at the same pose, including rejected legs.
             self.return_to(j, start)?;
@@ -2874,21 +2871,17 @@ impl Arm {
     /// What this replaces is a relay that measured the 250 Hz CAN round trip
     /// rather than the joint (identical `Tu` on joints an order of magnitude
     /// apart in inertia) and handed the result to a loop closed at 6250 Hz.
-    fn measure_mechanics(&mut self) -> Result<[Option<(f64, f64)>; N]> {
-        let legs: Vec<usize> = (0..N)
-            .filter(|j| self.only.is_none_or(|o| o == *j))
-            .collect();
+    fn measure_mechanics(&mut self, spans: &[(f64, f64); N]) -> Result<[Option<(f64, f64)>; N]> {
         let q = self.angles()?;
         let inertia = self.inertia(q)?;
         let mut friction = [None; N];
-        for &j in &legs {
+        for j in 0..N {
             self.emit(Event::Phase("friction", j));
-            let Some((b, tc)) = self.friction(j)? else {
+            let Some((b, tc)) = self.friction(j, spans[j])? else {
                 continue;
             };
             self.emit(Event::Mechanics(self.tick, j, inertia[j], b, tc));
             friction[j] = Some((b, tc));
-            self.friction[j] = (b, tc);
         }
         Ok(friction)
     }
@@ -2907,7 +2900,6 @@ impl Arm {
     /// and the current is the one at the start of that window. The joint
     /// is caught there, held, then eased back to where it started.
     fn breakaway(&mut self, j: usize, sign: f64) -> Result<Option<(f64, i64)>> {
-        self.settle(STICTION_REST_S)?;
         // Still first: the previous breakaway's return was still settling
         // when J3's ramp began, and the sliding test read that as a
         // breakaway at the balance current.
@@ -2975,18 +2967,16 @@ impl Arm {
         }
     }
 
-    /// Catch joint `j` where a current-mode excursion left it, let it
-    /// rest, then ease it back to `start` on the septic under its EXEC
-    /// caps: a chirp can leave the base degrees away, which is no
-    /// distance to jump in one frame.
+    /// Catch joint `j` where a current-mode excursion left it and ease it
+    /// back to `start` on the septic under its EXEC caps: a chirp can leave
+    /// the base degrees away, which is no distance to jump in one frame.
     fn return_to(&mut self, j: usize, start: i32) -> Result<()> {
         self.adopt(j)?;
-        self.settle(STICTION_REST_S)?;
         let result = self.run_motion(j, start, RETURN_S, false)?;
         if result.outcome != Outcome::Complete {
             return Err(format!("J{} did not return to where it started", j + 1).into());
         }
-        self.settle(STICTION_REST_S)
+        Ok(())
     }
 
     /// Static friction per joint at the pose the arm holds \[Nm\]. The two
@@ -2997,9 +2987,6 @@ impl Arm {
     fn stiction(&mut self, label: &'static str) -> Result<[Option<f64>; N]> {
         let mut out = [None; N];
         for (j, slot) in out.iter_mut().enumerate() {
-            if self.only.is_some_and(|o| o != j) {
-                continue;
-            }
             self.emit(Event::Phase("stiction", j));
             let cfg = &self.bundle.robot.joints[j];
             let factor =
@@ -3044,7 +3031,6 @@ impl Arm {
     /// whole chirp.
     fn belt(&mut self, j: usize, span: (f64, f64)) -> Result<bool> {
         self.emit(Event::Phase("belt chirp", j));
-        self.settle(STICTION_REST_S)?;
         self.wait_still(std::array::from_fn(|k| k == j))?;
         let start = self.pos(j)?;
         let at = self.conv[j].joint_rad(start);
@@ -3150,7 +3136,9 @@ impl Arm {
             ));
             return Ok(None);
         }
-        // Out along the wider side, then back from where that ended.
+        // Out along the wider side, then back from where that ended. The
+        // drive runs uncompensated from here, so every way out of this stage
+        // but a kept fit leaves it — and the overlay — with no ripple.
         let out = direction * per_tick.signum() * RIPPLE_SWEEP_TICKS_S;
         self.bus.set_ripple(node, &[])?;
         let start = self.pos(j)?;
@@ -3160,7 +3148,7 @@ impl Arm {
                 j,
                 "the drive records no capture (its firmware predates cmd 38)",
             ));
-            return Ok(None);
+            return Ok(Some(Vec::new()));
         };
         let far = start + (out * sweep_s).round() as i32;
         if self.run_motion(j, far, RETURN_S, false)?.outcome != Outcome::Complete {
@@ -3183,7 +3171,7 @@ impl Arm {
                 j,
                 "the sweeps do not pin the ripple down",
             ));
-            return Ok(None);
+            return Ok(Some(Vec::new()));
         };
         let mean = |x: f64, y: f64| ((x + y) / 2.0).round().clamp(-ilim, ilim) as i16;
         let harmonics: Vec<RippleHarmonic> = there
@@ -3221,7 +3209,7 @@ impl Arm {
                 j,
                 "the gains step does not pin the speed ripple down; cleared",
             ));
-            return Ok(None);
+            return Ok(Some(Vec::new()));
         };
         let before = ripple::total(&v0);
         let mut best = (ripple::total(&v1), harmonics.clone());
@@ -3247,7 +3235,7 @@ impl Arm {
         self.emit(Event::RippleCheck(self.tick, j, before, after, kept));
         if !kept {
             self.bus.set_ripple(node, &[])?;
-            return Ok(None);
+            return Ok(Some(Vec::new()));
         }
         self.bus.set_ripple(node, &chosen)?;
         Ok(Some(chosen))
@@ -3438,6 +3426,10 @@ impl Arm {
             }
             Err(error) => match self.runaway_joint.take() {
                 Some(j) if judged[j] => {
+                    // Settled on its configured gains before anything moves
+                    // again: a joint left in its limit cycle trips the guard
+                    // on the very next leg.
+                    self.calm(j, self.bundle.robot.joints[j].gains)?;
                     let back = *trail.last().ok_or("empty posture trail")?;
                     self.pose(back)?;
                     Ok(Some(j))
@@ -3451,7 +3443,7 @@ impl Arm {
     /// `check_hold` fails on. A joint not being judged has nothing to fall
     /// back to, so its failure to hold is the run's, not the candidate's.
     fn hold_fault(&mut self, why: &'static str, judged: [bool; N]) -> Result<Option<usize>> {
-        let held = self.measure_hold(why, None)?;
+        let held = self.measure_hold(why)?;
         let fault =
             (0..N).find(|&j| held[j].0 > self.tolerance() || held[j].1 > self.holding_limit(j));
         match fault {
@@ -4144,13 +4136,8 @@ impl Arm {
         restored
     }
 
-    /// The current feedforward for joint `j` moving at `ticks_s` motor
-    /// ticks/s: gravity at the measured pose, plus, with `friction`, the
-    /// current that carries the joint's friction at that speed \[mA\].
-    /// Coulomb ramps in over one of the speed filter's steps either side of
-    /// rest, below which the drive cannot tell the joint is moving; viscous
-    /// grows with the speed. Both are joint side, as the mechanics stage
-    /// measures them.
+    /// The current feedforward for joint `j`: gravity at the measured pose,
+    /// within the joint's current limit \[mA\].
     fn feedforward(&mut self, j: usize) -> i16 {
         let gravity = f64::from(self.gravity_feedforward()[j]);
         let ilim = self.bundle.robot.joints[j].ilim_ma;
@@ -4191,11 +4178,17 @@ impl Arm {
         ));
         let feedforward = self.gravity_feedforward()[j];
         let per_tick = self.per_tick(j);
+        let opened_at = self.pos(j)?;
         for _ in 0..self.ticks(CALM_S) {
             self.frame(Some((j, JointCommand::current(feedforward))))?;
-            // No loop bounds the joint now; the gravity current is a model.
+            // No loop bounds the joint now; the gravity current is a model,
+            // and a sag just under the runaway speed would cover a lot of
+            // ground in the time it is open.
             let reported = self.state.nodes[self.node(j)].speed_ticks_s.unwrap_or(0);
-            if (f64::from(reported) * per_tick).abs() > RUNAWAY_RAD_S {
+            let drifted = f64::from(self.pos(j)? - opened_at) * per_tick;
+            if (f64::from(reported) * per_tick).abs() > RUNAWAY_RAD_S
+                || drifted.abs() > CALM_OPEN_TRAVEL_RAD
+            {
                 self.adopt(j)?;
                 return Err(format!(
                     "J{} ran away with its loop open after its trial gains were withdrawn",
@@ -5231,6 +5224,16 @@ impl Arm {
             // Mid-leg counts: the leg back to the last checked pose, or to
             // ready itself, runs along the segment that was checked.
             if away && self.homed.iter().all(|h| *h) {
+                // A run ended by the runaway guard leaves that joint on its
+                // configured gains but maybe still in its limit cycle; the
+                // retrace would trip the guard on its first leg and park
+                // joint by joint from here instead.
+                if let Some(j) = self.runaway_joint.take() {
+                    if let Err(error) = self.calm(j, self.bundle.robot.joints[j].gains) {
+                        self.emit(Event::Phase("could not calm the joint that ran away", j));
+                        println!("calm J{}: {error}", j + 1);
+                    }
+                }
                 self.emit(Event::Phase(
                     "retrace the checked legs to ready before parking",
                     0,
@@ -6170,6 +6173,21 @@ fn run(args: Args) -> Result<()> {
     let existing = overlay.is_file().then(|| overlay.clone());
     let bundle = ConfigBundle::load_with(&args.config, existing.as_deref(), args.tool.as_deref())?;
     bundle.robot.validate()?;
+    // The arm's gravity is fitted with nothing on the flange: a tool shares
+    // the last link's regressor columns, so a fit with one on writes that
+    // tool into a correction every other tool then carries.
+    if mechanics_stage
+        && !bundle
+            .active_tool()
+            .is_some_and(|t| t.name.eq_ignore_ascii_case("Flange"))
+    {
+        return Err(format!(
+            "the mechanics stage identifies the bare arm, but `{}` is fitted: take the \
+             tool off and run with --tool Flange, or leave the stage out with --only",
+            bundle.robot.robot.active_tool
+        )
+        .into());
+    }
     if bundle.robot.joints.len() != N {
         return Err(format!(
             "par6-selfcal calibrates a {N}-joint arm; this configuration names {}",
@@ -6296,7 +6314,7 @@ fn run(args: Args) -> Result<()> {
     } else {
         None
     };
-    let spans = if limits_stage || gains_stage || belt_stage || ripple_stage {
+    let spans = if limits_stage || gains_stage || belt_stage || ripple_stage || mechanics_stage {
         Some(limit_spans(&bundle, &assets, ready)?)
     } else {
         None
@@ -6551,7 +6569,8 @@ fn run(args: Args) -> Result<()> {
                     if found.is_some() {
                         "passed"
                     } else {
-                        "unresolved"
+                        // Stiction is reported, never written.
+                        "retained: unresolved"
                     },
                 );
             }
@@ -6566,7 +6585,7 @@ fn run(args: Args) -> Result<()> {
                         if found.is_some() {
                             "passed"
                         } else {
-                            "unresolved"
+                            "retained: unresolved"
                         },
                     );
                 }
@@ -6582,12 +6601,13 @@ fn run(args: Args) -> Result<()> {
                 if captured {
                     "passed"
                 } else {
-                    "incomplete: travel guard"
+                    // The belt is reported, never written.
+                    "retained: travel guard"
                 },
             );
         }
-        if mechanics_stage {
-            let mut measured = arm.measure_mechanics()?;
+        if let (true, Some(spans)) = (mechanics_stage, &spans) {
+            let mut measured = arm.measure_mechanics(spans)?;
             for (j, found) in measured.iter_mut().enumerate() {
                 // A coefficient its own standard error swamps is not a
                 // measurement; the file keeps what it had.
@@ -6628,7 +6648,9 @@ fn run(args: Args) -> Result<()> {
                 } else {
                     match found {
                         Some(f) if f.velocity_reached && f.jerk_measured => "passed",
-                        Some(_) => "incomplete: lower bound only",
+                        // The caps it reached are written; a jerk it only
+                        // bounded is not.
+                        Some(_) => "passed: lower bound only",
                         None => "unresolved: no passing limits",
                     }
                 };
