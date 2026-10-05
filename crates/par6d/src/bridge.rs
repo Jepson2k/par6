@@ -295,6 +295,12 @@ const STANDOFF_CREEP_RAD: f64 = 4.0e-3;
 /// it at streaming speed.
 const STANDOFF_PLACEMENT_SCALE: (f64, f64) = (0.05, 0.05);
 
+/// How much nearer a placement has to come to its standoff \[rad\], on the
+/// joint with the most to go, to count as headway and earn another
+/// [`STANDOFF_TRAVEL_BUDGET_S`]: a quarter of the arrival tolerance, well
+/// above the jitter of a held pose.
+const STANDOFF_HEADWAY_RAD: f64 = STANDOFF_ARRIVED_RAD / 4.0;
+
 /// Consecutive FRESH snapshots below [`STREAM_MOVING_RAD_S`] that count
 /// as the arm having stopped.
 ///
@@ -303,8 +309,9 @@ const STANDOFF_PLACEMENT_SCALE: (f64, f64) = (0.05, 0.05);
 /// the RT publishes, so the count only advances on a new tick.
 const STANDOFF_STILL_TICKS: u8 = 8;
 
-/// How long the arm is given to reach a standoff before the stream is
-/// ended anyway \[s\], counted in RT ticks.
+/// How long the arm is given to come to rest, to make headway toward a
+/// standoff, or to settle on it before the phase is ended anyway \[s\],
+/// counted in RT ticks.
 ///
 /// The refeed exists because the client has stopped sending — its
 /// motion was refused — so nothing else would keep the stream alive
@@ -1542,12 +1549,15 @@ enum Standoff {
         goal: [f64; MAX_JOINTS],
         until_tick: u64,
     },
-    /// Travelling the last stretch onto the solved standoff, by
-    /// `until_tick`. `tries` counts the placements spent on this
-    /// refusal.
+    /// Travelling the last stretch onto the solved standoff. `best` is the
+    /// nearest it has come (the largest joint's distance, \[rad\]), and
+    /// `until_tick` moves out each time it comes nearer: the phase ends on
+    /// a placement that has stopped making headway, not on a slow one.
+    /// `tries` counts the placements spent on this refusal.
     Placing {
         stop: [f64; MAX_JOINTS],
         tries: u8,
+        best: f64,
         until_tick: u64,
     },
     /// Let go of the standoff and watching where that left the arm.
@@ -3138,6 +3148,7 @@ pub(crate) fn housekeeping_loop(
                                 a.standoff = Some(Standoff::Placing {
                                     stop,
                                     tries: 1,
+                                    best: f64::INFINITY,
                                     until_tick: snap.tick
                                         + placement_budget_ticks(
                                             &snap.q,
@@ -3150,7 +3161,28 @@ pub(crate) fn housekeeping_loop(
                                 a.still_tick = 0;
                                 break 'stream;
                             }
-                            Standoff::Placing { stop, tries, .. } => {
+                            Standoff::Placing {
+                                stop, tries, best, ..
+                            } => {
+                                // Headway buys more time: a creep the drive
+                                // follows slowly — a joint whose friction a
+                                // gentle velocity loop takes a while to break —
+                                // still finishes, while one that has stopped
+                                // runs out.
+                                let span = (0..par6_kin::NQ)
+                                    .map(|j| (stop[j] - snap.q[j]).abs())
+                                    .fold(0.0, f64::max);
+                                let expired = if span + STANDOFF_HEADWAY_RAD < best {
+                                    a.standoff = Some(Standoff::Placing {
+                                        stop,
+                                        tries,
+                                        best: span,
+                                        until_tick: snap.tick + standoff_budget_ticks(dt),
+                                    });
+                                    false
+                                } else {
+                                    expired
+                                };
                                 // Arrival is measured in POSITION, not in
                                 // speed: a snapshot's velocity passes through
                                 // zero whenever the executor re-plans, and
@@ -3191,21 +3223,22 @@ pub(crate) fn housekeeping_loop(
                                 }
                                 if expired {
                                     log::warn!(
-                                        "the standoff was not reached within the travel budget; \
-                                         holding the placement"
+                                        "the placement stopped short of its standoff; \
+                                         holding where it stopped"
                                     );
-                                    // Parked on the placement, not idled: an
-                                    // arm that has not settled is still
-                                    // moving, and IDLE has no velocity
-                                    // authority — handed over mid-settle it
-                                    // coasts, and measured on the sim rig
-                                    // that coast ended inside the keep-out.
-                                    // The refeed keeps the placement's own
-                                    // limits, and the servo lifecycle ends
-                                    // the stream as it would after arrival.
+                                    // Held where it stopped, not idled: IDLE
+                                    // has no velocity authority, and handed
+                                    // over mid-settle the arm coasts — measured
+                                    // on the sim rig, into the keep-out. Nor
+                                    // held on the standoff: that is a position
+                                    // command the plant chases, the overshoot
+                                    // the creep exists to prevent, and measured
+                                    // on the sim rig it ran 4.4 mm into the
+                                    // clearance. The servo lifecycle ends the
+                                    // stream as it would after arrival.
                                     a.standoff = None;
                                     a.parked = true;
-                                    a.servo_target = Some(stop);
+                                    a.servo_target = Some(snap.q);
                                     a.scale = STANDOFF_PLACEMENT_SCALE;
                                     a.deadline = now + servo_grace;
                                     break 'stream;
@@ -3264,6 +3297,7 @@ pub(crate) fn housekeeping_loop(
                                 a.standoff = Some(Standoff::Placing {
                                     stop,
                                     tries: tries + 1,
+                                    best: f64::INFINITY,
                                     until_tick: snap.tick + standoff_budget_ticks(dt),
                                 });
                                 break 'stream;
