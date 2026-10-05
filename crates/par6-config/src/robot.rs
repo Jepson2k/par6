@@ -956,7 +956,7 @@ pub struct RobotConfig {
     /// disabled.
     #[serde(default)]
     pub limits: LimitsSection,
-    /// Shutdown retreat. Omitted = no retreat.
+    /// Shutdown retreat. Omitted = the retreat to the park pose.
     #[serde(default)]
     pub shutdown: ShutdownConfig,
     /// Motion feel constants. Omitted = the shipped defaults.
@@ -1153,6 +1153,9 @@ impl RobotConfig {
         }
         if self.joints[..i].iter().any(|o| o.node_id == j.node_id) {
             return Err(invalid(f("node_id"), "duplicate node id"));
+        }
+        if self.joints[..i].iter().any(|o| o.name == j.name) {
+            return Err(invalid(f("name"), "duplicate joint name"));
         }
         if !(1..=24).contains(&j.encoder_bits) {
             return Err(invalid(f("encoder_bits"), "must be in 1..=24"));

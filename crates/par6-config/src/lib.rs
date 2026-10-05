@@ -115,10 +115,62 @@ pub struct ConfigBundle {
     pub installation_shapes: Vec<par6_proto::Shape>,
 }
 
+impl HomingConfig {
+    /// The sequence as `tool` runs it: without the gripper work when the
+    /// tool has no CAN driver to run it on.
+    ///
+    /// The sequence in `PAR6.toml` is written for the shipped gripper and
+    /// is shared by every tool, so selecting the bare flange (vendor
+    /// `Flange.xml`, `CAN_gripper = 0`) leaves steps addressing a node
+    /// that is not on the bus. Refusing the bundle instead would make the
+    /// safest possible first power-on — arm bare, nothing on the flange —
+    /// the one configuration that cannot boot, and would force the
+    /// operator to hand-edit the shared sequence this file exists to stop
+    /// them transcribing. The vendor resolves it the same way, skipping
+    /// both gripper homing modes with a warning
+    /// (`rcb-runtime/robotics/homing.py`). Asked per tool rather than
+    /// applied at load, since `select_tool` changes the tool under a
+    /// running runtime in either direction.
+    ///
+    /// Stripping can empty a step completely — the two gripper-homing
+    /// steps do nothing else. An empty group, and an empty step, are both
+    /// config errors when someone writes them by hand, and
+    /// [`Self::validate`] says so, so the emptied ones are removed rather
+    /// than left behind. Steps are addressed by order and never by index,
+    /// and the joints they home are named inside them, so dropping one
+    /// leaves the remaining sequence and its arm-joint references intact.
+    pub fn for_tool(&self, tool: Option<&ToolConfig>) -> Self {
+        let mut homing = self.clone();
+        if tool.is_none_or(|g| g.driver.is_some()) {
+            return homing;
+        }
+        let strip = |moves: &mut Vec<PreMove>| {
+            moves.retain(|m| !matches!(m, PreMove::GripperMove { .. }));
+        };
+        for step in &mut homing.sequence {
+            if let Some(h) = step.home.as_mut() {
+                h.gripper = None;
+            }
+            if step.home.as_ref().is_some_and(|h| h.joints.is_empty()) {
+                step.home = None;
+            }
+            strip(&mut step.pre_moves);
+            strip(&mut step.post_moves);
+        }
+        strip(&mut homing.post_moves);
+        homing.sequence.retain(|step| {
+            !(step.pre_moves.is_empty()
+                && step.home.is_none()
+                && step.move_to.is_empty()
+                && step.post_moves.is_empty())
+        });
+        homing
+    }
+}
+
 impl ConfigBundle {
     /// Load `robot_toml` plus every `grippers/*.toml` in the same
-    /// directory, drop the sequence steps the active tool cannot run,
-    /// then cross-validate.
+    /// directory, then cross-validate.
     pub fn load(robot_toml: &Path) -> Result<Self, ConfigError> {
         Self::load_with(robot_toml, None, None)
     }
@@ -126,8 +178,7 @@ impl ConfigBundle {
     /// [`load`](Self::load), fitted with the tool named `tool` rather than
     /// the one `active_tool` boots with — the tool on the arm is the
     /// operator's to say. Matched case-insensitively; an unknown name is
-    /// refused. The homing sequence is trimmed for THIS tool, which is why
-    /// the choice is made here rather than patched onto a loaded bundle.
+    /// refused.
     pub fn load_fitted(robot_toml: &Path, tool: &str) -> Result<Self, ConfigError> {
         Self::load_with(robot_toml, None, Some(tool))
     }
@@ -174,12 +225,11 @@ impl ConfigBundle {
                 .ok_or_else(|| invalid("tool", format!("no tool named `{name}`")))?;
             robot.robot.active_tool.clone_from(&tool.name);
         }
-        let mut bundle = Self {
+        let bundle = Self {
             robot,
             tools,
             installation_shapes,
         };
-        bundle.drop_gripper_homing_without_a_gripper();
         bundle.validate()?;
         Ok(bundle)
     }
@@ -220,73 +270,6 @@ impl ConfigBundle {
         Some(jh.home_offset_rad)
     }
 
-    /// Strip the gripper work out of the homing sequence when the active
-    /// tool has no CAN driver to run it on.
-    ///
-    /// The sequence in `PAR6.toml` is written for the shipped gripper and
-    /// is shared by every tool, so selecting the bare flange (vendor
-    /// `Flange.xml`, `CAN_gripper = 0`) leaves steps addressing a node
-    /// that is not on the bus. Refusing the bundle instead would make the
-    /// safest possible first power-on — arm bare, nothing on the flange —
-    /// the one configuration that cannot boot, and would force the
-    /// operator to hand-edit the shared sequence this file exists to stop
-    /// them transcribing. The vendor resolves it the same way, skipping
-    /// both gripper homing modes with a warning
-    /// (`rcb-runtime/robotics/homing.py`).
-    ///
-    /// Stripping can empty a step completely — the two gripper-homing
-    /// steps do nothing else. An empty group, and an empty step, are both
-    /// config errors when someone writes them by hand, and
-    /// [`Self::validate`] says so, so the emptied ones are removed rather
-    /// than left behind. Steps are addressed by order and never by index,
-    /// and the joints they home are named inside them, so dropping one
-    /// leaves the remaining sequence and its arm-joint references intact.
-    fn drop_gripper_homing_without_a_gripper(&mut self) {
-        if self.active_tool().is_none_or(|g| g.driver.is_some()) {
-            return;
-        }
-        let tool = self.robot.robot.active_tool.clone();
-        let strip = |where_: String, moves: &mut Vec<PreMove>| {
-            let before = moves.len();
-            moves.retain(|m| !matches!(m, PreMove::GripperMove { .. }));
-            if moves.len() < before {
-                log::warn!(
-                    "{where_}: skipping {} gripper move(s) — tool `{tool}` has no CAN driver",
-                    before - moves.len()
-                );
-            }
-        };
-        for (i, step) in self.robot.homing.sequence.iter_mut().enumerate() {
-            if let Some(mode) = step.home.as_mut().and_then(|h| h.gripper.take()) {
-                log::warn!(
-                    "homing.sequence[{i}]: skipping {mode:?} gripper homing — \
-                     tool `{tool}` has no CAN driver"
-                );
-            }
-            if step.home.as_ref().is_some_and(|h| h.joints.is_empty()) {
-                step.home = None;
-            }
-            strip(
-                format!("homing.sequence[{i}].pre_moves"),
-                &mut step.pre_moves,
-            );
-            strip(
-                format!("homing.sequence[{i}].post_moves"),
-                &mut step.post_moves,
-            );
-        }
-        strip(
-            "homing.post_moves".into(),
-            &mut self.robot.homing.post_moves,
-        );
-        self.robot.homing.sequence.retain(|step| {
-            !(step.pre_moves.is_empty()
-                && step.home.is_none()
-                && step.move_to.is_empty()
-                && step.post_moves.is_empty())
-        });
-    }
-
     fn validate(&self) -> Result<(), ConfigError> {
         for (i, s) in self.installation_shapes.iter().enumerate() {
             // The same contract SET_SHAPES enforces on the wire, written
@@ -315,7 +298,7 @@ impl ConfigBundle {
                 ));
             }
         }
-        let Some(active) = self.active_tool() else {
+        if self.active_tool().is_none() {
             return Err(invalid(
                 "robot.active_tool",
                 format!(
@@ -323,23 +306,28 @@ impl ConfigBundle {
                     self.robot.robot.active_tool
                 ),
             ));
-        };
+        }
         // Motor-mode gripper homing runs the joint FSM against the
         // gripper's own `[homing]` parameters; without them the step
         // would report Done on the tick it started and the jaws would
-        // never be referenced. A tool WITHOUT a driver never gets here —
-        // its gripper steps were dropped above.
+        // never be referenced. Every driven tool, not only the one fitted
+        // at boot: `select_tool` fits any of them. A tool without a driver
+        // runs the sequence without its gripper work (`for_tool`).
         let motor_homed = self.robot.homing.sequence.iter().any(|s| {
             s.home
                 .as_ref()
                 .is_some_and(|h| h.gripper == Some(GripperHomeMode::Motor))
         });
-        if motor_homed && active.homing.is_none() {
+        if let Some(tool) = self
+            .tools
+            .iter()
+            .find(|t| motor_homed && t.driver.is_some() && t.homing.is_none())
+        {
             return Err(invalid(
                 "homing.sequence",
                 format!(
                     "sequence homes the gripper motor but gripper `{}` has no [homing] section",
-                    active.name
+                    tool.name
                 ),
             ));
         }
@@ -724,32 +712,26 @@ mod tests {
             bundle.active_tool().map(|g| g.name.as_str()),
             Some("Flange")
         );
-        // Loading is not enough: the daemon and par6-selfcal both re-check
-        // the stripped robot config on startup, so whatever stripping
-        // leaves behind has to satisfy that check too. Leaving an emptied
-        // home group (or an emptied step) behind stopped both of them from
-        // starting with nothing on the flange.
-        bundle
-            .robot
-            .validate()
-            .expect("the stripped sequence must still satisfy RobotConfig::validate");
+        let homing = bundle.robot.homing.for_tool(bundle.active_tool());
+        // Whatever stripping leaves behind has to satisfy the sequence's
+        // own validation: an emptied home group (or an emptied step) left
+        // behind would refuse a homing run with nothing on the flange.
+        homing
+            .validate(bundle.robot.joints.len())
+            .expect("the stripped sequence must still validate");
         assert!(
-            bundle
-                .robot
-                .homing
+            homing
                 .sequence
                 .iter()
                 .all(|s| s.home.as_ref().is_none_or(|h| h.gripper.is_none())),
             "no step may home a gripper that has no driver"
         );
         assert!(
-            bundle
-                .robot
-                .homing
+            homing
                 .sequence
                 .iter()
                 .flat_map(|s| s.pre_moves.iter().chain(s.post_moves.iter()))
-                .chain(bundle.robot.homing.post_moves.iter())
+                .chain(homing.post_moves.iter())
                 .all(|m| !matches!(m, PreMove::GripperMove { .. })),
             "no move may command a gripper that has no driver"
         );
@@ -765,9 +747,8 @@ mod tests {
                     .copied()
                     .collect()
             };
-            let mut steps: Vec<_> = b
-                .robot
-                .homing
+            let homing = b.robot.homing.for_tool(b.active_tool());
+            let mut steps: Vec<_> = homing
                 .sequence
                 .iter()
                 .map(|s| {
@@ -785,7 +766,7 @@ mod tests {
                     !(pre.is_empty() && home.is_empty() && to.is_empty() && post.is_empty())
                 })
                 .collect();
-            steps.push((arm(&b.robot.homing.post_moves), vec![], vec![], vec![]));
+            steps.push((arm(&homing.post_moves), vec![], vec![], vec![]));
             steps
         };
         let driven_work = arm_work(&stock);

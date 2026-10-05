@@ -141,6 +141,17 @@ fn a_two_pass_tolerance_must_be_below_the_backoff_travel() {
     load_with(shipped, "two_pass_max_diff_ticks = 1349").expect("a tolerance inside the backoff");
 }
 
+/// A joint's name is how an overlay addresses it, so two joints may not
+/// share one.
+#[test]
+fn joint_names_are_unique() {
+    let field = refused_field(
+        load_with("name = \"joint2\"", "name = \"joint1\""),
+        "two joints named joint1",
+    );
+    assert_eq!(field, "joints[1].name");
+}
+
 /// One installation's values layer over the shipped file: a local overlay
 /// sets one joint's gain and stands the arm on its bench, everything it
 /// does not name stays shipped, and a key the schema does not know is

@@ -235,7 +235,7 @@ daemon runs, so a preview cannot disagree with the runtime — it *is* the runti
 | `crates/par6-py` | the `par6._par6` Python extension (PyO3 over par6-client + the preview) |
 | `cpp/` | the Pinocchio/coal/TOPPRA C-ABI shim |
 | `python/` | the `par6` pip package (waldoctl backend) |
-| `python/par6/_data/` | generated copy of `config/` + the URDF/MJCF assets, written by `scripts/sync_pkg_data.py` and enforced fresh by a test: edit `config/PAR6.toml`, never this. A consumer hashing the packaged model (WC's simulation case reports do) sees those hashes change whenever the config does, including when a stale copy is brought back into line |
+| `python/par6/_data/` | the runtime config (`config/` is a symlink to `_data/config/`) + the URDF/MJCF assets, copied by `scripts/sync_pkg_data.py` and enforced fresh by a test. A consumer hashing the packaged model (WC's simulation case reports do) sees those hashes change whenever the config or the assets do |
 | `python/par6/panel/` | the control box front panel service (`par6-panel`) and the preflight check (`par6-preflight`) |
 | `assets/` | PAR6 URDF, SRDF and meshes from Source Robotics — see `assets/NOTICE` |
 
@@ -759,18 +759,21 @@ has never been flashed on hardware as untested.
 
 ### Local overlay
 
-The shipped `PAR6.toml` describes the PAR6: vendor gains and limits, no
-gravity correction, no keep-outs. What one arm measured about itself — its
+The shipped `PAR6.toml` describes the PAR6: vendor gains and limits except
+where the PAR6 itself needs otherwise (each such value says why), no gravity
+correction, no keep-outs. What one arm measured about itself — its
 calibration, the tool bolted on, the bench it stands on — lives in a
 `local.toml` holding only the keys it changes, layered over the shipped file
 at load by `par6d`, the Python client and `par6-selfcal` alike. It is the
 file beside the robot TOML (`/etc/par6/local.toml` on the control box), or
 the one `--local-config` / `PAR6_LOCAL_CONFIG` names.
 
-Tables merge key by key. An array of tables merges entry by entry: by
-`name` when its entries have one, so an overlay sets one joint's gain or adds
-one shape without restating the rest, and by position otherwise, so an empty
-`[[homing.joints]]` leaves that joint as shipped. Any other value replaces
+Tables merge key by key. An array of named tables (`[[joints]]`,
+`[[installation_shapes]]`) merges entry by entry by `name`, so an overlay sets
+one joint's gain or adds one shape without restating the rest; every entry it
+writes must carry the `name` it changes. `[[homing.joints]]`, one entry per
+joint, merges by position, so an empty entry leaves that joint as shipped. Any
+other value — an ordered list like `[[homing.sequence]]` included — replaces
 the shipped one whole.
 
 ```toml
@@ -1045,9 +1048,12 @@ Layout after install:
 | `/var/lib/par6` | `StateDirectory`, the working directory |
 
 The shipped config is **replaced** on every install, so an upgrade never runs
-a stale copy; a file that differs is kept beside it as `*.previous`. This
-arm's calibration and installation live in `/etc/par6/local.toml`, which no
-install writes (see *Local overlay*). `--no-restart` installs without touching
+a stale copy; a file that differs is kept beside it as
+`*.previous-<timestamp>`. This arm's calibration and installation live in
+`/etc/par6/local.toml`, which no install writes (see *Local overlay*). Until
+that file exists, an install refuses to replace a `PAR6.toml` that differs
+from the shipped one: move the arm's own values into `local.toml` first, or
+create it empty if the arm has none. `--no-restart` installs without touching
 the running service.
 
 > Restarting `par6d` stops the arm and clears the queue. `install.sh` stops the

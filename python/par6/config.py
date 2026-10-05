@@ -1,8 +1,9 @@
 """Packaged PAR6 configuration and asset paths.
 
-The runtime's own config files (``config/PAR6.toml`` and
-``config/grippers/*.toml``) and URDF trees are mirrored into ``par6/_data``
-by ``scripts/sync_pkg_data.py`` and read through the engine's own loader
+The runtime's own config files (``par6/_data/config/PAR6.toml`` and its
+``grippers/*.toml``; the repo-root ``config`` is a symlink to them), with any
+local overlay layered over them, and the URDF trees ``scripts/sync_pkg_data.py``
+copies into ``par6/_data`` are read through the engine's own loader
 (:class:`par6._par6.Config`), so every limit, pose and name the Python
 surface exposes is the value the Rust runtime enforces.  This module only
 turns those values into paths and waldoctl dataclasses.

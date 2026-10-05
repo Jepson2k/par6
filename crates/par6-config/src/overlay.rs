@@ -4,11 +4,11 @@
 //! The shipped `PAR6.toml` describes the PAR6, not an arm: what one arm
 //! measured about itself (its calibration, the bench it stands on) lives in
 //! a `local.toml` that holds only the keys it changes. Tables merge key by
-//! key. An array of tables merges entry by entry — by `name` when every
-//! entry has one (`[[joints]]`, `[[installation_shapes]]`), so a local file
-//! sets one joint's gain or adds one shape without restating the rest, and
-//! by position otherwise (`[[homing.joints]]`); an entry with nothing to
-//! merge into is added. Any other value replaces the shipped one whole.
+//! key. An array of named tables (`[[joints]]`, `[[installation_shapes]]`)
+//! merges entry by entry by `name`, so a local file sets one joint's gain
+//! or adds one shape without restating the rest; `[[homing.joints]]`, one
+//! entry per joint, merges by position. Any other value — an ordered list
+//! like `[[homing.sequence]]` included — replaces the shipped one whole.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -121,9 +121,17 @@ fn merge(base: &mut toml::Table, overlay: toml::Table, at: &str) -> Result<(), C
         match (base.get_mut(&key), value) {
             (Some(toml::Value::Table(b)), toml::Value::Table(o)) => merge(b, o, &here)?,
             (Some(toml::Value::Array(b)), toml::Value::Array(o))
-                if is_tables(b) && is_tables(&o) =>
+                if is_tables(b)
+                    && is_tables(&o)
+                    && (named(b) || PER_JOINT.contains(&here.as_str())) =>
             {
-                let by_name = named(b) && named(&o);
+                let by_name = named(b);
+                if by_name && !named(&o) {
+                    return Err(invalid(
+                        "local overlay",
+                        format!("every `{here}` entry needs the `name` of the one it changes"),
+                    ));
+                }
                 for (i, entry) in o.into_iter().enumerate() {
                     let toml::Value::Table(entry) = entry else {
                         unreachable!("checked by is_tables")
@@ -148,6 +156,9 @@ fn merge(base: &mut toml::Table, overlay: toml::Table, at: &str) -> Result<(), C
     }
     Ok(())
 }
+
+/// Arrays of tables with one entry per joint, in joint order.
+const PER_JOINT: &[&str] = &["homing.joints"];
 
 fn is_tables(array: &[toml::Value]) -> bool {
     !array.is_empty() && array.iter().all(toml::Value::is_table)
@@ -260,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn an_overlay_merges_named_entries_by_name_and_the_rest_by_position() {
+    fn an_overlay_merges_named_entries_by_name_and_per_joint_ones_by_position() {
         let mut base = table(
             "scale = [1.0, 1.0]\n\
              [[joints]]\nname = \"joint1\"\n[joints.gains]\nkpv = 1.0\nkiv = 2.0\n\
@@ -298,6 +309,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(base["installation_shapes"].as_array().unwrap().len(), 1);
+
+        // An ordered list is replaced whole, the lists inside its steps too.
+        let mut base = table(
+            "[[homing.sequence]]\nhome = { joints = [1] }\n\
+             [[homing.sequence]]\nmove_to = [{ joint = 2, position_rad = 2.85 }, { joint = 1, position_rad = -1.85 }]\n\
+             [[homing.joints]]\npre_moves = [{ joint = 4 }, { joint = 5 }]\n",
+        );
+        merge(
+            &mut base,
+            table(
+                "[[homing.sequence]]\nmove_to = [{ joint = 1, position_rad = -1.9 }]\n\
+                 [[homing.joints]]\npre_moves = [{ joint = 3 }]\n",
+            ),
+            "",
+        )
+        .unwrap();
+        let want = table(
+            "[[homing.sequence]]\nmove_to = [{ joint = 1, position_rad = -1.9 }]\n\
+             [[homing.joints]]\npre_moves = [{ joint = 3 }]\n",
+        );
+        assert_eq!(base, want);
+
+        // An unnamed entry among named ones would land on whichever entry
+        // sits at its index.
+        let mut base = table("[[joints]]\nname = \"joint1\"\n[[joints]]\nname = \"joint2\"\n");
+        let err = merge(
+            &mut base,
+            table("[[joints]]\nkpv = 1.0\n[[joints]]\nname = \"joint2\"\n"),
+            "",
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("joints"), "{err}");
     }
 
     #[test]

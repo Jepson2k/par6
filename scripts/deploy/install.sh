@@ -94,6 +94,16 @@ install_local() {
       || die "bundled par6d is not an aarch64 binary: $(file -b "$bundle/par6d")"
   fi
 
+  # A robot file that differs from the shipped one may hold this arm's own
+  # values. Until there is a local.toml for them, replacing it would restart
+  # the arm without them.
+  if [ -e "$ETC_DEST/PAR6.toml" ] && [ ! -e "$ETC_DEST/local.toml" ] \
+    && ! cmp -s "$bundle/config/PAR6.toml" "$ETC_DEST/PAR6.toml"; then
+    die "$ETC_DEST/PAR6.toml differs from the shipped one and there is no
+  $ETC_DEST/local.toml. Move this arm's own values into local.toml (create it
+  empty if it has none; see README.md, \"Local overlay\"), then install again"
+  fi
+
   if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
     say "creating system user $SERVICE_USER"
     useradd --system --no-create-home --shell /usr/sbin/nologin "$SERVICE_USER"
@@ -170,8 +180,10 @@ install_local() {
 install_config() {
   local src="$1" dest="$2"
   if [ -e "$dest" ] && ! cmp -s "$src" "$dest"; then
-    cp -p "$dest" "$dest.previous"
-    say "replacing $dest; the old one is $dest.previous -- this arm's own values belong in $ETC_DEST/local.toml"
+    local kept
+    kept="$dest.previous-$(date +%Y%m%dT%H%M%S)"
+    cp -p "$dest" "$kept"
+    say "replacing $dest; the old one is $kept"
   fi
   install -m 0644 "$src" "$dest"
   say "installed $dest"
