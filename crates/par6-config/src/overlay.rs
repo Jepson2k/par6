@@ -9,6 +9,9 @@
 //! or adds one shape without restating the rest; `[[homing.joints]]`, one
 //! entry per joint, merges by position. Any other value — an ordered list
 //! like `[[homing.sequence]]` included — replaces the shipped one whole.
+//!
+//! A tool file is layered the same way: a `[[tools]]` entry in the overlay,
+//! named after the tool, merges over that tool's file.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -70,28 +73,143 @@ pub(crate) fn layered_label(robot_toml: &Path, local: Option<&Path>) -> String {
     }
 }
 
+/// The overlay's key for the entries layered over tool files.
+const TOOLS_KEY: &str = "tools";
+
+fn parse(path: &Path) -> Result<toml::Table, ConfigError> {
+    toml::from_str(&read_to_string(path)?).map_err(|source| ConfigError::Parse {
+        path: path.display().to_string(),
+        source: Box::new(source),
+    })
+}
+
+/// A merge error, attributed to the overlay: the mistake is there.
+fn in_overlay(local: &Path) -> impl Fn(ConfigError) -> ConfigError + '_ {
+    move |e| match e {
+        ConfigError::Invalid { field, reason } => ConfigError::Invalid {
+            field,
+            reason: format!("{reason} (in {})", local.display()),
+        },
+        other => other,
+    }
+}
+
 /// The robot file with `local` merged over it, as one document.
 pub(crate) fn layered_table(
     robot_toml: &Path,
     local: Option<&Path>,
 ) -> Result<toml::Table, ConfigError> {
-    let parse = |path: &Path| -> Result<toml::Table, ConfigError> {
-        toml::from_str(&read_to_string(path)?).map_err(|source| ConfigError::Parse {
-            path: path.display().to_string(),
-            source: Box::new(source),
-        })
-    };
     let mut table = parse(robot_toml)?;
     if let Some(local) = local {
-        merge(&mut table, parse(local)?, "").map_err(|e| match e {
-            ConfigError::Invalid { field, reason } => ConfigError::Invalid {
-                field,
-                reason: format!("{reason} (in {})", local.display()),
-            },
-            other => other,
-        })?;
+        let mut overlay = parse(local)?;
+        overlay.remove(TOOLS_KEY);
+        merge(&mut table, overlay, "").map_err(in_overlay(local))?;
     }
     Ok(table)
+}
+
+/// The overlay's `[[tools]]` entries, each naming the tool it changes.
+pub(crate) fn tool_overlays(local: Option<&Path>) -> Result<Vec<toml::Table>, ConfigError> {
+    let Some(local) = local else {
+        return Ok(Vec::new());
+    };
+    let refuse = |reason: &str| {
+        invalid(
+            "local overlay",
+            format!("{reason} (in {})", local.display()),
+        )
+    };
+    match parse(local)?.remove(TOOLS_KEY) {
+        None => Ok(Vec::new()),
+        Some(toml::Value::Array(entries)) => entries
+            .into_iter()
+            .map(|entry| match entry {
+                toml::Value::Table(t) if t.get("name").is_some_and(toml::Value::is_str) => Ok(t),
+                _ => Err(refuse(
+                    "every `tools` entry needs the `name` of the tool it changes",
+                )),
+            })
+            .collect(),
+        Some(_) => Err(refuse("`tools` is a list of `[[tools]]` entries")),
+    }
+}
+
+/// The tool file at `path` with the overlay entry naming its tool merged
+/// over it, and which entry that was.
+pub(crate) fn layered_tool(
+    path: &Path,
+    overlays: &[toml::Table],
+    local: Option<&Path>,
+) -> Result<(toml::Table, Option<usize>), ConfigError> {
+    let mut table = parse(path)?;
+    let entry = overlays
+        .iter()
+        .position(|o| table.get("name").is_some_and(|n| o.get("name") == Some(n)));
+    if let (Some(k), Some(local)) = (entry, local) {
+        let name = table["name"].as_str().unwrap_or_default().to_owned();
+        merge(&mut table, overlays[k].clone(), &format!("tools[{name}]"))
+            .map_err(in_overlay(local))?;
+    }
+    Ok((table, entry))
+}
+
+/// The directory a robot file's tools live in: `tools/` beside it, or
+/// `grippers/`, what it used to be called.
+pub(crate) fn tool_dir(robot_toml: &Path) -> PathBuf {
+    let beside = |name: &str| {
+        robot_toml
+            .parent()
+            .map(|p| p.join(name))
+            .unwrap_or_else(|| Path::new(name).to_path_buf())
+    };
+    match beside("tools") {
+        d if d.is_dir() => d,
+        _ => beside("grippers"),
+    }
+}
+
+/// The tool files beside `robot_toml`, sorted by path.
+pub(crate) fn tool_files(robot_toml: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+    let dir = tool_dir(robot_toml);
+    let mut paths: Vec<_> = std::fs::read_dir(&dir)
+        .map_err(|source| ConfigError::Io {
+            path: dir.display().to_string(),
+            source,
+        })?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+        .collect();
+    paths.sort();
+    Ok(paths)
+}
+
+/// Each tool file as the runtime runs it, by file name: verbatim when the
+/// overlay leaves it alone, else the merged document.
+pub fn effective_tool_tomls(
+    robot_toml: &Path,
+    local: Option<&Path>,
+) -> Result<Vec<(String, String)>, ConfigError> {
+    let overlays = tool_overlays(local)?;
+    tool_files(robot_toml)?
+        .iter()
+        .map(|path| {
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default()
+                .to_owned();
+            let content = match layered_tool(path, &overlays, local)? {
+                (_, None) => read_to_string(path)?,
+                (table, Some(_)) => toml::to_string(&table).map_err(|e| {
+                    invalid(
+                        "local overlay",
+                        format!("cannot serialize the merged {name}: {e}"),
+                    )
+                })?,
+            };
+            Ok((name, content))
+        })
+        .collect()
 }
 
 /// The robot TOML the runtime actually runs: the file verbatim when nothing

@@ -390,7 +390,8 @@ pub enum QueryResult {
         /// Robot TOML as the runtime runs it: the file, with the
         /// installation's local overlay merged in when there is one.
         robot_toml: String,
-        /// Tool TOMLs as `(file name, content)`, sorted by file name.
+        /// Tool TOMLs as `(file name, content)`, sorted by file name, each
+        /// as the runtime runs it: the overlay's entry for it merged in.
         tools: Vec<(String, String)>,
     },
 }

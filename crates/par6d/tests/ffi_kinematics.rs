@@ -910,16 +910,7 @@ fn angles_close(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS], tol_deg: f64) -> b
 ///   the program layer.
 #[test]
 fn collision_world_is_enforced_over_protocol_v2() {
-    // An installation that declares its floor, as an arm's local overlay
-    // does: a name a program shape may not take.
-    let config = test_config("collision");
-    std::fs::write(
-        config.with_file_name(par6_config::LOCAL_CONFIG_NAME),
-        "[[installation_shapes]]\nname = \"floor\"\nkind = \"box\"\n\
-         params = [6.0, 6.0, 0.2]\npose = [0.0, 0.0, -0.11, 0.0, 0.0, 0.0]\n",
-    )
-    .expect("write the local overlay");
-    let rig = Rig::boot_with(config);
+    let rig = boot_tagged("collision");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1582,13 +1573,21 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
     let end_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG);
     let mid_m = tcp_at_m(mid_deg);
 
+    // The overlay also sets one of the fitted tool's own values: the
+    // runtime reports the tool file as it runs it.
     let config = test_config("install-shapes");
+    let fitted = par6_config::ConfigBundle::load(&config)
+        .expect("config")
+        .robot
+        .robot
+        .active_tool;
     std::fs::write(
         config.with_file_name(par6_config::LOCAL_CONFIG_NAME),
         format!(
             "[[installation_shapes]]\nname = \"cage\"\nkind = \"box\"\n\
              params = [{KEEPOUT_M}, {KEEPOUT_M}, {KEEPOUT_M}]\n\
-             pose = [{}, {}, {}, 0.0, 0.0, 0.0]\n",
+             pose = [{}, {}, {}, 0.0, 0.0, 0.0]\n\
+             [[tools]]\nname = \"{fitted}\"\n[tools.driver]\nilim_ma = 912.0\n",
             mid_m[0], mid_m[1], mid_m[2],
         ),
     )
@@ -1612,24 +1611,35 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
                     .iter()
                     .map(|s| s.name.as_str())
                     .collect::<Vec<_>>(),
-                ["cage"],
+                ["floor", "cage"],
                 "{installation:?}"
             );
-            let cage = &installation[0];
+            let cage = &installation[1];
             assert_eq!(cage.kind, "box");
             assert_eq!(cage.params, vec![KEEPOUT_M; 3]);
         }
         other => panic!("unexpected SHAPES result {other:?}"),
     }
-    // A client rebuilding the config from CONFIG_BUNDLE gets the cage too.
+    // A client rebuilding the config from CONFIG_BUNDLE gets the cage and
+    // the fitted tool's own value too.
     match c.query(&Command::ConfigBundle) {
-        QueryResult::ConfigBundle { robot_toml, .. } => {
+        QueryResult::ConfigBundle {
+            robot_toml, tools, ..
+        } => {
             let doc: toml::Table = toml::from_str(&robot_toml).expect("the reported robot TOML");
-            assert_eq!(
-                doc["installation_shapes"][0]["name"].as_str(),
-                Some("cage"),
-                "{robot_toml}"
-            );
+            let names: Vec<_> = doc["installation_shapes"]
+                .as_array()
+                .expect("the installation shapes")
+                .iter()
+                .filter_map(|s| s["name"].as_str())
+                .collect();
+            assert_eq!(names, ["floor", "cage"], "{robot_toml}");
+            let (_, tool) = tools
+                .iter()
+                .find(|(name, _)| *name == format!("{fitted}.toml"))
+                .expect("the fitted tool's file");
+            let doc: toml::Table = toml::from_str(tool).expect("the reported tool TOML");
+            assert_eq!(doc["driver"]["ilim_ma"].as_float(), Some(912.0), "{tool}");
         }
         other => panic!("unexpected CONFIG_BUNDLE result {other:?}"),
     }
@@ -1705,7 +1715,7 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
                     .iter()
                     .map(|s| s.name.as_str())
                     .collect::<Vec<_>>(),
-                ["cage"],
+                ["floor", "cage"],
                 "{installation:?}"
             );
         }

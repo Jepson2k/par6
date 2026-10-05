@@ -761,7 +761,8 @@ has never been flashed on hardware as untested.
 
 The shipped `PAR6.toml` describes the PAR6: vendor gains and limits except
 where the PAR6 itself needs otherwise (each such value says why), no gravity
-correction, no keep-outs. What one arm measured about itself — its
+correction, and a floor at the mounting plane as its only keep-out. What one
+arm measured about itself — its
 calibration, the tool bolted on, the bench it stands on — lives in a
 `local.toml` holding only the keys it changes, layered over the shipped file
 at load by `par6d`, the Python client and `par6-selfcal` alike. It is the
@@ -774,7 +775,9 @@ one joint's gain or adds one shape without restating the rest; every entry it
 writes must carry the `name` it changes. `[[homing.joints]]`, one entry per
 joint, merges by position, so an empty entry leaves that joint as shipped. Any
 other value — an ordered list like `[[homing.sequence]]` included — replaces
-the shipped one whole.
+the shipped one whole. A tool file layers the same way: a `[[tools]]` entry
+named after the tool merges over that tool's file, and an entry for a tool no
+file defines is refused.
 
 ```toml
 [robot]
@@ -785,16 +788,22 @@ name = "joint2"
 [joints.gains]
 kiv = 0.0005
 
+# The bench this arm stands on, in place of the shipped floor.
 [[installation_shapes]]
 name = "floor"
 kind = "box"
 params = [6.0, 6.0, 0.2]
 pose = [0.0, 0.0, -0.11, 0.0, 0.0, 0.0]
+
+[[tools]]
+name = "MSG_small_motor_200mm_rail"
+[tools.driver]
+ilim_ma = 900.0
 ```
 
-The runtime reports the merged config to clients, so a client rebuilding it
-from `CONFIG_BUNDLE` gets this arm's values, and `par6d --check-config` names
-both files it loaded.
+The runtime reports the merged config to clients, the tool files included, so
+a client rebuilding it from `CONFIG_BUNDLE` gets this arm's values, and
+`par6d --check-config` names both files it loaded.
 
 ### Calibrating the arm
 

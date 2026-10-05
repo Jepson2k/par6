@@ -40,7 +40,8 @@ pub use homing::{
 };
 pub use io::{IoConfig, IoLine, MAX_IO_LINES};
 pub use overlay::{
-    effective_robot_toml, local_overlay, LocalOverlay, LOCAL_CONFIG_ENV, LOCAL_CONFIG_NAME,
+    effective_robot_toml, effective_tool_tomls, local_overlay, LocalOverlay, LOCAL_CONFIG_ENV,
+    LOCAL_CONFIG_NAME,
 };
 pub use robot::{
     BusConfig, ControlMode, DriverType, Gains, JogDefaults, JogProfile, JointConfig, JointLimits,
@@ -195,29 +196,27 @@ impl ConfigBundle {
         // `tools/` is the name; `grippers/` is what it used to be called,
         // and a config on disk is the operator's, not ours to invalidate.
         // A tool is not necessarily a gripper — the bare flange is one.
-        let beside = |name: &str| {
-            robot_toml
-                .parent()
-                .map(|p| p.join(name))
-                .unwrap_or_else(|| Path::new(name).to_path_buf())
-        };
-        let dir = match beside("tools") {
-            d if d.is_dir() => d,
-            _ => beside("grippers"),
-        };
-        let mut paths: Vec<_> = std::fs::read_dir(&dir)
-            .map_err(|source| ConfigError::Io {
-                path: dir.display().to_string(),
-                source,
-            })?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
-            .collect();
-        paths.sort();
-        let tools = paths
+        let overlays = overlay::tool_overlays(local)?;
+        let mut layered = vec![false; overlays.len()];
+        let tools = overlay::tool_files(robot_toml)?
             .iter()
-            .map(|p| ToolConfig::load(p))
+            .map(|path| {
+                let (table, entry) = overlay::layered_tool(path, &overlays, local)?;
+                if let Some(k) = entry {
+                    layered[k] = true;
+                }
+                ToolConfig::from_table(table, &overlay::layered_label(path, local))
+            })
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(k) = layered.iter().position(|done| !done) {
+            return Err(invalid(
+                "local overlay",
+                format!(
+                    "[[tools]] names `{}`, which no tool file defines",
+                    overlays[k]["name"].as_str().unwrap_or_default()
+                ),
+            ));
+        }
         if let Some(name) = fitted {
             let tool = tools
                 .iter()
@@ -819,11 +818,15 @@ mod tests {
     /// is its installation's — loads to an empty list.
     #[test]
     fn installation_shapes_load_from_the_robot_toml() {
+        // The stock arm stands on the surface it is mounted on.
         let stock = ConfigBundle::load(&config_dir().join("PAR6.toml")).expect("stock bundle");
-        assert!(
-            stock.installation_shapes.is_empty(),
-            "{:?}",
-            stock.installation_shapes
+        assert_eq!(
+            stock
+                .installation_shapes
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["floor"]
         );
 
         let with_shapes = TempConfig::new(|file, text| {
@@ -844,7 +847,7 @@ mod tests {
         });
         let bundle = ConfigBundle::load(&with_shapes.robot()).expect("shapes must load");
         assert_eq!(
-            bundle.installation_shapes,
+            bundle.installation_shapes[1..],
             [
                 par6_proto::Shape {
                     attachment: None,

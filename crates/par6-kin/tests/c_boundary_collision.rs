@@ -134,7 +134,13 @@ fn geometry_layout_tracks_layer_replacement() {
     );
 
     // Documented layout: [robot..., installation..., program...], and each
-    // world shape pairs against every robot link.
+    // world shape pairs against every robot link but the fixed base, which
+    // is as fixed as the shape is.
+    let moving = robot_names
+        .iter()
+        .filter(|n| !n.starts_with("base_link"))
+        .count();
+    assert!(moving < robot, "the base contributes geometry of its own");
     col.set_layer(Layer::Installation, &[box_at(1.0, 0.0, 0.0, 0.1)])
         .unwrap();
     col.set_layer(
@@ -143,7 +149,7 @@ fn geometry_layout_tracks_layer_replacement() {
     )
     .unwrap();
     assert_eq!(col.geom_count(), robot + 3);
-    assert_eq!(col.pair_count(), self_pairs + 3 * robot);
+    assert_eq!(col.pair_count(), self_pairs + 3 * moving);
     assert_eq!(col.geom_name(robot).unwrap(), "installation/0");
     assert_eq!(col.geom_name(robot + 1).unwrap(), "program/0");
     assert_eq!(col.geom_name(robot + 2).unwrap(), "program/1");
@@ -155,7 +161,7 @@ fn geometry_layout_tracks_layer_replacement() {
     col.set_layer(Layer::Installation, &[]).unwrap();
     assert_eq!(col.geom_count(), robot + 2);
     assert_eq!(col.geom_name(robot).unwrap(), "program/0");
-    assert_eq!(col.pair_count(), self_pairs + 2 * robot);
+    assert_eq!(col.pair_count(), self_pairs + 2 * moving);
 
     // An out-of-range index and a NULL handle are errors, not names.
     assert!(col.geom_name(col.geom_count()).is_err());
@@ -388,14 +394,16 @@ fn a_rejected_layer_leaves_the_previous_world_in_place() {
 }
 
 /// Each shape kind lands in the world with the extents its parameters
-/// give it. Hung centred under the base, a shape's top sits as far below
-/// the base's underside as those parameters put it — read as the world
-/// distance up to the base, against a sphere probe at the same centre —
-/// and a box whose top is a millimetre short of the underside is clear
-/// where one a millimetre into it collides.
+/// give it. Hung centred far under the arm, a shape's top sits as far below
+/// the arm's lowest moving geometry as those parameters put it — read as
+/// the world distance up to it, against a sphere probe at the same centre;
+/// the fixed base pairs with no world shape, and from this far the lowest
+/// point being off the axis changes no distance measurably — and a slab
+/// whose top is a millimetre short of that point is clear where one a
+/// millimetre into it collides.
 #[test]
 fn every_shape_kind_round_trips_into_the_world() {
-    const BELOW: f64 = 0.5;
+    const BELOW: f64 = 50.0;
     let mut col = load();
     let robot = col.robot_geom_count();
     let q = [0.0; 6];
@@ -463,19 +471,22 @@ fn every_shape_kind_round_trips_into_the_world() {
     let far = gap(plane(-0.4));
     assert!(((far - near) - 0.1).abs() < 1e-6, "planes {near} and {far}");
 
-    // A millimetre either side of the underside.
-    let base_z = underside - BELOW;
+    // A millimetre either side of the lowest moving point.
+    let lowest_z = underside - BELOW;
     let mut buf = [0i32; 32];
     for (dz, collides) in [(-0.001, false), (0.001, true)] {
-        let cube = at(
+        let slab = at(
             ffi::PAR6_SHAPE_BOX,
             3,
-            [0.1, 0.1, 0.1, 0.0],
-            base_z - 0.05 + dz,
+            [0.4, 0.4, 0.1, 0.0],
+            lowest_z - 0.05 + dz,
         );
-        col.set_layer(Layer::Program, &[cube]).unwrap();
+        col.set_layer(Layer::Program, &[slab]).unwrap();
         let (active, _) = col.check_into(&q, false, &mut buf).unwrap();
-        assert_eq!(active, collides, "a cube {dz} m into the underside");
+        assert_eq!(
+            active, collides,
+            "a slab {dz} m into the lowest moving point"
+        );
     }
 }
 

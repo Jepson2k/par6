@@ -163,7 +163,6 @@ def _set_scalar(text: str, key: str, value: object) -> str:
 def sim_config(
     dest: Path,
     config_patch: Callable[[str], str] | None = None,
-    local: str | None = None,
 ) -> Path:
     """The packaged PAR6 config re-ticked for CI, written under *dest*.
 
@@ -171,8 +170,6 @@ def sim_config(
     daemon under test runs the joints, limits and homing sequence the
     Python package advertises.  It boots fitted with the packaged tool; a
     test that needs another fits it with ``select_tool``, as a user does.
-    *local* is an installation's own overlay, written beside it as
-    ``local.toml``.
     """
     src = _cfg.data_root() / "config"
     dest.mkdir(parents=True, exist_ok=True)
@@ -187,8 +184,6 @@ def sim_config(
         patched = config_patch(patched)
     out = dest / "PAR6.toml"
     out.write_text(patched)
-    if local is not None:
-        (dest / "local.toml").write_text(local)
     for gripper in sorted((src / "grippers").glob("*.toml")):
         shutil.copy(gripper, dest / "grippers" / gripper.name)
     return out
@@ -211,13 +206,12 @@ class LiveDaemon:
         workdir: Path,
         status_transport: str = "unicast",
         config_patch: Callable[[str], str] | None = None,
-        local: str | None = None,
     ) -> "LiveDaemon":
         binary = par6d_binary()
         if binary is None:
             raise RuntimeError("par6d binary not available")
         workdir.mkdir(parents=True, exist_ok=True)
-        config = sim_config(workdir / "config", config_patch, local)
+        config = sim_config(workdir / "config", config_patch)
         status_port = free_udp_port()
         shm_dir = Path(tempfile.mkdtemp(prefix="shm-", dir=workdir))
         log_path = workdir / "par6d.log"

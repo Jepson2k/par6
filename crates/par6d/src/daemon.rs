@@ -804,22 +804,8 @@ fn read_config_files(
     let (robot_filename, _) = read(robot_toml)?;
     let robot_content = par6_config::effective_robot_toml(robot_toml, local)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
-    let dir = robot_toml
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("grippers");
-    let mut paths: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    paths.sort();
-    let tools = paths
-        .iter()
-        .map(|g| read(g))
-        .collect::<std::io::Result<Vec<_>>>()?;
+    let tools = par6_config::effective_tool_tomls(robot_toml, local)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(ConfigFiles {
         fingerprint: config_fingerprint(&robot_filename, &robot_content, &tools),
         robot_filename,

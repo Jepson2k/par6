@@ -166,6 +166,20 @@ impl ToolConfig {
         Ok(cfg)
     }
 
+    /// A tool config from a parsed document `label` names (a file, or a
+    /// file with an overlay over it), validated.
+    pub(crate) fn from_table(table: toml::Table, label: &str) -> Result<Self, ConfigError> {
+        let cfg: Self =
+            toml::Value::Table(table)
+                .try_into()
+                .map_err(|source| ConfigError::Parse {
+                    path: label.to_owned(),
+                    source: Box::new(source),
+                })?;
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
     /// Load and validate a gripper config file.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = read_to_string(path)?;

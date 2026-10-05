@@ -198,3 +198,63 @@ fn a_local_overlay_layers_one_installations_values_over_the_shipped_file() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A tool file layers the same way: a `[[tools]]` entry, named after the
+/// tool, changes that tool and no other, and the runtime reports the tool
+/// as it runs it. An entry for a tool no file defines, or naming none, is
+/// refused rather than left to do nothing.
+#[test]
+fn a_local_overlay_layers_one_tools_values_over_its_file() {
+    use par6_config::ConfigBundle;
+    const TOOL: &str = "MSG_small_motor_150mm_rail";
+    let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+    let dir = std::env::temp_dir().join(format!("par6-config-tool-overlay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let local = dir.join("local.toml");
+    let write = |text: &str| std::fs::write(&local, text).expect("overlay");
+    write(&format!(
+        "[[tools]]\nname = \"{TOOL}\"\n[tools.driver]\nilim_ma = 900.0\n"
+    ));
+    let plain = ConfigBundle::load(&shipped).expect("shipped");
+    let layered = ConfigBundle::load_with(&shipped, Some(&local), None).expect("layered");
+    let tool = |b: &ConfigBundle, name: &str| {
+        b.tools
+            .iter()
+            .find(|t| t.name == name)
+            .expect("tool")
+            .clone()
+    };
+    let (was, now) = (tool(&plain, TOOL), tool(&layered, TOOL));
+    assert_eq!(now.driver.as_ref().unwrap().ilim_ma, 900.0);
+    assert_eq!(
+        now.driver.as_ref().unwrap().gains,
+        was.driver.as_ref().unwrap().gains
+    );
+    assert_eq!(now.kinematics, was.kinematics);
+    for t in plain.tools.iter().filter(|t| t.name != TOOL) {
+        assert_eq!(tool(&layered, &t.name), *t, "{} changed", t.name);
+    }
+    assert_eq!(layered.robot, plain.robot);
+
+    let reported = par6_config::effective_tool_tomls(&shipped, Some(&local)).expect("reported");
+    let changed: Vec<_> = reported
+        .iter()
+        .filter(|(name, content)| {
+            *content
+                != std::fs::read_to_string(shipped.with_file_name("grippers").join(name)).unwrap()
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(changed, [format!("{TOOL}.toml")]);
+
+    for (overlay, what) in [
+        ("[[tools]]\nname = \"NoSuchTool\"\n", "NoSuchTool"),
+        ("[[tools]]\n[tools.driver]\nilim_ma = 900.0\n", "name"),
+    ] {
+        write(overlay);
+        let err = ConfigBundle::load_with(&shipped, Some(&local), None)
+            .expect_err("an entry that changes no tool must be refused");
+        assert!(err.to_string().contains(what), "{err}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

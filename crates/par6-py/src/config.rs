@@ -95,6 +95,13 @@ impl Config {
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
+    /// Each tool file as the runtime runs it, `(file name, content)` in file
+    /// order: verbatim, or with the local overlay's entry merged in.
+    fn tool_tomls(&self) -> PyResult<Vec<(String, String)>> {
+        par6_config::effective_tool_tomls(&self.path, self.local.as_deref())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
     fn name(&self) -> String {
         self.bundle.robot.robot.name.clone()
     }

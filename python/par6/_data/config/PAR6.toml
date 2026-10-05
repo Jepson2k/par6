@@ -687,8 +687,8 @@ tau_ext_window_s = 0.1
 # `kind` is one of: box, sphere, cylinder, capsule, cone, ellipsoid.
 # `params` are the primitive's constructor arguments in waldoctl field order
 # (box: [x, y, z] full side lengths).
-# Optional: `collision = false` (visual-only marker), `margin` (extra
-# standoff in metres on top of the runtime's 5 mm clearance).
+# Optional: `collision = false` (visual-only marker), `margin` (this
+# shape's standoff in metres, in place of the runtime's 5 mm clearance).
 #
 # Every entry is validated at startup through the same path a client
 # `set_shapes` runs — a malformed shape refuses boot, naming the shape.
@@ -699,3 +699,15 @@ tau_ext_window_s = 0.1
 # kind = "box"
 # params = [0.8, 0.8, 0.02]
 # pose = [0.3, 0.0, -0.11, 0.0, 0.0, 0.0]
+
+# The surface the arm is mounted on: its top face at the mounting plane,
+# under the base. The base never pairs with it, being as fixed as it is.
+# An arm standing on anything else names its own `floor` in local.toml.
+[[installation_shapes]]
+name = "floor"
+kind = "box"
+params = [6.0, 6.0, 0.2]
+pose = [0.0, 0.0, -0.1, 0.0, 0.0, 0.0]
+
+# No mass: welded where it is declared, and solid.
+[installation_shapes.physics]

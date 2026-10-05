@@ -1,7 +1,8 @@
 //! The collision world's contract on the shipped PAR6 URDF variants,
 //! derived from what the runtime and the frontend need of it: the arm's
 //! own poses are clear, a keep-out where the tool is gets reported by
-//! name, one a metre away does not, the floor catches the base, a margin
+//! name, one a metre away does not, the floor the base stands on pairs with
+//! no link but the moving ones, a margin
 //! moves the verdict, the layers stay independent, a rejected world
 //! changes nothing, and a segment sweep finds what its endpoints hide.
 //! Every shape is placed from the model's own TCP so the scenarios hold on
@@ -289,25 +290,36 @@ fn verdicts_follow_the_world_on_every_variant() {
             .unwrap();
         assert_eq!(col.pair_count() - self_pairs, with_one / 2);
 
-        // The floor is an installation keep-out the base stands on.
-        let floor = Shape {
+        // The floor the base stands on, here a slab up through the base
+        // itself: the base is fixed to the world as the floor is, so their
+        // contact is no motion's doing and is never a pair; the arm at home
+        // stands clear of a floor at the mounting plane.
+        let slab = |top: f64| Shape {
             attachment: None,
             name: "floor".to_owned(),
             kind: ShapeKind::Box,
             params: [2.0, 2.0, 0.04],
-            pose: [0.0; 6],
+            pose: [0.0, 0.0, top - 0.02, 0.0, 0.0, 0.0],
             collision: true,
             margin: None,
         };
-        col.set_layer(Layer::Installation, &[floor]).unwrap();
+        col.set_layer(Layer::Installation, &[slab(0.02)]).unwrap();
         let pairs = pair_set(&mut col, &HOME);
         assert!(
-            pairs
+            !pairs
                 .iter()
-                .any(|(a, b)| (a == "floor" && b.starts_with("base_link"))
-                    || (b == "floor" && a.starts_with("base_link"))),
-            "{variant:?}: the floor must catch the base: {pairs:?}"
+                .any(|(a, b)| a.starts_with("base_link") || b.starts_with("base_link")),
+            "{variant:?}: the fixed base must not pair with the floor: {pairs:?}"
         );
+        // Within the runtime's own clearance, too.
+        let mut gated = load(variant, COLLISION_CLEARANCE_M);
+        gated.set_layer(Layer::Installation, &[slab(0.0)]).unwrap();
+        for (name, q) in [("home", HOME), ("reach", REACH)] {
+            assert!(
+                pair_set(&mut gated, &q).is_empty(),
+                "{variant:?}: {name} must stand clear of the floor it is mounted on"
+            );
+        }
         col.set_layer(Layer::Installation, &[]).unwrap();
         col.set_layer(Layer::Program, &[]).unwrap();
 
@@ -374,17 +386,9 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
     assert_eq!(col.clearance(), 0.0);
     assert!(!col.check(&REACH, false).unwrap().active());
 
-    // Installation keep-out: the arm's own floor, always in contact.
-    let floor = Shape {
-        attachment: None,
-        name: "floor".to_owned(),
-        kind: ShapeKind::Box,
-        params: [2.0, 2.0, 0.04],
-        pose: [0.0; 6],
-        collision: true,
-        margin: None,
-    };
-    assert_eq!(col.set_layer(Layer::Installation, &[floor]).unwrap(), 1);
+    // Installation keep-out: a fence where the tool reaches.
+    let fence = box_shape("fence", 0.06, tcp_at(variant, &REACH), None);
+    assert_eq!(col.set_layer(Layer::Installation, &[fence]).unwrap(), 1);
     assert_eq!(
         col.set_layer(Layer::Program, std::slice::from_ref(&keepout))
             .unwrap(),
@@ -393,7 +397,7 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
 
     let names = pair_set(&mut col, &REACH);
     assert!(
-        involves(&names, "floor"),
+        involves(&names, "fence"),
         "installation layer must be enforced: {names:?}"
     );
     assert!(
@@ -405,7 +409,7 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
     assert_eq!(col.set_layer(Layer::Program, &[]).unwrap(), 3);
     let names = pair_set(&mut col, &REACH);
     assert!(
-        involves(&names, "floor"),
+        involves(&names, "fence"),
         "clearing the program layer must not drop installation keep-outs: {names:?}"
     );
     assert!(
