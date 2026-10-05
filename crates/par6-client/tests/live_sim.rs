@@ -815,6 +815,7 @@ fn servo_l_holds_the_line_where_servo_j_pose_does_not() {
 
             let mut samples = 0u32;
             let mut arrived = false;
+            let mut nearest = f64::INFINITY;
             for _ in 0..250 {
                 if mode == 0 {
                     client.servo_l(target, Some(0.3), Some(0.3)).await
@@ -838,12 +839,18 @@ fn servo_l_holds_the_line_where_servo_j_pose_does_not() {
                     *out = out.max(off_line(&start, &target, &here));
                     samples += 1;
                 }
+                nearest = nearest.min(remaining);
                 if remaining < 1.0 {
                     arrived = true;
                     break;
                 }
             }
-            assert!(arrived, "mode {mode} never reached its target");
+            let speeds = client.joint_speeds().await.expect("joint speeds");
+            assert!(
+                arrived,
+                "mode {mode} never reached its target: nearest {nearest:.2} mm, \
+                 joint speeds now {speeds:.3?}"
+            );
             assert!(
                 samples > 20,
                 "mode {mode}: only {samples} samples along the path"

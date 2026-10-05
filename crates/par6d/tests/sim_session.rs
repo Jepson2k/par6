@@ -2082,8 +2082,8 @@ fn a_flood_of_identical_jog_setpoints_does_not_delay_the_release() {
     // Let go, and time the arm to rest on the runtime's own clock. The
     // ramp-down from the release speed is v/a plus the jerk-limited ends
     // (a/jerk = 1/jerk_factor); a per-datagram queue would add one tick
-    // per datagram before the release is even read. Twice the ramp, plus
-    // the drives settling onto the held target, separates the two.
+    // per datagram before the release is even read. Half that backlog on
+    // top of the ramp separates the two with the drives' settle to spare.
     let robot = par6_config::RobotConfig::load(&test_config()).expect("test config");
     let l = robot.joints[0].limits.for_mode(par6_config::LimitMode::Jog);
     let a = (l.velocity_rad_s / robot.jog.accel_time_s).min(l.acceleration_rad_s2);
@@ -2094,8 +2094,9 @@ fn a_flood_of_identical_jog_setpoints_does_not_delay_the_release() {
     });
     let ramp_s = released.speeds[0].abs() / a + 1.0 / robot.jog.jerk_factor;
     let took_s = (stopped.mono_time_ns - released.mono_time_ns) as f64 * 1e-9;
+    let backlog_s = 300.0 * robot.robot.tick_dt_s;
     assert!(
-        took_s <= 2.0 * ramp_s + 0.2,
+        took_s < ramp_s + backlog_s / 2.0,
         "the release took {took_s:.3} s to rest; its ramp is {ramp_s:.3} s — it \
          waited behind a backlog of 300 datagrams"
     );
