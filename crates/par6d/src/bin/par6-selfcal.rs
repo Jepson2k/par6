@@ -673,6 +673,11 @@ const IDENT_HOLD_FRACTION: f64 = 0.6;
 struct Args {
     #[arg(default_value = "config/PAR6.toml")]
     config: PathBuf,
+    /// This arm's local overlay: layered over the config, and where
+    /// `--apply` writes what was measured (default: `local.toml` beside the
+    /// config).
+    #[arg(long, value_name = "PATH", env = par6_config::LOCAL_CONFIG_ENV)]
+    local_config: Option<PathBuf>,
     #[arg(long, default_value = "calibration-runs")]
     output_dir: PathBuf,
     /// Print the history table for this existing run directory -- its
@@ -683,7 +688,7 @@ struct Args {
     /// Run against the simulator instead of the arm.
     #[arg(long)]
     sim: bool,
-    /// Write the identified gravity correction into the config.
+    /// Write what was measured into the local overlay.
     #[arg(long)]
     apply: bool,
     /// Also find each joint's velocity, acceleration and jerk limits, and
@@ -5617,33 +5622,6 @@ fn identification_poses(
 
 // ---------------------------------------------------------------- applying
 
-/// Replace a top-level array in place, or add the whole line when the file
-/// does not carry it yet.
-fn patch_array(text: &mut String, key: &str, values: &[f64]) -> Result<()> {
-    // Full precision, not a fixed decimal place: these run from tens of
-    // milli-kg-m down to the solver's own noise floor, and rounding would
-    // quietly zero the small ones.
-    let rendered = values
-        .iter()
-        .map(|v| format!("{v:?}"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let Some(start) = text.find(&format!("{key} =")) else {
-        text.insert_str(0, &format!("{key} = [{rendered}]  # selfcal: measured\n"));
-        return Ok(());
-    };
-    let open = start
-        + text[start..]
-            .find('[')
-            .ok_or_else(|| format!("{key} is not an array"))?;
-    let close = open
-        + text[open..]
-            .find(']')
-            .ok_or_else(|| format!("{key} is not closed"))?;
-    text.replace_range(open..=close, &format!("[{rendered}]"));
-    Ok(())
-}
-
 /// Earlier runs the end-of-run history shows beside this one: the two that
 /// must agree for repeatability, and one more for the trend.
 const HISTORY_RUNS: usize = 3;
@@ -6023,8 +6001,10 @@ fn compact(value: f64, decimals: usize) -> String {
     text.trim_end_matches('0').trim_end_matches('.').to_owned()
 }
 
-/// Patch the measured values into the file as written, so its comments and
-/// layout survive; a full re-serialisation would discard them.
+/// The measured values as the installation's local overlay: `original`
+/// (the overlay as it stands, empty when there is none) with what this run
+/// moved written over it, its comments and every value it did not touch
+/// kept as they were.
 fn patch_config(
     original: &str,
     correction: Option<&[f64]>,
@@ -6034,16 +6014,17 @@ fn patch_config(
     tuned: Option<&[Option<Tuned>; N]>,
     limits: Option<&[Option<Found>; N]>,
 ) -> Result<String> {
-    let mut text = original.to_owned();
+    let mut overlay = par6_config::LocalOverlay::parse(original)?;
+    let joint = |j: usize| format!("joint{}", j + 1);
     if let Some(correction) = correction {
-        patch_array(&mut text, "gravity_correction", correction)?;
+        overlay.set_array(&[], "gravity_correction", correction)?;
         // Identification measures the true torque, so any per-joint trim from
         // an older calibration is superseded and would otherwise multiply it.
-        patch_array(&mut text, "gravity_scale", &[1.0; N])?;
+        overlay.set_array(&[], "gravity_scale", &[1.0; N])?;
     }
     if let Some(friction) = friction {
         // The friction the simulator's joints show their drives: measured
-        // joint by joint, a joint the run skipped keeps the file's value.
+        // joint by joint, a joint the run skipped keeps its current value.
         let measured = |pick: fn(&(f64, f64)) -> f64, current: &[f64]| -> Vec<f64> {
             friction
                 .iter()
@@ -6051,137 +6032,72 @@ fn patch_config(
                 .map(|(m, c)| m.as_ref().map_or(*c, pick))
                 .collect()
         };
-        let viscous = measured(|m| m.0, &sim.viscous_nm_s);
-        let coulomb = measured(|m| m.1, &sim.coulomb_nm);
-        patch_array(&mut text, "viscous_nm_s", &viscous)?;
-        patch_array(&mut text, "coulomb_nm", &coulomb)?;
+        overlay.set_array(
+            &["sim"],
+            "viscous_nm_s",
+            &measured(|m| m.0, &sim.viscous_nm_s),
+        )?;
+        overlay.set_array(&["sim"], "coulomb_nm", &measured(|m| m.1, &sim.coulomb_nm))?;
     }
     for (j, r) in ripples.into_iter().flatten().enumerate() {
-        // What the stage found for a joint it visited replaces what the file
-        // had, and a visited joint it found nothing for loses its line.
-        if let Some(r) = r {
-            patch_joint_ripple(&mut text, j, r)?;
+        // What the stage found for a joint it visited replaces what the
+        // overlay had, and a visited joint it found nothing for loses its
+        // line, so the shipped value stands again.
+        match r {
+            Some(r) if r.is_empty() => overlay.remove_joint_key(&joint(j), "ripple")?,
+            Some(r) => {
+                let entries: toml_edit::Array = r
+                    .iter()
+                    .map(|h| {
+                        let mut entry = toml_edit::InlineTable::new();
+                        entry.insert("harmonic", i64::from(h.harmonic).into());
+                        entry.insert("a_ma", i64::from(h.a_ma).into());
+                        entry.insert("b_ma", i64::from(h.b_ma).into());
+                        toml_edit::Value::InlineTable(entry)
+                    })
+                    .collect();
+                overlay.set_joint(&joint(j), &[], "ripple", entries)?;
+            }
+            None => {}
         }
     }
     for (j, t) in tuned.into_iter().flatten().enumerate() {
-        // Only what the design moved: a joint it left alone keeps its lines
-        // byte for byte, comments and all.
+        // Only what the design moved: a gain it left alone is not written.
         if let Some(t) = t {
-            let mut values = Vec::new();
-            if t.after.kpv != t.before.kpv {
-                values.push(("kpv", t.after.kpv));
-            }
-            if t.after.kiv != t.before.kiv {
-                values.push(("kiv", t.after.kiv));
-            }
-            if t.after.kpp != t.before.kpp {
-                values.push(("kpp", t.after.kpp));
-            }
-            if !values.is_empty() {
-                patch_joint_table(&mut text, j, "[joints.gains]", &values)?;
+            for (key, before, after) in [
+                ("kpv", t.before.kpv, t.after.kpv),
+                ("kiv", t.before.kiv, t.after.kiv),
+                ("kpp", t.before.kpp, t.after.kpp),
+            ] {
+                if after != before {
+                    overlay.set_joint(&joint(j), &["gains"], key, after)?;
+                }
             }
         }
     }
     for (j, found) in limits.into_iter().flatten().enumerate() {
+        // A cap the search left where it was is not written, and a jerk it
+        // only bounded keeps its configured value.
         if let Some(found) = found {
-            patch_exec_limits(&mut text, j, found)?;
-        }
-    }
-    Ok(text)
-}
-
-/// Write what the limits stage moved in joint `j`'s `[joints.limits.exec]`
-/// table: a cap the search left where the file had it keeps its line byte
-/// for byte, and a jerk it only bounded keeps its configured value.
-fn patch_exec_limits(text: &mut String, j: usize, found: &Found) -> Result<()> {
-    let caps = &found.caps;
-    let was = &found.configured;
-    let mut values = Vec::new();
-    if caps.velocity != was.velocity {
-        values.push(("velocity_rad_s", caps.velocity));
-    }
-    if caps.acceleration != was.acceleration {
-        values.push(("acceleration_rad_s2", caps.acceleration));
-    }
-    if found.jerk_measured && caps.jerk != was.jerk {
-        values.push(("jerk_rad_s3", caps.jerk));
-    }
-    if values.is_empty() {
-        return Ok(());
-    }
-    patch_joint_table(text, j, "[joints.limits.exec]", &values)
-}
-
-/// Set `values` inside joint `j`'s `header` table, keeping everything else
-/// in the file byte for byte.
-fn patch_joint_table(
-    text: &mut String,
-    j: usize,
-    header: &str,
-    values: &[(&str, f64)],
-) -> Result<()> {
-    let name = text
-        .find(&format!("name = \"joint{}\"", j + 1))
-        .ok_or_else(|| format!("configuration has no joint{}", j + 1))?;
-    let next_joint = text[name..]
-        .find("[[joints]]")
-        .map_or(text.len(), |i| name + i);
-    let table = text[name..next_joint]
-        .find(header)
-        .map(|i| name + i)
-        .ok_or_else(|| format!("joint{} has no {header} table", j + 1))?;
-    let body = table + header.len();
-    let end = body
-        + text[body..]
-            .find("\n[")
-            .map_or(text.len() - body, |i| i + 1);
-    let mut block = text[body..end].to_owned();
-    for (key, value) in values {
-        let value = if header == "[joints.gains]" {
-            value.to_string()
-        } else {
-            format!("{value:.5}")
-        };
-        block = set_value(&block, key, &value);
-    }
-    text.replace_range(body..end, &block);
-    Ok(())
-}
-
-/// Set one `key = value` inside a table body, keeping the rest byte for byte
-/// and a trailing comment on the line; appended when the table lacks it.
-fn set_value(block: &str, key: &str, value: &str) -> String {
-    let mut out = String::with_capacity(block.len() + key.len() + value.len() + 4);
-    let mut replaced = false;
-    for line in block.split_inclusive('\n') {
-        let trimmed = line.trim_start();
-        let is_key = trimmed
-            .strip_prefix(key)
-            .is_some_and(|rest| rest.trim_start().starts_with('='));
-        if !replaced && is_key {
-            let indent = &line[..line.len() - trimmed.len()];
-            let comment = line.find('#').map_or("", |i| line[i..].trim_end());
-            out.push_str(indent);
-            out.push_str(key);
-            out.push_str(" = ");
-            out.push_str(value);
-            if !comment.is_empty() {
-                out.push(' ');
-                out.push_str(comment);
+            let (caps, was) = (&found.caps, &found.configured);
+            let round = |v: f64| (v * 1e5).round() / 1e5;
+            for (key, cap, configured, write) in [
+                ("velocity_rad_s", caps.velocity, was.velocity, true),
+                (
+                    "acceleration_rad_s2",
+                    caps.acceleration,
+                    was.acceleration,
+                    true,
+                ),
+                ("jerk_rad_s3", caps.jerk, was.jerk, found.jerk_measured),
+            ] {
+                if write && cap != configured {
+                    overlay.set_joint(&joint(j), &["limits", "exec"], key, round(cap))?;
+                }
             }
-            out.push('\n');
-            replaced = true;
-        } else {
-            out.push_str(line);
         }
     }
-    if !replaced {
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(&format!("{key} = {value}\n"));
-    }
-    out
+    Ok(overlay.to_string())
 }
 
 fn main() -> std::process::ExitCode {
@@ -6245,10 +6161,14 @@ fn run(args: Args) -> Result<()> {
     let stiction_stage = runs(Stage::Stiction);
     let belt_stage = runs(Stage::Belt);
     let mechanics_stage = runs(Stage::Mechanics);
-    let bundle = match &args.tool {
-        Some(tool) => ConfigBundle::load_fitted(&args.config, tool)?,
-        None => ConfigBundle::load(&args.config)?,
-    };
+    // The shipped config describes the PAR6; this arm's own values, the
+    // ones a run measures, live in its overlay.
+    let overlay = args
+        .local_config
+        .clone()
+        .unwrap_or_else(|| args.config.with_file_name(par6_config::LOCAL_CONFIG_NAME));
+    let existing = overlay.is_file().then(|| overlay.clone());
+    let bundle = ConfigBundle::load_with(&args.config, existing.as_deref(), args.tool.as_deref())?;
     bundle.robot.validate()?;
     if bundle.robot.joints.len() != N {
         return Err(format!(
@@ -6338,7 +6258,10 @@ fn run(args: Args) -> Result<()> {
         .then(|| runtime::Runtime::prepare(timing.cpu))
         .transpose()?;
 
-    let original = fs::read_to_string(&args.config)?;
+    let original = match &existing {
+        Some(path) => fs::read_to_string(path)?,
+        None => String::new(),
+    };
     let config_correction = bundle.robot.gravity_correction.clone();
     // The runtime multiplies the gravity feedforward by this
     // (par6-rt/src/core.rs), but the model identified against here does not
@@ -6846,12 +6769,18 @@ fn run(args: Args) -> Result<()> {
         limits.as_ref(),
     )
     .and_then(|patched| {
-        par6_config::RobotConfig::from_toml_str(&patched)?;
+        let written = directory.join(par6_config::LOCAL_CONFIG_NAME);
+        fs::write(&written, &patched)?;
+        ConfigBundle::load_with(&args.config, Some(&written), args.tool.as_deref())?;
         Ok(patched)
     });
     match &candidate {
-        Ok(patched) => {
-            fs::write(directory.join("calibrated.toml"), patched)?;
+        Ok(_) => {
+            let effective = par6_config::effective_robot_toml(
+                &args.config,
+                Some(&directory.join(par6_config::LOCAL_CONFIG_NAME)),
+            )?;
+            fs::write(directory.join("calibrated.toml"), run_record(&effective)?)?;
             fs::write(
                 directory.join("run.toml"),
                 format!("sim = {}\ntool = {active_tool:?}\n", args.sim),
@@ -7002,18 +6931,30 @@ fn run(args: Args) -> Result<()> {
         return Err("--apply writes masses fitted to the simulator; refusing".into());
     }
     if args.apply {
-        let backup = args.config.with_extension("toml.before-selfcal");
-        if !backup.exists() {
+        let backup = overlay.with_extension("toml.before-selfcal");
+        if existing.is_some() && !backup.exists() {
             fs::write(backup, &original)?;
         }
-        let temp = args.config.with_extension("toml.selfcal-tmp");
+        let temp = overlay.with_extension("toml.selfcal-tmp");
         fs::write(&temp, &patched)?;
-        fs::rename(temp, &args.config)?;
-        println!("applied to {}", args.config.display());
+        fs::rename(temp, &overlay)?;
+        println!("applied to {}", overlay.display());
     } else {
-        println!("results: {}", directory.join("calibrated.toml").display());
+        println!(
+            "results: {}",
+            directory.join(par6_config::LOCAL_CONFIG_NAME).display()
+        );
     }
     Ok(())
+}
+
+/// A run's record of the config it would leave the arm with, for the
+/// history: the robot document without its installation shapes, which the
+/// robot schema on its own does not read.
+fn run_record(effective: &str) -> Result<String> {
+    let mut table: toml::Table = toml::from_str(effective)?;
+    table.remove("installation_shapes");
+    Ok(toml::to_string(&table)?)
 }
 
 /// Save/restore around the real-time transition. The syscalls themselves are
@@ -7096,65 +7037,4 @@ mod runtime {
     pub fn sleep(deadline: Duration) {
         par6_rt::rt::sleep_until(deadline.as_nanos() as u64);
     }
-}
-
-/// Write joint `j`'s `ripple` line in its `[[joints]]` table, or remove it
-/// when there is nothing to feed forward.
-fn patch_joint_ripple(text: &mut String, j: usize, ripple: &[RippleHarmonic]) -> Result<()> {
-    let entries: Vec<String> = ripple
-        .iter()
-        .map(|h| {
-            format!(
-                "{{ harmonic = {}, a_ma = {}, b_ma = {} }}",
-                h.harmonic, h.a_ma, h.b_ma
-            )
-        })
-        .collect();
-    patch_joint_key(
-        text,
-        j,
-        "ripple",
-        (!ripple.is_empty()).then(|| format!("[{}]", entries.join(", "))),
-    )
-}
-
-/// Set joint `j`'s top-level `key` in its `[[joints]]` table to `value`, or
-/// remove the key for `None`.
-fn patch_joint_key(text: &mut String, j: usize, key: &str, value: Option<String>) -> Result<()> {
-    let name = text
-        .find(&format!("name = \"joint{}\"", j + 1))
-        .ok_or_else(|| format!("configuration has no joint{}", j + 1))?;
-    // The joint's own keys end at its first sub-table.
-    let keys_end = text[name..]
-        .find("\n[")
-        .map_or(text.len(), |i| name + i + 1);
-    if let Some(at) = text[name..keys_end].find(&format!("\n{key} = ")) {
-        let line = name + at + 1;
-        // An array value may run over several lines; it ends at the bracket
-        // that closes it, and the line that bracket is on goes with it.
-        let value = line + key.len() + 3;
-        let mut end = value;
-        let mut depth = 0i32;
-        for (i, c) in text[value..].char_indices() {
-            match c {
-                '[' => depth += 1,
-                ']' => depth -= 1,
-                '\n' if depth <= 0 => {
-                    end = value + i + 1;
-                    break;
-                }
-                _ => {}
-            }
-            end = text.len();
-        }
-        text.replace_range(line..end, "");
-    }
-    let Some(value) = value else {
-        return Ok(());
-    };
-    let keys_end = text[name..]
-        .find("\n[")
-        .map_or(text.len(), |i| name + i + 1);
-    text.insert_str(keys_end, &format!("{key} = {value}  # selfcal: measured\n"));
-    Ok(())
 }

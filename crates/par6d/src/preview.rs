@@ -281,7 +281,8 @@ impl Preview {
         };
         let config_path =
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
-        let bundle = par6_config::ConfigBundle::load(&config_path)?;
+        let (bundle, _) =
+            crate::options::load_config(&config_path, opts.local_config.as_deref(), None)?;
         let robot = &bundle.robot;
         let stack = load_preview_kin(&opts, &config_path, robot, bundle.active_tool())?;
         let gripper_driver = bundle.active_tool().and_then(|g| g.driver.as_ref());

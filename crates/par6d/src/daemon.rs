@@ -40,7 +40,7 @@ use par6_server::{ConfigInfoData, ServerConfig, ServerHandle};
 
 use crate::bridge::{housekeeping_loop, CoreLink, CoreOp, RtBridge, SharedState};
 use crate::grant::{self, BusGrant};
-use crate::options::{resolve_config_path, Options};
+use crate::options::{load_config, resolve_config_path, Options};
 use crate::planner::Par6Planner;
 use par6_rt::adapters::{MotionJog, MotionStream};
 
@@ -126,7 +126,7 @@ impl Daemon {
     pub fn start(opts: &Options) -> Result<Self, DaemonError> {
         let config_path =
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
-        let mut loaded = ConfigBundle::load(&config_path)?;
+        let (mut loaded, local) = load_config(&config_path, opts.local_config.as_deref(), None)?;
         // What actually caps the tick rate is the wire, not the loop: the
         // steady-state exchange has to finish inside one tick, and on
         // classic CAN it is the binding constraint long before compute
@@ -157,7 +157,7 @@ impl Daemon {
                             "gripper node {node} reports tool id {id}: fitting `{name}` in \
                              place of the configured `{configured}`"
                         );
-                        loaded = ConfigBundle::load_fitted(&config_path, &name)?;
+                        loaded = load_config(&config_path, local.as_deref(), Some(&name))?.0;
                         // A gripper drive on the bus is one more frame a tick.
                         refuse_unfit_bus(&loaded)?;
                     }
@@ -211,11 +211,15 @@ impl Daemon {
             )));
         }
         log::info!(
-            "loaded {} ({} joints, tick {} Hz) from {}",
+            "loaded {} ({} joints, tick {} Hz) from {}{}",
             robot.robot.name,
             robot.joints.len(),
             robot.tick_rate_hz(),
-            config_path.display()
+            config_path.display(),
+            local
+                .as_deref()
+                .map(|l| format!(" + {}", l.display()))
+                .unwrap_or_default()
         );
         log::info!(
             "loop bands: degraded > {:.2}x dt, critical > {:.2}x dt sustained {} s",
@@ -382,7 +386,7 @@ impl Daemon {
             },
         );
         let mut cfg = server_config(opts, &bundle);
-        cfg.config_info = config_info(&config_path, &bundle.robot);
+        cfg.config_info = config_info(&config_path, local.as_deref(), &bundle.robot);
         let status_port = cfg.status_port;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -781,7 +785,13 @@ fn fitted_files(mut files: ConfigFiles, active_tool: &str) -> ConfigFiles {
     files
 }
 
-fn read_config_files(robot_toml: &std::path::Path) -> std::io::Result<ConfigFiles> {
+/// The robot TOML as the runtime runs it — with the local overlay merged
+/// in, so a client that rebuilds the config from these files gets the
+/// arm's values, not the shipped ones — and the tool files beside it.
+fn read_config_files(
+    robot_toml: &std::path::Path,
+    local: Option<&std::path::Path>,
+) -> std::io::Result<ConfigFiles> {
     let read = |path: &std::path::Path| -> std::io::Result<(String, String)> {
         let name = path
             .file_name()
@@ -791,7 +801,9 @@ fn read_config_files(robot_toml: &std::path::Path) -> std::io::Result<ConfigFile
         let content = std::fs::read_to_string(path)?;
         Ok((name, content))
     };
-    let (robot_filename, robot_content) = read(robot_toml)?;
+    let (robot_filename, _) = read(robot_toml)?;
+    let robot_content = par6_config::effective_robot_toml(robot_toml, local)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     let dir = robot_toml
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
@@ -816,9 +828,13 @@ fn read_config_files(robot_toml: &std::path::Path) -> std::io::Result<ConfigFile
     })
 }
 
-fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) -> ConfigInfoData {
+fn config_info(
+    config_path: &std::path::Path,
+    local: Option<&std::path::Path>,
+    robot: &par6_config::RobotConfig,
+) -> ConfigInfoData {
     let m = robot.motion;
-    let files = read_config_files(config_path)
+    let files = read_config_files(config_path, local)
         .map(|files| fitted_files(files, &robot.robot.active_tool))
         .unwrap_or_else(|e| {
             log::warn!("config file readback failed: {e}");

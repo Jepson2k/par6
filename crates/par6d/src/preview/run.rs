@@ -208,7 +208,11 @@ impl Preview {
                 "must be finite and in (0, 3600]",
             ));
         }
-        let mut bundle = par6_config::ConfigBundle::load(&self.config_path)?;
+        let (mut bundle, _) = crate::options::load_config(
+            &self.config_path,
+            self.opts.local_config.as_deref(),
+            None,
+        )?;
         // The engine this run boots is fitted with the tool the session has
         // now, which a `select_tool` may have changed since startup.
         bundle.robot.robot.active_tool.clone_from(&self.tool);

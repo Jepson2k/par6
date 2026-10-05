@@ -378,8 +378,8 @@ pub enum QueryResult {
         /// Context identifier required by attached geometry declarations.
         attachment_epoch: u64,
     },
-    /// CONFIG_BUNDLE result: the loaded config files verbatim, so a
-    /// client can run previews from exactly the daemon's numbers.
+    /// CONFIG_BUNDLE result: the loaded config files, so a client can run
+    /// previews from exactly the daemon's numbers.
     ConfigBundle {
         /// Config file path on the daemon host.
         path: String,
@@ -387,7 +387,8 @@ pub enum QueryResult {
         fingerprint: String,
         /// Robot TOML file name (base name, e.g. `PAR6.toml`).
         robot_filename: String,
-        /// Robot TOML content.
+        /// Robot TOML as the runtime runs it: the file, with the
+        /// installation's local overlay merged in when there is one.
         robot_toml: String,
         /// Tool TOMLs as `(file name, content)`, sorted by file name.
         tools: Vec<(String, String)>,

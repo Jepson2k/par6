@@ -41,9 +41,12 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        match par6_config::ConfigBundle::load(&path) {
-            Ok(_) => {
-                println!("config OK: {}", path.display());
+        match par6d::options::load_config(&path, opts.local_config.as_deref(), None) {
+            Ok((_, local)) => {
+                match local {
+                    Some(local) => println!("config OK: {} + {}", path.display(), local.display()),
+                    None => println!("config OK: {}", path.display()),
+                }
                 return;
             }
             Err(e) => {

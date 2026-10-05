@@ -140,3 +140,50 @@ fn a_two_pass_tolerance_must_be_below_the_backoff_travel() {
     assert_eq!(field, "homing.joints[0].two_pass_max_diff_ticks");
     load_with(shipped, "two_pass_max_diff_ticks = 1349").expect("a tolerance inside the backoff");
 }
+
+/// One installation's values layer over the shipped file: a local overlay
+/// sets one joint's gain and stands the arm on its bench, everything it
+/// does not name stays shipped, and a key the schema does not know is
+/// refused with the overlay named, since the mistake is there.
+#[test]
+fn a_local_overlay_layers_one_installations_values_over_the_shipped_file() {
+    use par6_config::ConfigBundle;
+    let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+    let dir = std::env::temp_dir().join(format!("par6-config-overlay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let local = dir.join("local.toml");
+    std::fs::write(
+        &local,
+        "[[joints]]\nname = \"joint1\"\n\
+         [[joints]]\nname = \"joint2\"\n[joints.gains]\nkiv = 0.00123\n\
+         [[installation_shapes]]\nname = \"bench\"\nkind = \"box\"\n\
+         params = [1.0, 1.0, 0.1]\npose = [0.0, 0.0, -0.06, 0.0, 0.0, 0.0]\n",
+    )
+    .expect("overlay");
+    let plain = ConfigBundle::load(&shipped).expect("shipped");
+    let layered = ConfigBundle::load_with(&shipped, Some(&local), None).expect("layered");
+    assert_eq!(layered.robot.joints[1].gains.kiv, 0.00123);
+    assert_eq!(
+        layered.robot.joints[1].gains.kpv,
+        plain.robot.joints[1].gains.kpv
+    );
+    assert_eq!(layered.robot.joints[0], plain.robot.joints[0]);
+    assert_eq!(layered.robot.sim, plain.robot.sim);
+    assert!(
+        layered
+            .installation_shapes
+            .iter()
+            .any(|s| s.name == "bench"),
+        "the overlay's bench shape: {:?}",
+        layered.installation_shapes
+    );
+
+    std::fs::write(&local, "[sim]\nviscous = [0.0]\n").expect("typo");
+    let err = ConfigBundle::load_with(&shipped, Some(&local), None)
+        .expect_err("an unknown key must be refused");
+    assert!(
+        err.to_string().contains("local.toml"),
+        "the refusal must name the overlay: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -54,11 +54,14 @@ fn limit_mode(mode: &str) -> PyResult<LimitMode> {
     }
 }
 
-/// One loaded robot config bundle (robot TOML + its `grippers/*.toml`).
+/// One loaded robot config bundle (robot TOML + its `grippers/*.toml`),
+/// with the installation's local overlay layered over it as `par6d`
+/// layers it.
 #[pyclass(module = "par6._par6")]
 pub struct Config {
     bundle: ConfigBundle,
     path: PathBuf,
+    local: Option<PathBuf>,
 }
 
 #[pymethods]
@@ -72,13 +75,24 @@ impl Config {
             Some(p) => PathBuf::from(p),
             None => par6d::options::resolve_config_path(None).map_err(PyRuntimeError::new_err)?,
         };
-        let bundle = ConfigBundle::load(&path)
+        let (bundle, local) = par6d::options::load_config(&path, None, None)
             .map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", path.display())))?;
-        Ok(Self { bundle, path })
+        Ok(Self {
+            bundle,
+            path,
+            local,
+        })
     }
 
     fn path(&self) -> String {
         self.path.display().to_string()
+    }
+
+    /// The robot TOML as the runtime runs it: the file, with the local
+    /// overlay merged in when there is one.
+    fn robot_toml(&self) -> PyResult<String> {
+        par6_config::effective_robot_toml(&self.path, self.local.as_deref())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     fn name(&self) -> String {

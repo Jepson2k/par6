@@ -35,6 +35,7 @@ sha2 = { workspace = true }
 libc = "0.2"
 socketcan = { workspace = true }
 toml = { workspace = true }
+toml_edit = { workspace = true }
 # par6-selfcal paces the drives itself, so it needs the same real-time
 # treatment the runtime's control loop gets.
 thread-priority = { workspace = true }

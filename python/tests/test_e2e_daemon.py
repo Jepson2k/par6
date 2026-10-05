@@ -1322,9 +1322,7 @@ async def test_preview_refuses_the_move_the_runtime_refuses(daemon: LiveDaemon):
 
 
 @pytest.mark.timeout(180)
-async def test_shape_physics_survives_the_wire_in_both_directions(
-    daemon: LiveDaemon,
-):
+async def test_shape_physics_survives_the_wire_in_both_directions(tmp_path):
     """A shape's physics reaches the runtime and comes back.
 
     ``physics`` is what decides whether a shape is a body the simulator can
@@ -1358,6 +1356,23 @@ async def test_shape_physics_survives_the_wire_in_both_directions(
     )
     keepout = Box(name="wall", x=0.1, y=0.1, z=0.1, pose=(0.6, 0.0, 0.2, 0, 0, 0))
 
+    # An installation's floor, declared where an installation's values
+    # live: a static fixture, welded and solid.
+    floor = (
+        '[[installation_shapes]]\nname = "floor"\nkind = "box"\n'
+        "params = [6.0, 6.0, 0.2]\npose = [0.0, 0.0, -0.11, 0.0, 0.0, 0.0]\n"
+        "[installation_shapes.physics]\n"
+    )
+    daemon = LiveDaemon.start(tmp_path, local=floor)
+    try:
+        await _round_trip_physics(daemon, block, table, keepout)
+    finally:
+        daemon.stop()
+
+
+async def _round_trip_physics(
+    daemon: LiveDaemon, block: Box, table: Box, keepout: Box
+) -> None:
     async with daemon.client() as client:
         assert await client.wait_ready(timeout=STEP_BUDGET_S)
         try:

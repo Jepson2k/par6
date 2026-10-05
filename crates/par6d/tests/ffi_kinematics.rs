@@ -45,7 +45,7 @@ fn boot_tagged(tag: &str) -> Rig {
 /// LOOP_CRITICAL. Every RT time constant derives from config seconds, so
 /// the wiring under test is identical.
 fn test_config(tag: &str) -> PathBuf {
-    common::nominal_gravity_config(&format!("ffi-{tag}"), TEST_TICK_DT_S)
+    common::retimed_config(&format!("ffi-{tag}"), TEST_TICK_DT_S)
 }
 
 /// The tick period every rig in this file boots at. Anything that has to
@@ -910,7 +910,16 @@ fn angles_close(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS], tol_deg: f64) -> b
 ///   the program layer.
 #[test]
 fn collision_world_is_enforced_over_protocol_v2() {
-    let rig = boot_tagged("collision");
+    // An installation that declares its floor, as an arm's local overlay
+    // does: a name a program shape may not take.
+    let config = test_config("collision");
+    std::fs::write(
+        config.with_file_name(par6_config::LOCAL_CONFIG_NAME),
+        "[[installation_shapes]]\nname = \"floor\"\nkind = \"box\"\n\
+         params = [6.0, 6.0, 0.2]\npose = [0.0, 0.0, -0.11, 0.0, 0.0, 0.0]\n",
+    )
+    .expect("write the local overlay");
+    let rig = Rig::boot_with(config);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1367,7 +1376,8 @@ fn streaming_is_gated_by_the_collision_world() {
         enable_and_teleport(&rig, &mut c, start_deg);
         rig.drain_status();
         // Re-sent once a frame, as a held key is, and the replies drained.
-        // Placed means at rest in IDLE for two seconds still holding it.
+        // Placed means at rest for two seconds still holding it, in
+        // whichever mode the placement left the arm.
         let (mut closest, mut still_since, mut latched) = (f64::INFINITY, None, None);
         let (mut closest_at, mut closest_mode) = (0, ControllerMode::Idle);
         let mut first_ns: Option<u64> = None;
@@ -1388,9 +1398,7 @@ fn streaming_is_gated_by_the_collision_world() {
             if latched.is_none() && s.collision_active {
                 latched = Some(s.collision_pairs.clone());
             }
-            let still = latched.is_some()
-                && s.mode == ControllerMode::Idle
-                && s.speeds.iter().all(|v| v.abs() < 0.01);
+            let still = latched.is_some() && s.speeds.iter().all(|v| v.abs() < 0.01);
             still_since = if still {
                 still_since.or(Some(s.mono_time_ns))
             } else {
@@ -1532,12 +1540,14 @@ fn streaming_is_gated_by_the_collision_world() {
 
 // ---- installation keep-outs ------------------------------------------------
 
-/// `[[installation_shapes]]` in the robot TOML is a real producer for the
-/// installation layer (issue #19 gap 3): the configured keep-out arrives
+/// `[[installation_shapes]]` is a real producer for the installation layer
+/// (issue #19 gap 3), declared where an installation's own values live: in
+/// the local overlay beside the robot TOML. The configured keep-out arrives
 /// in the ENFORCED collision world at boot (a planned move through it is
 /// refused, not merely echoed), the SHAPES query reads it back on the
-/// `installation` list, and neither `set_shapes` nor `reset_state` can
-/// remove it. A malformed entry refuses BOOT with the shape named.
+/// `installation` list, CONFIG_BUNDLE reports it in the config the runtime
+/// runs, and neither `set_shapes` nor `reset_state` can remove it. A
+/// malformed entry refuses BOOT with the shape named.
 #[test]
 fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
     let mid_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG / 2.0);
@@ -1546,18 +1556,15 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
 
     let config = test_config("install-shapes");
     std::fs::write(
-        &config,
+        config.with_file_name(par6_config::LOCAL_CONFIG_NAME),
         format!(
-            "{}\n[[installation_shapes]]\nname = \"cage\"\nkind = \"box\"\n\
+            "[[installation_shapes]]\nname = \"cage\"\nkind = \"box\"\n\
              params = [{KEEPOUT_M}, {KEEPOUT_M}, {KEEPOUT_M}]\n\
              pose = [{}, {}, {}, 0.0, 0.0, 0.0]\n",
-            std::fs::read_to_string(&config).expect("test config"),
-            mid_m[0],
-            mid_m[1],
-            mid_m[2],
+            mid_m[0], mid_m[1], mid_m[2],
         ),
     )
-    .expect("write config");
+    .expect("write the local overlay");
     let rig = Rig::boot_with(config);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
@@ -1572,22 +1579,31 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
             ..
         } => {
             assert_eq!(program, Vec::<Shape>::new());
-            // The shipped config declares the floor, and this fixture
-            // adds the cage: both are installation shapes, both enforced
-            // from boot, neither reachable from the wire.
             assert_eq!(
                 installation
                     .iter()
                     .map(|s| s.name.as_str())
                     .collect::<Vec<_>>(),
-                ["floor", "cage"],
+                ["cage"],
                 "{installation:?}"
             );
-            let cage = &installation[1];
+            let cage = &installation[0];
             assert_eq!(cage.kind, "box");
             assert_eq!(cage.params, vec![KEEPOUT_M; 3]);
         }
         other => panic!("unexpected SHAPES result {other:?}"),
+    }
+    // A client rebuilding the config from CONFIG_BUNDLE gets the cage too.
+    match c.query(&Command::ConfigBundle) {
+        QueryResult::ConfigBundle { robot_toml, .. } => {
+            let doc: toml::Table = toml::from_str(&robot_toml).expect("the reported robot TOML");
+            assert_eq!(
+                doc["installation_shapes"][0]["name"].as_str(),
+                Some("cage"),
+                "{robot_toml}"
+            );
+        }
+        other => panic!("unexpected CONFIG_BUNDLE result {other:?}"),
     }
 
     // ENFORCED, not just echoed: the sweep through it is refused with
@@ -1630,7 +1646,7 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
                     .iter()
                     .map(|s| s.name.as_str())
                     .collect::<Vec<_>>(),
-                ["floor", "cage"],
+                ["cage"],
                 "{installation:?}"
             );
         }

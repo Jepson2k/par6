@@ -135,15 +135,6 @@ fn write_atomic(dst: &std::path::Path, bytes: &[u8]) {
 /// `(tag, dt)`, so concurrent writers are harmless as long as no reader
 /// can catch one mid-write.
 pub fn retimed_config(tag: &str, dt: f64) -> PathBuf {
-    simulator_config(tag, dt, false)
-}
-
-/// A simulator whose modeled masses are exact needs no physical-arm gravity trim.
-pub fn nominal_gravity_config(tag: &str, dt: f64) -> PathBuf {
-    simulator_config(tag, dt, true)
-}
-
-fn simulator_config(tag: &str, dt: f64, nominal_gravity: bool) -> PathBuf {
     let src = shipped_config();
     let dir = std::env::temp_dir().join(format!("par6d-{tag}-{}", std::process::id()));
     let grippers = dir.join("grippers");
@@ -153,9 +144,6 @@ fn simulator_config(tag: &str, dt: f64, nominal_gravity: bool) -> PathBuf {
     // A rig exits limp: a retreat on every test's shutdown is a wait per
     // test that proves nothing, and the retreat has a test of its own.
     patched = set_scalar(&patched, "safe_park", "false");
-    if nominal_gravity {
-        patched = set_scalar(&patched, "gravity_scale", "[1.0, 1.0, 1.0, 1.0, 1.0, 1.0]");
-    }
     let dst = dir.join("PAR6.toml");
     write_atomic(&dst, patched.as_bytes());
     for entry in std::fs::read_dir(src.parent().unwrap().join("grippers")).expect("grippers dir") {

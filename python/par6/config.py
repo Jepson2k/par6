@@ -115,8 +115,9 @@ def can_interface(robot_toml: str | None) -> str:
 
 
 def config_files(path: str | Path) -> dict:
-    """The robot TOML at *path* and the ``grippers/*.toml`` beside it,
-    verbatim, in the shape of the daemon's CONFIG_BUNDLE answer.
+    """The robot TOML at *path* as the runtime runs it (with the local
+    overlay merged in) and the ``grippers/*.toml`` beside it, verbatim, in
+    the shape of the daemon's CONFIG_BUNDLE answer.
 
     ``fingerprint`` is computed the way the daemon computes CONFIG_INFO's:
     sha256 over each file's name, a newline and its content — the robot
@@ -133,7 +134,10 @@ def config_files(path: str | Path) -> dict:
         digest.update(content.encode())
         return file.name, content
 
-    robot_filename, robot_toml = read(robot)
+    robot_filename, robot_toml = robot.name, Config(str(robot)).robot_toml()
+    digest.update(robot_filename.encode())
+    digest.update(b"\n")
+    digest.update(robot_toml.encode())
     grippers = [read(f) for f in sorted((robot.parent / "grippers").glob("*.toml"))]
     return {
         "path": str(robot),

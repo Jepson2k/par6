@@ -668,6 +668,7 @@ Precedence throughout is **CLI flag > `PAR6_*` environment variable > robot TOML
 | Variable | Effect |
 |---|---|
 | `PAR6_CONFIG` | robot TOML path (`--config`) |
+| `PAR6_LOCAL_CONFIG` | this arm's local overlay (`--local-config`; default `local.toml` beside the robot TOML) |
 | `PAR6_ASSETS` | `par6_description` tree with the URDFs (`--assets`) |
 | `PAR6_COMMAND_PORT` | command UDP port; `0` = ephemeral (`--port`) |
 | `PAR6_BIND` | command-socket bind address (`--bind`) |
@@ -756,6 +757,42 @@ covers the CRC, the frame layout and what a release must refuse, and stops
 there. A bench flash is part of bringing up a new drive; treat an image that
 has never been flashed on hardware as untested.
 
+### Local overlay
+
+The shipped `PAR6.toml` describes the PAR6: vendor gains and limits, no
+gravity correction, no keep-outs. What one arm measured about itself — its
+calibration, the tool bolted on, the bench it stands on — lives in a
+`local.toml` holding only the keys it changes, layered over the shipped file
+at load by `par6d`, the Python client and `par6-selfcal` alike. It is the
+file beside the robot TOML (`/etc/par6/local.toml` on the control box), or
+the one `--local-config` / `PAR6_LOCAL_CONFIG` names.
+
+Tables merge key by key. An array of tables merges entry by entry: by
+`name` when its entries have one, so an overlay sets one joint's gain or adds
+one shape without restating the rest, and by position otherwise, so an empty
+`[[homing.joints]]` leaves that joint as shipped. Any other value replaces
+the shipped one whole.
+
+```toml
+[robot]
+active_tool = "MSG_small_motor_200mm_rail"
+
+[[joints]]
+name = "joint2"
+[joints.gains]
+kiv = 0.0005
+
+[[installation_shapes]]
+name = "floor"
+kind = "box"
+params = [6.0, 6.0, 0.2]
+pose = [0.0, 0.0, -0.11, 0.0, 0.0, 0.0]
+```
+
+The runtime reports the merged config to clients, so a client rebuilding it
+from `CONFIG_BUNDLE` gets this arm's values, and `par6d --check-config` names
+both files it loaded.
+
 ### Calibrating the arm
 
 There are two, for two different things.
@@ -802,7 +839,9 @@ its candidate `calibrated.toml`, `stages.tsv`, the per-tick `samples.csv` and
 `history.tsv`: the candidate's values beside the three most recent earlier runs
 in the same directory that measured them, with the change against the newest,
 printed at the end of the run and on demand with `--history <run-dir>` (no arm
-needed). `--apply` writes the results into the config, keeping a backup. Stages other than ripple and gains can use `--sim`,
+needed). `--apply` writes the results into the arm's local overlay
+(`local.toml` beside the config, or `--local-config`), keeping a backup; the
+shipped config is never written. Stages other than ripple and gains can use `--sim`,
 which refuses `--apply`; nothing about tuning is developed or tested in the
 simulator.
 `--limits` (off by default) also finds each joint's velocity,
@@ -998,15 +1037,18 @@ Layout after install:
 |---|---|
 | `/usr/local/bin/par6d` | the runtime binary |
 | `/usr/local/lib/par6/*.so` | the Pinocchio shim + its runtime closure (rpath target) |
-| `/etc/par6/PAR6.toml` | robot config (`PAR6_CONFIG` in the unit) |
+| `/etc/par6/PAR6.toml` | robot config as shipped (`PAR6_CONFIG` in the unit) |
 | `/etc/par6/grippers/*.toml` | gripper configs |
+| `/etc/par6/local.toml` | this arm's own values, layered over the robot config (yours; no install writes it) |
 | `/usr/share/par6/par6_description` | URDF/meshes — the kinematics and collision models |
 | `/etc/systemd/system/par6d.service` | the unit |
 | `/var/lib/par6` | `StateDirectory`, the working directory |
 
-An existing `/etc/par6/*.toml` is **kept** on re-install (tuning survives
-upgrades); pass `--force-config` to overwrite. `--no-restart` installs without
-touching the running service.
+The shipped config is **replaced** on every install, so an upgrade never runs
+a stale copy; a file that differs is kept beside it as `*.previous`. This
+arm's calibration and installation live in `/etc/par6/local.toml`, which no
+install writes (see *Local overlay*). `--no-restart` installs without touching
+the running service.
 
 > Restarting `par6d` stops the arm and clears the queue. `install.sh` stops the
 > service before swapping the binary unless `--no-restart` is given.

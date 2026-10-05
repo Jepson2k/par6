@@ -535,7 +535,8 @@ impl Default for SimConfig {
     fn default() -> Self {
         Self {
             motor_jm_kg_m2: vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6],
-            // Measured on the test arm by par6-selfcal, 2026-09-23.
+            // A reference arm's, as par6-selfcal measured it on 2026-09-23:
+            // the simulator's model of a PAR6, not any one arm's calibration.
             viscous_nm_s: vec![0.033145, 1.513348, 0.0, 0.0, 0.033714, 0.009957],
             coulomb_nm: vec![0.2314, 0.9030, 2.2047, 0.1279, 0.0521, 0.0854],
             powered_support_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],

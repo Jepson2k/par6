@@ -16,8 +16,9 @@
 # Installs to:
 #   /usr/local/bin/par6d              the runtime binary
 #   /usr/local/lib/par6/*.so          the Pinocchio shim, libmujoco and their runtime closure
-#   /etc/par6/PAR6.toml               robot config (kept on re-install unless --force-config)
+#   /etc/par6/PAR6.toml               robot config, as shipped (replaced on every install)
 #   /etc/par6/grippers/*.toml         gripper configs (same rule)
+#   /etc/par6/local.toml              this arm's own values: yours, never written here
 #   /usr/share/par6/par6_description  URDF/meshes (the kinematics/collision models)
 #   /etc/systemd/system/par6d.service the unit
 #
@@ -34,7 +35,6 @@ BUNDLE=""
 STAGE_ONLY=""
 LOCAL=0
 RESTART=1
-FORCE_CONFIG=0
 BINARY="$ROOT/target/$TARGET_TRIPLE/release/par6d"
 CONFIG_DIR="$ROOT/config"
 ASSETS_DIR="$ROOT/assets/par6_description"
@@ -72,7 +72,6 @@ while [ $# -gt 0 ]; do
     --stage-only) STAGE_ONLY="${2:?--stage-only needs a directory}"; shift 2;;
     --local) LOCAL=1; shift;;
     --no-restart) RESTART=0; shift;;
-    --force-config) FORCE_CONFIG=1; shift;;
     -h|--help) usage 0;;
     *) echo "install: unknown argument $1" >&2; usage 2;;
   esac
@@ -164,11 +163,15 @@ install_local() {
   fi
 }
 
+# The shipped config describes the PAR6 and is replaced whole, so an upgrade
+# never leaves a stale copy behind; this arm's own values live in
+# local.toml, which no install writes. A file that was edited in place is
+# kept beside the new one for its values to be moved over.
 install_config() {
   local src="$1" dest="$2"
-  if [ -e "$dest" ] && [ "$FORCE_CONFIG" -eq 0 ]; then
-    say "keeping existing $dest (pass --force-config to overwrite)"
-    return
+  if [ -e "$dest" ] && ! cmp -s "$src" "$dest"; then
+    cp -p "$dest" "$dest.previous"
+    say "replacing $dest; the old one is $dest.previous -- this arm's own values belong in $ETC_DEST/local.toml"
   fi
   install -m 0644 "$src" "$dest"
   say "installed $dest"
@@ -217,7 +220,6 @@ install_remote() {
 
   local flags="--local --bundle '$remote_dir'"
   if [ "$RESTART" -eq 0 ]; then flags="$flags --no-restart"; fi
-  if [ "$FORCE_CONFIG" -eq 1 ]; then flags="$flags --force-config"; fi
   # -t so sudo can prompt for a password on the box.
   ssh -t "$HOST" "set -e
     cd '$remote_dir'

@@ -21,11 +21,14 @@
 //!
 //! Load a robot alone with [`RobotConfig::load`], a single gripper with
 //! [`ToolConfig::load`], or everything (robot + every gripper next to
-//! it, cross-validated) with [`ConfigBundle::load`].
+//! it, cross-validated) with [`ConfigBundle::load`]. An installation's own
+//! values layer over the shipped robot file from a local overlay (see
+//! [`local_overlay`]) through [`ConfigBundle::load_with`].
 
 mod gripper;
 mod homing;
 mod io;
+mod overlay;
 mod robot;
 
 pub use gripper::{
@@ -36,6 +39,9 @@ pub use homing::{
     PreMove, ReleaseConfig, SequenceStep,
 };
 pub use io::{IoConfig, IoLine, MAX_IO_LINES};
+pub use overlay::{
+    effective_robot_toml, local_overlay, LocalOverlay, LOCAL_CONFIG_ENV, LOCAL_CONFIG_NAME,
+};
 pub use robot::{
     BusConfig, ControlMode, DriverType, Gains, JogDefaults, JogProfile, JointConfig, JointLimits,
     KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits, MotionConfig, ProtocolConfig,
@@ -114,7 +120,7 @@ impl ConfigBundle {
     /// directory, drop the sequence steps the active tool cannot run,
     /// then cross-validate.
     pub fn load(robot_toml: &Path) -> Result<Self, ConfigError> {
-        Self::load_inner(robot_toml, None)
+        Self::load_with(robot_toml, None, None)
     }
 
     /// [`load`](Self::load), fitted with the tool named `tool` rather than
@@ -123,11 +129,18 @@ impl ConfigBundle {
     /// refused. The homing sequence is trimmed for THIS tool, which is why
     /// the choice is made here rather than patched onto a loaded bundle.
     pub fn load_fitted(robot_toml: &Path, tool: &str) -> Result<Self, ConfigError> {
-        Self::load_inner(robot_toml, Some(tool))
+        Self::load_with(robot_toml, None, Some(tool))
     }
 
-    fn load_inner(robot_toml: &Path, fitted: Option<&str>) -> Result<Self, ConfigError> {
-        let (mut robot, installation_shapes) = load_robot_with_shapes(robot_toml)?;
+    /// [`load`](Self::load) with `local` merged over the robot file (see
+    /// [`local_overlay`]), fitted with `tool` when given (see
+    /// [`load_fitted`](Self::load_fitted)).
+    pub fn load_with(
+        robot_toml: &Path,
+        local: Option<&Path>,
+        fitted: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        let (mut robot, installation_shapes) = load_robot_with_shapes(robot_toml, local)?;
         // `tools/` is the name; `grippers/` is what it used to be called,
         // and a config on disk is the operator's, not ours to invalidate.
         // A tool is not necessarily a gripper — the bare flange is one.
@@ -342,36 +355,25 @@ impl ConfigBundle {
 /// they are a server-layer vocabulary, not a robot parameter — so
 /// `RobotConfig` keeps its own schema and its `deny_unknown_fields` typo
 /// protection, and the split hands it exactly the document minus this one
-/// key. A file without the key takes the plain [`RobotConfig::load`]
-/// path, byte for byte.
+/// key. A file without the key, with nothing layered over it, takes the
+/// plain [`RobotConfig::load`] path, byte for byte.
 fn load_robot_with_shapes(
     path: &Path,
+    local: Option<&Path>,
 ) -> Result<(RobotConfig, Vec<par6_proto::Shape>), ConfigError> {
-    let text = read_to_string(path)?;
+    let label = overlay::layered_label(path, local);
     let parse_err = |source: toml::de::Error| ConfigError::Parse {
-        path: path.display().to_string(),
+        path: label.clone(),
         source: Box::new(source),
     };
-    let mut table: toml::Table = toml::from_str(&text).map_err(parse_err)?;
-    let Some(value) = table.remove("installation_shapes") else {
-        return Ok((RobotConfig::load(path)?, Vec::new()));
+    let mut table = overlay::layered_table(path, local)?;
+    let shapes: Vec<par6_proto::Shape> = match table.remove("installation_shapes") {
+        Some(value) => value.try_into().map_err(parse_err)?,
+        None if local.is_none() => return Ok((RobotConfig::load(path)?, Vec::new())),
+        None => Vec::new(),
     };
-    let shapes: Vec<par6_proto::Shape> = value.try_into().map_err(parse_err)?;
-    let rest = toml::to_string(&table).map_err(|e| {
-        invalid(
-            "installation_shapes",
-            format!("cannot re-serialize the remaining config: {e}"),
-        )
-    })?;
-    let robot = RobotConfig::from_toml_str(&rest).map_err(|e| match e {
-        // Re-attach the real path: the round-trip through a string names
-        // `<string>` otherwise, which is useless in a startup error.
-        ConfigError::Parse { source, .. } => ConfigError::Parse {
-            path: path.display().to_string(),
-            source,
-        },
-        other => other,
-    })?;
+    let robot: RobotConfig = toml::Value::Table(table).try_into().map_err(parse_err)?;
+    robot.validate()?;
     Ok((robot, shapes))
 }
 
@@ -832,41 +834,16 @@ mod tests {
     /// `[[installation_shapes]]` rides in the robot TOML and comes out of
     /// `ConfigBundle::load` as typed shapes, without costing `RobotConfig`
     /// its strict schema: the same file's robot half still validates, and
-    /// a file WITHOUT the section still loads to an empty list.
+    /// the shipped file, which declares none — the ground a PAR6 stands on
+    /// is its installation's — loads to an empty list.
     #[test]
     fn installation_shapes_load_from_the_robot_toml() {
         let stock = ConfigBundle::load(&config_dir().join("PAR6.toml")).expect("stock bundle");
-        assert_eq!(
-            stock
-                .installation_shapes
-                .iter()
-                .map(|s| s.name.as_str())
-                .collect::<Vec<_>>(),
-            ["floor"],
-            "the shipped config declares the ground the robot stands on"
+        assert!(
+            stock.installation_shapes.is_empty(),
+            "{:?}",
+            stock.installation_shapes
         );
-
-        // A robot that declares no ground at all still loads, with an
-        // empty layer.
-        let bare =
-            TempConfig::new(|file, text| {
-                if file == "PAR6.toml" {
-                    let stripped = without_section(
-                        &without_section(text, "[[installation_shapes]]"),
-                        "[installation_shapes.physics]",
-                    );
-                    assert!(
-                        stripped.lines().all(|l| l.trim_start().starts_with('#')
-                            || !l.contains("installation_shapes")),
-                        "the floor is the only declared shape"
-                    );
-                    stripped
-                } else {
-                    text.to_owned()
-                }
-            });
-        let bundle = ConfigBundle::load(&bare.robot()).expect("no installation shapes loads");
-        assert!(bundle.installation_shapes.is_empty());
 
         let with_shapes = TempConfig::new(|file, text| {
             if file == "PAR6.toml" {
@@ -886,7 +863,7 @@ mod tests {
         });
         let bundle = ConfigBundle::load(&with_shapes.robot()).expect("shapes must load");
         assert_eq!(
-            bundle.installation_shapes[1..],
+            bundle.installation_shapes,
             [
                 par6_proto::Shape {
                     attachment: None,
@@ -910,7 +887,6 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(bundle.installation_shapes[0].name, "floor");
         // The robot half of the same file went through its normal
         // parse-and-validate path.
         assert_eq!(bundle.robot, stock.robot);

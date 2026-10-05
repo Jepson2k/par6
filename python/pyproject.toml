@@ -63,6 +63,8 @@ par6-drives = "par6.gui.drives:DrivesPanel"
 manifest-path = "../crates/par6-py/Cargo.toml"
 python-source = "."
 module-name = "par6._par6"
+# One installation's overlay is never shipped, even if one sits in the tree.
+exclude = ["par6/_data/config/local.toml"]
 
 [tool.ruff]
 target-version = "py311"

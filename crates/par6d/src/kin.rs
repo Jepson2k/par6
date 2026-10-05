@@ -722,7 +722,8 @@ pub fn estimation_model(
     package_dir: Option<&Path>,
 ) -> Result<crate::calibrate::EstimationModel, String> {
     let config_path = crate::options::resolve_config_path(config)?;
-    let bundle = par6_config::ConfigBundle::load(&config_path).map_err(|e| e.to_string())?;
+    let (bundle, _) =
+        crate::options::load_config(&config_path, None, None).map_err(|e| e.to_string())?;
     let robot = &bundle.robot;
     let assets_dir = resolve_assets_dir(assets, &config_path)?;
     let gripper = bundle.active_tool();

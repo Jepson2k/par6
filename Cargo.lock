@@ -822,6 +822,7 @@ dependencies = [
  "serde",
  "thiserror 2.0.20",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -929,6 +930,7 @@ dependencies = [
  "thread-priority",
  "tokio",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]

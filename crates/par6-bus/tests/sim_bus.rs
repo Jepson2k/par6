@@ -2121,20 +2121,19 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
         rig.bus.world_object_pose("block").is_none(),
         "no block before it is declared"
     );
-    // The installation layer the shipped config declares — the floor is a
-    // shape like any other, so the scene only has one once it is applied.
-    rig.bus
-        .set_world(Layer::Installation, &robot.installation_shapes);
-    // Where a dropped body comes to rest: the floor's own top face, read
-    // from the shape the config declares rather than assumed to be z = 0.
-    // It sits below the mounting plane by the height of the plate the arm
-    // is bolted to.
-    let floor_top = robot
-        .installation_shapes
-        .iter()
-        .find(|s| s.name == "floor")
-        .map(|s| s.pose[2] + s.params[2] / 2.0)
-        .expect("the shipped config declares a floor");
+    // An installation's floor — a shape like any other, so the scene only
+    // has one once it is applied — welded 10 mm below the mounting plane,
+    // clear of the base. Where a dropped body comes to rest is its top
+    // face, read from the shape rather than assumed to be z = 0.
+    let floor = shape(
+        "floor",
+        "box",
+        &[6.0, 6.0, 0.2],
+        [0.0, 0.0, -0.11, 0.0, 0.0, 0.0],
+        Some(None),
+    );
+    let floor_top = floor.pose[2] + floor.params[2] / 2.0;
+    rig.bus.set_world(Layer::Installation, &[floor]);
 
     // A free block in the air over the floor, plus a keep-out and a marker
     // that must not become bodies — all beyond the arm's reach, so nothing
