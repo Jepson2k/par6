@@ -268,6 +268,15 @@ pub trait Planner: Send {
         Vec::new()
     }
 
+    /// The tool the runtime was just fitted with, `(tool, variant)`, taken
+    /// once: by a `start`, or by `poll` when the gripper drive reports
+    /// another. A swap is made when its command starts, so the command
+    /// plane follows this rather than the command's answer, which a stop
+    /// can still turn into a cancellation.
+    fn take_fitted_tool(&mut self) -> Option<(String, Option<String>)> {
+        None
+    }
+
     /// Drop the latched collision verdict. The server calls this when it
     /// accepts a motion command, so a refusal's pairs never outlive the
     /// motion that produced them.

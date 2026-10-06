@@ -60,6 +60,7 @@ impl RtJogEngine for MotionJog {
     /// acceleration is `v_full / accel_time_s`, so dividing the time by
     /// the fraction scales the acceleration by it.
     fn set_accel_scale(&mut self, accel: f64) {
+        let accel = accel.clamp(par6_motion::MIN_ACCEL_FRACTION, 1.0);
         if let Err(e) = self.engine.set_accel_time_s(self.base_accel_time_s / accel) {
             log::warn!("jog accel scale {accel} refused: {e}");
         }

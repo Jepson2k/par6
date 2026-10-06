@@ -161,6 +161,17 @@ pub struct ServoPreview {
     pub finished_tick: Option<usize>,
 }
 
+/// A tool's `calibrate` hold and jaw-move grace, in ticks.
+fn tool_ticks(tool: Option<&par6_config::ToolConfig>, dt: f64) -> (u64, u64) {
+    let driver = tool.and_then(|g| g.driver.as_ref());
+    (
+        driver.map_or(0, |d| (d.settle.calibrate_min_wait_s / dt).round() as u64),
+        driver.map_or(0, |d| {
+            ((d.settle.command_grace_s / dt).round() as u64).max(2)
+        }),
+    )
+}
+
 /// The offline session: a virtual arm plus the runtime's planner,
 /// server-side validation and state (profile, TCP offset, completion
 /// policy, IO levels, tool state) — everything a program can observe.
@@ -195,6 +206,10 @@ pub struct Preview {
     /// (`driver.settle.command_grace_s`, at least two): the floor on how
     /// long any tool action takes, however short its travel.
     tool_grace_ticks: u64,
+    /// The tool registry a `select_tool` looks its settle times up in.
+    bundle: Arc<par6_config::ConfigBundle>,
+    /// Where the planner leaves the models it rebuilt for a new tool.
+    tool_swap: crate::bridge::ToolMailbox,
     /// Queued moves waiting for the successor they blend into, each with
     /// its span in the commanded record.
     held: session::BlendQueue<(usize, Command)>,
@@ -285,13 +300,10 @@ impl Preview {
             crate::options::load_config(&config_path, opts.local_config.as_deref(), None)?;
         let robot = &bundle.robot;
         let stack = load_preview_kin(&opts, &config_path, robot, bundle.active_tool())?;
-        let gripper_driver = bundle.active_tool().and_then(|g| g.driver.as_ref());
-        let tool_calibrate_hold_ticks = gripper_driver.map_or(0, |d| {
-            (d.settle.calibrate_min_wait_s / robot.robot.tick_dt_s).round() as u64
-        });
-        let tool_grace_ticks = gripper_driver.map_or(0, |d| {
-            ((d.settle.command_grace_s / robot.robot.tick_dt_s).round() as u64).max(2)
-        });
+        let (tool_calibrate_hold_ticks, tool_grace_ticks) =
+            tool_ticks(bundle.active_tool(), robot.robot.tick_dt_s);
+        let tool_swap = crate::bridge::ToolMailbox::default();
+        let shared = Arc::new(bundle.clone());
 
         let (cmds_tx, cmds_rx) = mpsc::channel();
         let (ops_tx, ops_rx) = mpsc::channel();
@@ -310,13 +322,16 @@ impl Preview {
                 tool_offset: stack.tool_offset,
             },
             PlannerSwap {
-                source: None,
-                bundle: std::sync::Arc::new(bundle.clone()),
-                tools: Default::default(),
+                source: stack.source,
+                bundle: Arc::clone(&shared),
+                tools: Arc::clone(&tool_swap),
             },
         )?;
 
-        let mut snap = StateSnapshot::default();
+        let mut snap = StateSnapshot {
+            bus_simulated: true,
+            ..Default::default()
+        };
         for (out, rad) in snap.q.iter_mut().zip(robot.robot.park_pose_rad.iter()) {
             *out = *rad;
         }
@@ -350,6 +365,8 @@ impl Preview {
             ready_pose,
             tool_calibrate_hold_ticks,
             tool_grace_ticks,
+            bundle: shared,
+            tool_swap,
             held: session::BlendQueue::default(),
             profile: cfg.initial_profile.clone(),
             tool: cfg.fitted_tool.clone(),
@@ -1787,6 +1804,25 @@ impl Preview {
                 }
                 self.tool_variant = p.variant_key.clone();
                 self.tool = tool;
+                // The planner rebuilt its own models when it took the
+                // command; the jog solver and the stream gate are this
+                // session's to adopt, as the bridge's threads do live.
+                if let Ok(mut swap) = self.tool_swap.lock() {
+                    if let Some(kin) = swap.housekeeping.take() {
+                        self.cart = kin;
+                    }
+                    if let Some(c) = swap.gate_collision.take() {
+                        self.gate.set_collision(c);
+                    }
+                    swap.bridge = None;
+                }
+                let fitted = self
+                    .bundle
+                    .tools
+                    .iter()
+                    .find(|g| g.name.eq_ignore_ascii_case(&self.tool));
+                (self.tool_calibrate_hold_ticks, self.tool_grace_ticks) =
+                    tool_ticks(fitted, self.dt);
                 self.sync_planner();
             }
             Command::ToolAction(p) => match p.action.as_str() {

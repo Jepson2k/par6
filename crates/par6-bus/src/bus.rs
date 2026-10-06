@@ -221,4 +221,10 @@ pub trait DriverBus {
     fn recover_link(&mut self) -> bool {
         false
     }
+
+    /// Whether this bus is a simulation: its drives are whatever the
+    /// runtime last fitted, and say nothing about the arm.
+    fn simulated(&self) -> bool {
+        false
+    }
 }

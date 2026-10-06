@@ -1508,6 +1508,7 @@ async fn flashing_enter_and_exit_follow_the_rt_verdict() {
 #[tokio::test]
 async fn commissioning_is_gated_on_an_idle_arm_and_the_config_and_bus_scan_reports_every_id() {
     let mut h = start(|cfg| {
+        cfg.tool_ids = vec![13];
         cfg.tunable_nodes = (0..6)
             .map(|node| par6_server::TunableNode {
                 node,
@@ -1559,6 +1560,15 @@ async fn commissioning_is_gated_on_an_idle_arm_and_the_config_and_bus_scan_repor
         }))
         .await;
     assert!(err.cause.contains("node 9"), "{}", err.cause);
+    // An id no configured tool carries would refuse the next boot.
+    let err = c
+        .expect_error(&Command::SetToolId(SetToolId {
+            node: 2,
+            tool_id: 77,
+            force: false,
+        }))
+        .await;
+    assert!(err.cause.contains("tool id 77"), "{}", err.cause);
     let ev = h.rt_events();
     assert_eq!(
         ev.iter()

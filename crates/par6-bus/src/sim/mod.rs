@@ -1101,12 +1101,19 @@ fn tool_inertial(g: &ToolConfig) -> scene::ToolInertial {
     }
 }
 
-/// The scene geometry a tool brings: its URDF variant's, or the bare
-/// flange's for a tool that names none.
+/// The scene geometry a tool brings, by the rule the kinematics picks its
+/// tree with — its declared URDF variant, else the vendor's name prefix — so
+/// the plant swings the tool the controller models.
 fn scene_tool(tool: Option<&ToolConfig>) -> scene::Tool {
-    tool.and_then(|g| g.urdf_variant.as_deref())
-        .and_then(scene::Tool::from_urdf_variant)
-        .unwrap_or(scene::Tool::Flange)
+    let Some(g) = tool else {
+        return scene::Tool::Flange;
+    };
+    match par6_kin::GripperVariant::resolve(&g.name.to_ascii_uppercase(), g.urdf_variant.as_deref())
+    {
+        par6_kin::GripperVariant::Flange => scene::Tool::Flange,
+        par6_kin::GripperVariant::Msg => scene::Tool::Msg,
+        par6_kin::GripperVariant::Ssg48 => scene::Tool::Ssg48,
+    }
 }
 
 impl DriverBus for SimBus {
@@ -1114,11 +1121,22 @@ impl DriverBus for SimBus {
     /// node is the new tool's: its drive answers with its own stroke and
     /// id, or nothing answers when the tool has no driver. Objects in the
     /// world start again from their spawn poses.
+    fn simulated(&self) -> bool {
+        true
+    }
+
     fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>) {
         let q = self.true_joint_rad();
+        let was = (self.scene.tool, self.tool);
         self.scene.tool = scene_tool(tool);
         self.tool = tool.map(tool_inertial);
-        self.plant = Some(self.make_plant(robot, &q));
+        match self.try_make_plant(robot, &q) {
+            Ok(plant) => self.plant = Some(plant),
+            Err(e) => {
+                log::error!("sim: no plant for the new tool ({e}); the previous one stays");
+                (self.scene.tool, self.tool) = was;
+            }
+        }
         self.mj_jaw_cmd = None;
         let node = self.gripper_node;
         self.fresh.refit_gripper(node, self.tick);
@@ -1678,6 +1696,17 @@ impl SimBus {
     /// Compile the scene for this robot config with the current world and
     /// place the arm at `q0`; keeps the base spec for later world changes.
     fn make_plant(&mut self, robot: &RobotConfig, q0: &[f64]) -> mujoco::MujocoPlant {
+        self.try_make_plant(robot, q0)
+            .unwrap_or_else(|e| panic!("sim scene: {e}"))
+    }
+
+    /// [`Self::make_plant`], with a scene the configuration cannot build
+    /// answered rather than fatal.
+    fn try_make_plant(
+        &mut self,
+        robot: &RobotConfig,
+        q0: &[f64],
+    ) -> Result<mujoco::MujocoPlant, String> {
         let sim = &robot.sim;
         let tuning: Vec<scene::JointTuning> = self
             .maps
@@ -1695,23 +1724,20 @@ impl SimBus {
                 sim.arm_lateral_damping_nm_s,
             ),
         };
-        let mut spec = self
-            .scene
-            .spec(&build)
-            .unwrap_or_else(|e| panic!("sim scene: {e}"));
-        let base = scene::BaseSpec::new(&spec).unwrap_or_else(|e| panic!("sim scene: {e}"));
+        let mut spec = self.scene.spec(&build).map_err(|e| e.to_string())?;
+        let base = scene::BaseSpec::new(&spec).map_err(|e| e.to_string())?;
         scene::inject_world(&mut spec, &[&self.world[0], &self.world[1]])
-            .unwrap_or_else(|e| panic!("sim scene: {e}"));
-        let model = scene::compile(&mut spec).unwrap_or_else(|e| panic!("sim scene: {e}"));
+            .map_err(|e| e.to_string())?;
+        let model = scene::compile(&mut spec)?;
         self.base_spec = Some(base);
         self.world_dirty = false;
-        mujoco::MujocoPlant::new(
+        Ok(mujoco::MujocoPlant::new(
             model,
             &self.maps,
             q0,
             &robot.sim.powered_support_nm,
             &self.gravity_correction,
-        )
+        ))
     }
 
     /// Rebuild the scene around the current world layers, in place.

@@ -259,7 +259,7 @@ impl Preview {
                 tool_offset: stack.tool_offset,
             },
             PlannerSwap {
-                source: Some(stack.source),
+                source: stack.source,
                 bundle: std::sync::Arc::new(bundle.clone()),
                 tools: Default::default(),
             },

@@ -61,6 +61,25 @@ use std::{
 };
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+/// `println!` that cannot end the run: a console gone away (a closed
+/// `| tee`, a dropped session) makes `println!` panic, and in a build that
+/// aborts on panic that skips the park and drops the shoulder.
+macro_rules! say {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($t)*);
+    }};
+}
+
+/// `print!` that cannot end the run (see `say!`).
+macro_rules! say_raw {
+    ($($t:tt)*) => {{
+        use std::io::Write as _;
+        let _ = write!(std::io::stdout(), $($t)*);
+    }};
+}
+
 const N: usize = 6;
 const LOOP_HZ: f64 = 6250.0;
 
@@ -672,8 +691,10 @@ const IDENT_HOLD_FRACTION: f64 = 0.6;
     about = "Home a PAR6, measure its mechanics and identify its link masses"
 )]
 struct Args {
-    #[arg(default_value = "config/PAR6.toml")]
-    config: PathBuf,
+    /// The robot TOML par6d runs (default: as par6d finds it — PAR6_CONFIG,
+    /// a checkout's config/PAR6.toml, then /etc/par6/PAR6.toml).
+    #[arg(env = "PAR6_CONFIG")]
+    config: Option<PathBuf>,
     /// This arm's local overlay: layered over the config, and where
     /// `--apply` writes what was measured (default: `local.toml` beside the
     /// config).
@@ -1001,7 +1022,7 @@ fn writer(rx: Receiver<Event>, directory: PathBuf) -> std::io::Result<()> {
             continue;
         }
         if let Some(text) = describe(&event) {
-            println!("{text}");
+            say!("{text}");
             writeln!(console, "{text}")?;
         }
     }
@@ -1506,8 +1527,10 @@ impl Arm {
                 && !self.restoring
                 && !self.homing
                 && self.homed[j]
-                // Gain trials have their own guard and bounded backoff path.
-                && !(self.gain_joint == Some(j) && self.sane_gains[j].is_some())
+                // Gain trials and calm() have their own guard and bounded
+                // backoff path; a joint-by-joint park answers for its joint.
+                && self.sane_gains[j].is_none()
+                && self.only.is_none_or(|o| o == j)
                 && command.vel.is_some();
             if !guarded {
                 self.tracking_runaway[j] = 0;
@@ -2564,13 +2587,11 @@ impl Arm {
                 }
                 return Err(format!("J{} gave no feedback after release", j + 1).into());
             }
-            // Selfcal drives the six arm joints only; a sequence that needs the
-            // gripper moved cannot be run here, and silently skipping it would
-            // home the arm from a pose the config did not ask for.
+            // Selfcal drives the six arm joints only. A gripper move positions
+            // the jaw, not the arm, so the arm homes from the pose the config
+            // asks for without it; the jaw stays where it is.
             PreMove::GripperMove { .. } => {
-                return Err(
-                    "the homing sequence moves the gripper, which selfcal does not drive".into(),
-                );
+                say!("homing: the jaw is left where it is (selfcal drives the arm only)");
             }
         }
         Ok(())
@@ -3138,17 +3159,23 @@ impl Arm {
         }
         // Out along the wider side, then back from where that ended. The
         // drive runs uncompensated from here, so every way out of this stage
-        // but a kept fit leaves it — and the overlay — with no ripple.
+        // but a kept fit, or no capture at all, leaves it — and the
+        // overlay — with no ripple.
         let out = direction * per_tick.signum() * RIPPLE_SWEEP_TICKS_S;
         self.bus.set_ripple(node, &[])?;
         let start = self.pos(j)?;
         let Some(there) = self.capture_step(j, out, RIPPLE_CAPTURE_DIVISOR, span)? else {
+            // Old firmware, or a capture status that came late: either way
+            // nothing was measured, so the drive and the file keep what the
+            // config gives.
+            self.bus
+                .set_ripple(node, &self.bundle.robot.joints[j].ripple)?;
             self.emit(Event::RippleNote(
                 self.tick,
                 j,
-                "the drive records no capture (its firmware predates cmd 38)",
+                "the drive recorded no capture (firmware before cmd 38, or no status in time)",
             ));
-            return Ok(Some(Vec::new()));
+            return Ok(None);
         };
         let far = start + (out * sweep_s).round() as i32;
         if self.run_motion(j, far, RETURN_S, false)?.outcome != Outcome::Complete {
@@ -4179,14 +4206,18 @@ impl Arm {
         let feedforward = self.gravity_feedforward()[j];
         let per_tick = self.per_tick(j);
         let opened_at = self.pos(j)?;
-        for _ in 0..self.ticks(CALM_S) {
+        // The joint opens still loud from its limit cycle (J1 read 132 and
+        // 239 deg/s on its first open-loop frame): its speed is judged once
+        // that has had the quiet allowance to die away, its travel always.
+        let grace = self.ticks(CALM_QUIET_S);
+        for t in 0..self.ticks(CALM_S) {
             self.frame(Some((j, JointCommand::current(feedforward))))?;
             // No loop bounds the joint now; the gravity current is a model,
             // and a sag just under the runaway speed would cover a lot of
             // ground in the time it is open.
             let reported = self.state.nodes[self.node(j)].speed_ticks_s.unwrap_or(0);
             let drifted = f64::from(self.pos(j)? - opened_at) * per_tick;
-            if (f64::from(reported) * per_tick).abs() > RUNAWAY_RAD_S
+            if (t >= grace && (f64::from(reported) * per_tick).abs() > RUNAWAY_RAD_S)
                 || drifted.abs() > CALM_OPEN_TRAVEL_RAD
             {
                 self.adopt(j)?;
@@ -4710,7 +4741,7 @@ fn gain_pose_plan(
             && world.check_segment(&at, &ready, 40)?.is_none()
             && world.check_segment(&ready, &approach, 40)?.is_none();
         if !(direct || via_ready) || world.check_segment(&approach, &target, 40)?.is_some() {
-            println!(
+            say!(
                 "gains: identification pose {} is not reachable for the posture check; skipped",
                 i + 1
             );
@@ -5231,7 +5262,7 @@ impl Arm {
                 if let Some(j) = self.runaway_joint.take() {
                     if let Err(error) = self.calm(j, self.bundle.robot.joints[j].gains) {
                         self.emit(Event::Phase("could not calm the joint that ran away", j));
-                        println!("calm J{}: {error}", j + 1);
+                        say!("calm J{}: {error}", j + 1);
                     }
                 }
                 self.emit(Event::Phase(
@@ -5320,7 +5351,9 @@ impl Arm {
                 .effective_home_offset(j)
                 .ok_or("missing home offset")?
         } else {
-            self.bundle.robot.robot.park_pose_rad[j]
+            // Where the daemon's shutdown retreat leaves it, so a run ends in
+            // the posture every other stop does.
+            self.bundle.robot.safe_park_q()[j]
         };
         let mut outcome = self.park_to(j, target);
         if outcome.is_err() && self.bundle.robot.parks_on_endstop(j) {
@@ -5773,14 +5806,20 @@ type LimitPick = fn(&par6_config::ResolvedLimits) -> Option<f64>;
 /// moved; the whole table is left as `history.tsv`. `None` when no earlier
 /// run can be compared; what was skipped is said.
 fn history(directory: &Path) -> Result<Option<(String, String)>> {
+    // Absolute, so a bare run name has a parent to list and is not its own
+    // sibling there.
+    let directory = &directory.canonicalize()?;
     let current = Run::load(directory)?;
     let Some(parent) = directory.parent() else {
         return Ok(None);
     };
+    let own = run_stamp(directory);
     let mut siblings: Vec<(u128, PathBuf)> = fs::read_dir(parent)?
         .filter_map(|entry| entry.ok().map(|entry| entry.path()))
         .filter(|path| path != directory && path.is_dir())
         .filter_map(|path| run_stamp(&path).map(|stamp| (stamp, path)))
+        // Earlier runs only: a newer one beside it is no history of this one.
+        .filter(|(stamp, _)| own.is_none_or(|own| *stamp < own))
         .collect();
     siblings.sort_by_key(|(stamp, _)| std::cmp::Reverse(*stamp));
     let mut earlier: Vec<Run> = Vec::new();
@@ -5799,14 +5838,14 @@ fn history(directory: &Path) -> Result<Option<(String, String)>> {
             }
             Ok(_) => skipped += 1,
             Err(error) => {
-                println!("history: {}: {error}", path.display());
+                say!("history: {}: {error}", path.display());
                 skipped += 1;
             }
         }
     }
     if earlier.is_empty() {
         if skipped > 0 {
-            println!(
+            say!(
                 "history: no comparable earlier run in {} ({skipped} skipped: no record, \
                  other simulator flag, or unreadable)",
                 parent.display()
@@ -6105,6 +6144,8 @@ fn patch_config(
 
 fn main() -> std::process::ExitCode {
     use clap::Parser;
+    // An empty PAR6_* variable is unset, as par6d reads it.
+    par6d::options::clear_empty_env();
     match run(Args::parse()) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
@@ -6127,16 +6168,16 @@ fn stage_status(
         row.2 = status;
     }
     match joint {
-        Some(j) => println!("STAGE {stage} J{}: {status}", j + 1),
-        None => println!("STAGE {stage}: {status}"),
+        Some(j) => say!("STAGE {stage} J{}: {status}", j + 1),
+        None => say!("STAGE {stage}: {status}"),
     }
 }
 
 fn run(args: Args) -> Result<()> {
     if let Some(dir) = &args.history {
         match history(dir)? {
-            Some((console, _)) => print!("{console}"),
-            None => println!(
+            Some((console, _)) => say_raw!("{console}"),
+            None => say!(
                 "history: no comparable earlier run beside {}",
                 dir.display()
             ),
@@ -6164,14 +6205,45 @@ fn run(args: Args) -> Result<()> {
     let stiction_stage = runs(Stage::Stiction);
     let belt_stage = runs(Stage::Belt);
     let mechanics_stage = runs(Stage::Mechanics);
+    // One controller on the bus: a running par6d keeps commanding the
+    // drives every tick, and the current limits this run opens with would
+    // drop the shoulder it is holding.
+    if !args.sim {
+        for entry in fs::read_dir("/proc")?.flatten() {
+            let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                continue;
+            };
+            if pid == std::process::id() {
+                continue;
+            }
+            let comm = fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+            if matches!(comm.trim(), "par6d" | "par6-selfcal") {
+                return Err(format!(
+                    "another controller is running ({} pid {pid}): stop it first \
+                     (sudo systemctl stop par6d)",
+                    comm.trim()
+                )
+                .into());
+            }
+        }
+    }
     // The shipped config describes the PAR6; this arm's own values, the
     // ones a run measures, live in its overlay.
-    let overlay = args
-        .local_config
+    // Resolved as par6d resolves them, so a run calibrates, and --apply
+    // writes, the config the runtime actually loads.
+    let config = par6d::options::resolve_config_path(args.config.as_deref())?;
+    let existing = par6_config::local_overlay(&config, args.local_config.as_deref())?;
+    let overlay = existing
         .clone()
-        .unwrap_or_else(|| args.config.with_file_name(par6_config::LOCAL_CONFIG_NAME));
-    let existing = overlay.is_file().then(|| overlay.clone());
-    let bundle = ConfigBundle::load_with(&args.config, existing.as_deref(), args.tool.as_deref())?;
+        .unwrap_or_else(|| config.with_file_name(par6_config::LOCAL_CONFIG_NAME));
+    say!(
+        "config: {}{}",
+        config.display(),
+        existing
+            .as_ref()
+            .map_or_else(String::new, |o| format!(" + {}", o.display()))
+    );
+    let bundle = ConfigBundle::load_with(&config, existing.as_deref(), args.tool.as_deref())?;
     bundle.robot.validate()?;
     // The arm's gravity is fitted with nothing on the flange: a tool shares
     // the last link's regressor columns, so a fit with one on writes that
@@ -6214,7 +6286,7 @@ fn run(args: Args) -> Result<()> {
     // Resolved the way the daemon resolves it: a lexical step up from the
     // config directory, never `config/..` through the filesystem, which
     // follows the `config` symlink into the package and lands beside it.
-    let assets = par6d::kin::resolve_assets_dir(None, &args.config)?;
+    let assets = par6d::kin::resolve_assets_dir(None, &config)?;
     let ready = planned_ready(&bundle)?;
     let poses = if mechanics_stage || limits_stage || gains_stage {
         // Plan the poses before anything moves: a scene that cannot be covered
@@ -6230,7 +6302,7 @@ fn run(args: Args) -> Result<()> {
                 format!("J{} {:.0}..{:.0}", j + 1, lo.to_degrees(), hi.to_degrees())
             })
             .collect();
-        println!(
+        say!(
             "identification plan: {} poses, J1 held at ready, {} deg; {:.1} of {} parameters \
          observable",
             poses.len(),
@@ -6251,7 +6323,7 @@ fn run(args: Args) -> Result<()> {
             .as_nanos()
     ));
     fs::create_dir_all(&directory)?;
-    println!("RUN DIRECTORY: {}", directory.display());
+    say!("RUN DIRECTORY: {}", directory.display());
     fs::write(
         directory.join("identification-poses.csv"),
         poses
@@ -6267,9 +6339,14 @@ fn run(args: Args) -> Result<()> {
     let sink = directory.clone();
     let recorder = std::thread::spawn(move || writer(rx, sink));
 
+    // Every way a terminal or a supervisor ends a process parks the arm
+    // first: a dropped SSH session sends SIGHUP, and a stopped controller
+    // (Ctrl-Z) would leave the drives on their last frame.
     unsafe {
-        libc::signal(libc::SIGINT, cancel as *const () as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, cancel as *const () as libc::sighandler_t);
+        for signal in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT] {
+            libc::signal(signal, cancel as *const () as libc::sighandler_t);
+        }
+        libc::signal(libc::SIGTSTP, libc::SIG_IGN);
     }
     let timing = bundle.robot.timing.unwrap_or_default();
     let _runtime = (!args.sim)
@@ -6304,9 +6381,7 @@ fn run(args: Args) -> Result<()> {
         out[4] = (-60.0_f64).to_radians();
         let mut world = collision_world(&bundle, &assets)?;
         if world.check_segment(&ready, &out, 40)?.is_some() {
-            println!(
-                "stiction: the arm-out pose is not reachable from ready; measuring at ready only"
-            );
+            say!("stiction: the arm-out pose is not reachable from ready; measuring at ready only");
             None
         } else {
             Some(out)
@@ -6326,11 +6401,11 @@ fn run(args: Args) -> Result<()> {
     };
     if gains_stage {
         if candidates.is_some() {
-            println!("gains: verify selected candidates together, without a gain search");
+            say!("gains: verify selected candidates together, without a gain search");
         } else {
-            println!("gains: StepFOC Kpv -> Kiv -> Kpp on fixed lattices, at most {GAIN_OBSERVATIONS} observations per joint including verification");
+            say!("gains: StepFOC Kpv -> Kiv -> Kpp on fixed lattices, at most {GAIN_OBSERVATIONS} observations per joint including verification");
         }
-        println!(
+        say!(
             "gains: {} calibration poses qualify the accepted candidates together",
             gain_poses.len()
         );
@@ -6476,7 +6551,7 @@ fn run(args: Args) -> Result<()> {
                             if index == 0 {
                                 found[j] = None;
                                 reverted[j] = true;
-                                println!(
+                                say!(
                                     "gains J{}: misbehaved on a calibration pose at the {} lattice \
                                      floor; configured gains retained",
                                     j + 1,
@@ -6491,7 +6566,7 @@ fn run(args: Args) -> Result<()> {
                                 ..candidate
                             });
                             arm.gain_configure(j, next)?;
-                            println!(
+                            say!(
                                 "gains J{}: misbehaved on a calibration pose ({kind:?}); {} one \
                                  lattice step down to {:.6}, poses taken again",
                                 j + 1,
@@ -6502,7 +6577,7 @@ fn run(args: Args) -> Result<()> {
                         Some(_) => {
                             found[j] = None;
                             reverted[j] = true;
-                            println!(
+                            say!(
                                 "gains J{}: misbehaved on a calibration pose after \
                                  {POSE_BACKOFF_STEPS} gain steps; configured gains retained",
                                 j + 1
@@ -6511,7 +6586,7 @@ fn run(args: Args) -> Result<()> {
                         None => {
                             judged[j] = false;
                             unjudged[j] = true;
-                            println!(
+                            say!(
                                 "gains J{}: misbehaves on a calibration pose with its configured \
                                  gains; reported, not judged further",
                                 j + 1
@@ -6693,7 +6768,7 @@ fn run(args: Args) -> Result<()> {
                 restored_ripple = restored_ripple.and(restored);
             }
         }
-        println!(
+        say!(
             "ripple: original settings {} before parking",
             if restored_ripple.is_ok() {
                 "restored"
@@ -6715,12 +6790,23 @@ fn run(args: Args) -> Result<()> {
     );
     let gain_used = arm.gain_used;
     let idle = (arm.idle_stops, arm.idle_total_s, arm.idle_longest);
-    let correction = fit.as_ref().map(|f| f.correction.clone());
+    // `fit_arm` solves for a correction ON TOP OF everything the model
+    // already carries, the installed `gravity_correction` included, so the
+    // value belonging in the file is installed + fitted. Writing the delta
+    // alone made a second --apply throw away the first run's masses while
+    // reporting an improved residual.
+    let correction: Option<Vec<f64>> = fit.as_ref().map(|f| {
+        f.correction
+            .iter()
+            .enumerate()
+            .map(|(i, d)| d + config_correction.get(i).copied().unwrap_or(0.0))
+            .collect()
+    });
     arm.events.take();
     drop(arm);
     let recorded = recorder.join().map_err(|_| "recording thread failed")?;
 
-    println!(
+    say!(
         "parking: {}",
         if parked.is_ok() {
             "completed"
@@ -6736,7 +6822,7 @@ fn run(args: Args) -> Result<()> {
         idle.2 .2 + 1,
         idle.2 .1
     );
-    println!("{idle_report}");
+    say!("{idle_report}");
     let result = outcome
         .and(restored_gains)
         .and(restored_ripple)
@@ -6793,13 +6879,13 @@ fn run(args: Args) -> Result<()> {
     .and_then(|patched| {
         let written = directory.join(par6_config::LOCAL_CONFIG_NAME);
         fs::write(&written, &patched)?;
-        ConfigBundle::load_with(&args.config, Some(&written), args.tool.as_deref())?;
+        ConfigBundle::load_with(&config, Some(&written), args.tool.as_deref())?;
         Ok(patched)
     });
     match &candidate {
         Ok(_) => {
             let effective = par6_config::effective_robot_toml(
-                &args.config,
+                &config,
                 Some(&directory.join(par6_config::LOCAL_CONFIG_NAME)),
             )?;
             fs::write(directory.join("calibrated.toml"), run_record(&effective)?)?;
@@ -6809,16 +6895,16 @@ fn run(args: Args) -> Result<()> {
             )?;
             match history(&directory) {
                 Ok(Some((console, table))) => {
-                    print!("{console}");
+                    say_raw!("{console}");
                     if let Err(error) = fs::write(directory.join("history.tsv"), table) {
-                        println!("history: not saved: {error}");
+                        say!("history: not saved: {error}");
                     }
                 }
                 Ok(None) => {}
-                Err(error) => println!("history: unavailable: {error}"),
+                Err(error) => say!("history: unavailable: {error}"),
             }
         }
-        Err(error) => println!("candidate: not written: {error}"),
+        Err(error) => say!("candidate: not written: {error}"),
     }
     result?;
 
@@ -6843,7 +6929,7 @@ fn run(args: Args) -> Result<()> {
             )?;
         }
         fs::write(directory.join("identified-arm.toml"), report)?;
-        println!(
+        say!(
             "identification: torque residual {:.5} Nm -> {:.5} Nm; {} of {} parameters fixed",
             fit.rms_before_nm,
             fit.rms_nm,
@@ -6852,21 +6938,8 @@ fn run(args: Args) -> Result<()> {
         );
     }
 
-    // `fit_arm` solves for a correction ON TOP OF everything the model
-    // already carries, the installed `gravity_correction` included, so the
-    // value belonging in the file is installed + fitted. Writing the delta
-    // alone made a second --apply throw away the first run's masses while
-    // reporting an improved residual.
-    let installed = &config_correction;
-    let correction: Option<Vec<f64>> = correction.map(|delta| {
-        delta
-            .iter()
-            .enumerate()
-            .map(|(i, d)| d + installed.get(i).copied().unwrap_or(0.0))
-            .collect()
-    });
     if correction.is_some() && !stale_scale.is_empty() {
-        println!(
+        say!(
             "gravity_scale was not unity on {stale_scale:?}; the identification supersedes it \
              and it is written back as 1.0"
         );
@@ -6874,7 +6947,7 @@ fn run(args: Args) -> Result<()> {
     if let Some(limits) = &limits {
         for (j, found) in limits.iter().enumerate() {
             match found {
-                Some(f) => println!(
+                Some(f) => say!(
                     "limits J{}: velocity {:.4} rad/s{}, acceleration {:.4} rad/s2, jerk {:.4} rad/s3{}, \
                      speed ripple {:.1}%",
                     j + 1,
@@ -6889,7 +6962,7 @@ fn run(args: Args) -> Result<()> {
                     },
                     100.0 * f.ripple
                 ),
-                None => println!(
+                None => say!(
                     "limits J{}: misses the requirements even at {LIMITS_MIN_FACTOR} of its EXEC \
                      limits; left unchanged",
                     j + 1
@@ -6904,7 +6977,7 @@ fn run(args: Args) -> Result<()> {
                 .enumerate()
                 .filter_map(|(j, s)| s.map(|s| format!("J{} {s:.3}", j + 1)))
                 .collect();
-            println!("stiction at {label}: {} Nm", joints.join(", "));
+            say!("stiction at {label}: {} Nm", joints.join(", "));
         }
     }
     if let Some(ripples) = &ripples {
@@ -6916,7 +6989,7 @@ fn run(args: Args) -> Result<()> {
                 .iter()
                 .map(|h| format!("h{} {}/{} mA", h.harmonic, h.a_ma, h.b_ma))
                 .collect();
-            println!(
+            say!(
                 "ripple J{}: {}",
                 j + 1,
                 if harmonics.is_empty() {
@@ -6930,10 +7003,10 @@ fn run(args: Args) -> Result<()> {
     if let Some(tuned) = &tuned {
         for (j, t) in tuned.iter().enumerate() {
             if chosen[j] && t.is_none() {
-                println!("gains J{}: unchanged (no gain change accepted)", j + 1);
+                say!("gains J{}: unchanged (no gain change accepted)", j + 1);
             }
             if let Some(t) = t {
-                println!(
+                say!(
                     "gains J{}: kpv {:.6} -> {:.6}, kiv {:.8} -> {:.8}, kpp {:.5} -> {:.5}; {} observations",
                     j + 1, t.before.kpv, t.after.kpv, t.before.kiv, t.after.kiv,
                     t.before.kpp, t.after.kpp, t.observations
@@ -6960,9 +7033,9 @@ fn run(args: Args) -> Result<()> {
         let temp = overlay.with_extension("toml.selfcal-tmp");
         fs::write(&temp, &patched)?;
         fs::rename(temp, &overlay)?;
-        println!("applied to {}", overlay.display());
+        say!("applied to {}", overlay.display());
     } else {
-        println!(
+        say!(
             "results: {}",
             directory.join(par6_config::LOCAL_CONFIG_NAME).display()
         );

@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use par6_proto::command::{Home, JogL, MoveJ, MoveL, SelectProfile, Stop, WriteIo};
+use par6_proto::command::{Home, JogL, MoveJ, MoveL, SelectProfile, SelectTool, Stop, WriteIo};
 use par6_proto::{Command, ControllerMode, ErrorCode, Frame, Shape, NUM_JOINTS};
 use par6_server::ShapeLayer;
 use par6d::preview::Preview;
@@ -1152,6 +1152,58 @@ fn a_jog_l_into_a_joint_limit_brakes_on_its_axis() {
         worst < 0.001,
         "the tool left its axis by {:.2} mm at the limit",
         worst * 1e3
+    );
+}
+
+fn xyz(p: &[f64; 16]) -> [f64; 3] {
+    [p[3], p[7], p[11]]
+}
+
+/// A `select_tool` re-fits what the preview plans and jogs with: the TCP is
+/// the new tool's, and a `jog_l` that only tilts the tool tilts it about
+/// that TCP rather than the one that came off.
+#[test]
+fn a_selected_tool_is_the_one_the_preview_plans_and_jogs() {
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
+    preview.teleport_rad(to_rad(&wrist_clear_deg()));
+    let before = preview.pose().expect("pose");
+    let other = if preview.tool().0 == "Flange" {
+        "SSG48"
+    } else {
+        "Flange"
+    };
+    let r = preview.submit(Command::SelectTool(SelectTool {
+        key: 3,
+        tool_name: other.to_owned(),
+        variant_key: None,
+    }));
+    assert!(r.valid(), "select_tool: {:?}", r.error);
+    assert_eq!(preview.tool().0, other);
+    let at = preview.pose().expect("pose");
+    assert!(
+        distance(xyz(&before), xyz(&at)) > 0.02,
+        "the TCP stayed where the old tool put it"
+    );
+
+    let r = preview.preview_jog_l([0.0, 0.0, 0.0, 0.5, 0.0, 0.0], Frame::Trf, 0.5, None);
+    assert!(r.valid(), "the jog previews: {:?}", r.error);
+    let record = preview.plan_record(None);
+    let poses = span_tcp(&record, r.start_row, r.rows);
+    let end = poses.last().expect("the jog has rows");
+    assert!(
+        rotation_angle_deg(&at, end) > 5.0,
+        "the tool barely tilted: {:.1} deg",
+        rotation_angle_deg(&at, end)
+    );
+    let drift = poses
+        .iter()
+        .map(|p| distance(xyz(&at), xyz(p)))
+        .fold(0.0f64, f64::max);
+    assert!(
+        drift < 0.001,
+        "the TCP moved {:.1} mm while the tool tilted about it",
+        drift * 1e3
     );
 }
 

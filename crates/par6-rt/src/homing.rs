@@ -13,7 +13,8 @@
 //!   firmware calibrate / motor homing), `move_to` cubic-Hermite position
 //!   moves, `post_moves`, then the global trailing moves. A failed
 //!   position or home phase fails the sequence. The entire sequence,
-//!   including trailing moves, fails and stops after 90 seconds.
+//!   including trailing moves, fails and stops once it outlasts the sum of
+//!   its parts' own bounds.
 //! - the per-joint FSM: approach (stall = windowed displacement plateau
 //!   AND current-ratio window, both required; hall = trigger/edge with
 //!   the pre-clear guard, on cmd-32 bits dropped at every approach entry
@@ -156,6 +157,10 @@ pub struct HomerParams {
     pub preclear_ticks: u32,
     pub in_pos_streak: u32,
     pub pre_post_timeout: u32,
+    /// The longest the post-home move can take: the profile sized for the
+    /// joint's whole hard range at its post-home speed \[ticks\]; 0 when it
+    /// has none.
+    pub post_ticks: u32,
     pub normal_vel_limit: f32,
     pub normal_ilim: f32,
     pub dt: f64,
@@ -223,6 +228,7 @@ impl HomerParams {
             preclear_ticks: ticks(PRECLEAR_GUARD_S),
             in_pos_streak: ticks(DETECT_WINDOW_S).max(1),
             pre_post_timeout: ticks(PRE_POST_TIMEOUT_S).max(1),
+            post_ticks: 0,
             normal_vel_limit: normal_vel_limit as f32,
             normal_ilim: normal_ilim as f32,
             dt,
@@ -887,14 +893,25 @@ impl HomingSystem {
         let dt = robot.robot.tick_dt_s;
         let ticks = |s: f64| (s / dt).round() as u32;
         let params: [HomerParams; MAX_JOINTS] = std::array::from_fn(|i| {
-            HomerParams::from_config(
-                robot.joints[i].node_id,
-                &robot.homing.joints[i],
-                robot.homing.joints[i].seek_timeout_s(&robot.joints[i]),
-                robot.joints[i].velocity_limit_ticks_s,
-                robot.joints[i].ilim_ma,
+            let (joint, jh) = (&robot.joints[i], &robot.homing.joints[i]);
+            let mut p = HomerParams::from_config(
+                joint.node_id,
+                jh,
+                jh.seek_timeout_s(joint),
+                joint.velocity_limit_ticks_s,
+                joint.ilim_ma,
                 dt,
-            )
+            );
+            // The post move's span is sized at its start (peak tangent
+            // 1.5·d/span at the post-home speed), from at most the whole range.
+            if let Some(post) = &jh.post_home {
+                let ticks_per_rad = f64::from(1u32 << joint.encoder_bits) / std::f64::consts::TAU
+                    * joint.gear_ratio;
+                let range = (joint.limits.hard_max_rad - joint.limits.hard_min_rad) * ticks_per_rad;
+                p.post_ticks =
+                    ((1.5 * range / post.speed_ticks_s.abs().max(1.0)) / dt).ceil() as u32;
+            }
+            p
         });
         let active_tool = bundle.active_tool();
         let gripper_driver = active_tool.and_then(|g| g.driver.as_ref());
@@ -982,6 +999,7 @@ impl HomingSystem {
                 p.pause_ticks,
                 p.settle_ticks,
                 p.release.map_or(0, |r| r.dur_ticks),
+                p.post_ticks,
                 p.pre_post_timeout,
             ]
             .into_iter()

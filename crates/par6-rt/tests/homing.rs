@@ -144,8 +144,18 @@ fn a_home_after_a_tool_change_homes_as_the_tool_now_fitted() {
     let booted = home(&mut core, &mut handles, &tx);
 
     let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&driven);
+    for _ in 0..10 {
+        core.tick(core.tick_dt_s(), false);
+    }
+    let before = handles.snapshots.latest().q[4];
     core.set_gripper_tool(Some(&flange), driven.robot.bus.gripper_node, 1);
     core.set_tool_home_offset(4, flanged.effective_home_offset(4).expect("J4 offset"));
+    core.tick(core.tick_dt_s(), false);
+    assert_eq!(
+        handles.snapshots.latest().q[4],
+        before,
+        "the encoder reads the same angle whatever tool is bolted on"
+    );
     let changed = home(&mut core, &mut handles, &tx);
 
     assert_eq!(
@@ -158,6 +168,61 @@ fn a_home_after_a_tool_change_homes_as_the_tool_now_fitted() {
         changed.1,
         booted.1
     );
+}
+
+/// A driven tool taken off leaves nothing reading on its node, whichever
+/// tick the change lands on: a reply in flight as the jaw came off is not
+/// a reading of anything on the arm, and with no poll after it would read
+/// on forever.
+#[test]
+fn a_removed_jaw_leaves_no_reading_behind() {
+    let driven = common::bundle();
+    let jaw = driven.active_tool().expect("the shipped tool").clone();
+    assert!(
+        jaw.driver.is_some(),
+        "the premise: the shipped tool is driven"
+    );
+    let mut flanged = driven.clone();
+    flanged.robot.robot.active_tool = "Flange".to_owned();
+    let flange = flanged.active_tool().expect("the flange").clone();
+    let gnode = driven.robot.bus.gripper_node;
+    let node = usize::from(gnode);
+    let (mut core, handles, _tx, _line) = sim_core_with_bundle(&driven);
+    let dt = core.tick_dt_s();
+    let mut reads = handles.snapshots;
+    let mut tick = |core: &mut RtCore<SimBus>| {
+        core.tick(dt, false);
+        reads.latest().nodes
+    };
+    // Every phase of the telemetry round, so one of them catches a reply
+    // in flight.
+    for phase in 0..2 * par6_bus::MAX_NODES {
+        core.set_gripper_tool(Some(&jaw), gnode, 1);
+        let reported = (0..500).any(|_| tick(&mut core)[node].temperature_c.is_some());
+        assert!(reported, "the fitted jaw never reported a temperature");
+        for _ in 0..phase {
+            tick(&mut core);
+        }
+        core.set_gripper_tool(Some(&flange), gnode, 1);
+        for _ in 0..50 {
+            tick(&mut core);
+        }
+        let nodes = tick(&mut core);
+        let left = nodes[node];
+        assert!(
+            left.temperature_c.is_none()
+                && left.current_ma.is_none()
+                && left.voltage_mv.is_none()
+                && left.error_flags.is_none(),
+            "phase {phase}: the removed jaw still reads {left:?}"
+        );
+        assert!(
+            nodes[usize::from(driven.robot.joints[0].node_id)]
+                .temperature_c
+                .is_some(),
+            "phase {phase}: the arm's drives stopped reporting"
+        );
+    }
 }
 
 #[test]

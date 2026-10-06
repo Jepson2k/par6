@@ -711,7 +711,8 @@ pub fn load_collision(
 /// The model a payload estimation measures against — the arm with its
 /// fitted gripper, the collision world the wrist swing is planned in,
 /// and the joint window — from the config the daemon runs, resolved the
-/// way the daemon resolves it.
+/// way the daemon resolves it, fitted with `tool` (the one the runtime has
+/// fitted now) when given.
 ///
 /// `package_dir` is where `package://` mesh URIs resolve when the assets
 /// tree is the installed Python package's `_data` rather than a repo
@@ -720,10 +721,11 @@ pub fn estimation_model(
     config: Option<&Path>,
     assets: Option<&Path>,
     package_dir: Option<&Path>,
+    tool: Option<&str>,
 ) -> Result<crate::calibrate::EstimationModel, String> {
     let config_path = crate::options::resolve_config_path(config)?;
     let (bundle, _) =
-        crate::options::load_config(&config_path, None, None).map_err(|e| e.to_string())?;
+        crate::options::load_config(&config_path, None, tool).map_err(|e| e.to_string())?;
     let robot = &bundle.robot;
     let assets_dir = resolve_assets_dir(assets, &config_path)?;
     let gripper = bundle.active_tool();

@@ -518,6 +518,9 @@ pub struct RtCore<B: DriverBus> {
 
     // Seams.
     gravity: Box<dyn GravityModel>,
+    /// The declared payload, `(mass, com, inertia)`, as the last
+    /// `SetPayload` gave it.
+    payload: (f64, [f64; 3], Option<[f64; 6]>),
     gravity_scale: [f64; MAX_JOINTS],
     jog: Box<dyn JogEngine>,
     stream: Box<dyn StreamTracker>,
@@ -702,6 +705,8 @@ pub struct RtCore<B: DriverBus> {
     boot_selfcheck_tick: u64,
     /// Tick of the one re-scan that follows a boot-time link cycle.
     rescan_at: Option<u64>,
+    /// The bring-up after a link cycle has run; the rescan judges it next.
+    rescan_configured: bool,
 
     // Opt-in per-phase tick profiler (see `TickProfile`).
     profile_on: bool,
@@ -794,6 +799,7 @@ impl<B: DriverBus> RtCore<B> {
                 ControlMode::Pd => Pack::Pd,
             },
             gravity: hooks.gravity,
+            payload: (0.0, [0.0; 3], None),
             gravity_scale: robot.gravity_scale,
             jog: hooks.jog,
             stream: hooks.stream,
@@ -931,6 +937,7 @@ impl<B: DriverBus> RtCore<B> {
             scan_epoch: 0,
             boot_selfcheck_tick: u64::from(robot.ticks(BOOT_SELFCHECK_S).max(1)),
             rescan_at: None,
+            rescan_configured: false,
             profile_on: false,
             profile: TickProfile::default(),
             writer,
@@ -987,6 +994,10 @@ impl<B: DriverBus> RtCore<B> {
         let dt = self.dt;
         self.boot.tool = gripper.cloned();
         self.bus.fit_tool(&self.boot.robot, gripper);
+        // What the gripper node last said is the old tool's drive talking:
+        // its readings and faults are not the new tool's, or anyone's.
+        self.bus_state.nodes[usize::from(gripper_node)] = par6_bus::NodeState::default();
+        self.bus_state.gripper = par6_bus::GripperState::default();
         self.homing.set_gripper(&self.boot.robot, gripper, dt);
         let driver = gripper.and_then(|g| g.driver.as_ref());
         // Whether there is a gripper node to keep fresh, drive and settle
@@ -1055,12 +1066,15 @@ impl<B: DriverBus> RtCore<B> {
         )?;
         self.bus = bus;
         self.bus_state = BusState::new();
+        // Bus-off events counted on the old bus are no fault of the new one.
+        self.bus_off_events_seen = self.bus.link_health().bus_off_events;
         self.sector_done = [false; MAX_JOINTS];
         self.filters_seeded = false;
         self.bus_booted_at = self.tick;
         self.config_repush_armed_at = self.tick;
         self.link_recovered = false;
         self.rescan_at = None;
+        self.rescan_configured = false;
         self.homed = false;
         self.not_homed_refused = false;
         self.mode = Mode::Booting;
@@ -1157,7 +1171,11 @@ impl<B: DriverBus> RtCore<B> {
     /// A different tool is a different load on every gravity-loaded joint,
     /// so the feedforward has to come from a model built for it. Applied
     /// off-tick through a `CoreOp`, like every other core mutation.
-    pub fn set_gravity(&mut self, gravity: Box<dyn GravityModel>) {
+    pub fn set_gravity(&mut self, mut gravity: Box<dyn GravityModel>) {
+        // The declared payload is the RT's to keep: a model built elsewhere
+        // may predate the latest one.
+        let (mass, com, inertia) = self.payload;
+        gravity.set_payload(mass, com, inertia);
         self.gravity = gravity;
     }
 
@@ -1167,28 +1185,13 @@ impl<B: DriverBus> RtCore<B> {
         self.fk = fk;
     }
 
-    /// Re-base one joint's home OFFSET for a tool change, keeping the
-    /// reference tick homing latched.
-    ///
-    /// A tool-dependent home offset means the same encoder reading is a
-    /// different joint angle under a different tool. The arm has not
-    /// moved, so the reading stands and only its interpretation changes;
-    /// the cached mirrors are refreshed from the live reading under the
-    /// new mapping, and the next home latches against the new offset. The
-    /// caller re-seeds motion targets once it has done every joint —
-    /// leaving them aimed at pre-swap angles would drag the arm to a pose
-    /// that no longer means what it did.
+    /// The home offset the next homing of `joint` latches against, for a
+    /// newly fitted tool. The reference already latched stands: the
+    /// encoder reads the same joint angle whatever is bolted on, and the
+    /// tool only moves where a stop that homes against its body sits.
     pub fn set_tool_home_offset(&mut self, joint: usize, offset_rad: f64) {
-        if joint >= MAX_JOINTS {
-            return;
-        }
-        self.conv[joint].set_home_offset(offset_rad);
-        self.homing.set_home_offset(joint, offset_rad);
-        let ticks = self.bus_state.nodes[usize::from(self.node_of[joint])].position_ticks;
-        if let Some(ticks) = ticks {
-            let rad = self.conv[joint].joint_rad(ticks);
-            self.q[joint] = rad;
-            self.q_filt[joint] = rad;
+        if joint < MAX_JOINTS {
+            self.homing.set_home_offset(joint, offset_rad);
         }
     }
 
@@ -1486,21 +1489,25 @@ impl<B: DriverBus> RtCore<B> {
         // the same config re-sends a backend opened at boot got.
         let since_boot = self.tick - self.bus_booted_at;
         let rescan = self.rescan_at == Some(self.tick);
+        if rescan && !self.rescan_configured {
+            // The boot probes ran against a deaf bus — every node read as
+            // legacy, no kt answered — so the recovered link gets the whole
+            // bring-up again. Blocking, as the boot's own was, while nothing
+            // on the bus is being driven. Judged on the next tick, once the
+            // drain has published what it learned.
+            if let Err(e) = self.bus.boot_configure(
+                &self.boot.robot,
+                self.boot.tool.as_ref(),
+                self.boot.config_repeats,
+            ) {
+                log::error!("the bus bring-up after the link cycle failed: {e}");
+            }
+            self.rescan_configured = true;
+            self.rescan_at = Some(self.tick + 1);
+            return;
+        }
         if since_boot == self.boot_selfcheck_tick || rescan {
             self.rescan_at = None;
-            if rescan {
-                // The boot probes ran against a deaf bus — every node read
-                // as legacy, no kt answered — so the recovered link gets
-                // the whole bring-up again. Blocking, as the boot's own
-                // was, while nothing on the bus is being driven.
-                if let Err(e) = self.bus.boot_configure(
-                    &self.boot.robot,
-                    self.boot.tool.as_ref(),
-                    self.boot.config_repeats,
-                ) {
-                    log::error!("the bus bring-up after the link cycle failed: {e}");
-                }
-            }
             let connected = self.bus.connected_nodes();
             let arm_mask: u16 = self
                 .node_of
@@ -1765,6 +1772,7 @@ impl<B: DriverBus> RtCore<B> {
                 }
             }
             RtCommand::SetPayload { mass, com, inertia } => {
+                self.payload = (mass, com, inertia);
                 self.gravity.set_payload(mass, com, inertia);
             }
             RtCommand::WriteIo { port, value } => self.set_io_output(port, value),
@@ -2119,6 +2127,18 @@ impl<B: DriverBus> RtCore<B> {
                     log::warn!("bus RX drain failed: {e} (+{n} suppressed)");
                 }
             }
+        }
+        if !self.has_can_gripper {
+            // No driven tool is fitted, so whatever answers on its node — a
+            // reply in flight as the jaw came off, or a drive nothing here
+            // drives — reads nothing on the arm. Which tool it says it is
+            // stays: that is how the tool on the arm is known.
+            let node = &mut self.bus_state.nodes[usize::from(self.gripper_node)];
+            *node = par6_bus::NodeState {
+                device_info: node.device_info,
+                ..Default::default()
+            };
+            self.bus_state.gripper = par6_bus::GripperState::default();
         }
         for i in 0..MAX_JOINTS {
             let node = &self.bus_state.nodes[usize::from(self.node_of[i])];
@@ -2896,6 +2916,7 @@ impl<B: DriverBus> RtCore<B> {
         s.tau_commanded = self.mirror.tau;
         s.gravity_comp = gravity_applied;
         s.bus_nodes = self.bus.connected_nodes();
+        s.bus_simulated = self.bus.simulated();
         s.bus_scan_epoch = self.scan_epoch;
         s.tick_profile = self.profile;
         s.q_target = self.q_target;

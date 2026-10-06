@@ -81,8 +81,9 @@ impl<B: DriverBus> RtCore<B> {
 
     /// Deliberate exit path, run ONCE after the final `run()` returns on
     /// process shutdown (not on the op-application breaks): the
-    /// configured retreat to the rest pose (off unless `[shutdown]
-    /// safe_park` asks for it; its timeout logs and moves on), then halt
+    /// configured retreat to the rest pose (`[shutdown] safe_park`, on by
+    /// default; a joint-space move with no keep-out or contact check, and
+    /// its timeout logs and moves on), then halt
     /// to IDLE and tick until the arm measures at rest (bounded by
     /// [`SHUTDOWN_SETTLE_BUDGET_S`]), then one SAFETY_STOP tick so the
     /// last frame on the bus idles the drives on purpose. In FLASHING

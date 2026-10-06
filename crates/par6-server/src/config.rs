@@ -110,6 +110,13 @@ pub struct ServerConfig {
     /// ceilings its configuration declares. Empty = a runtime with no
     /// tunable drives, and every `set_pid_gains` is refused.
     pub tunable_nodes: Vec<TunableNode>,
+    /// Each driven tool's drive on the gripper node, by tool key: what
+    /// [`fit_tool`](Self::fit_tool) puts in
+    /// [`tunable_nodes`](Self::tunable_nodes) for it.
+    pub tool_drives: Vec<(String, TunableNode)>,
+    /// The `can_tool_id`s the configured tools carry: what `set_tool_id`
+    /// may provision a drive with.
+    pub tool_ids: Vec<u8>,
     /// Motion profile names (`select_profile` validation).
     pub profiles: Vec<String>,
     /// Profile active at startup (and after `reset_state`).
@@ -209,6 +216,8 @@ impl Default for ServerConfig {
             cartesian: true,
             digital_outputs: Vec::new(),
             tunable_nodes: Vec::new(),
+            tool_drives: Vec::new(),
+            tool_ids: Vec::new(),
             profiles: vec!["default".to_owned()],
             initial_profile: "default".to_owned(),
             joint_hard_limits_deg: [(f64::NEG_INFINITY, f64::INFINITY); NUM_JOINTS],
@@ -237,6 +246,13 @@ impl ServerConfig {
                 .iter()
                 .any(|t| t.eq_ignore_ascii_case(&tool)),
         );
+        // The gripper node is the tool's drive: its ceilings, or none.
+        let drives = &self.tool_drives;
+        self.tunable_nodes
+            .retain(|n| !drives.iter().any(|(_, d)| d.node == n.node));
+        if let Some((_, drive)) = drives.iter().find(|(t, _)| t.eq_ignore_ascii_case(&tool)) {
+            self.tunable_nodes.push(*drive);
+        }
         self.fitted_tool.clone_from(&tool);
         tool
     }

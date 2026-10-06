@@ -582,8 +582,15 @@ impl CoreClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
         let cache = Arc::clone(&self.estimation);
-        let key = format!("{config:?}|{assets:?}|{package_dir:?}");
         future_into_py(py, async move {
+            // The tool the runtime has fitted now, which a select_tool may
+            // have changed since it booted: its mass is no payload.
+            let tool = match client.tools().await {
+                Ok(par6_proto::QueryResult::Tools { tool, .. }) if !tool.is_empty() => Some(tool),
+                Ok(_) => None,
+                Err(e) => return Err(PyRuntimeError::new_err(format!("tools: {e}"))),
+            };
+            let key = format!("{config:?}|{assets:?}|{package_dir:?}|{tool:?}");
             let mut slot = cache.lock().await;
             if !matches!(&*slot, Some((k, _)) if *k == key) {
                 // Off the async thread: this parses the URDF and builds the
@@ -594,6 +601,7 @@ impl CoreClient {
                         config.as_deref().map(std::path::Path::new),
                         assets.as_deref().map(std::path::Path::new),
                         package_dir.as_deref().map(std::path::Path::new),
+                        tool.as_deref(),
                     )
                 })
                 .await

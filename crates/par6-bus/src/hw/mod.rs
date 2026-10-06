@@ -69,6 +69,11 @@ pub use link::OpenError;
 /// application plane.
 const SILENT_RX_CAP: usize = 64;
 
+/// Combined telemetry polls a drive may leave unanswered in a row before it
+/// is polled the vendor way: past a dropped frame or two, short of a fault
+/// going unseen for long.
+const TELEMETRY_FALLBACK_POLLS: u8 = 3;
+
 /// SocketCAN [`DriverBus`] backend. Build with [`SocketCanBus::open`],
 /// then [`DriverBus::boot_configure`] before any per-tick call.
 #[derive(Debug)]
@@ -104,6 +109,8 @@ pub struct SocketCanBus {
     // Per-tick bookkeeping.
     fresh: FreshnessClock,
     poll: PollScheduler,
+    /// Combined telemetry polls each node has left unanswered in a row.
+    telemetry_unanswered: [u8; MAX_NODES],
     rx_cap: usize,
     config_pace: Duration,
     silent: bool,
@@ -161,6 +168,7 @@ impl SocketCanBus {
             tick_start: SystemTime::now(),
             fresh: FreshnessClock::default(),
             poll: PollScheduler::default(),
+            telemetry_unanswered: [0; MAX_NODES],
             rx_cap: 32,
             config_pace: Duration::from_micros(500),
             silent: false,
@@ -278,6 +286,9 @@ impl SocketCanBus {
         let node = match decode_frame(frame) {
             Ok(d) => {
                 state.nodes[usize::from(d.node)].live_error_bit = d.err_bit;
+                if matches!(d.payload, Payload::Telemetry { .. }) {
+                    self.telemetry_unanswered[usize::from(d.node)] = 0;
+                }
                 match d.payload {
                     Payload::Capture {
                         channel,
@@ -305,6 +316,13 @@ impl SocketCanBus {
         self.connected |= 1 << n;
         if self.fresh.mark(node, self.tick, booted) {
             state.reconnected_mask |= 1 << n;
+            // A drive back from a silence may be back on other firmware
+            // (a flash): it is asked the combined way again, and falls back
+            // below if it does not answer that.
+            if let Some(target) = self.poll_nodes.iter().position(|p| *p == node) {
+                self.poll.set_legacy(target, false);
+                self.telemetry_unanswered[n] = 0;
+            }
         }
         let (_, raw_cmd, _) = unpack_can_id(frame.id);
         if raw_cmd == CommandId::RespondGripperData.raw() {
@@ -360,10 +378,12 @@ impl SocketCanBus {
                 Ok(Some((frame, _))) => {
                     let (node, ..) = unpack_can_id(frame.id);
                     self.connected |= 1 << u16::from(node);
-                    // Boot replies precede the first tick; they enter the
-                    // freshness clock at tick 0 so a node that answers
-                    // boot and then dies latches like any other.
-                    self.fresh.mark(node, 0, true);
+                    // Boot replies enter the freshness clock at the tick
+                    // the bring-up runs on (0 at boot, later after a link
+                    // cycle), so a node that answers it and then dies
+                    // latches like any other, and one that answers a late
+                    // bring-up is not already old.
+                    self.fresh.mark(node, self.tick, true);
                     if let Ok(d) = decode_frame(&frame) {
                         apply_payload(&d, &mut self.boot_state);
                         self.boot_state_pending = true;
@@ -588,8 +608,16 @@ fn apply_payload(decoded: &DecodedFrame, state: &mut BusState) {
 }
 
 impl DriverBus for SocketCanBus {
-    fn fit_tool(&mut self, _robot: &RobotConfig, _tool: Option<&ToolConfig>) {
-        self.fresh.refit_gripper(self.gripper_node, self.tick);
+    fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>) {
+        let node = self.gripper_node;
+        self.fresh.refit_gripper(node, self.tick);
+        // The configuration stored for the gripper node is the tool's drive:
+        // what a retune starts from and a reconnect resends, or none.
+        self.node_configs.retain(|c| c.node != node);
+        if let Some(d) = tool.and_then(|g| g.driver.as_ref()) {
+            self.node_configs
+                .push(NodeConfig::gripper(node, d, robot.bus.watchdog_action));
+        }
     }
 
     fn begin_tick(&mut self, tick: u64) {
@@ -725,6 +753,22 @@ impl DriverBus for SocketCanBus {
             }
             PollStep::Poll { target, kind } => {
                 let node = self.poll_nodes[target];
+                if kind == PollKind::Telemetry {
+                    // A drive that stopped answering the combined poll —
+                    // reflashed to vendor firmware while the runtime ran —
+                    // still answers the vendor's three, and its faults
+                    // only reach the error flags through them.
+                    let missed = &mut self.telemetry_unanswered[usize::from(node)];
+                    *missed = missed.saturating_add(1);
+                    if *missed > TELEMETRY_FALLBACK_POLLS {
+                        *missed = 0;
+                        self.poll.set_legacy(target, true);
+                        log::warn!(
+                            "node {node}: no combined telemetry reply; polling temperature, \
+                             voltage and errors separately"
+                        );
+                    }
+                }
                 let f = encode_poll(node, kind);
                 self.send(&f)
             }

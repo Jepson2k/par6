@@ -309,11 +309,8 @@ pub(crate) struct PlannerKin {
 }
 
 /// What the planner needs to rebuild its models when the tool changes.
-///
-/// `source` is `None` offline: the preview has no assets tree to reload
-/// from, so it tracks the selected tool without swapping geometry.
 pub(crate) struct PlannerSwap {
-    pub(crate) source: Option<crate::daemon::KinSource>,
+    pub(crate) source: crate::daemon::KinSource,
     pub(crate) bundle: std::sync::Arc<ConfigBundle>,
     pub(crate) tools: crate::bridge::ToolMailbox,
 }
@@ -369,9 +366,14 @@ pub(crate) struct Par6Planner {
     /// Everything a `select_tool` rebuild needs: where the models come
     /// from, the tool registry to look the new one up in, the name in
     /// force, and the drop box the other model owners read.
-    source: Option<crate::daemon::KinSource>,
+    source: crate::daemon::KinSource,
     bundle: std::sync::Arc<ConfigBundle>,
+    /// A tool swap just made, for the command plane to follow.
+    tool_change: Option<(String, Option<String>)>,
     fitted_tool: String,
+    /// The tool id the gripper drive last reported, acted on once: a report
+    /// no tool can be fitted for is logged once, not every pass.
+    drive_tool_seen: u8,
     tools: crate::bridge::ToolMailbox,
 }
 
@@ -396,9 +398,8 @@ impl Par6Planner {
     /// which is when `select_tool` completes — STATUS reports the new TCP
     /// from then on. `None` means there was nothing to swap. The other
     /// owners take theirs from the mailbox at their own next safe point.
-    /// Home offsets are re-based in place: the endstop the arm latched has
-    /// not moved, only what that reading means, so this is arithmetic
-    /// rather than a re-home.
+    /// A tool-dependent home offset is the next home's to latch against;
+    /// the reference already latched stands.
     fn adopt_tool(&mut self, name: &str) -> Result<Option<Arc<AtomicBool>>, WireError> {
         if name.eq_ignore_ascii_case(&self.fitted_tool) {
             return Ok(None);
@@ -418,13 +419,37 @@ impl Par6Planner {
         else {
             return Err(refused(format!("no tool named '{name}'")));
         };
-        let Some(source) = self.source.as_ref() else {
-            // Offline: no assets tree to rebuild from, so track the
-            // selection without pretending the geometry changed.
-            self.fitted_tool.clone_from(&gripper.name);
-            return Ok(None);
-        };
-        let source = source.for_gripper(Some(gripper));
+        // A provisioned drive reports the tool it was set up for: that is
+        // the tool on the arm, and modelling another — a frontend syncing its
+        // own selection, say — would run the gravity and the keep-outs of a
+        // tool that is not there.
+        let snap = self.snapshots.latest();
+        if !snap.bus_simulated {
+            let node = self.bundle.robot.bus.gripper_node;
+            let info = snap.nodes[usize::from(node)].device_info;
+            // A drive answering on the gripper node that has not said which
+            // tool it is yet — just after the last change — is asked again
+            // before another is fitted on its word.
+            if info.is_none() && snap.bus_nodes & (1 << u16::from(node)) != 0 {
+                return Err(refused(
+                    "the gripper drive has not reported which tool it is yet; select again in \
+                     a moment"
+                        .to_owned(),
+                ));
+            }
+            let reported = info
+                .map(|d| d.tool_id)
+                .filter(|id| *id != 0)
+                .and_then(|id| self.bundle.tool_by_can_id(id).map(|t| (id, t.name.clone())));
+            if let Some((id, on_arm)) = reported.filter(|(_, n)| *n != gripper.name) {
+                return Err(refused(format!(
+                    "the gripper drive reports tool id {id}, `{on_arm}`: that is the tool on \
+                     the arm; select it, or provision the drive with `par6 tool-id` after \
+                     changing the tool"
+                )));
+            }
+        }
+        let source = self.source.for_gripper(Some(gripper));
         let rebuilt = (|| {
             Ok::<_, crate::daemon::DaemonError>((
                 source.cart_kin(&self.tool_offset)?,
@@ -437,8 +462,14 @@ impl Par6Planner {
                 source.kin_fk(&self.tool_offset)?,
             ))
         })();
-        let (planner, bridge, housekeeping, mut collision, gate_collision, mut gravity, fk) =
+        let (mut planner, bridge, housekeeping, mut collision, gate_collision, mut gravity, fk) =
             rebuilt.map_err(|e| refused(format!("cannot load tool '{name}': {e}")))?;
+        // The declared payload is held in the new tool's jaws as it was in
+        // the old one's (the RT puts its own copy on its new model).
+        let payload = self.payload;
+        planner
+            .set_tool(payload.mass, payload.com, payload.inertia)
+            .map_err(|e| refused(format!("tool '{name}': the payload does not apply: {e}")))?;
         collision
             .adopt_layers(&self.collision)
             .map_err(|e| refused(format!("tool '{name}': the keep-outs do not apply: {e}")))?;
@@ -474,9 +505,6 @@ impl Par6Planner {
             for (j, offset) in offsets {
                 core.set_tool_home_offset(j, offset);
             }
-            // The targets every mode holds are joint angles, and the
-            // angles just moved under them.
-            core.reseed_motion_targets();
             raised.store(true, Ordering::Release);
         }));
         if let Ok(mut swap) = self.tools.lock() {
@@ -493,6 +521,49 @@ impl Par6Planner {
         self.fitted_tool.clone_from(&gripper.name);
         log::info!("select_tool: now running '{name}'");
         Ok(Some(applied))
+    }
+
+    /// The gripper drive is the authority on which tool is on the arm. A
+    /// drive the daemon's boot probe could not hear — the link came back
+    /// only after a recovery — gets its tool fitted here instead, as the
+    /// daemon would have, once the arm is at rest.
+    fn follow_drive_tool(&mut self, snap: &StateSnapshot) {
+        if snap.bus_simulated
+            || self.inflight.is_some()
+            || !matches!(snap.mode, Mode::Idle | Mode::Booting)
+        {
+            return;
+        }
+        let node = self.bundle.robot.bus.gripper_node;
+        let Some(id) = snap.nodes[usize::from(node)]
+            .device_info
+            .map(|d| d.tool_id)
+            .filter(|id| *id != 0 && *id != self.drive_tool_seen)
+        else {
+            return;
+        };
+        self.drive_tool_seen = id;
+        let Some(name) = self.bundle.tool_by_can_id(id).map(|t| t.name.clone()) else {
+            log::error!(
+                "gripper node {node} reports tool id {id}, which no configured tool carries \
+                 (can_tool_id); add it to that tool's config, or provision the drive with \
+                 `par6 tool-id`"
+            );
+            return;
+        };
+        let was = self.fitted_tool.clone();
+        match self.adopt_tool(&name) {
+            Ok(Some(_)) => {
+                log::info!(
+                    "gripper node {node} reports tool id {id}: fitting `{name}` in place of `{was}`"
+                );
+                self.tool_change = Some((self.fitted_tool.clone(), None));
+            }
+            Ok(None) => {}
+            Err(e) => log::error!(
+                "gripper node {node} reports tool `{name}`, which cannot be fitted: {e}"
+            ),
+        }
     }
 
     pub(crate) fn new(
@@ -556,7 +627,9 @@ impl Par6Planner {
             invalidated: None,
             motion,
             source: swap.source,
+            tool_change: None,
             fitted_tool: swap.bundle.robot.robot.active_tool.clone(),
+            drive_tool_seen: 0,
             tools: swap.tools,
             bundle: swap.bundle,
             payload: par6_server::PayloadSpec::default(),
@@ -1787,7 +1860,10 @@ impl Par6Planner {
                 }
             }
             Command::SelectTool(p) => match self.adopt_tool(&p.tool_name)? {
-                Some(applied) => InFlightKind::ToolSwap { applied },
+                Some(applied) => {
+                    self.tool_change = Some((self.fitted_tool.clone(), p.variant_key.clone()));
+                    InFlightKind::ToolSwap { applied }
+                }
                 None => InFlightKind::Instant,
             },
             Command::Checkpoint(_)
@@ -2437,6 +2513,7 @@ impl Planner for Par6Planner {
             self.pump_ring();
         } else {
             self.update_enablement(&snap);
+            self.follow_drive_tool(&snap);
         }
         if let Some(out) = self.invalidated.take() {
             return Some(out);
@@ -2576,6 +2653,10 @@ impl Planner for Par6Planner {
 
     fn warnings(&self) -> Vec<WireError> {
         self.near_singularity.iter().cloned().collect()
+    }
+
+    fn take_fitted_tool(&mut self) -> Option<(String, Option<String>)> {
+        self.tool_change.take()
     }
 
     fn sync(&mut self, ctx: PlanContext<'_>) {
@@ -2898,4 +2979,136 @@ fn rt_error(snap: &StateSnapshot) -> WireError {
             &[("detail", "the RT core latched a hard error")],
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use par6_rt::{sample_ring, snapshot_channel, RtCommand, SampleConsumer, SnapshotWriter};
+    use std::sync::mpsc;
+
+    /// A planner on the shipped config, and the ends that see what it does:
+    /// the snapshot it reads, and the mailbox its rebuilt models land in.
+    struct Rig {
+        p: Par6Planner,
+        snap_w: SnapshotWriter<StateSnapshot>,
+        tools: crate::bridge::ToolMailbox,
+        ops: mpsc::Receiver<crate::bridge::CoreOp>,
+        _cmds: mpsc::Receiver<RtCommand>,
+        _ring: SampleConsumer,
+    }
+
+    fn rig() -> Rig {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+        let bundle = ConfigBundle::load(&path).expect("config");
+        let opts = crate::Options {
+            sim: true,
+            config: Some(path.clone()),
+            ..Default::default()
+        };
+        let stack =
+            crate::daemon::load_kin_stack(&opts, &path, &bundle.robot, bundle.active_tool())
+                .expect("kinematics");
+        let (cmds_tx, cmds_rx) = mpsc::channel();
+        let (ops_tx, ops_rx) = mpsc::channel();
+        let (producer, ring) = sample_ring(64);
+        let (snap_w, snap_r) = snapshot_channel::<StateSnapshot>();
+        let tools = crate::bridge::ToolMailbox::default();
+        let planner = Par6Planner::new(
+            CoreLink::new(cmds_tx, ops_tx, Arc::new(AtomicBool::new(false))),
+            producer,
+            ExecHeartbeat::unmonitored(),
+            snap_r,
+            &bundle,
+            PlannerKin {
+                kin: stack.planner,
+                collision: stack.collision,
+                tool_offset: stack.tool_offset,
+            },
+            PlannerSwap {
+                source: stack.source,
+                bundle: Arc::new(bundle.clone()),
+                tools: Arc::clone(&tools),
+            },
+        )
+        .expect("planner");
+        Rig {
+            p: planner,
+            snap_w,
+            tools,
+            ops: ops_rx,
+            _cmds: cmds_rx,
+            _ring: ring,
+        }
+    }
+
+    /// An idle arm whose gripper drive, on `node`, reports `tool_id`.
+    fn reporting(node: u8, tool_id: u8, simulated: bool) -> StateSnapshot {
+        let mut snap = StateSnapshot {
+            mode: Mode::Idle,
+            bus_simulated: simulated,
+            bus_nodes: 1 << u16::from(node),
+            ..Default::default()
+        };
+        snap.nodes[usize::from(node)].device_info = Some(par6_bus::DeviceInfo {
+            tool_id,
+            ..Default::default()
+        });
+        snap
+    }
+
+    /// A drive heard only after the boot probe — a link that came back on
+    /// recovery — reporting another tool than the one fitted has that tool
+    /// fitted, with every model rebuilt for it. The simulator's drive
+    /// reports whatever the bundle fitted, and is not followed.
+    #[test]
+    fn the_tool_the_gripper_drive_reports_is_fitted() {
+        let Rig {
+            mut p,
+            mut snap_w,
+            tools,
+            ops,
+            ..
+        } = rig();
+        let fitted = p.fitted_tool.clone();
+        let other = p
+            .bundle
+            .tools
+            .iter()
+            .find(|t| t.can_tool_id.is_some() && t.name != fitted)
+            .expect("a second keyed tool")
+            .clone();
+        let fitted_id = p
+            .bundle
+            .tools
+            .iter()
+            .find(|t| t.name == fitted)
+            .and_then(|t| t.can_tool_id)
+            .expect("the shipped tool is keyed");
+        let id = other.can_tool_id.unwrap();
+        let node = p.bundle.robot.bus.gripper_node;
+
+        for (snap, what) in [
+            (reporting(node, fitted_id, false), "the fitted tool"),
+            (reporting(node, id, true), "a simulated drive"),
+        ] {
+            snap_w.publish(&snap);
+            let _ = p.poll();
+            assert_eq!(p.take_fitted_tool(), None, "{what} changed the tool");
+            assert_eq!(p.fitted_tool, fitted, "{what} changed the tool");
+        }
+
+        snap_w.publish(&reporting(node, id, false));
+        let _ = p.poll();
+        assert_eq!(p.take_fitted_tool(), Some((other.name.clone(), None)));
+        assert_eq!(p.fitted_tool, other.name);
+        let swap = tools.lock().unwrap();
+        assert!(
+            swap.bridge.is_some() && swap.housekeeping.is_some() && swap.gate_collision.is_some(),
+            "the other model owners were not handed the new tool's models"
+        );
+        drop(swap);
+        assert!(ops.try_recv().is_ok(), "the RT models were not swapped");
+    }
 }

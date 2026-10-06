@@ -1358,8 +1358,9 @@ fn streaming_is_gated_by_the_collision_world() {
         })
     };
     let toward_l = jog_l([toward[0], toward[1], 0.0, 0.0, 0.0, 0.0]);
-    // Held, or let go the moment it is refused: a release while the refusal
-    // is still putting the arm down must not take the arm away from it.
+    // Held, or let go the moment it is refused. Held, the refusal puts the
+    // arm on the standoff; let go, it stops where its brake leaves it — never
+    // inside the clearance, and with no approach nobody is asking for.
     let held = [
         ("jog_j at 10 %", jog_j(0, 0.1, 0.2), None),
         ("jog_j at full speed", jog_j(0, 1.0, 0.2), None),
@@ -1384,6 +1385,12 @@ fn streaming_is_gated_by_the_collision_world() {
         // whichever mode the placement left the arm.
         let (mut closest, mut still_since, mut latched) = (f64::INFINITY, None, None);
         let (mut closest_at, mut closest_mode) = (0, ControllerMode::Idle);
+        // Handed to IDLE while still moving: the drop out of a refusal's
+        // control that lets the arm coast where it will. Above an encoder
+        // count a tick, which on the base alone reads 0.056 rad/s.
+        let mut coasting = None;
+        // Where the refusal's brake first left it at rest.
+        let mut brake_rest = None;
         let mut first_ns: Option<u64> = None;
         let deadline = Instant::now() + 2 * BUDGET;
         let s = loop {
@@ -1407,7 +1414,16 @@ fn streaming_is_gated_by_the_collision_world() {
             if latched.is_none() && s.collision_active {
                 latched = Some(s.collision_pairs.clone());
             }
+            if latched.is_some()
+                && s.mode == ControllerMode::Idle
+                && s.speeds.iter().any(|v| v.abs() > 0.1)
+            {
+                coasting.get_or_insert(s.speeds);
+            }
             let still = latched.is_some() && s.speeds.iter().all(|v| v.abs() < 0.01);
+            if still && brake_rest.is_none() {
+                brake_rest = Some(gap);
+            }
             still_since = if still {
                 still_since.or(Some(s.mono_time_ns))
             } else {
@@ -1432,11 +1448,109 @@ fn streaming_is_gated_by_the_collision_world() {
             closest_at as f64 * 1e-9
         );
         assert!(
-            rest <= clearance_mm + 5.0,
-            "{what}: rests {rest:.1} mm from the keep-out, more than 5 mm out of its \
-             {clearance_mm:.0} mm clearance"
+            coasting.is_none(),
+            "{what}: dropped into IDLE moving at {coasting:?} rad/s"
         );
+        if release.is_none() {
+            assert!(
+                rest <= clearance_mm + 5.0,
+                "{what}: rests {rest:.1} mm from the keep-out, more than 5 mm out of its \
+                 {clearance_mm:.0} mm clearance"
+            );
+        } else {
+            // Two millimetres for the drive settling onto where it stopped.
+            assert!(
+                rest - closest < 2.0,
+                "{what}: came {closest:.1} mm from the keep-out and then back to {rest:.1} mm, \
+                 rather than resting where its brake left it"
+            );
+            // Braked well short of the clearance, it was let go of long
+            // before a placement could have put it there.
+            if let Some(braked) = brake_rest.filter(|b| *b > clearance_mm + 50.0) {
+                assert!(
+                    rest > clearance_mm + 5.0,
+                    "{what}: braked {braked:.1} mm from the keep-out and let go of, it was \
+                     still carried on to the standoff, {rest:.1} mm from it"
+                );
+            }
+        }
     }
+
+    // --- a keep-out dropped across a placement under way, nothing held:
+    // the arm is stopped and put on the new keep-out's clearance, not
+    // carried on through it toward the standoff it was solved for before.
+    let wall_m = tcp_at_m(with_j0(mid_deg, -0.6 * KEEPOUT_M * deg_per_m));
+    let wall = keepout_at("wall", [wall_m[0] * 1e3, wall_m[1] * 1e3, wall_m[2] * 1e3]);
+    let mut wall_world = keepout_world(wall_m);
+    c.ok(&Command::Reset);
+    enable_and_teleport(&rig, &mut c, start_deg);
+    rig.drain_status();
+    let jog = jog_j(0, 1.0, 0.2);
+    // Until the wall goes down, decided on the newest frame: this loop's
+    // own queries trail the stream, and a stale frame would drop it late.
+    let (mut latched, mut braked) = (false, false);
+    let deadline = Instant::now() + 2 * BUDGET;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the refused jog never set off on its placement"
+        );
+        rig.drain_status();
+        let Some(s) = rig.recv_status() else { continue };
+        c.send(&jog);
+        c.drain();
+        latched |= s.collision_active;
+        braked |= latched && s.speeds.iter().all(|v| v.abs() < 0.01);
+        // Close enough that the placement's own gentle brake would carry
+        // the arm into it, far enough that a full-rate stop does not.
+        let gap = world_gap_m(&mut wall_world, s.angles) * 1e3;
+        if braked && gap < 55.0 {
+            assert!(
+                gap > 35.0,
+                "the premise: the wall goes down ahead of the arm, not {gap:.1} mm from it"
+            );
+            c.ok(&set_shapes(vec![keepout.clone(), wall.clone()]));
+            break;
+        }
+    }
+    let (mut closest, mut still_since, mut link_lost) = (f64::INFINITY, None, false);
+    let s = loop {
+        assert!(
+            Instant::now() < deadline,
+            "a placement under a dropped keep-out never came to rest"
+        );
+        let Some(s) = rig.recv_status() else { continue };
+        c.drain();
+        link_lost |= s
+            .error
+            .as_ref()
+            .is_some_and(|e| e.code == ErrorCode::SysRtiLinkLost as u16);
+        closest = closest.min(world_gap_m(&mut wall_world, s.angles) * 1e3);
+        still_since = if s.speeds.iter().all(|v| v.abs() < 0.01) {
+            still_since.or(Some(s.mono_time_ns))
+        } else {
+            None
+        };
+        if still_since.is_some_and(|t| s.mono_time_ns - t >= 2_000_000_000) {
+            break s;
+        }
+    };
+    let rest = world_gap_m(&mut wall_world, s.angles) * 1e3;
+    assert!(
+        !link_lost,
+        "the placement went unfed and the RT latched a lost stream link"
+    );
+    assert!(
+        closest >= clearance_mm - 1.0,
+        "came within {closest:.1} mm of the keep-out dropped across its placement"
+    );
+    assert!(
+        rest <= clearance_mm + 5.0,
+        "rests {rest:.1} mm from the keep-out dropped across its placement, more than 5 mm \
+         out of its clearance"
+    );
+    c.ok(&Command::Reset);
+    c.ok(&set_shapes(vec![keepout.clone()]));
 
     // --- from inside the keep-out, an escaping jog is permitted, joint
     // or cartesian. Teleport into the box (a keep-out dropped over the

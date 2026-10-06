@@ -40,8 +40,8 @@ pub use homing::{
 };
 pub use io::{IoConfig, IoLine, MAX_IO_LINES};
 pub use overlay::{
-    effective_robot_toml, effective_tool_tomls, local_overlay, LocalOverlay, LOCAL_CONFIG_ENV,
-    LOCAL_CONFIG_NAME,
+    config_fingerprint, effective_robot_toml, effective_tool_tomls, fitted_robot_toml,
+    local_overlay, LocalOverlay, LOCAL_CONFIG_ENV, LOCAL_CONFIG_NAME,
 };
 pub use robot::{
     BusConfig, ControlMode, DriverType, Gains, JogDefaults, JogProfile, JointConfig, JointLimits,

@@ -534,6 +534,8 @@ pub struct StateSnapshot {
     /// Node ids that have answered on the bus this boot (bit per id):
     /// the boot scan plus every frame since, configured or not.
     pub bus_nodes: u16,
+    /// The bus is a simulation (see `DriverBus::simulated`).
+    pub bus_simulated: bool,
     /// Bumped once each `RescanBus` has pinged every id and settled.
     pub bus_scan_epoch: u32,
     /// The opt-in tick profile (all zero unless switched on).
@@ -607,6 +609,7 @@ impl Default for StateSnapshot {
             jog: JogStatus::default(),
             stream: StreamStatus::default(),
             bus_nodes: 0,
+            bus_simulated: false,
             bus_scan_epoch: 0,
             tick_profile: TickProfile::default(),
             io_lines: [0; MAX_IO_LINES],

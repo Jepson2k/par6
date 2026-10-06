@@ -61,6 +61,15 @@ fn local_overlay_from(
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(LOCAL_CONFIG_NAME);
+    // Something there that is not a file is an overlay gone wrong, not an
+    // installation with none: loading the shipped values over it would
+    // drop the arm's own without a word.
+    if beside.exists() && !beside.is_file() {
+        return Err(invalid(
+            "local overlay",
+            format!("{} is not a file", beside.display()),
+        ));
+    }
     Ok(beside.is_file().then_some(beside))
 }
 
@@ -103,9 +112,24 @@ pub(crate) fn layered_table(
     if let Some(local) = local {
         let mut overlay = parse(local)?;
         overlay.remove(TOOLS_KEY);
+        unalias(&mut table);
+        unalias(&mut overlay);
         merge(&mut table, overlay, "").map_err(in_overlay(local))?;
     }
     Ok(table)
+}
+
+/// The old spellings a robot file may still use, as the keys they alias:
+/// merged under two names, an overlay's value would sit beside the shipped
+/// one rather than over it.
+fn unalias(doc: &mut toml::Table) {
+    if let Some(toml::Value::Table(robot)) = doc.get_mut("robot") {
+        if !robot.contains_key("active_tool") {
+            if let Some(tool) = robot.remove("active_gripper") {
+                robot.insert("active_tool".to_owned(), tool);
+            }
+        }
+    }
 }
 
 /// The overlay's `[[tools]]` entries, each naming the tool it changes.
@@ -286,6 +310,42 @@ fn named(array: &[toml::Value]) -> bool {
     array
         .iter()
         .all(|e| e.get("name").is_some_and(toml::Value::is_str))
+}
+
+/// sha256 hex over the robot TOML and each tool file, each hashed as its
+/// file name, a newline, then its content bytes: the CONFIG_INFO
+/// fingerprint.
+pub fn config_fingerprint(
+    robot_filename: &str,
+    robot_toml: &str,
+    tools: &[(String, String)],
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    for (name, content) in std::iter::once((robot_filename, robot_toml))
+        .chain(tools.iter().map(|(n, c)| (n.as_str(), c.as_str())))
+    {
+        hasher.update(name.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(content.as_bytes());
+    }
+    format!("{:x}", hasher.finalize())
+}
+
+/// `robot_toml` naming `tool` as the one fitted, whatever spelling it used
+/// for it, and otherwise as written; `None` when it already does, or is not
+/// a robot TOML.
+pub fn fitted_robot_toml(robot_toml: &str, tool: &str) -> Option<String> {
+    let mut doc = robot_toml.parse::<toml_edit::DocumentMut>().ok()?;
+    let robot = doc.get_mut("robot")?.as_table_like_mut()?;
+    let already = robot.get("active_tool").and_then(|v| v.as_str()) == Some(tool)
+        && robot.get("active_gripper").is_none();
+    if already {
+        return None;
+    }
+    robot.remove("active_gripper");
+    robot.insert("active_tool", toml_edit::value(tool));
+    Some(doc.to_string())
 }
 
 /// A local overlay a tool edits in place — `par6-selfcal --apply` writing

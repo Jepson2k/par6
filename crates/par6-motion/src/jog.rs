@@ -25,6 +25,12 @@ pub const MIN_JERK_FACTOR: f64 = 0.5;
 /// Safety factor on the lookahead stopping distance.
 const STOP_MARGIN: f64 = 1.5;
 
+/// The smallest share of the configured jog acceleration a jog runs at:
+/// the engine and the collision gate's projection of its stop both floor
+/// a client's fraction here, so the gate never projects a shorter stop than
+/// the engine then takes.
+pub const MIN_ACCEL_FRACTION: f64 = 0.01;
+
 /// One joint's jog ramp rates: the acceleration a ramp from rest to
 /// `v_full` over `accel_time_s` needs, capped at the joint's limit, and
 /// `jerk_factor` times that as the jerk \[rad/s², rad/s³\].

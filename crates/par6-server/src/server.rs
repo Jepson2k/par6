@@ -1093,6 +1093,27 @@ impl<R: RtCommands> Core<R> {
                 .map(|()| self.runtime.rt.save_config(p.node)),
             C::SetToolId(p) => self
                 .commissioning_gate(p.node, p.force, "set_tool_id")
+                .and_then(|()| {
+                    // An id no configured tool carries refuses the next boot,
+                    // and another tool's fits that tool: only the ids the
+                    // config knows, or 0 to unprovision, unless forced.
+                    if p.force || p.tool_id == 0 || self.cfg.tool_ids.contains(&p.tool_id) {
+                        Ok(())
+                    } else {
+                        Err(make_error(
+                            ErrorCode::CommValidationError,
+                            UNATTRIBUTED,
+                            &[(
+                                "detail",
+                                &format!(
+                                    "no configured tool carries tool id {}; configured ids {:?} \
+                                     (or 0 to unprovision, or force)",
+                                    p.tool_id, self.cfg.tool_ids
+                                ),
+                            )],
+                        ))
+                    }
+                })
                 .map(|()| self.runtime.rt.set_tool_id(p.node, p.tool_id)),
             C::SetStatusRate(p) => {
                 match status_rate_fault(1.0 / self.cfg.config_info.tick_dt_s, p.hz) {
@@ -1349,8 +1370,12 @@ impl<R: RtCommands> Core<R> {
             _ => {
                 if let Some(superseded) = self.active_stream.take() {
                     // Type change: cancel and flush the stale backlog of
-                    // the previous stream before starting fresh.
-                    self.runtime.rt.cancel_stream();
+                    // the previous stream before starting fresh — unless a
+                    // refusal is still putting the arm down, which owns it
+                    // against a new kind of stream as against the old.
+                    if !self.runtime.rt.refusal_in_progress() {
+                        self.runtime.rt.cancel_stream();
+                    }
                     self.drain_stream_backlog(superseded);
                 }
                 // The setpoint reaches the RT before the cancellations
@@ -1360,9 +1385,13 @@ impl<R: RtCommands> Core<R> {
                 let outcome = self.runtime.rt.stream(&cmd);
                 // A refusal the runtime is still bringing to rest is a
                 // stream too: a move queued behind it cancels it rather
-                // than running while it is put down.
-                if outcome.is_ok() || self.runtime.rt.refusal_in_progress() {
+                // than running while it is put down, and the refusal is
+                // the stream's own, latched as a refused update is.
+                if outcome.is_ok() {
                     self.active_stream = Some(tag);
+                } else if self.runtime.rt.refusal_in_progress() {
+                    self.active_stream = Some(tag);
+                    refused_in_place = true;
                 }
                 self.complete_cancelled("a streaming preemption", dropped)
                     .await;
@@ -1678,7 +1707,7 @@ impl<R: RtCommands> Core<R> {
         // starts, so it waits out a brake: a stop decelerates along the old
         // path and a released jog or stream ramps down, and a plan taken
         // mid-brake would start from where the arm no longer is.
-        if plans_from_pose(head.cmd.tag()) && self.arm_braking() {
+        if waits_for_rest(head.cmd.tag()) && self.arm_braking() {
             return;
         }
         if self.holding_for_blend() {
@@ -1716,6 +1745,7 @@ impl<R: RtCommands> Core<R> {
             PlanEvent::ToolOutcome(out) => self.on_tool_outcome(out).await,
             PlanEvent::ToolStarted { tag, result } => self.on_tool_started(tag, result).await,
             PlanEvent::ShapesApplied { tag, result } => self.on_shapes_applied(tag, result).await,
+            PlanEvent::ToolFitted { tool, variant } => self.adopt_tool_selection(&tool, variant),
         }
     }
 
@@ -1814,25 +1844,7 @@ impl<R: RtCommands> Core<R> {
                     PostEffect::None => {}
                     PostEffect::Checkpoint(label) => self.last_checkpoint = label,
                     PostEffect::SelectTool { tool, variant } => {
-                        // The planner has already swapped the models; this
-                        // is the command plane catching up. STATUS, the
-                        // tool-action gate and every later `select_tool`
-                        // compare against it.
-                        let tool = self.cfg.fit_tool(&tool);
-                        // A different tool, or a different variant of the
-                        // same one, carries its own TCP frame, so an offset
-                        // measured against the old one describes nothing —
-                        // a real change clears it, a re-selection leaves it
-                        // alone (the client API documents the reset, and it
-                        // is what the parol6 runtime does).
-                        if variant != self.tool_variant || tool != self.tool {
-                            self.invalidate_attachments();
-                            self.tcp_offset_mm = [0.0; 3];
-                            self.tcp_rotation_deg = [0.0; 3];
-                        }
-                        self.tool_variant = variant;
-                        self.tool = tool;
-                        self.sync_planner();
+                        self.adopt_tool_selection(&tool, variant);
                     }
                     PostEffect::TcpTransform(v) => {
                         self.tcp_offset_mm = [v[0], v[1], v[2]];
@@ -1894,6 +1906,34 @@ impl<R: RtCommands> Core<R> {
 
     /// Take the active command and the moves blended into its motion —
     /// the commands a cancellation of the running motion drops.
+    /// The command plane catching up with a tool swap the planner has
+    /// already made: STATUS, the tool-action gate and every later
+    /// `select_tool` compare against it.
+    fn adopt_tool_selection(&mut self, tool: &str, variant: Option<String>) {
+        let tool = self.cfg.fit_tool(tool);
+        // The config a client rebuilds from CONFIG_BUNDLE fits the tool the
+        // arm wears now, not the one it booted with.
+        let ci = &mut self.cfg.config_info;
+        if let Some(text) = par6_config::fitted_robot_toml(&ci.robot_toml, &tool) {
+            ci.robot_toml = text;
+            ci.fingerprint =
+                par6_config::config_fingerprint(&ci.robot_filename, &ci.robot_toml, &ci.tools);
+        }
+        // A different tool, or a different variant of the same one, carries
+        // its own TCP frame, so an offset measured against the old one
+        // describes nothing — a real change clears it, a re-selection
+        // leaves it alone (the client API documents the reset, and it is
+        // what the parol6 runtime does).
+        if variant != self.tool_variant || tool != self.tool {
+            self.invalidate_attachments();
+            self.tcp_offset_mm = [0.0; 3];
+            self.tcp_rotation_deg = [0.0; 3];
+        }
+        self.tool_variant = variant;
+        self.tool = tool;
+        self.sync_planner();
+    }
+
     fn drop_active(&mut self) -> Vec<(u64, SocketAddr)> {
         // A head whose plan is still being computed is active motion too.
         // It is not in `executing` yet — the planner has not answered —
@@ -3050,12 +3090,21 @@ impl<R: RtCommands> Core<R> {
 
 // ---- free helpers ----------------------------------------------------------
 
-/// Queued commands the planner plans from the arm's measured pose.
-fn plans_from_pose(cmd: CmdType) -> bool {
+/// Queued commands that wait for the arm to stop braking: the moves the
+/// planner plans from its measured pose, and a tool change, which re-models
+/// the arm under whatever it is doing.
+fn waits_for_rest(cmd: CmdType) -> bool {
     use CmdType as C;
     matches!(
         cmd,
-        C::MoveJ | C::MoveJPose | C::MoveL | C::MoveC | C::MoveS | C::MoveP | C::Home
+        C::MoveJ
+            | C::MoveJPose
+            | C::MoveL
+            | C::MoveC
+            | C::MoveS
+            | C::MoveP
+            | C::Home
+            | C::SelectTool
     )
 }
 

@@ -240,7 +240,7 @@ fn a_payload_fit_charges_nothing_to_the_arms_own_correction() {
     )
     .expect("write the overlay");
     let model = |config: &PathBuf| {
-        par6d::kin::estimation_model(Some(config), Some(&assets_dir()), None)
+        par6d::kin::estimation_model(Some(config), Some(&assets_dir()), None, None)
             .expect("estimation model")
             .kin
     };
@@ -284,7 +284,7 @@ fn planned_poses_keep_their_approach_offsets_inside_the_window() {
     let bundle = par6_config::ConfigBundle::load(&shipped_config()).expect("config");
     let robot = &bundle.robot;
     let mut collision =
-        par6d::kin::estimation_model(Some(&shipped_config()), Some(&assets_dir()), None)
+        par6d::kin::estimation_model(Some(&shipped_config()), Some(&assets_dir()), None, None)
             .expect("estimation model")
             .collision;
 
@@ -395,7 +395,7 @@ fn a_failed_estimate_leaves_the_declared_payload_standing() {
             .expect("the payload is declared");
 
         let mut model =
-            par6d::kin::estimation_model(Some(&model_config), Some(&assets_dir()), None)
+            par6d::kin::estimation_model(Some(&model_config), Some(&assets_dir()), None, None)
                 .expect("estimation model");
 
         // A spread no wrist has room for: the run fails in planning,

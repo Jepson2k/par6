@@ -74,6 +74,9 @@ impl PollScheduler {
     pub(super) fn configure(&mut self, targets: usize) {
         self.targets = targets;
         self.legacy = vec![false; targets];
+        // Room for every target on the vendor way, so a target changing
+        // its way at run time does not allocate on the tick.
+        self.cycle = Vec::with_capacity(3 * targets);
         self.cursor = 0;
         self.slot = 0;
         self.device_info_remaining = 0;
@@ -82,7 +85,8 @@ impl PollScheduler {
     }
 
     /// Poll `target` the vendor way (three kinds a cycle) or the
-    /// combined way; a target's answer to the boot probe decides.
+    /// combined way: a target's answer to the boot probe decides, and its
+    /// answers at run time after that.
     pub(super) fn set_legacy(&mut self, target: usize, legacy: bool) {
         if target < self.targets && self.legacy[target] != legacy {
             self.legacy[target] = legacy;

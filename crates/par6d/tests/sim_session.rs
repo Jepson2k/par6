@@ -2885,6 +2885,17 @@ fn select_tool_fits_a_different_tool() {
         "selecting the bare flange must complete, got {detail:?}"
     );
     assert_fitted(&rig, &bundle, "Flange");
+    // The jaw's drive came off with it: what it last reported is no
+    // reading of anything on the arm now.
+    let node = usize::from(bundle.robot.bus.gripper_node);
+    rig.drain_status();
+    let s = rig.wait_status("the jaw drive's readings are gone", |_| true);
+    assert!(
+        s.drive_health.temperatures_c[node].is_nan() && s.drive_health.currents_ma[node].is_nan(),
+        "the removed jaw still reports {} C, {} mA",
+        s.drive_health.temperatures_c[node],
+        s.drive_health.currents_ma[node]
+    );
     let err = c.expect_error(&tool_action(7003, "FLANGE", "calibrate", &[]));
     assert_eq!(
         err.code,

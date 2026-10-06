@@ -1065,8 +1065,13 @@ from the shipped one: move the arm's own values into `local.toml` first, or
 create it empty if the arm has none. `--no-restart` installs without touching
 the running service.
 
-> Restarting `par6d` stops the arm and clears the queue. `install.sh` stops the
-> service before swapping the binary unless `--no-restart` is given.
+> Restarting `par6d` clears the queue and, on a homed and enabled arm, first
+> drives it to its park pose (`[shutdown] safe_park`, on in the shipped config):
+> every joint at once at `velocity_limit_rad_s`, the shoulder and elbow onto
+> their endstops, with no keep-out or contact check on the way. Clear the arm's
+> path, or set `safe_park = false` in `local.toml`, before restarting it near
+> a fixture. `install.sh` stops the service before swapping the binary unless
+> `--no-restart` is given.
 
 ### 3. The unit
 
@@ -1190,7 +1195,9 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
 
 ## Safety notes
 
-- **Restarting `par6d` stops the arm and clears the queue.** `scripts/deploy/install.sh`
+- **Restarting `par6d` parks the arm, then clears the queue.** A homed, enabled arm
+  drives to its park pose on exit (`[shutdown] safe_park`, on in the shipped
+  config) with no keep-out or contact check on the way. `scripts/deploy/install.sh`
   stops the service before swapping the binary unless `--no-restart` is given.
 - **A refused command is not a stopped arm.** Fire-and-forget refusals latch as the
   standing error; check `error()` or the STATUS broadcast rather than assuming a send

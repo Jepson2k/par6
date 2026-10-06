@@ -349,7 +349,7 @@ impl Daemon {
                 tool_offset,
             },
             crate::planner::PlannerSwap {
-                source: Some(kin_source),
+                source: kin_source,
                 bundle: bundle.clone(),
                 tools: tools.clone(),
             },
@@ -737,50 +737,15 @@ struct ConfigFiles {
     tools: Vec<(String, String)>,
 }
 
-/// sha256 hex over the robot TOML and each gripper file, each hashed as its
-/// file name, a newline, then its content bytes.
-fn config_fingerprint(
-    robot_filename: &str,
-    robot_toml: &str,
-    tools: &[(String, String)],
-) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    for (name, content) in std::iter::once((robot_filename, robot_toml))
-        .chain(tools.iter().map(|(n, c)| (n.as_str(), c.as_str())))
-    {
-        hasher.update(name.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(content.as_bytes());
-    }
-    format!("{:x}", hasher.finalize())
-}
-
 /// The files as the daemon runs them: when the gripper drive identified a
 /// tool other than the file's `active_tool`, the served TOML names that
 /// tool and the fingerprint follows, so a client that materializes this
 /// bundle (payload estimation does) fits what the arm is wearing.
 fn fitted_files(mut files: ConfigFiles, active_tool: &str) -> ConfigFiles {
-    let fitted = format!("active_tool = \"{active_tool}\"");
-    let mut changed = false;
-    let text: Vec<String> = files
-        .robot_toml
-        .lines()
-        .map(|line| {
-            let trimmed = line.trim_start();
-            let is_key =
-                trimmed.starts_with("active_tool") && trimmed[11..].trim_start().starts_with('=');
-            if is_key && trimmed != fitted {
-                changed = true;
-                return fitted.clone();
-            }
-            line.to_owned()
-        })
-        .collect();
-    if changed {
-        files.robot_toml = text.join("\n") + "\n";
+    if let Some(text) = par6_config::fitted_robot_toml(&files.robot_toml, active_tool) {
+        files.robot_toml = text;
         files.fingerprint =
-            config_fingerprint(&files.robot_filename, &files.robot_toml, &files.tools);
+            par6_config::config_fingerprint(&files.robot_filename, &files.robot_toml, &files.tools);
     }
     files
 }
@@ -807,7 +772,7 @@ fn read_config_files(
     let tools = par6_config::effective_tool_tomls(robot_toml, local)
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(ConfigFiles {
-        fingerprint: config_fingerprint(&robot_filename, &robot_content, &tools),
+        fingerprint: par6_config::config_fingerprint(&robot_filename, &robot_content, &tools),
         robot_filename,
         robot_toml: robot_content,
         tools,
@@ -886,13 +851,29 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
             voltage_limit_mv: j.voltage_limit_mv,
         })
         .collect();
-    if let Some(d) = bundle.active_tool().and_then(|g| g.driver.as_ref()) {
-        cfg.tunable_nodes.push(par6_server::TunableNode {
-            node: robot.bus.gripper_node,
-            ilim_ma: d.ilim_ma,
-            velocity_limit_ticks_s: d.velocity_limit_ticks_s,
-            voltage_limit_mv: d.voltage_limit_mv,
-        });
+    cfg.tool_ids = bundle.tools.iter().filter_map(|g| g.can_tool_id).collect();
+    cfg.tool_drives = bundle
+        .tools
+        .iter()
+        .filter_map(|g| {
+            let d = g.driver.as_ref()?;
+            Some((
+                g.name.clone(),
+                par6_server::TunableNode {
+                    node: robot.bus.gripper_node,
+                    ilim_ma: d.ilim_ma,
+                    velocity_limit_ticks_s: d.velocity_limit_ticks_s,
+                    voltage_limit_mv: d.voltage_limit_mv,
+                },
+            ))
+        })
+        .collect();
+    if let Some((_, drive)) = cfg
+        .tool_drives
+        .iter()
+        .find(|(t, _)| *t == robot.robot.active_tool)
+    {
+        cfg.tunable_nodes.push(*drive);
     }
     // The window `teleport` may place a joint in. Refusing outside it is
     // the server's job: the bridge is fire-and-forget and has no reply
@@ -1109,6 +1090,8 @@ pub(crate) struct PreviewKin {
     /// lane than the planner's and each holds mutable scratch.
     pub(crate) gate_collision: par6_kin::Collision,
     pub(crate) tool_offset: crate::kin::ToolOffset,
+    /// What a `select_tool` rebuilds the models from.
+    pub(crate) source: KinSource,
 }
 
 pub(crate) fn load_preview_kin(
@@ -1125,6 +1108,7 @@ pub(crate) fn load_preview_kin(
         collision: src.collision()?,
         gate_collision: src.collision()?,
         tool_offset,
+        source: src,
     })
 }
 

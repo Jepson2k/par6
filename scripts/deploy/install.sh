@@ -22,8 +22,9 @@
 #   /usr/share/par6/par6_description  URDF/meshes (the kinematics/collision models)
 #   /etc/systemd/system/par6d.service the unit
 #
-# RESTARTING par6d STOPS THE ROBOT. The service is restarted unless
-# --no-restart is passed.
+# RESTARTING par6d MOVES A HOMED ARM TO ITS PARK POSE, unchecked against
+# keep-outs ([shutdown] safe_park), then stops it. The service is restarted
+# unless --no-restart is passed.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -94,14 +95,24 @@ install_local() {
       || die "bundled par6d is not an aarch64 binary: $(file -b "$bundle/par6d")"
   fi
 
-  # A robot file that differs from the shipped one may hold this arm's own
+  # A config file that differs from the shipped one may hold this arm's own
   # values. Until there is a local.toml for them, replacing it would restart
   # the arm without them.
-  if [ -e "$ETC_DEST/PAR6.toml" ] && [ ! -e "$ETC_DEST/local.toml" ] \
-    && ! cmp -s "$bundle/config/PAR6.toml" "$ETC_DEST/PAR6.toml"; then
-    die "$ETC_DEST/PAR6.toml differs from the shipped one and there is no
-  $ETC_DEST/local.toml. Move this arm's own values into local.toml (create it
-  empty if it has none; see README.md, \"Local overlay\"), then install again"
+  if [ -e "$ETC_DEST/local.toml" ] && [ ! -f "$ETC_DEST/local.toml" ]; then
+    die "$ETC_DEST/local.toml is not a file; the arm's own values belong in one"
+  fi
+  if [ ! -e "$ETC_DEST/local.toml" ]; then
+    local shipped edited
+    for shipped in "$bundle/config/PAR6.toml" "$bundle"/config/grippers/*.toml; do
+      [ -e "$shipped" ] || continue
+      edited="$ETC_DEST/${shipped#"$bundle"/config/}"
+      if [ -e "$edited" ] && ! cmp -s "$shipped" "$edited"; then
+        die "$edited differs from the shipped one and there is no
+  $ETC_DEST/local.toml. Move this arm's own values into local.toml -- a tool's
+  under a [[tools]] entry named after it -- or create it empty if it has none
+  (see README.md, \"Local overlay\"), then install again"
+      fi
+    done
   fi
 
   if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then

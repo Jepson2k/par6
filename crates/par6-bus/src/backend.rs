@@ -193,6 +193,10 @@ impl DriverBus for RuntimeBus {
         dispatch!(self, recover_link())
     }
 
+    fn simulated(&self) -> bool {
+        self.is_sim()
+    }
+
     fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>) {
         dispatch!(self, fit_tool(robot, tool))
     }
