@@ -1476,6 +1476,42 @@ fn streaming_is_gated_by_the_collision_world() {
         }
     }
 
+    // --- the same layer re-sent all through a placement puts nothing in
+    // its way, and does not hold it up.
+    c.ok(&Command::Reset);
+    enable_and_teleport(&rig, &mut c, start_deg);
+    rig.drain_status();
+    let jog = jog_j(0, 1.0, 0.2);
+    let (mut latched, mut still_since) = (false, None);
+    let deadline = Instant::now() + 2 * BUDGET;
+    let s = loop {
+        assert!(
+            Instant::now() < deadline,
+            "a placement under a re-sent layer never came to rest"
+        );
+        let Some(s) = rig.recv_status() else { continue };
+        c.send(&jog);
+        c.drain();
+        latched |= s.collision_active;
+        if latched {
+            c.ok(&set_shapes(vec![keepout.clone()]));
+        }
+        still_since = if latched && s.speeds.iter().all(|v| v.abs() < 0.01) {
+            still_since.or(Some(s.mono_time_ns))
+        } else {
+            None
+        };
+        if still_since.is_some_and(|t| s.mono_time_ns - t >= 2_000_000_000) {
+            break s;
+        }
+    };
+    let rest = world_gap_m(&mut world, s.angles) * 1e3;
+    assert!(
+        rest <= clearance_mm + 5.0,
+        "under a re-sent layer the placement stopped {rest:.1} mm from the keep-out, more \
+         than 5 mm out of its clearance"
+    );
+
     // --- a keep-out dropped across a placement under way, nothing held:
     // the arm is stopped and put on the new keep-out's clearance, not
     // carried on through it toward the standoff it was solved for before.

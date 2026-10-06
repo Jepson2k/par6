@@ -371,9 +371,9 @@ pub(crate) struct Par6Planner {
     /// A tool swap just made, for the command plane to follow.
     tool_change: Option<(String, Option<String>)>,
     fitted_tool: String,
-    /// The tool id the gripper drive last reported, acted on once: a report
-    /// no tool can be fitted for is logged once, not every pass.
-    drive_tool_seen: u8,
+    /// A tool id the gripper drive reports that could not be fitted, so it
+    /// is reported once rather than retried every pass.
+    drive_tool_refused: Option<u8>,
     tools: crate::bridge::ToolMailbox,
 }
 
@@ -424,13 +424,19 @@ impl Par6Planner {
         // own selection, say — would run the gravity and the keep-outs of a
         // tool that is not there.
         let snap = self.snapshots.latest();
-        if !snap.bus_simulated {
-            let node = self.bundle.robot.bus.gripper_node;
-            let info = snap.nodes[usize::from(node)].device_info;
+        // Only a drive still answering speaks for the arm: one unbolted
+        // with its tool has gone quiet, and what it said last is not what
+        // is fitted now.
+        let heard = matches!(
+            snap.node_freshness[MAX_JOINTS],
+            par6_rt::Freshness::Fresh | par6_rt::Freshness::Stale
+        );
+        if !snap.bus_simulated && heard {
+            let info = snap.nodes[MAX_JOINTS].device_info;
             // A drive answering on the gripper node that has not said which
             // tool it is yet — just after the last change — is asked again
             // before another is fitted on its word.
-            if info.is_none() && snap.bus_nodes & (1 << u16::from(node)) != 0 {
+            if info.is_none() {
                 return Err(refused(
                     "the gripper drive has not reported which tool it is yet; select again in \
                      a moment"
@@ -523,31 +529,39 @@ impl Par6Planner {
         Ok(Some(applied))
     }
 
-    /// The gripper drive is the authority on which tool is on the arm. A
-    /// drive the daemon's boot probe could not hear — the link came back
-    /// only after a recovery — gets its tool fitted here instead, as the
-    /// daemon would have, once the arm is at rest.
+    /// The gripper drive is the authority on which tool is on the arm. One
+    /// the daemon's boot probe did not hear — a link that came back only on
+    /// recovery, a bus swapped in — holds the runtime in BOOTING until its
+    /// tool is fitted (see `RtCore`), and it is fitted here, as the boot
+    /// probe would have: nothing moves in BOOTING. A tool that cannot be
+    /// fitted is reported once and keeps the hold.
     fn follow_drive_tool(&mut self, snap: &StateSnapshot) {
-        if snap.bus_simulated
-            || self.inflight.is_some()
-            || !matches!(snap.mode, Mode::Idle | Mode::Booting)
-        {
+        if snap.bus_simulated || self.inflight.is_some() || snap.mode != Mode::Booting {
             return;
         }
-        let node = self.bundle.robot.bus.gripper_node;
-        let Some(id) = snap.nodes[usize::from(node)]
+        let Some(id) = snap.nodes[MAX_JOINTS]
             .device_info
             .map(|d| d.tool_id)
-            .filter(|id| *id != 0 && *id != self.drive_tool_seen)
+            .filter(|id| *id != 0)
         else {
             return;
         };
-        self.drive_tool_seen = id;
+        let fitted = self
+            .bundle
+            .tools
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(&self.fitted_tool))
+            .and_then(|t| t.can_tool_id);
+        if fitted == Some(id) || self.drive_tool_refused == Some(id) {
+            return;
+        }
+        let node = self.bundle.robot.bus.gripper_node;
         let Some(name) = self.bundle.tool_by_can_id(id).map(|t| t.name.clone()) else {
+            self.drive_tool_refused = Some(id);
             log::error!(
                 "gripper node {node} reports tool id {id}, which no configured tool carries \
-                 (can_tool_id); add it to that tool's config, or provision the drive with \
-                 `par6 tool-id`"
+                 (can_tool_id); the runtime stays in BOOTING. Add it to that tool's config, or \
+                 provision the drive with `par6 tool-id`"
             );
             return;
         };
@@ -560,9 +574,13 @@ impl Par6Planner {
                 self.tool_change = Some((self.fitted_tool.clone(), None));
             }
             Ok(None) => {}
-            Err(e) => log::error!(
-                "gripper node {node} reports tool `{name}`, which cannot be fitted: {e}"
-            ),
+            Err(e) => {
+                self.drive_tool_refused = Some(id);
+                log::error!(
+                    "gripper node {node} reports tool `{name}`, which cannot be fitted, so the \
+                     runtime stays in BOOTING: {e}"
+                );
+            }
         }
     }
 
@@ -629,7 +647,7 @@ impl Par6Planner {
             source: swap.source,
             tool_change: None,
             fitted_tool: swap.bundle.robot.robot.active_tool.clone(),
-            drive_tool_seen: 0,
+            drive_tool_refused: None,
             tools: swap.tools,
             bundle: swap.bundle,
             payload: par6_server::PayloadSpec::default(),
@@ -2993,7 +3011,7 @@ mod tests {
         p: Par6Planner,
         snap_w: SnapshotWriter<StateSnapshot>,
         tools: crate::bridge::ToolMailbox,
-        ops: mpsc::Receiver<crate::bridge::CoreOp>,
+        _ops: mpsc::Receiver<crate::bridge::CoreOp>,
         _cmds: mpsc::Receiver<RtCommand>,
         _ring: SampleConsumer,
     }
@@ -3037,38 +3055,37 @@ mod tests {
             p: planner,
             snap_w,
             tools,
-            ops: ops_rx,
+            _ops: ops_rx,
             _cmds: cmds_rx,
             _ring: ring,
         }
     }
 
-    /// An idle arm whose gripper drive, on `node`, reports `tool_id`.
-    fn reporting(node: u8, tool_id: u8, simulated: bool) -> StateSnapshot {
+    /// The runtime in `mode` with the gripper drive reporting `tool_id`.
+    fn reporting(mode: Mode, tool_id: u8, simulated: bool) -> StateSnapshot {
         let mut snap = StateSnapshot {
-            mode: Mode::Idle,
+            mode,
             bus_simulated: simulated,
-            bus_nodes: 1 << u16::from(node),
             ..Default::default()
         };
-        snap.nodes[usize::from(node)].device_info = Some(par6_bus::DeviceInfo {
+        snap.nodes[MAX_JOINTS].device_info = Some(par6_bus::DeviceInfo {
             tool_id,
             ..Default::default()
         });
         snap
     }
 
-    /// A drive heard only after the boot probe — a link that came back on
-    /// recovery — reporting another tool than the one fitted has that tool
-    /// fitted, with every model rebuilt for it. The simulator's drive
-    /// reports whatever the bundle fitted, and is not followed.
+    /// A drive the boot probe did not hear reports another tool than the
+    /// one fitted: while the runtime holds in BOOTING, where nothing moves,
+    /// that tool is fitted with every model rebuilt for it — and only then.
+    /// The simulator's drive reports whatever the bundle fitted, and is not
+    /// followed; a tool no config carries is not fitted at all.
     #[test]
-    fn the_tool_the_gripper_drive_reports_is_fitted() {
+    fn the_tool_the_gripper_drive_reports_is_fitted_while_booting() {
         let Rig {
             mut p,
             mut snap_w,
             tools,
-            ops,
             ..
         } = rig();
         let fitted = p.fitted_tool.clone();
@@ -3087,11 +3104,24 @@ mod tests {
             .and_then(|t| t.can_tool_id)
             .expect("the shipped tool is keyed");
         let id = other.can_tool_id.unwrap();
-        let node = p.bundle.robot.bus.gripper_node;
+        let unknown = (1..=u8::MAX)
+            .find(|n| p.bundle.tool_by_can_id(*n).is_none())
+            .expect("an id no tool carries");
 
         for (snap, what) in [
-            (reporting(node, fitted_id, false), "the fitted tool"),
-            (reporting(node, id, true), "a simulated drive"),
+            (
+                reporting(Mode::Booting, fitted_id, false),
+                "the fitted tool",
+            ),
+            (reporting(Mode::Booting, id, true), "a simulated drive"),
+            (
+                reporting(Mode::Idle, id, false),
+                "a drive heard out of BOOTING",
+            ),
+            (
+                reporting(Mode::Booting, unknown, false),
+                "a tool no config carries",
+            ),
         ] {
             snap_w.publish(&snap);
             let _ = p.poll();
@@ -3099,7 +3129,7 @@ mod tests {
             assert_eq!(p.fitted_tool, fitted, "{what} changed the tool");
         }
 
-        snap_w.publish(&reporting(node, id, false));
+        snap_w.publish(&reporting(Mode::Booting, id, false));
         let _ = p.poll();
         assert_eq!(p.take_fitted_tool(), Some((other.name.clone(), None)));
         assert_eq!(p.fitted_tool, other.name);
@@ -3108,7 +3138,46 @@ mod tests {
             swap.bridge.is_some() && swap.housekeeping.is_some() && swap.gate_collision.is_some(),
             "the other model owners were not handed the new tool's models"
         );
-        drop(swap);
-        assert!(ops.try_recv().is_ok(), "the RT models were not swapped");
+    }
+
+    /// A drive that reports a tool refuses the selection of another — but
+    /// only while it is still heard: unbolted with its tool, its last word
+    /// is not the arm's, and the tool fitted in its place can be selected.
+    #[test]
+    fn only_a_drive_still_heard_refuses_another_tool() {
+        let Rig {
+            mut p, mut snap_w, ..
+        } = rig();
+        let fitted = p.fitted_tool.clone();
+        let reported = p
+            .bundle
+            .tools
+            .iter()
+            .find(|t| t.can_tool_id.is_some() && t.name != fitted)
+            .expect("a second keyed tool")
+            .clone();
+        let passive = p
+            .bundle
+            .tools
+            .iter()
+            .find(|t| t.driver.is_none())
+            .expect("a passive tool")
+            .name
+            .clone();
+        let mut snap = reporting(Mode::Idle, reported.can_tool_id.unwrap(), false);
+        snap.node_freshness[MAX_JOINTS] = par6_rt::Freshness::Fresh;
+        snap_w.publish(&snap);
+        assert!(
+            p.adopt_tool(&passive).is_err(),
+            "a drive still answering let another tool be fitted"
+        );
+        snap.node_freshness[MAX_JOINTS] = par6_rt::Freshness::Lost;
+        snap_w.publish(&snap);
+        assert!(
+            p.adopt_tool(&passive)
+                .is_ok_and(|applied| applied.is_some()),
+            "a drive no longer heard still refused the tool fitted in its place"
+        );
+        assert_eq!(p.fitted_tool, passive);
     }
 }

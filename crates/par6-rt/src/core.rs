@@ -554,6 +554,14 @@ pub struct RtCore<B: DriverBus> {
     /// One link cycle per bus life: a boot scan that finds nobody cycles
     /// the interface once and re-scans; a second silence is a fault.
     link_recovered: bool,
+    /// Held in BOOTING after the selfcheck: on a real bus the gripper
+    /// drive reports a tool the runtime has not fitted. The second flag
+    /// keeps the log to one line per hold.
+    tool_hold: bool,
+    tool_hold_logged: bool,
+    /// Until when a gripper drive that has not yet said which tool it is
+    /// gets to answer before it is taken to say nothing.
+    tool_hold_until: u64,
     errors: ErrorManager,
     timing: LoopTiming,
     bus_faults: BusFaultLogs,
@@ -833,6 +841,9 @@ impl<B: DriverBus> RtCore<B> {
             ref_check_sum: [0.0; MAX_JOINTS],
             ref_check_n: 0,
             link_recovered: false,
+            tool_hold: false,
+            tool_hold_logged: false,
+            tool_hold_until: 0,
             errors: ErrorManager::new(dt),
             timing: LoopTiming::new(dt, robot.loop_timing()),
             bus_faults: BusFaultLogs::new(u64::from(robot.ticks(BUS_FAULT_LOG_PERIOD_S).max(1))),
@@ -1073,6 +1084,7 @@ impl<B: DriverBus> RtCore<B> {
         self.bus_booted_at = self.tick;
         self.config_repush_armed_at = self.tick;
         self.link_recovered = false;
+        self.tool_hold = false;
         self.rescan_at = None;
         self.rescan_configured = false;
         self.homed = false;
@@ -1483,6 +1495,56 @@ impl<B: DriverBus> RtCore<B> {
         refused
     }
 
+    /// The tool the gripper drive reports, when it is not the one fitted:
+    /// only a real drive, provisioned with an id, can say. The simulator's
+    /// is whatever the bundle fits.
+    fn unfitted_drive_tool(&self) -> Option<u8> {
+        if self.bus.simulated() {
+            return None;
+        }
+        let reported = self.bus_state.nodes[usize::from(self.gripper_node)]
+            .device_info
+            .map(|d| d.tool_id)
+            .filter(|id| *id != 0)?;
+        let fitted = self.boot.tool.as_ref().and_then(|t| t.can_tool_id);
+        (fitted != Some(reported)).then_some(reported)
+    }
+
+    fn gripper_present(&self) -> bool {
+        self.bus.connected_nodes() & (1 << u16::from(self.gripper_node)) != 0
+    }
+
+    /// Leave BOOTING once the drive and the fitted tool agree, as the
+    /// daemon's boot probe has them before anything moves.
+    fn release_tool_hold(&mut self) {
+        if self.mode != Mode::Booting {
+            self.tool_hold = false;
+            return;
+        }
+        let unheard = !self.bus.simulated()
+            && self.gripper_present()
+            && self.bus_state.nodes[usize::from(self.gripper_node)]
+                .device_info
+                .is_none();
+        if unheard && self.tick < self.tool_hold_until {
+            return;
+        }
+        match self.unfitted_drive_tool() {
+            Some(id) if !self.tool_hold_logged => {
+                self.tool_hold_logged = true;
+                log::warn!(
+                    "the gripper drive reports tool id {id}, which is not the fitted tool; \
+                     holding in BOOTING until it is"
+                );
+            }
+            Some(_) => {}
+            None => {
+                self.tool_hold = false;
+                let _ = self.request_mode(Mode::Idle);
+            }
+        }
+    }
+
     fn boot_oneshots(&mut self) {
         // Ticks since this BUS came up, not since the process did: a
         // backend swapped in at tick 90 000 needs the same selfcheck and
@@ -1535,8 +1597,25 @@ impl<B: DriverBus> RtCore<B> {
                 self.adopt_driver_kt();
             }
             if self.mode == Mode::Booting {
-                let _ = self.request_mode(Mode::Idle);
+                self.tool_hold = true;
+                self.tool_hold_logged = false;
+                self.tool_hold_until =
+                    self.tick + u64::from(self.boot.robot.ticks(self.boot.robot.bus.lost_s).max(1));
+                // Identity is otherwise polled every few seconds: asked now,
+                // the drive answers before anything leaves BOOTING.
+                if !self.bus.simulated() && self.gripper_present() {
+                    self.bus.queue_poll_override(
+                        PollAction::Poll {
+                            node: self.gripper_node,
+                            kind: par6_bus::PollKind::DeviceInfo,
+                        },
+                        1,
+                    );
+                }
             }
+        }
+        if self.tool_hold {
+            self.release_tool_hold();
         }
         // The scheduled shots ride their own arm point, not the bus
         // boot: a FLASHING exit re-arms them without re-running the
@@ -1644,6 +1723,11 @@ impl<B: DriverBus> RtCore<B> {
 
     fn apply_command(&mut self, cmd: RtCommand) {
         match cmd {
+            // Only the drive's own tool fitted ends the hold; a mode change
+            // out of it would run the arm on another tool's model.
+            RtCommand::SetMode(Mode::Idle) if self.tool_hold => {
+                log::warn!("mode request Idle refused: waiting for the gripper drive's tool");
+            }
             RtCommand::SetMode(target) => {
                 if let Err(e) = self.request_mode(target) {
                     log::warn!("mode request {target:?} refused: {e:?}");

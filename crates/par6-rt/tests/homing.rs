@@ -186,7 +186,6 @@ fn a_removed_jaw_leaves_no_reading_behind() {
     flanged.robot.robot.active_tool = "Flange".to_owned();
     let flange = flanged.active_tool().expect("the flange").clone();
     let gnode = driven.robot.bus.gripper_node;
-    let node = usize::from(gnode);
     let (mut core, handles, _tx, _line) = sim_core_with_bundle(&driven);
     let dt = core.tick_dt_s();
     let mut reads = handles.snapshots;
@@ -198,7 +197,7 @@ fn a_removed_jaw_leaves_no_reading_behind() {
     // in flight.
     for phase in 0..2 * par6_bus::MAX_NODES {
         core.set_gripper_tool(Some(&jaw), gnode, 1);
-        let reported = (0..500).any(|_| tick(&mut core)[node].temperature_c.is_some());
+        let reported = (0..500).any(|_| tick(&mut core)[MAX_JOINTS].temperature_c.is_some());
         assert!(reported, "the fitted jaw never reported a temperature");
         for _ in 0..phase {
             tick(&mut core);
@@ -208,7 +207,7 @@ fn a_removed_jaw_leaves_no_reading_behind() {
             tick(&mut core);
         }
         let nodes = tick(&mut core);
-        let left = nodes[node];
+        let left = nodes[MAX_JOINTS];
         assert!(
             left.temperature_c.is_none()
                 && left.current_ma.is_none()
@@ -217,9 +216,7 @@ fn a_removed_jaw_leaves_no_reading_behind() {
             "phase {phase}: the removed jaw still reads {left:?}"
         );
         assert!(
-            nodes[usize::from(driven.robot.joints[0].node_id)]
-                .temperature_c
-                .is_some(),
+            nodes[0].temperature_c.is_some(),
             "phase {phase}: the arm's drives stopped reporting"
         );
     }

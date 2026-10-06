@@ -2964,9 +2964,12 @@ impl RtBridge {
 /// End a stream housekeeping was driving and hold where it stopped. The
 /// release goes first: it tells the RT the stream is over, or its watchdog
 /// can latch RTI_LINK_LOST in the ticks before the hold lands.
-/// Where a STREAM running at the RT's commanded velocity comes to rest
-/// stopping at the limiter's full rate: per joint, the time-optimal
-/// jerk-limited stop. Not moving in STREAM, it is where the arm is.
+/// About where a STREAM running at the RT's commanded velocity comes to
+/// rest stopping at the limiter's full rate: per joint, the time-optimal
+/// jerk-limited stop from that speed. The limiter ends every joint
+/// together and starts from its own acceleration, so a joint may pass its
+/// point by a little — under a milliradian from a placement's speed. Not
+/// moving in STREAM, it is where the arm is.
 fn full_rate_rest(snap: &StateSnapshot, limits: &MotionLimits) -> [f64; MAX_JOINTS] {
     if snap.mode != Mode::Stream {
         return snap.q;
@@ -3174,28 +3177,46 @@ pub(crate) fn housekeeping_loop(
                         // A world changed under a placement may have put
                         // something on its way: stop the arm, let it come to
                         // rest, and solve the standoff again toward where it
-                        // was headed.
+                        // was headed. A layer re-sent unchanged, or one
+                        // nowhere near, leaves the placement running.
                         let epoch = gate.lock().unwrap().epoch();
                         if epoch != a.world_epoch {
                             a.world_epoch = epoch;
-                            // Braking solves at rest, in the world it rests in.
                             if let Standoff::Placing { stop, .. }
                             | Standoff::Settling { stop, .. } = phase
                             {
-                                // Stopped at the full rate, not the
-                                // placement's gentle one, which would carry
-                                // it on into whatever was put in its way;
-                                // fed while it stops.
-                                a.servo_target = (snap.mode == Mode::Stream)
-                                    .then(|| full_rate_rest(&snap, &stream_limits));
-                                a.scale = (STANDOFF_PLACEMENT_SCALE.0, 1.0);
-                                a.standoff = Some(Standoff::Braking {
-                                    goal: stop,
-                                    until_tick: snap.tick + standoff_budget_ticks(dt),
-                                });
-                                a.still = 0;
-                                a.still_tick = 0;
-                                break 'stream;
+                                let clear = gate
+                                    .lock()
+                                    .unwrap()
+                                    .stop_point(&snap.q, &stop)
+                                    .is_ok_and(|to| to == stop);
+                                if !clear {
+                                    if snap.mode == Mode::Stream {
+                                        // Stopped at the full rate, not the
+                                        // placement's gentle one, which would
+                                        // carry it on into whatever was put in
+                                        // its way; fed while it stops.
+                                        a.servo_target =
+                                            Some(full_rate_rest(&snap, &stream_limits));
+                                        a.scale = (STANDOFF_PLACEMENT_SCALE.0, 1.0);
+                                    } else {
+                                        // Not streaming yet, with a STREAM entry
+                                        // perhaps still queued: released, so the
+                                        // RT brakes whatever it enters and its
+                                        // watchdog stands down without a feed.
+                                        link.send(RtCommand::StreamRelease);
+                                        a.servo_target = None;
+                                    }
+                                    // Braking solves at rest, in the world it
+                                    // rests in.
+                                    a.standoff = Some(Standoff::Braking {
+                                        goal: stop,
+                                        until_tick: snap.tick + standoff_budget_ticks(dt),
+                                    });
+                                    a.still = 0;
+                                    a.still_tick = 0;
+                                    break 'stream;
+                                }
                             }
                         }
                         // Let go of mid-placement, outside the clearance: braked
