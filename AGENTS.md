@@ -84,6 +84,13 @@ resolving that enum everywhere it is used.
   they are timing-sensitive and share resources. par6's own suites are designed to be
   parallel-safe; keep them that way (no fixed ports — allocate free ones per test).
 
+## Stop and failure policy
+
+Settled; see *Stop and failure policy* in `README.md` and follow it rather than asking.
+Anything that moves the arm reads the e-stop line every control tick. In normal
+operation an e-stop or failure holds position under power; `par6-selfcal` alone parks
+and releases (its e-stop still holds).
+
 ## Rust rules
 
 - The RT tick path allocates NOTHING after init (preallocate in constructors; slices

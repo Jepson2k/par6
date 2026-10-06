@@ -30,6 +30,7 @@ below works on a laptop and in CI.
 - [Development setup](#development-setup)
 - [Deploying to the control box](#deploying-to-the-control-box)
 - [Known divergences from parol6](#known-divergences-from-parol6)
+- [Stop and failure policy](#stop-and-failure-policy)
 - [Safety notes](#safety-notes)
 - [License](#license)
 
@@ -1192,6 +1193,28 @@ Deliberate, and unlikely to change:
   data — read them by name (`ErrorCode.SYS_SELF_COLLISION`), never by number.
 
 Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
+
+## Stop and failure policy
+
+Settled with the owner; code that moves the arm follows it.
+
+- **Anything that moves the arm reads the e-stop line** (ESTOP_1) every control tick, and
+  refuses to start if it cannot.
+- **In normal operation an e-stop or any failure holds the arm where it is**, under power:
+  the runtime drops to ACTIVE_ERROR, a zero-velocity hold, and nothing moves until the
+  operator resets. Holding under power is a protective stop (IEC 60204-1 category 2); an
+  emergency stop is category 0 or 1 by that standard, but the PAR6 has no brakes, and
+  removing power would drop the arm.
+- **A normal shutdown puts the arm down**: `par6d` retreats to its safe park, the shoulder
+  and elbow onto their homing endstops, then goes limp (`[shutdown] safe_park`).
+- **A dead daemon or CAN link drops the arm.** Each drive's own watchdog idles it; the
+  firmware has no hold action. This is the accepted exception.
+- **`par6-selfcal` parks and releases** on a failure and at the end of a run: the area is
+  known clear and nothing is held, and a run may be on a bad tune that oscillates loudly
+  under a hold. Parking runs with its motion guards on.
+- **An e-stop during `par6-selfcal` holds the arm where it is.** Once it is released the
+  arm keeps holding until Ctrl-C asks for the usual park and release; nothing moves on its
+  own after a reset.
 
 ## Safety notes
 

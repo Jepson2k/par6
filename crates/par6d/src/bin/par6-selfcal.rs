@@ -1333,6 +1333,13 @@ struct Arm {
     dt: f64,
     deadline: Duration,
     simulated: bool,
+    /// The box's ESTOP_1 line, read every control tick: nothing that moves
+    /// the arm runs without it. `None` under `--sim`, which has no button.
+    estop: Option<Box<dyn par6_rt::gpio::EstopGpio>>,
+    estop_debounce: par6_rt::gpio::Debouncer,
+    /// Holding through an e-stop: the hold's own ticks skip the checks
+    /// that would end it.
+    estop_holding: bool,
 }
 
 impl Arm {
@@ -1342,6 +1349,14 @@ impl Arm {
         simulated: bool,
         events: SyncSender<Event>,
     ) -> Result<Self> {
+        // Before anything is configured to move.
+        let estop = if simulated {
+            None
+        } else {
+            Some(par6_rt::gpio::open_estop1().map_err(|e| {
+                format!("{e} -- the physical e-stop must be readable before the arm moves")
+            })?)
+        };
         let tool = bundle.active_tool();
         let mut bus: RuntimeBus = if simulated {
             RuntimeBus::from(SimBus::new(Scene {
@@ -1413,7 +1428,51 @@ impl Arm {
             tick: 0,
             deadline: Duration::ZERO,
             simulated,
+            estop,
+            estop_debounce: par6_rt::gpio::Debouncer::new(),
+            estop_holding: false,
         })
+    }
+
+    /// Whether the e-stop is pressed (or its chain broken), debounced as
+    /// the runtime debounces it.
+    fn estop_engaged(&mut self) -> bool {
+        let Some(line) = self.estop.as_mut() else {
+            return false;
+        };
+        !self.estop_debounce.update(line.read_estop1())
+    }
+
+    /// An e-stop holds the arm where it is, under power, as the runtime
+    /// does: nothing parks or releases while it is engaged. Once it is
+    /// released the arm keeps holding until the operator asks for the
+    /// run's usual end with Ctrl-C, so nothing moves on its own after a
+    /// reset. The motion that was running then ends as a failure.
+    fn hold_through_estop(&mut self) -> Result<()> {
+        self.estop_holding = true;
+        CANCEL.store(false, Ordering::Relaxed);
+        let at: [i32; N] = std::array::from_fn(|j| self.pos(j).unwrap_or(self.hold[j]));
+        self.hold = at;
+        say!("E-STOP: holding position. Release it, then press Ctrl-C to park and release.");
+        let mut reminded = false;
+        let outcome = loop {
+            let engaged = self.estop_engaged();
+            if let Err(e) = self.exchange(at.map(|p| JointCommand::position(p, 0, 0)), false) {
+                break Err(e);
+            }
+            if CANCEL.load(Ordering::Relaxed) {
+                if !engaged {
+                    break Ok(());
+                }
+                CANCEL.store(false, Ordering::Relaxed);
+                if !reminded {
+                    reminded = true;
+                    say!("E-STOP still engaged: release it first, then press Ctrl-C.");
+                }
+            }
+        };
+        self.estop_holding = false;
+        outcome
     }
 
     /// Recording is best effort. It must never fail a motion or a park: a
@@ -1462,7 +1521,11 @@ impl Arm {
 
     /// One control tick: judge the drives, pace, drain, send.
     fn exchange(&mut self, commands: [JointCommand; N], check: bool) -> Result<()> {
-        if !self.stopping && CANCEL.load(Ordering::Relaxed) {
+        if !self.estop_holding && self.estop_engaged() {
+            self.hold_through_estop()?;
+            return Err("e-stop".into());
+        }
+        if !self.stopping && !self.estop_holding && CANCEL.load(Ordering::Relaxed) {
             return Err("cancelled".into());
         }
         // Judge on what the last tick's drain showed, before this one begins:
@@ -5355,16 +5418,7 @@ impl Arm {
             // the posture every other stop does.
             self.bundle.robot.safe_park_q()[j]
         };
-        let mut outcome = self.park_to(j, target);
-        if outcome.is_err() && self.bundle.robot.parks_on_endstop(j) {
-            // These hold the arm up: try once more without requiring feedback
-            // rather than release them where they are.
-            self.emit(Event::Phase("park blind: feedback unavailable", j));
-            self.blind = true;
-            outcome = self.park_to(j, target);
-            self.blind = false;
-        }
-        outcome
+        self.park_to(j, target)
     }
 
     fn park_to(&mut self, j: usize, target: f64) -> Result<()> {
