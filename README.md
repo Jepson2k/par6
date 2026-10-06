@@ -1196,8 +1196,6 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
 
 ## Stop and failure policy
 
-Settled with the owner; code that moves the arm follows it.
-
 - **Anything that moves the arm reads the e-stop line** (ESTOP_1) every control tick, and
   refuses to start if it cannot.
 - **In normal operation an e-stop or any failure holds the arm where it is**, under power:
