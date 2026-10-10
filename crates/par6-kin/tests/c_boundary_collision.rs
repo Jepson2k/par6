@@ -37,9 +37,35 @@ fn box_at(x: f64, y: f64, z: f64, side: f64) -> ShapeDesc {
     }
 }
 
+/// The Rust mirrors read the same bytes the shim writes: every value
+/// struct that crosses the boundary has the shim's size and field
+/// offsets.
 #[test]
-fn abi_version_is_v12() {
-    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 12);
+fn the_rust_mirrors_have_the_shims_layout() {
+    use std::mem::{offset_of, size_of};
+    let ours = [
+        size_of::<ffi::par6_tool_params>(),
+        offset_of!(ffi::par6_tool_params, transform),
+        offset_of!(ffi::par6_tool_params, mass),
+        offset_of!(ffi::par6_tool_params, com),
+        offset_of!(ffi::par6_tool_params, inertia),
+        size_of::<ffi::par6_shape>(),
+        offset_of!(ffi::par6_shape, kind),
+        offset_of!(ffi::par6_shape, n_params),
+        offset_of!(ffi::par6_shape, params),
+        offset_of!(ffi::par6_shape, pose),
+        offset_of!(ffi::par6_shape, margin),
+        size_of::<ffi::par6_shape_placement>(),
+        offset_of!(ffi::par6_shape_placement, name),
+        offset_of!(ffi::par6_shape_placement, parent_frame),
+        offset_of!(ffi::par6_shape_placement, allowed_contacts),
+        offset_of!(ffi::par6_shape_placement, n_allowed_contacts),
+    ]
+    .map(|v| v as u64);
+    let mut theirs = [0u64; 16];
+    let n = unsafe { ffi::par6_shim_layout(theirs.as_mut_ptr(), theirs.len() as i32) };
+    assert_eq!(n as usize, ours.len(), "the shim reports every field");
+    assert_eq!(theirs, ours);
 }
 
 #[test]
@@ -108,7 +134,13 @@ fn geometry_layout_tracks_layer_replacement() {
     );
 
     // Documented layout: [robot..., installation..., program...], and each
-    // world shape pairs against every robot link.
+    // world shape pairs against every robot link but the fixed base, which
+    // is as fixed as the shape is.
+    let moving = robot_names
+        .iter()
+        .filter(|n| !n.starts_with("base_link"))
+        .count();
+    assert!(moving < robot, "the base contributes geometry of its own");
     col.set_layer(Layer::Installation, &[box_at(1.0, 0.0, 0.0, 0.1)])
         .unwrap();
     col.set_layer(
@@ -117,7 +149,7 @@ fn geometry_layout_tracks_layer_replacement() {
     )
     .unwrap();
     assert_eq!(col.geom_count(), robot + 3);
-    assert_eq!(col.pair_count(), self_pairs + 3 * robot);
+    assert_eq!(col.pair_count(), self_pairs + 3 * moving);
     assert_eq!(col.geom_name(robot).unwrap(), "installation/0");
     assert_eq!(col.geom_name(robot + 1).unwrap(), "program/0");
     assert_eq!(col.geom_name(robot + 2).unwrap(), "program/1");
@@ -129,10 +161,9 @@ fn geometry_layout_tracks_layer_replacement() {
     col.set_layer(Layer::Installation, &[]).unwrap();
     assert_eq!(col.geom_count(), robot + 2);
     assert_eq!(col.geom_name(robot).unwrap(), "program/0");
-    assert_eq!(col.pair_count(), self_pairs + 2 * robot);
+    assert_eq!(col.pair_count(), self_pairs + 2 * moving);
 
-    // An out-of-range index and a buffer too small for the name are both
-    // errors, not truncated strings.
+    // An out-of-range index and a NULL handle are errors, not names.
     assert!(col.geom_name(col.geom_count()).is_err());
     let mut tiny = [0u8; 2];
     let status = unsafe {
@@ -186,7 +217,7 @@ fn null_and_out_of_range_arguments_are_rejected() {
     assert!(CollisionModel::from_urdf(&urdf(), Some(&package_dir()), f64::NAN).is_err());
 
     let mut col = load();
-    // NULL handle / NULL q / unknown layer.
+    // A NULL handle is refused before anything else is read...
     assert_eq!(
         unsafe {
             ffi::par6_col_check(
@@ -200,11 +231,33 @@ fn null_and_out_of_range_arguments_are_rejected() {
         },
         ffi::PAR6_ERR_INVALID_ARG
     );
+    // ...and on a live handle each argument is checked for itself: a NULL
+    // q, a layer that is neither, a name buffer too short for the name.
+    let path = std::ffi::CString::new(urdf().to_str().unwrap()).unwrap();
+    let pkg = std::ffi::CString::new(package_dir().to_str().unwrap()).unwrap();
     let mut err = [0u8; 256];
+    let h = unsafe {
+        ffi::par6_col_create(
+            path.as_ptr(),
+            pkg.as_ptr(),
+            0.0,
+            err.as_mut_ptr().cast(),
+            err.len() as i32,
+        )
+    };
+    assert!(!h.is_null(), "a live handle for the argument checks");
+    let mut n_pairs = 0;
+    let mut pairs = [0i32; 8];
+    assert_eq!(
+        unsafe { ffi::par6_col_check(h, std::ptr::null(), 0, pairs.as_mut_ptr(), 4, &mut n_pairs) },
+        ffi::PAR6_ERR_INVALID_ARG,
+        "NULL q"
+    );
     for layer in [-1i32, 2, 99] {
+        err.fill(0);
         let status = unsafe {
             ffi::par6_col_set_layer(
-                std::ptr::null_mut(),
+                h,
                 layer,
                 std::ptr::null(),
                 0,
@@ -214,7 +267,26 @@ fn null_and_out_of_range_arguments_are_rejected() {
             )
         };
         assert_eq!(status, ffi::PAR6_ERR_INVALID_ARG, "layer {layer}");
+        let msg = std::ffi::CStr::from_bytes_until_nul(&err)
+            .unwrap()
+            .to_string_lossy();
+        assert!(msg.contains("layer"), "layer {layer}: {msg}");
     }
+    let mut name = vec![0u8; 256];
+    assert_eq!(
+        unsafe { ffi::par6_col_geom_name(h, 0, name.as_mut_ptr().cast(), name.len() as i32) },
+        ffi::PAR6_OK,
+        "the control: a buffer the name fits"
+    );
+    let len = name.iter().position(|b| *b == 0).expect("terminated");
+    assert!(len > 1, "a name longer than the short buffer below");
+    let mut short = vec![0u8; len];
+    assert_eq!(
+        unsafe { ffi::par6_col_geom_name(h, 0, short.as_mut_ptr().cast(), short.len() as i32) },
+        ffi::PAR6_ERR_INVALID_ARG,
+        "a buffer one byte short of the name and its NUL"
+    );
+    unsafe { ffi::par6_col_destroy(h) };
 
     // Dimension mismatch is caught in Rust before crossing the boundary.
     let mut pairs = [0i32; 8];
@@ -321,41 +393,101 @@ fn a_rejected_layer_leaves_the_previous_world_in_place() {
     }
 }
 
+/// Each shape kind lands in the world with the extents its parameters
+/// give it. Hung centred far under the arm, a shape's top sits as far below
+/// the arm's lowest moving geometry as those parameters put it — read as
+/// the world distance up to it, against a sphere probe at the same centre;
+/// the fixed base pairs with no world shape, and from this far the lowest
+/// point being off the axis changes no distance measurably — and a slab
+/// whose top is a millimetre short of that point is clear where one a
+/// millimetre into it collides.
 #[test]
 fn every_shape_kind_round_trips_into_the_world() {
+    const BELOW: f64 = 50.0;
     let mut col = load();
     let robot = col.robot_geom_count();
-    let kinds: [(i32, usize, [f64; 4]); 7] = [
-        (ffi::PAR6_SHAPE_BOX, 3, [0.1, 0.2, 0.3, 0.0]),
-        (ffi::PAR6_SHAPE_SPHERE, 1, [0.1, 0.0, 0.0, 0.0]),
-        (ffi::PAR6_SHAPE_CYLINDER, 2, [0.1, 0.2, 0.0, 0.0]),
-        (ffi::PAR6_SHAPE_CAPSULE, 2, [0.1, 0.2, 0.0, 0.0]),
-        (ffi::PAR6_SHAPE_CONE, 2, [0.1, 0.2, 0.0, 0.0]),
-        (ffi::PAR6_SHAPE_ELLIPSOID, 3, [0.1, 0.2, 0.3, 0.0]),
-        (ffi::PAR6_SHAPE_PLANE, 4, [0.0, 0.0, 1.0, -5.0]),
-    ];
-    let shapes: Vec<ShapeDesc> = kinds
-        .iter()
-        .enumerate()
-        .map(|(i, &(kind, n_params, params))| ShapeDesc {
-            kind,
-            params,
-            n_params,
-            // Parked far away and, for the plane, well below the base, so
-            // this test is about construction, not about who collides.
-            pose: [10.0 + i as f64, 0.0, 0.0, 0.0, 0.0, 0.0],
-            margin: None,
-        })
-        .collect();
-
-    col.set_layer(Layer::Program, &shapes).unwrap();
-    assert_eq!(col.geom_count(), robot + kinds.len());
-    let mut buf = [0i32; 32];
-    let (active, _) = col.check_into(&[0.0; 6], false, &mut buf).unwrap();
+    let q = [0.0; 6];
+    let at = |kind, n_params, params, z: f64| ShapeDesc {
+        kind,
+        params,
+        n_params,
+        pose: [0.0, 0.0, z, 0.0, 0.0, 0.0],
+        margin: None,
+    };
+    let mut gap = |shape: ShapeDesc| -> f64 {
+        col.set_layer(Layer::Program, &[shape]).unwrap();
+        assert_eq!(col.geom_count(), robot + 1);
+        col.world_distance(&q).unwrap()
+    };
+    let r0 = 0.05;
+    let underside = gap(at(ffi::PAR6_SHAPE_SPHERE, 1, [r0, 0.0, 0.0, 0.0], -BELOW)) + r0;
     assert!(
-        !active,
-        "shapes parked outside the workspace must not collide"
+        underside > 0.4,
+        "the probe hangs clear of the base: {underside}"
     );
+    for (name, kind, n_params, params, top) in [
+        ("box", ffi::PAR6_SHAPE_BOX, 3, [0.1, 0.2, 0.3, 0.0], 0.15),
+        (
+            "sphere",
+            ffi::PAR6_SHAPE_SPHERE,
+            1,
+            [0.12, 0.0, 0.0, 0.0],
+            0.12,
+        ),
+        (
+            "cylinder",
+            ffi::PAR6_SHAPE_CYLINDER,
+            2,
+            [0.1, 0.2, 0.0, 0.0],
+            0.1,
+        ),
+        (
+            "capsule",
+            ffi::PAR6_SHAPE_CAPSULE,
+            2,
+            [0.05, 0.2, 0.0, 0.0],
+            0.15,
+        ),
+        ("cone", ffi::PAR6_SHAPE_CONE, 2, [0.1, 0.24, 0.0, 0.0], 0.12),
+        (
+            "ellipsoid",
+            ffi::PAR6_SHAPE_ELLIPSOID,
+            3,
+            [0.1, 0.2, 0.3, 0.0],
+            0.3,
+        ),
+    ] {
+        let d = gap(at(kind, n_params, params, -BELOW));
+        assert!(
+            (d - (underside - top)).abs() < 1e-4,
+            "{name}: {d} m under the base, where its parameters put its top \
+             {} m under it",
+            underside - top
+        );
+    }
+    // Half-spaces whose surfaces lie 0.1 m apart read 0.1 m apart.
+    let plane = |offset| at(ffi::PAR6_SHAPE_PLANE, 4, [0.0, 0.0, 1.0, offset], 0.0);
+    let near = gap(plane(-0.3));
+    let far = gap(plane(-0.4));
+    assert!(((far - near) - 0.1).abs() < 1e-6, "planes {near} and {far}");
+
+    // A millimetre either side of the lowest moving point.
+    let lowest_z = underside - BELOW;
+    let mut buf = [0i32; 32];
+    for (dz, collides) in [(-0.001, false), (0.001, true)] {
+        let slab = at(
+            ffi::PAR6_SHAPE_BOX,
+            3,
+            [0.4, 0.4, 0.1, 0.0],
+            lowest_z - 0.05 + dz,
+        );
+        col.set_layer(Layer::Program, &[slab]).unwrap();
+        let (active, _) = col.check_into(&q, false, &mut buf).unwrap();
+        assert_eq!(
+            active, collides,
+            "a slab {dz} m into the lowest moving point"
+        );
+    }
 }
 
 /// An SRDF's `<disable_collisions>` entries remove the named self pairs
@@ -429,17 +561,45 @@ fn world_distance_reads_world_pairs_only_and_tracks_approach() {
         depths.last().unwrap() < &0.0,
         "the walk must end in contact: {depths:?}"
     );
+    // Separated, the box's flat underside closes on the arm's top by
+    // exactly each step: coal's pair distance is exact there.
+    let separated: Vec<f64> = depths
+        .windows(2)
+        .filter(|w| w[0] > 0.0 && w[1] > 0.0)
+        .map(|w| w[0] - w[1])
+        .collect();
+    assert!(
+        separated.len() >= 3,
+        "the walk must spend several steps separated: {depths:?}"
+    );
+    for closed in &separated {
+        assert!(
+            (closed - step).abs() < 1e-6,
+            "a separated 30 mm approach step reported as {closed:.6} m ({depths:?})"
+        );
+    }
     for w in depths.windows(2) {
-        if w[0] > 0.02 && w[1] > 0.02 {
-            assert!(
-                (w[0] - w[1] - step).abs() < 0.5 * step,
-                "a separated 30 mm approach step reported as {:.4} m ({depths:?})",
-                w[0] - w[1]
-            );
-        }
         assert!(
             w[1] < w[0] + 1e-9,
             "lowering the box must never raise the signal ({depths:?})"
         );
     }
+
+    // A self contact never masks the world reading: folded onto itself,
+    // with the box well clear above, the arm still reads the box's gap.
+    let folded = [0.0, -2.4, 6.5, 0.0, 1.6, 0.0];
+    col.set_layer(Layer::Program, &[]).unwrap();
+    let mut buf = [0i32; 64];
+    let (self_contact, _) = col.check_into(&folded, false, &mut buf).unwrap();
+    assert!(
+        self_contact,
+        "the control pose must fold the arm into itself"
+    );
+    col.set_layer(Layer::Program, &[box_at(0.0, 0.0, 2.0, 0.3)])
+        .unwrap();
+    let world = col.world_distance(&folded).unwrap();
+    assert!(
+        world.is_finite() && world > 0.5,
+        "a self contact leaked into the world distance: {world}"
+    );
 }

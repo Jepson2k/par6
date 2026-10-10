@@ -140,7 +140,10 @@ pub fn retimed_config(tag: &str, dt: f64) -> PathBuf {
     let grippers = dir.join("grippers");
     std::fs::create_dir_all(&grippers).expect("test config dir");
     let text = std::fs::read_to_string(&src).expect("read PAR6.toml");
-    let patched = set_scalar(&text, "tick_dt_s", &dt.to_string());
+    let mut patched = set_scalar(&text, "tick_dt_s", &dt.to_string());
+    // A rig exits limp: a retreat on every test's shutdown is a wait per
+    // test that proves nothing, and the retreat has a test of its own.
+    patched = set_scalar(&patched, "safe_park", "false");
     let dst = dir.join("PAR6.toml");
     write_atomic(&dst, patched.as_bytes());
     for entry in std::fs::read_dir(src.parent().unwrap().join("grippers")).expect("grippers dir") {
@@ -199,7 +202,7 @@ pub fn is_timeout(e: &std::io::Error) -> bool {
 pub fn redirect_bus_grant() {
     static ONCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let dir = ONCE.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("par6-test-shm-{}", std::process::id()));
+        let dir = scratch_shm_base().join(format!("par6-test-shm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch shm dir");
         // SAFETY: set before any daemon in this binary reads it, and
         // always to the same value.
@@ -273,6 +276,76 @@ pub fn free_udp_port() -> u16 {
 /// rather than with `--test-threads=1` is what lets a plain `cargo test`
 /// run the whole workspace and mean something.
 static RT_SLOT: Mutex<()> = Mutex::new(());
+
+/// A spawned `par6d` process. It holds the [`RT_SLOT`] for its life, as
+/// an in-process [`Rig`] does, and is killed if the test that spawned it
+/// fails before stopping it — a leaked child would go on ticking and
+/// broadcasting into every test after it.
+pub struct Par6dChild {
+    pub child: std::process::Child,
+    /// Everything the child wrote to stderr so far.
+    pub stderr: std::sync::Arc<Mutex<String>>,
+    _slot: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Par6dChild {
+    /// Spawn `cmd`, waiting for the slot first, with stderr collected
+    /// into [`Par6dChild::stderr`].
+    pub fn spawn(cmd: &mut std::process::Command) -> Par6dChild {
+        let slot = RT_SLOT.lock().unwrap_or_else(|e| e.into_inner());
+        let mut child = cmd
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn par6d");
+        let stderr = std::sync::Arc::new(Mutex::new(String::new()));
+        let pipe = child.stderr.take().expect("piped stderr");
+        let sink = stderr.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(pipe).lines().map_while(Result::ok) {
+                let mut text = sink.lock().unwrap();
+                text.push_str(&line);
+                text.push('\n');
+            }
+        });
+        Par6dChild {
+            child,
+            stderr,
+            _slot: slot,
+        }
+    }
+}
+
+impl Drop for Par6dChild {
+    fn drop(&mut self) {
+        if matches!(self.child.try_wait(), Ok(None)) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+/// Where the test rigs' bus-grant segments live: the runtime's
+/// shared-memory filesystem, since a write to ordinary disk there can
+/// stall the snapshot fan-out that publishes them.
+fn scratch_shm_base() -> PathBuf {
+    let shm = PathBuf::from("/dev/shm");
+    if cfg!(target_os = "linux") && shm.is_dir() {
+        shm
+    } else {
+        std::env::temp_dir()
+    }
+}
+
+/// A fresh directory for one spawned daemon's bus-grant segments, so no
+/// two of them, and no in-process rig, ever share a claim.
+pub fn private_shm_dir() -> PathBuf {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = scratch_shm_base().join(format!("par6-child-shm-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("child shm dir");
+    dir
+}
 
 pub struct Rig {
     daemon: Option<Daemon>,
@@ -431,7 +504,11 @@ impl Rig {
     }
 
     pub fn shutdown(mut self) {
-        self.daemon.take().expect("running").shutdown();
+        self.daemon
+            .take()
+            .expect("running")
+            .shutdown()
+            .expect("the daemon's threads exit cleanly");
     }
 }
 
@@ -447,7 +524,10 @@ impl Drop for Rig {
     /// reused port, not as the leak it is.
     fn drop(&mut self) {
         if let Some(daemon) = self.daemon.take() {
-            daemon.shutdown();
+            let stopped = daemon.shutdown();
+            if !std::thread::panicking() {
+                stopped.expect("the daemon's threads exit cleanly");
+            }
         }
     }
 }
@@ -650,6 +730,9 @@ impl Client {
 
     /// Drain whatever replies are already buffered into the stash.
     pub fn drain(&mut self) {
+        self.sock
+            .set_nonblocking(true)
+            .expect("nonblocking reply socket");
         while let Some(r) = self.try_recv() {
             if let Reply::Complete {
                 index,
@@ -661,6 +744,9 @@ impl Client {
                 self.completes.push((index, ok, detail, verdict));
             }
         }
+        self.sock
+            .set_nonblocking(false)
+            .expect("blocking reply socket");
     }
 }
 

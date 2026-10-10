@@ -406,6 +406,19 @@ pub struct SaveConfig {
     pub force: bool,
 }
 
+/// SET_TOOL_ID: tell a gripper drive which tool it is built into and have
+/// it saved. Commissioning only — see [`crate::CmdType::SetToolId`].
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetToolId {
+    /// Target node (0..=15).
+    pub node: u8,
+    /// The tool id (`can_tool_id` of a configured tool; 0 clears it).
+    pub tool_id: u8,
+    /// Allow a `node` the config does not list.
+    pub force: bool,
+}
+
 /// SET_STATUS_RATE: change the STATUS broadcast rate for this session.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -825,6 +838,7 @@ pub enum Command {
     SetPidGains(SetPidGains),
     SetCanId(SetCanId),
     SaveConfig(SaveConfig),
+    SetToolId(SetToolId),
     SetStatusRate(SetStatusRate),
     // QUERY
     Ping,
@@ -907,6 +921,7 @@ impl Command {
             C::SetPidGains(_) => CmdType::SetPidGains,
             C::SetCanId(_) => CmdType::SetCanId,
             C::SaveConfig(_) => CmdType::SaveConfig,
+            C::SetToolId(_) => CmdType::SetToolId,
             C::SetStatusRate(_) => CmdType::SetStatusRate,
             C::Ping => CmdType::Ping,
             C::Status => CmdType::Status,
@@ -1034,6 +1049,11 @@ impl Command {
                     "must differ from node",
                 )
             }
+            C::SetToolId(p) => check(
+                p.node <= 15,
+                "set_tool_id.node",
+                "must be a CAN node id (0..=15)",
+            ),
             C::SaveConfig(p) => check(
                 p.node <= 15,
                 "save_config.node",
@@ -1408,6 +1428,7 @@ fn arity(tag: CmdType) -> usize {
         T::SetPidGains => 13,
         T::SetCanId => 5,
         T::SaveConfig => 4,
+        T::SetToolId => 5,
         T::SetStatusRate | T::SetExecutionSpeed => 3,
         T::ServoJ | T::ServoJPose | T::ServoL => 5,
         T::JogJ => 5,
@@ -1517,6 +1538,11 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         }
         C::SaveConfig(p) => {
             w_uint(buf, u64::from(p.node));
+            w_bool(buf, p.force);
+        }
+        C::SetToolId(p) => {
+            w_uint(buf, u64::from(p.node));
+            w_uint(buf, u64::from(p.tool_id));
             w_bool(buf, p.force);
         }
         C::SetStatusRate(p) => w_f64(buf, p.hz),
@@ -2074,6 +2100,14 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         }),
         T::SaveConfig => Command::SaveConfig(SaveConfig {
             node: r_node_id(&mut r, "save_config.node")?,
+            force: r.bool()?,
+        }),
+        T::SetToolId => Command::SetToolId(SetToolId {
+            node: r_node_id(&mut r, "set_tool_id.node")?,
+            tool_id: u8::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+                what: "set_tool_id.tool_id",
+                why: "must fit a byte".into(),
+            })?,
             force: r.bool()?,
         }),
         T::SetStatusRate => Command::SetStatusRate(SetStatusRate { hz: r.f64()? }),

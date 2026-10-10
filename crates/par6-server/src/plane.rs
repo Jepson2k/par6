@@ -204,6 +204,14 @@ pub enum PlanEvent {
         /// Its verdict.
         result: Result<(), WireError>,
     },
+    /// The runtime now wears another tool: a started command fitted it,
+    /// or the gripper drive reported it.
+    ToolFitted {
+        /// Registry key of the tool now fitted.
+        tool: String,
+        /// Jaw/variant key within it; `None` = the tool default.
+        variant: Option<String>,
+    },
     /// `set_shapes` answered.
     ShapesApplied {
         /// Who was waiting.
@@ -398,7 +406,11 @@ fn planner_loop<P: Planner>(
                     let index = batch[0].index;
                     let borrowed: Vec<QueuedCommand<'_>> =
                         batch.iter().map(OwnedQueued::as_ref).collect();
-                    match p.start(&borrowed) {
+                    let started = p.start(&borrowed);
+                    if let Some((tool, variant)) = p.take_fitted_tool() {
+                        emit(PlanEvent::ToolFitted { tool, variant });
+                    }
+                    match started {
                         Ok(n) => emit(PlanEvent::Started {
                             index,
                             taken: n.clamp(1, borrowed.len()),
@@ -426,6 +438,9 @@ fn planner_loop<P: Planner>(
         //    bounded one-period hole between non-blended queued moves.
         if let Some(out) = p.poll() {
             emit(PlanEvent::Outcome(out));
+        }
+        if let Some((tool, variant)) = p.take_fitted_tool() {
+            emit(PlanEvent::ToolFitted { tool, variant });
         }
         if let Some(out) = p.poll_tool() {
             emit(PlanEvent::ToolOutcome(out));

@@ -702,8 +702,8 @@ class DryRunRobotClient(RobotOwner):
     # ------------------------------------------------------------------
 
     def select_tool(self, tool_name: str, variant_key: str = "", **kwargs: Any) -> int:
-        """Select a tool — refused for any tool the runtime is not fitted
-        with, matching the runtime's own rule."""
+        """Fit a tool in the preview as the runtime fits one: any
+        configured tool, an unknown key refused."""
         return self._system(
             {
                 "type": "select_tool",

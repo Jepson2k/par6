@@ -143,7 +143,7 @@ impl Client {
     }
 
     /// The runtime's effective configuration (path, content fingerprint,
-    /// per-joint limits, motion constants) — the config-skew hook.
+    /// per-joint limits, motion constants).
     pub async fn config_info(&self) -> Result<QueryResult, ClientError> {
         self.query(Command::ConfigInfo).await
     }
@@ -401,6 +401,23 @@ impl Client {
         self.system(Command::SetCanId(cmd::SetCanId {
             node,
             new_id,
+            force,
+        }))
+        .await
+    }
+
+    /// Commissioning: tell gripper drive `node` it is built into tool
+    /// `tool_id` and have it saved (`SET_TOOL_ID`). Same gate and `force`
+    /// rule as `set_can_id`.
+    pub async fn set_tool_id(
+        &self,
+        node: u8,
+        tool_id: u8,
+        force: bool,
+    ) -> Result<Ack, ClientError> {
+        self.system(Command::SetToolId(cmd::SetToolId {
+            node,
+            tool_id,
             force,
         }))
         .await

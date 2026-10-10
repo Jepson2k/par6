@@ -87,20 +87,16 @@ fn outputs_hold_their_level_across_an_estop() {
         .unwrap();
     rig.tick();
     assert_eq!(rig.io_lines.output(1), 0, "and clears on the next write");
-}
 
-/// A port past the declared outputs drives nothing.
-///
-/// The command plane refuses these against the same count, so one
-/// arriving here means the two disagree — and writing `io_lines` past
-/// the outputs would corrupt the next line's published level, or a
-/// neighbouring field's.
-#[test]
-fn a_port_past_the_declared_outputs_changes_no_line() {
-    let mut rig = Rig::new();
+    // A port past the declared outputs drives nothing: the command plane
+    // refuses these against the same count, so one arriving here means
+    // the two disagree — and writing `io_lines` past the outputs would
+    // corrupt the next line's published level, or a neighbouring field's.
+    rig.cmds
+        .send(RtCommand::WriteIo { port: 2, value: 1 })
+        .unwrap();
     rig.tick();
     let before = rig.snap().io_lines;
-
     for port in [3u8, 62, 200] {
         rig.cmds
             .send(RtCommand::WriteIo { port, value: 1 })
@@ -108,4 +104,9 @@ fn a_port_past_the_declared_outputs_changes_no_line() {
         rig.tick();
     }
     assert_eq!(rig.snap().io_lines, before, "nothing moved");
+    assert_eq!(
+        rig.snap().io_output_levels(),
+        [0, 0, 1],
+        "the last port kept its level"
+    );
 }

@@ -145,6 +145,12 @@ fn changing_speed_does_not_introduce_a_jerk_spike_on_a_smooth_path() {
 fn rate_transitions_pause_resume_and_flush_preserve_motion_derivatives() {
     let mut config = bundle();
     config.robot.motion.execution_override_transition_s = 0.03;
+    // The oracle differentiates the observed scale, which is exact only
+    // as far as the transition is gentle; its tolerance was set at this
+    // acceleration limit, so the case pins it whatever the arm ships.
+    if let Some(exec) = config.robot.joints[0].limits.exec.as_mut() {
+        exec.acceleration_rad_s2 = 9.6;
+    }
     let acceleration_limit = config.robot.joints[0]
         .limits
         .for_mode(LimitMode::Exec)

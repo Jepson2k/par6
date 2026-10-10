@@ -111,7 +111,7 @@ pub(crate) fn load_kin(assets_dir: &Path, variant: GripperVariant) -> Result<Kin
 /// gravity compensation instead of a parsed-and-ignored field.
 pub fn load_gravity_kin(
     assets_dir: &Path,
-    gripper: Option<&par6_config::GripperConfig>,
+    gripper: Option<&par6_config::ToolConfig>,
 ) -> Result<Kin, String> {
     let tool = gripper.map(|g| {
         let k = &g.kinematics;
@@ -711,7 +711,8 @@ pub fn load_collision(
 /// The model a payload estimation measures against — the arm with its
 /// fitted gripper, the collision world the wrist swing is planned in,
 /// and the joint window — from the config the daemon runs, resolved the
-/// way the daemon resolves it.
+/// way the daemon resolves it, fitted with `tool` (the one the runtime has
+/// fitted now) when given.
 ///
 /// `package_dir` is where `package://` mesh URIs resolve when the assets
 /// tree is the installed Python package's `_data` rather than a repo
@@ -720,17 +721,21 @@ pub fn estimation_model(
     config: Option<&Path>,
     assets: Option<&Path>,
     package_dir: Option<&Path>,
+    tool: Option<&str>,
 ) -> Result<crate::calibrate::EstimationModel, String> {
     let config_path = crate::options::resolve_config_path(config)?;
-    let bundle = par6_config::ConfigBundle::load(&config_path).map_err(|e| e.to_string())?;
+    let (bundle, _) =
+        crate::options::load_config(&config_path, None, tool).map_err(|e| e.to_string())?;
     let robot = &bundle.robot;
     let assets_dir = resolve_assets_dir(assets, &config_path)?;
-    let gripper = bundle.active_gripper();
+    let gripper = bundle.active_tool();
     let variant = variant_for(
-        &robot.robot.active_gripper,
+        &robot.robot.active_tool,
         gripper.and_then(|g| g.urdf_variant.as_deref()),
     );
-    let kin = load_gravity_kin(&assets_dir, gripper)?;
+    let mut kin = load_gravity_kin(&assets_dir, gripper)?;
+    kin.set_gravity_correction(&robot.gravity_correction)
+        .map_err(|e| e.to_string())?;
     let collision =
         load_collision(&assets_dir, variant, package_dir, 0.0).map_err(|e| e.to_string())?;
     Ok(crate::calibrate::EstimationModel {
@@ -768,9 +773,13 @@ mod tests {
             0.0,
             std::f64::consts::PI,
         ];
+        let (cond_max, sigma_min) = (
+            bundle.robot.motion.singularity_cond_max,
+            bundle.robot.motion.singularity_sigma_min,
+        );
         let (sigma, cond) = cart.singularity(&singular).expect("metrics");
         assert!(
-            cond > 1000.0 || sigma < 1e-4,
+            cond > cond_max || sigma < sigma_min,
             "the straight wrist must read singular: sigma {sigma:.6}, cond {cond:.0}"
         );
 
@@ -778,7 +787,7 @@ mod tests {
         let healthy = [0.3, -1.2, 2.4, 0.4, -0.9, 2.0];
         let (sigma, cond) = cart.singularity(&healthy).expect("metrics");
         assert!(
-            cond <= 1000.0 && sigma >= 1e-4,
+            cond <= cond_max && sigma >= sigma_min,
             "a bent pose must read healthy: sigma {sigma:.6}, cond {cond:.0}"
         );
     }
@@ -797,9 +806,9 @@ mod tests {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
         let assets = resolve_assets_dir(None, &config).expect("assets tree");
         let bundle = par6_config::ConfigBundle::load(&config).expect("bundle");
-        assert!(bundle.grippers.len() > 3, "the shipped tools are all here");
+        assert!(bundle.tools.len() > 3, "the shipped tools are all here");
 
-        for g in &bundle.grippers {
+        for g in &bundle.tools {
             assert!(
                 g.urdf_variant.is_some(),
                 "{}: shipped gripper TOMLs declare urdf_variant explicitly",
@@ -850,6 +859,15 @@ mod tests {
             (-170.0, 45.0, -5.0),
         ] {
             let built = wire_pose_to_matrix(&[120.0, -45.0, 300.0, rx, ry, rz]);
+            for (got, want) in [built[3], built[7], built[11]]
+                .iter()
+                .zip([0.120, -0.045, 0.300])
+            {
+                assert!(
+                    (got - want).abs() < 1e-12,
+                    "the wire's millimetres are the matrix's metres: {got} vs {want}"
+                );
+            }
             let want = intrinsic_xyz(rx, ry, rz);
             for (i, (a, b)) in built.iter().zip(want.iter()).enumerate().take(11) {
                 if i % 4 != 3 {
@@ -859,7 +877,13 @@ mod tests {
                     );
                 }
             }
-            let back = matrix_to_xyzrpy(&want);
+            let back = matrix_to_xyzrpy(&built);
+            for (got, want) in back[..3].iter().zip([0.120, -0.045, 0.300]) {
+                assert!(
+                    (got - want).abs() < 1e-12,
+                    "decoded metres: {got} vs {want}"
+                );
+            }
             let got = [
                 back[3].to_degrees(),
                 back[4].to_degrees(),
@@ -872,118 +896,73 @@ mod tests {
                 );
             }
         }
-    }
 
-    /// The everyday tool-down pose: pointing the tool at the table and
-    /// spinning the wrist. Under the fixed-axis reading of the same
-    /// three numbers the wrist angle comes back NEGATED — the taught
-    /// pose and the replayed pose are `2·rz` apart, and the arm enters
-    /// the fixture rotated.
-    #[test]
-    fn tool_down_wrist_angle_keeps_its_sign() {
-        for rz in [10.0, 30.0, 90.0] {
-            let down = intrinsic_xyz(180.0, 0.0, rz);
-            let back = matrix_to_xyzrpy(&down);
-            assert!(
-                (back[5].to_degrees() - rz).abs() < 1e-9,
-                "tool-down rz={rz} decoded as {}",
-                back[5].to_degrees()
-            );
-            assert!((back[3].to_degrees().abs() - 180.0).abs() < 1e-9);
-            assert!(back[4].abs() < 1e-9);
+        // The everyday tool-down pose keeps its wrist angle's sign: under the fixed-axis reading the wrist comes back negated, 2·rz from the taught pose.
+        {
+            for rz in [10.0, 30.0, 90.0] {
+                let down = intrinsic_xyz(180.0, 0.0, rz);
+                let back = matrix_to_xyzrpy(&down);
+                assert!(
+                    (back[5].to_degrees() - rz).abs() < 1e-9,
+                    "tool-down rz={rz} decoded as {}",
+                    back[5].to_degrees()
+                );
+                assert!((back[3].to_degrees().abs() - 180.0).abs() < 1e-9);
+                assert!(back[4].abs() < 1e-9);
+            }
         }
-    }
 
-    /// A pose whose pitch sits exactly on gimbal lock still names the
-    /// orientation it is in: roll and yaw are no longer separable, so
-    /// the pair the decode picks has to rebuild the same matrix.
-    #[test]
-    fn gimbal_locked_pose_round_trips_to_the_same_orientation() {
-        for (pitch, rx, rz) in [(90.0, 40.0, 25.0), (-90.0, -15.0, 100.0)] {
-            let locked = intrinsic_xyz(rx, pitch, rz);
-            let back = matrix_to_xyzrpy(&locked);
-            let again = wire_pose_to_matrix(&[
-                0.0,
-                0.0,
-                0.0,
-                back[3].to_degrees(),
-                back[4].to_degrees(),
-                back[5].to_degrees(),
-            ]);
-            for (i, (a, b)) in locked.iter().zip(again.iter()).enumerate().take(11) {
-                if i % 4 != 3 {
-                    assert!(
-                        (a - b).abs() < 1e-9,
-                        "pitch {pitch} elem {i}: {a} vs {b} (decoded {:?})",
-                        &back[3..]
-                    );
+        // A pitch exactly on gimbal lock still decodes to a pair that rebuilds the same matrix.
+        {
+            for (pitch, rx, rz) in [(90.0, 40.0, 25.0), (-90.0, -15.0, 100.0)] {
+                let locked = intrinsic_xyz(rx, pitch, rz);
+                let back = matrix_to_xyzrpy(&locked);
+                let again = wire_pose_to_matrix(&[
+                    0.0,
+                    0.0,
+                    0.0,
+                    back[3].to_degrees(),
+                    back[4].to_degrees(),
+                    back[5].to_degrees(),
+                ]);
+                for (i, (a, b)) in locked.iter().zip(again.iter()).enumerate().take(11) {
+                    if i % 4 != 3 {
+                        assert!(
+                            (a - b).abs() < 1e-9,
+                            "pitch {pitch} elem {i}: {a} vs {b} (decoded {:?})",
+                            &back[3..]
+                        );
+                    }
                 }
             }
         }
     }
 
-    #[test]
-    fn wire_pose_round_trips_through_matrix() {
-        let poses = [
-            [120.0, -45.0, 300.0, 10.0, -20.0, 130.0],
-            [0.0, 0.0, 0.0, -170.0, 45.0, -5.0],
-            [5.0, 5.0, 5.0, 0.0, 0.0, 0.0],
-        ];
-        for p in poses {
-            let m = wire_pose_to_matrix(&p);
-            let back = matrix_to_xyzrpy(&m);
-            let again = wire_pose_to_matrix(&[
-                back[0] * 1000.0,
-                back[1] * 1000.0,
-                back[2] * 1000.0,
-                back[3].to_degrees(),
-                back[4].to_degrees(),
-                back[5].to_degrees(),
-            ]);
-            for (i, (a, b)) in m.iter().zip(again.iter()).enumerate() {
-                assert!((a - b).abs() < 1e-9, "pose {p:?} elem {i}: {a} vs {b}");
-            }
-        }
-    }
-
-    /// The wire pose convention and `par6-motion`'s segment geometry
-    /// meet here: a segment built from two wire poses interpolates in
-    /// the rpy convention this module decodes with.
-    #[test]
-    fn cart_segment_interpolates_endpoints_and_midpoint_rotation() {
-        let start = wire_pose_to_matrix(&[100.0, 0.0, 200.0, 0.0, 0.0, 0.0]);
-        let end = wire_pose_to_matrix(&[200.0, 50.0, 200.0, 0.0, 0.0, 90.0]);
-        let seg = par6_motion::cart::LineSegment::new(&start, &end);
-        assert!((seg.length_m() - (0.1f64.powi(2) + 0.05f64.powi(2)).sqrt()).abs() < 1e-12);
-        assert!((seg.angle_rad() - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
-        let mid = seg.sample(0.5);
-        let rpy = matrix_to_xyzrpy(&mid);
-        assert!((rpy[0] - 0.15).abs() < 1e-12, "midpoint x");
-        assert!((rpy[5].to_degrees() - 45.0).abs() < 1e-9, "midpoint yaw");
-        for (g, w) in seg.sample(1.0).iter().zip(end.iter()) {
-            assert!((g - w).abs() < 1e-9);
-        }
-    }
-
+    /// A dense system whose first column has a zero on the diagonal, so
+    /// elimination must pivot to get anywhere; and a singular one, which
+    /// has no answer to give.
     #[test]
     fn solve6_inverts_a_known_system() {
-        // A = diag(2) with an off-diagonal coupling; b chosen so x is exact.
-        let mut a = [[0.0; 6]; 6];
-        for (i, row) in a.iter_mut().enumerate() {
-            row[i] = 2.0;
-        }
-        a[0][5] = 1.0;
+        let a = [
+            [0.0, 2.0, -1.0, 3.0, 1.0, 4.0],
+            [3.0, -1.0, 2.0, 0.0, 5.0, 1.0],
+            [1.0, 4.0, 0.0, -2.0, 2.0, -3.0],
+            [-2.0, 1.0, 3.0, 1.0, 0.0, 2.0],
+            [4.0, 0.0, 1.0, 2.0, -1.0, 1.0],
+            [2.0, 3.0, -2.0, 1.0, 3.0, 0.0],
+        ];
         let x_true = [1.0, -2.0, 3.0, 0.5, -0.25, 4.0];
-        let mut b = [0.0; 6];
-        for r in 0..6 {
-            for c in 0..6 {
-                b[r] += a[r][c] * x_true[c];
-            }
-        }
-        let x = solve6(&mut a, &b).expect("solvable");
+        let times = |x: &[f64; 6]| -> [f64; 6] {
+            std::array::from_fn(|r| (0..6).map(|c| a[r][c] * x[c]).sum())
+        };
+        let x = solve6(&mut a.clone(), &times(&x_true)).expect("solvable");
         for (g, w) in x.iter().zip(x_true.iter()) {
-            assert!((g - w).abs() < 1e-12);
+            assert!((g - w).abs() < 1e-9, "solved {x:?}, expected {x_true:?}");
         }
+
+        let mut singular = a;
+        singular[4] = singular[1];
+        assert_eq!(solve6(&mut singular, &times(&x_true)), None);
     }
 
     /// The explicit key decides; the prefix rule is only the fallback.

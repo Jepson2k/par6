@@ -38,7 +38,6 @@ use par6_bus::{
 use par6_config::{ConfigBundle, ControlMode, KtSource, LimitMode, MAX_IO_LINES};
 
 use crate::dispatch::{self, CommandMirror, JointSetpoint};
-use crate::drift_lock::DriftLock;
 use crate::errors::ErrorManager;
 use crate::exec::{ExecPlayback, ExecTick};
 use crate::gpio::{Debouncer, DigitalIo, EstopGpio, EstopMonitor};
@@ -61,7 +60,8 @@ use crate::MAX_JOINTS;
 /// The `boot_configure` arguments, retained for a live bus swap.
 struct BootConfig {
     robot: par6_config::RobotConfig,
-    gripper: Option<par6_config::GripperConfig>,
+    /// The fitted tool, driven or not: the simulator carries its mass.
+    tool: Option<par6_config::ToolConfig>,
     config_repeats: u8,
 }
 
@@ -101,12 +101,17 @@ const STREAM_REST_RAD_S: f64 = 1e-9;
 const RELEASE_REST_BAND_RAD: f64 = 0.05;
 const RELEASE_REST_WINDOW_S: f64 = 0.2;
 
-const BOOT_SELFCHECK_S: f64 = 0.032;
+/// Wait from a bus coming up to its selfcheck scan \[s\].
+pub const BOOT_SELFCHECK_S: f64 = 0.032;
+/// Settling time between a boot-time link cycle and the re-scan that
+/// judges it \[s\]: the interface comes back up, the first stored-config
+/// shot (0.2 s) reaches the drives, and their replies fill the roll.
+const LINK_RECOVERY_SETTLE_S: f64 = 0.5;
 /// Clear_Error frame repeats per faulted node during the clear sequence.
 const CLEAR_ERROR_REPEATS: u8 = 3;
 /// EXEC link watchdog: heartbeat silence while samples pending that
 /// latches `EXEC_LINK_LOST` \[s\].
-const EXEC_HEARTBEAT_TIMEOUT_S: f64 = 0.5;
+pub const EXEC_HEARTBEAT_TIMEOUT_S: f64 = 0.5;
 /// First-order EMA coefficient for the `*_filtered` measured-state
 /// mirrors (light smoothing for telemetry/external-torque estimation).
 const MEAS_FILTER_ALPHA: f64 = 0.2;
@@ -118,12 +123,19 @@ struct ShutdownPark {
     tolerance_rad: f64,
     timeout_ticks: u32,
     target: [f64; MAX_JOINTS],
-    /// The fraction of the STREAM velocity limits under which no joint
-    /// exceeds the configured retreat speed: `min_j(v_park / v_j)`,
-    /// capped at 1.
-    speed_fraction: f64,
+    /// Per joint, the fraction of its STREAM velocity limit that is the
+    /// configured retreat speed, capped at 1. One shared fraction — the
+    /// wrists' — left the shoulder crawling at 3 deg/s and timing out
+    /// short of its endstop (2026-09-23).
+    speed_fractions: [f64; MAX_JOINTS],
     saved_scale: (f64, f64),
     running: bool,
+    /// The stream tracker's normal (soft) clamp, restored when the
+    /// retreat ends.
+    soft_bounds: ([f64; MAX_JOINTS], [f64; MAX_JOINTS]),
+    /// The clamp the retreat runs under: each joint's travel, so one
+    /// parked on its homing endstop can reach it.
+    hard_bounds: ([f64; MAX_JOINTS], [f64; MAX_JOINTS]),
 }
 
 impl ShutdownPark {
@@ -131,21 +143,30 @@ impl ShutdownPark {
         let cfg = &robot.shutdown;
         let mut target = [0.0; MAX_JOINTS];
         for (t, q) in target.iter_mut().zip(robot.safe_park_q()) {
-            *t = *q;
+            *t = q;
         }
-        let speed_fraction = robot
-            .joints
-            .iter()
-            .map(|j| cfg.velocity_limit_rad_s / j.limits.for_mode(LimitMode::Stream).velocity_rad_s)
-            .fold(1.0, f64::min);
+        let mut soft = ([0.0; MAX_JOINTS], [0.0; MAX_JOINTS]);
+        let mut hard = ([0.0; MAX_JOINTS], [0.0; MAX_JOINTS]);
+        for (i, j) in robot.joints.iter().enumerate().take(MAX_JOINTS) {
+            soft.0[i] = j.limits.soft_min_rad;
+            soft.1[i] = j.limits.soft_max_rad;
+            (hard.0[i], hard.1[i]) = j.limits.travel_rad();
+        }
+        let mut speed_fractions = [1.0; MAX_JOINTS];
+        for (f, j) in speed_fractions.iter_mut().zip(&robot.joints) {
+            *f = (cfg.velocity_limit_rad_s / j.limits.for_mode(LimitMode::Stream).velocity_rad_s)
+                .min(1.0);
+        }
         Self {
             enabled: cfg.safe_park,
             tolerance_rad: cfg.tolerance_rad,
             timeout_ticks: robot.ticks(cfg.timeout_s).max(1),
             target,
-            speed_fraction,
+            speed_fractions,
             saved_scale: (1.0, 1.0),
             running: false,
+            soft_bounds: soft,
+            hard_bounds: hard,
         }
     }
 }
@@ -496,6 +517,10 @@ pub struct RtCore<B: DriverBus> {
 
     // Seams.
     gravity: Box<dyn GravityModel>,
+    /// The declared payload, `(mass, com, inertia)`, as the last
+    /// `SetPayload` gave it.
+    payload: (f64, [f64; 3], Option<[f64; 6]>),
+    gravity_scale: [f64; MAX_JOINTS],
     jog: Box<dyn JogEngine>,
     stream: Box<dyn StreamTracker>,
     stream_shaped: Box<dyn StreamTracker>,
@@ -520,6 +545,22 @@ pub struct RtCore<B: DriverBus> {
 
     // Subsystems.
     homing: HomingSystem,
+    /// `homing.reference_check_nm`: per-joint bound on the mean holding
+    /// residual over the sequence's final hold; empty disables.
+    ref_check_nm: Vec<f64>,
+    ref_check_sum: [f64; MAX_JOINTS],
+    ref_check_n: u32,
+    /// One link cycle per bus life: a boot scan that finds nobody cycles
+    /// the interface once and re-scans; a second silence is a fault.
+    link_recovered: bool,
+    /// Held in BOOTING after the selfcheck: on a real bus the gripper
+    /// drive reports a tool the runtime has not fitted. The second flag
+    /// keeps the log to one line per hold.
+    tool_hold: bool,
+    tool_hold_logged: bool,
+    /// Until when a gripper drive that has not yet said which tool it is
+    /// gets to answer before it is taken to say nothing.
+    tool_hold_until: u64,
     errors: ErrorManager,
     timing: LoopTiming,
     bus_faults: BusFaultLogs,
@@ -617,6 +658,10 @@ pub struct RtCore<B: DriverBus> {
     /// Consecutive ticks with every joint inside that band, against
     /// `release_rest_needed` ([`RELEASE_REST_WINDOW_S`] in ticks).
     release_rest_streak: u32,
+    /// Each joint's position generation at the last rest check: a tick
+    /// without a new encoder reading on every joint restarts the rest
+    /// window, since a cached position does not move whatever the arm does.
+    release_rest_generation: [u64; MAX_JOINTS],
     release_rest_needed: u32,
     jog_joints: u8,
     jog_blocked: u16,
@@ -655,9 +700,6 @@ pub struct RtCore<B: DriverBus> {
     // Shutdown retreat.
     park: ShutdownPark,
 
-    // Freedrive drift lock.
-    drift: DriftLock,
-
     // Bus rescan (BUS_SCAN): the next id to ping, the settle countdown
     // after the last ping, and the epoch the snapshot publishes.
     scan_next: Option<u8>,
@@ -668,6 +710,10 @@ pub struct RtCore<B: DriverBus> {
     /// Tick after a bus comes up at which the selfcheck runs, from
     /// [`BOOT_SELFCHECK_S`] at this tick rate.
     boot_selfcheck_tick: u64,
+    /// Tick of the one re-scan that follows a boot-time link cycle.
+    rescan_at: Option<u64>,
+    /// The bring-up after a link cycle has run; the rescan judges it next.
+    rescan_configured: bool,
 
     // Opt-in per-phase tick profiler (see `TickProfile`).
     profile_on: bool,
@@ -695,8 +741,9 @@ impl<B: DriverBus> RtCore<B> {
             });
         }
         let dt = robot.robot.tick_dt_s;
-        let gripper = bundle.active_gripper().filter(|g| g.driver.is_some());
-        bus.boot_configure(robot, gripper, robot.bus.boot_config_repeats)?;
+        let tool = bundle.active_tool();
+        bus.boot_configure(robot, tool, robot.bus.boot_config_repeats)?;
+        let gripper = tool.filter(|g| g.driver.is_some());
 
         let conv: [JointConversion; MAX_JOINTS] =
             std::array::from_fn(|i| JointConversion::from_config(&robot.joints[i]));
@@ -744,7 +791,7 @@ impl<B: DriverBus> RtCore<B> {
             config_repush_armed_at: 0,
             boot: BootConfig {
                 robot: robot.clone(),
-                gripper: gripper.cloned(),
+                tool: tool.cloned(),
                 config_repeats: robot.bus.boot_config_repeats,
             },
             torque_ma_factor,
@@ -759,6 +806,8 @@ impl<B: DriverBus> RtCore<B> {
                 ControlMode::Pd => Pack::Pd,
             },
             gravity: hooks.gravity,
+            payload: (0.0, [0.0; 3], None),
+            gravity_scale: robot.gravity_scale,
             jog: hooks.jog,
             stream: hooks.stream,
             stream_shaped: hooks.stream_shaped,
@@ -787,6 +836,13 @@ impl<B: DriverBus> RtCore<B> {
             commands: hooks.commands,
             fk: hooks.fk,
             homing: HomingSystem::new(bundle),
+            ref_check_nm: robot.homing.reference_check_nm.clone(),
+            ref_check_sum: [0.0; MAX_JOINTS],
+            ref_check_n: 0,
+            link_recovered: false,
+            tool_hold: false,
+            tool_hold_logged: false,
+            tool_hold_until: 0,
             errors: ErrorManager::new(dt),
             timing: LoopTiming::new(dt, robot.loop_timing()),
             bus_faults: BusFaultLogs::new(u64::from(robot.ticks(BUS_FAULT_LOG_PERIOD_S).max(1))),
@@ -853,6 +909,7 @@ impl<B: DriverBus> RtCore<B> {
             stream_released: false,
             release_rest_ref: None,
             release_rest_streak: 0,
+            release_rest_generation: [0; MAX_JOINTS],
             release_rest_needed: robot.ticks(RELEASE_REST_WINDOW_S).max(1),
             jog_joints: 0,
             jog_blocked: 0,
@@ -884,12 +941,13 @@ impl<B: DriverBus> RtCore<B> {
             stream_lp_alpha: lowpass_alpha(robot.stream.lowpass_cutoff_hz, dt),
             stream_filt: [0.0; MAX_JOINTS],
             park: ShutdownPark::from_config(robot),
-            drift: DriftLock::from_config(robot),
             scan_next: None,
             scan_settle: 0,
             scan_settle_ticks: u8::try_from(robot.ticks(SCAN_SETTLE_S).max(1)).unwrap_or(u8::MAX),
             scan_epoch: 0,
             boot_selfcheck_tick: u64::from(robot.ticks(BOOT_SELFCHECK_S).max(1)),
+            rescan_at: None,
+            rescan_configured: false,
             profile_on: false,
             profile: TickProfile::default(),
             writer,
@@ -926,6 +984,53 @@ impl<B: DriverBus> RtCore<B> {
     /// The bus backend (sim scenario hooks, backend switching in `par6d`).
     pub fn bus_mut(&mut self) -> &mut B {
         &mut self.bus
+    }
+
+    /// Adopt a newly fitted tool's gripper — the `select_tool`
+    /// follow-through for the jaw.
+    ///
+    /// The homing system takes the new pinion radius and homing plan and
+    /// drops the reference latched against the jaw that came off. A driven
+    /// tool also has its own current, velocity and voltage limits, which
+    /// have to reach the node before anything drives it: the limits stored
+    /// for that node are replaced too, so every later resend (reconnect,
+    /// FLASHING exit) carries them as well.
+    pub fn set_gripper_tool(
+        &mut self,
+        gripper: Option<&par6_config::ToolConfig>,
+        gripper_node: par6_bus::NodeId,
+        repeats: u8,
+    ) {
+        let dt = self.dt;
+        self.boot.tool = gripper.cloned();
+        self.bus.fit_tool(&self.boot.robot, gripper);
+        // What the gripper node last said is the old tool's drive talking:
+        // its readings and faults are not the new tool's, or anyone's.
+        self.bus_state.nodes[usize::from(gripper_node)] = par6_bus::NodeState::default();
+        self.bus_state.gripper = par6_bus::GripperState::default();
+        self.homing.set_gripper(&self.boot.robot, gripper, dt);
+        let driver = gripper.and_then(|g| g.driver.as_ref());
+        // Whether there is a gripper node to keep fresh, drive and settle
+        // is the tool's, not the boot's.
+        self.has_can_gripper = driver.is_some();
+        self.homing_gcmd = if self.has_can_gripper {
+            GripperCommand::FirmwarePoll
+        } else {
+            GripperCommand::NoGripper
+        };
+        self.gripper_settle = GripperSettle::new(dt, &driver.map(|d| d.settle).unwrap_or_default());
+        self.gripper_gate = GripperGate::default();
+        if let Some(d) = driver {
+            let tune = par6_bus::DriveTune {
+                gains: d.gains,
+                ilim_ma: d.ilim_ma,
+                velocity_limit_ticks_s: d.velocity_limit_ticks_s,
+                voltage_limit_mv: d.voltage_limit_mv,
+            };
+            if let Err(e) = self.bus.retune_node(gripper_node, &tune, repeats) {
+                log::error!("select_tool: the gripper node refused its new limits: {e}");
+            }
+        }
     }
 
     /// Whether the arm has stopped travelling: every joint inside
@@ -966,15 +1071,21 @@ impl<B: DriverBus> RtCore<B> {
     pub fn replace_bus(&mut self, mut bus: B) -> Result<(), CoreError> {
         bus.boot_configure(
             &self.boot.robot,
-            self.boot.gripper.as_ref(),
+            self.boot.tool.as_ref(),
             self.boot.config_repeats,
         )?;
         self.bus = bus;
         self.bus_state = BusState::new();
+        // Bus-off events counted on the old bus are no fault of the new one.
+        self.bus_off_events_seen = self.bus.link_health().bus_off_events;
         self.sector_done = [false; MAX_JOINTS];
         self.filters_seeded = false;
         self.bus_booted_at = self.tick;
         self.config_repush_armed_at = self.tick;
+        self.link_recovered = false;
+        self.tool_hold = false;
+        self.rescan_at = None;
+        self.rescan_configured = false;
         self.homed = false;
         self.not_homed_refused = false;
         self.mode = Mode::Booting;
@@ -1034,6 +1145,24 @@ impl<B: DriverBus> RtCore<B> {
         }
         self.set_homed(true);
         self.reseed_motion_targets();
+        // The landed pose's own feedforward from its first tick. Ramped
+        // from the pose the arm left, the drives carry the difference on
+        // their loops meanwhile, and the landing creeps as those unwind.
+        self.refresh_gravity();
+        let applied = if self.gravity_applied() {
+            self.g
+        } else {
+            [0.0; MAX_JOINTS]
+        };
+        self.torque_slew.seed(&applied);
+    }
+
+    /// The gravity feedforward at the current `q`, scaled per joint.
+    fn refresh_gravity(&mut self) {
+        self.gravity.gravity(&self.q, &mut self.g);
+        for (g, scale) in self.g.iter_mut().zip(self.gravity_scale) {
+            *g *= scale;
+        }
     }
 
     /// Simulator/teleport path: re-aim every motion hold at the landed
@@ -1066,6 +1195,35 @@ impl<B: DriverBus> RtCore<B> {
         self.exec.set_policy(policy);
     }
 
+    /// Swap the gravity model — the `select_tool` follow-through.
+    ///
+    /// A different tool is a different load on every gravity-loaded joint,
+    /// so the feedforward has to come from a model built for it. Applied
+    /// off-tick through a `CoreOp`, like every other core mutation.
+    pub fn set_gravity(&mut self, mut gravity: Box<dyn GravityModel>) {
+        // The declared payload is the RT's to keep: a model built elsewhere
+        // may predate the latest one.
+        let (mass, com, inertia) = self.payload;
+        gravity.set_payload(mass, com, inertia);
+        self.gravity = gravity;
+    }
+
+    /// Swap the forward-kinematics model — the `select_tool`
+    /// follow-through for everything that reads a TCP pose.
+    pub fn set_fk(&mut self, fk: Box<dyn ForwardKin>) {
+        self.fk = fk;
+    }
+
+    /// The home offset the next homing of `joint` latches against, for a
+    /// newly fitted tool. The reference already latched stands: the
+    /// encoder reads the same joint angle whatever is bolted on, and the
+    /// tool only moves where a stop that homes against its body sits.
+    pub fn set_tool_home_offset(&mut self, joint: usize, offset_rad: f64) {
+        if joint < MAX_JOINTS {
+            self.homing.set_home_offset(joint, offset_rad);
+        }
+    }
+
     /// Reset the loop timing statistics (the `reset_loop_stats`
     /// follow-through); the warmup gate re-arms. The scheduling flags are
     /// state, not statistics, and survive.
@@ -1085,7 +1243,7 @@ impl<B: DriverBus> RtCore<B> {
     /// before the process exits. BOOTING / ACTIVE_ERROR / SAFETY_STOP
     /// already run a stationary law and are left in place; FLASHING is a
     /// bus-silent maintenance window and must stay silent.
-    pub fn shutdown_halt(&mut self) {
+    pub(crate) fn shutdown_halt(&mut self) {
         if matches!(
             self.mode,
             Mode::Idle | Mode::Booting | Mode::ActiveError | Mode::SafetyStop | Mode::Flashing
@@ -1096,7 +1254,7 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     /// Ticks the shutdown retreat may run before its timeout.
-    pub fn shutdown_park_timeout_ticks(&self) -> u32 {
+    pub(crate) fn shutdown_park_timeout_ticks(&self) -> u32 {
         self.park.timeout_ticks
     }
 
@@ -1117,7 +1275,7 @@ impl<B: DriverBus> RtCore<B> {
     /// which is what makes a slow retreat smooth rather than sluggish.
     /// The scale is restored by [`RtCore::shutdown_park_end`] whatever
     /// happens.
-    pub fn shutdown_park_begin(&mut self) -> bool {
+    pub(crate) fn shutdown_park_begin(&mut self) -> bool {
         if !self.park.enabled || self.mode == Mode::Flashing {
             return false;
         }
@@ -1133,24 +1291,26 @@ impl<B: DriverBus> RtCore<B> {
         if self.has_can_gripper {
             self.apply_command(RtCommand::GripperStop);
         }
-        if let Err(refusal) = self.request_mode(Mode::Stream) {
+        // A working mode can only leave for IDLE, and the exit arrives in
+        // whatever mode the last command left behind — EXEC after a
+        // finished move, JOG after a jog. Idling first abandons that work,
+        // which is what a shutdown means anyway.
+        if let Err(refusal) = self
+            .request_mode(Mode::Idle)
+            .and_then(|()| self.request_mode(Mode::Stream))
+        {
             log::warn!("shutdown: retreat refused ({refusal:?}); halting in place");
             return false;
         }
         self.park.saved_scale = self.stream_scale;
-        // The retreat is a joint-space move to a fixed pose, so it runs
-        // on the rate limiter even if a cartesian stream was live: the
-        // mode request above is a no-op when STREAM is already the mode,
-        // and would leave the clamp-only tracker holding the path.
-        self.stream_is_shaped = false;
-        self.stream.activate(&self.q);
-        self.stream_commanded = self.q;
-        let f = self.park.speed_fraction;
-        self.stream.set_scale(f, 1.0);
-        self.stream_scale = (f, 1.0);
+        let f = self.park.speed_fractions;
+        self.stream.set_scale_per_joint(&f, 1.0);
+        self.stream_scale = (f.iter().copied().fold(1.0, f64::min), 1.0);
+        let (min, max) = self.park.hard_bounds;
+        self.stream.set_bounds(&min, &max);
         log::info!(
-            "shutdown: retreating to the rest pose at {:.3} of the STREAM limits",
-            f
+            "shutdown: retreating to the rest pose at {:?} of the STREAM velocity limits",
+            f.map(|v| (v * 1000.0).round() / 1000.0)
         );
         self.park.running = true;
         true
@@ -1161,7 +1321,7 @@ impl<B: DriverBus> RtCore<B> {
     /// `true` once every joint measures within tolerance of the pose,
     /// or when the retreat can no longer run (a hard error dropped the
     /// mode) — the caller then proceeds to the halt.
-    pub fn shutdown_park_feed(&mut self) -> bool {
+    pub(crate) fn shutdown_park_feed(&mut self) -> bool {
         if !self.park.running || self.mode != Mode::Stream {
             return true;
         }
@@ -1183,7 +1343,7 @@ impl<B: DriverBus> RtCore<B> {
 
     /// End the retreat: restore the stream scale the retreat overrode.
     /// Runs on every exit from the retreat, reached or not.
-    pub fn shutdown_park_end(&mut self) {
+    pub(crate) fn shutdown_park_end(&mut self) {
         if !self.park.running {
             return;
         }
@@ -1191,12 +1351,14 @@ impl<B: DriverBus> RtCore<B> {
         let (v, a) = self.park.saved_scale;
         self.stream.set_scale(v, a);
         self.stream_scale = (v, a);
+        let (min, max) = self.park.soft_bounds;
+        self.stream.set_bounds(&min, &max);
     }
 
     /// Whether every joint's measured speed is inside the shutdown rest
     /// band — the condition the exit path waits on before idling the
     /// drives.
-    pub fn at_rest(&self) -> bool {
+    pub(crate) fn at_rest(&self) -> bool {
         self.qd_filt.iter().all(|v| v.abs() < SHUTDOWN_REST_RAD_S)
     }
 
@@ -1206,7 +1368,7 @@ impl<B: DriverBus> RtCore<B> {
     /// the last motion frame until the CAN watchdog expires and drops
     /// them out mid-hold. No-op in FLASHING (the bus is silent by
     /// contract there, and the arm is parked and asserted).
-    pub fn shutdown_limp(&mut self) {
+    pub(crate) fn shutdown_limp(&mut self) {
         if self.mode == Mode::Flashing {
             return;
         }
@@ -1260,7 +1422,7 @@ impl<B: DriverBus> RtCore<B> {
         lap(&mut mark, &mut laps, 4);
 
         // Gravity: computed every tick, published always.
-        self.gravity.gravity(&self.q, &mut self.g);
+        self.refresh_gravity();
 
         // External torque: what the measured (filtered) torque carries
         // beyond the model's gravity — a contact, a payload the model
@@ -1317,13 +1479,126 @@ impl<B: DriverBus> RtCore<B> {
 
     // ------------------------------------------------------------ boot
 
+    /// The post-homing reference plausibility check: with every joint
+    /// held on its drive's own loops at the ready pose, the current it
+    /// draws is the load the latched reference implies. A mean residual
+    /// against G(q) beyond the configured bound means the reference is
+    /// wrong by far more than the model is — a seek that stopped early.
+    fn check_reference(&mut self) -> bool {
+        if self.ref_check_nm.is_empty() || self.ref_check_n == 0 || !self.gravity.describes_arm() {
+            return false;
+        }
+        let n = f64::from(self.ref_check_n);
+        let residuals: [f64; MAX_JOINTS] = std::array::from_fn(|j| self.ref_check_sum[j] / n);
+        log::info!(
+            "homing reference check: mean holding residual {residuals:.2?} Nm over {n} ticks, \
+             bounds {:.2?} Nm",
+            self.ref_check_nm
+        );
+        let mut refused = false;
+        for (j, (residual, bound)) in residuals.iter().zip(&self.ref_check_nm).enumerate() {
+            if residual.abs() > *bound {
+                log::warn!(
+                    "homing reference check: J{j} holding residual {residual:+.2} Nm exceeds \
+                     {bound:.2} Nm at the ready pose; the reference is refused"
+                );
+                self.homing.fail_reference(j);
+                refused = true;
+            }
+        }
+        refused
+    }
+
+    /// The tool the gripper drive reports, when it is not the one fitted:
+    /// only a real drive, provisioned with an id, can say. The simulator's
+    /// is whatever the bundle fits.
+    fn unfitted_drive_tool(&self) -> Option<u8> {
+        if self.bus.simulated() {
+            return None;
+        }
+        let reported = self.bus_state.nodes[usize::from(self.gripper_node)]
+            .device_info
+            .map(|d| d.tool_id)
+            .filter(|id| *id != 0)?;
+        let fitted = self.boot.tool.as_ref().and_then(|t| t.can_tool_id);
+        (fitted != Some(reported)).then_some(reported)
+    }
+
+    fn gripper_present(&self) -> bool {
+        self.bus.connected_nodes() & (1 << u16::from(self.gripper_node)) != 0
+    }
+
+    /// Leave BOOTING once the drive and the fitted tool agree, as the
+    /// daemon's boot probe has them before anything moves.
+    fn release_tool_hold(&mut self) {
+        if self.mode != Mode::Booting {
+            self.tool_hold = false;
+            return;
+        }
+        let unheard = !self.bus.simulated()
+            && self.gripper_present()
+            && self.bus_state.nodes[usize::from(self.gripper_node)]
+                .device_info
+                .is_none();
+        if unheard && self.tick < self.tool_hold_until {
+            return;
+        }
+        match self.unfitted_drive_tool() {
+            Some(id) if !self.tool_hold_logged => {
+                self.tool_hold_logged = true;
+                log::warn!(
+                    "the gripper drive reports tool id {id}, which is not the fitted tool; \
+                     holding in BOOTING until it is"
+                );
+            }
+            Some(_) => {}
+            None => {
+                self.tool_hold = false;
+                let _ = self.request_mode(Mode::Idle);
+            }
+        }
+    }
+
     fn boot_oneshots(&mut self) {
         // Ticks since this BUS came up, not since the process did: a
         // backend swapped in at tick 90 000 needs the same selfcheck and
         // the same config re-sends a backend opened at boot got.
         let since_boot = self.tick - self.bus_booted_at;
-        if since_boot == self.boot_selfcheck_tick {
+        let rescan = self.rescan_at == Some(self.tick);
+        if rescan && !self.rescan_configured {
+            // The boot probes ran against a deaf bus — every node read as
+            // legacy, no kt answered — so the recovered link gets the whole
+            // bring-up again. Blocking, as the boot's own was, while nothing
+            // on the bus is being driven. Judged on the next tick, once the
+            // drain has published what it learned.
+            if let Err(e) = self.bus.boot_configure(
+                &self.boot.robot,
+                self.boot.tool.as_ref(),
+                self.boot.config_repeats,
+            ) {
+                log::error!("the bus bring-up after the link cycle failed: {e}");
+            }
+            self.rescan_configured = true;
+            self.rescan_at = Some(self.tick + 1);
+            return;
+        }
+        if since_boot == self.boot_selfcheck_tick || rescan {
+            self.rescan_at = None;
             let connected = self.bus.connected_nodes();
+            let arm_mask: u16 = self
+                .node_of
+                .iter()
+                .fold(0, |m, node| m | (1 << u16::from(*node)));
+            if connected & arm_mask == 0 && !self.link_recovered && self.bus.recover_link() {
+                // Whole-bus silence, cycled once: the stored-config shots
+                // re-arm from this tick and the scan is judged again once
+                // the link and the drives have had time to answer.
+                self.link_recovered = true;
+                self.config_repush_armed_at = self.tick;
+                let settle = u64::from(self.boot.robot.ticks(LINK_RECOVERY_SETTLE_S).max(1));
+                self.rescan_at = Some(self.tick + settle);
+                return;
+            }
             for i in 0..MAX_JOINTS {
                 if connected & (1 << u16::from(self.node_of[i])) == 0 {
                     self.errors.latch(ErrorCode::CanLost, Some(i as u8));
@@ -1336,8 +1611,25 @@ impl<B: DriverBus> RtCore<B> {
                 self.adopt_driver_kt();
             }
             if self.mode == Mode::Booting {
-                let _ = self.request_mode(Mode::Idle);
+                self.tool_hold = true;
+                self.tool_hold_logged = false;
+                self.tool_hold_until =
+                    self.tick + u64::from(self.boot.robot.ticks(self.boot.robot.bus.lost_s).max(1));
+                // Identity is otherwise polled every few seconds: asked now,
+                // the drive answers before anything leaves BOOTING.
+                if !self.bus.simulated() && self.gripper_present() {
+                    self.bus.queue_poll_override(
+                        PollAction::Poll {
+                            node: self.gripper_node,
+                            kind: par6_bus::PollKind::DeviceInfo,
+                        },
+                        1,
+                    );
+                }
             }
+        }
+        if self.tool_hold {
+            self.release_tool_hold();
         }
         // The scheduled shots ride their own arm point, not the bus
         // boot: a FLASHING exit re-arms them without re-running the
@@ -1445,6 +1737,11 @@ impl<B: DriverBus> RtCore<B> {
 
     fn apply_command(&mut self, cmd: RtCommand) {
         match cmd {
+            // Only the drive's own tool fitted ends the hold; a mode change
+            // out of it would run the arm on another tool's model.
+            RtCommand::SetMode(Mode::Idle) if self.tool_hold => {
+                log::warn!("mode request Idle refused: waiting for the gripper drive's tool");
+            }
             RtCommand::SetMode(target) => {
                 if let Err(e) = self.request_mode(target) {
                     log::warn!("mode request {target:?} refused: {e:?}");
@@ -1573,6 +1870,7 @@ impl<B: DriverBus> RtCore<B> {
                 }
             }
             RtCommand::SetPayload { mass, com, inertia } => {
+                self.payload = (mass, com, inertia);
                 self.gravity.set_payload(mass, com, inertia);
             }
             RtCommand::WriteIo { port, value } => self.set_io_output(port, value),
@@ -1587,6 +1885,18 @@ impl<B: DriverBus> RtCore<B> {
                 Ok(()) => log::info!("node {node} asked to save its configuration"),
                 Err(e) => log::error!("save_config on node {node} refused: {e}"),
             },
+            RtCommand::SetToolId { node, tool_id } => {
+                match self
+                    .bus
+                    .set_tool_id(node, tool_id)
+                    .and_then(|()| self.bus.save_config(node))
+                {
+                    Ok(()) => {
+                        log::info!("node {node} told it is tool {tool_id}, and asked to save it")
+                    }
+                    Err(e) => log::error!("set_tool_id on node {node} refused: {e}"),
+                }
+            }
             RtCommand::RescanBus => {
                 if self.bus.is_silent() {
                     log::warn!("bus rescan skipped: the bus is silent (FLASHING)");
@@ -1759,6 +2069,8 @@ impl<B: DriverBus> RtCore<B> {
         match target {
             Mode::Homing => {
                 self.homed = false;
+                self.ref_check_sum = [0.0; MAX_JOINTS];
+                self.ref_check_n = 0;
                 self.homing.start(&mut self.bus);
             }
             Mode::Jog => {
@@ -1914,6 +2226,18 @@ impl<B: DriverBus> RtCore<B> {
                 }
             }
         }
+        if !self.has_can_gripper {
+            // No driven tool is fitted, so whatever answers on its node — a
+            // reply in flight as the jaw came off, or a drive nothing here
+            // drives — reads nothing on the arm. Which tool it says it is
+            // stays: that is how the tool on the arm is known.
+            let node = &mut self.bus_state.nodes[usize::from(self.gripper_node)];
+            *node = par6_bus::NodeState {
+                device_info: node.device_info,
+                ..Default::default()
+            };
+            self.bus_state.gripper = par6_bus::GripperState::default();
+        }
         for i in 0..MAX_JOINTS {
             let node = &self.bus_state.nodes[usize::from(self.node_of[i])];
             if let Some(pos) = node.position_ticks {
@@ -1952,8 +2276,18 @@ impl<B: DriverBus> RtCore<B> {
                 .zip(reference.iter())
                 .all(|(q, r)| (q - r).abs() <= RELEASE_REST_BAND_RAD)
         });
-        if held {
+        let mut fresh = true;
+        for i in 0..MAX_JOINTS {
+            let node = &self.bus_state.nodes[usize::from(self.node_of[i])];
+            fresh &= node.position_ticks.is_some()
+                && node.position_generation != self.release_rest_generation[i];
+            self.release_rest_generation[i] = node.position_generation;
+        }
+        if held && fresh {
             self.release_rest_streak = self.release_rest_streak.saturating_add(1);
+        } else if held {
+            // Rest is evidence about now: a joint that went quiet voids it.
+            self.release_rest_streak = 0;
         } else {
             self.release_rest_ref = Some(self.q);
             self.release_rest_streak = 0;
@@ -2292,9 +2626,6 @@ impl<B: DriverBus> RtCore<B> {
         if self.mode != Mode::Exec {
             self.exec.at_rest();
         }
-        if self.mode != Mode::Idle {
-            self.drift.reset();
-        }
         if self.mode == Mode::Flashing {
             // Bus-silent: not a single frame, polls included.
             self.mirror = CommandMirror::default();
@@ -2319,7 +2650,14 @@ impl<B: DriverBus> RtCore<B> {
             self.step_scan();
             let _ = self.bus.poll_step();
             match status {
+                SeqStatus::Checking => {
+                    for (sum, ext) in self.ref_check_sum.iter_mut().zip(self.tau_ext) {
+                        *sum += ext;
+                    }
+                    self.ref_check_n += 1;
+                }
                 SeqStatus::Complete => {
+                    let refused = self.check_reference();
                     // Complete only says the sequence ran to its end, not
                     // that it referenced anything: a config whose home
                     // groups omit a joint still completes. Claiming
@@ -2333,6 +2671,9 @@ impl<B: DriverBus> RtCore<B> {
                         log::info!("homing sequence complete");
                         self.homed = true;
                         self.not_homed_refused = false;
+                    } else if refused {
+                        log::warn!("homing sequence FAILED the reference check");
+                        self.homed = false;
                     } else {
                         log::warn!(
                             "homing sequence completed without referencing {unreferenced:?}; \
@@ -2368,25 +2709,7 @@ impl<B: DriverBus> RtCore<B> {
 
         match self.mode {
             Mode::Booting => dispatch::law_booting(&mut self.setpoints),
-            Mode::Idle => {
-                let hold = self.gravity_applied();
-                if hold && self.drift.enabled() {
-                    if self.drift.tick(&self.q, &self.qd) {
-                        let lock = self.drift.status();
-                        dispatch::law_freedrive(
-                            &lock.hold_rad,
-                            &self.g,
-                            &lock.integral_nm,
-                            &mut self.setpoints,
-                        );
-                    } else {
-                        dispatch::law_idle(true, &self.g, &mut self.setpoints);
-                    }
-                } else {
-                    self.drift.reset();
-                    dispatch::law_idle(hold, &self.g, &mut self.setpoints);
-                }
-            }
+            Mode::Idle => dispatch::law_idle(self.gravity_applied(), &self.g, &mut self.setpoints),
             Mode::ActiveError => dispatch::law_active_error(&mut self.setpoints),
             Mode::SafetyStop => dispatch::law_safety_stop(&mut self.setpoints),
             Mode::Jog => {
@@ -2690,8 +3013,8 @@ impl<B: DriverBus> RtCore<B> {
         s.qd_commanded = self.mirror.qd;
         s.tau_commanded = self.mirror.tau;
         s.gravity_comp = gravity_applied;
-        s.drift_lock = *self.drift.status();
         s.bus_nodes = self.bus.connected_nodes();
+        s.bus_simulated = self.bus.simulated();
         s.bus_scan_epoch = self.scan_epoch;
         s.tick_profile = self.profile;
         s.q_target = self.q_target;

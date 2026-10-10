@@ -279,12 +279,11 @@ class TestToolTransforms:
     @requires_par6d
     @pytest.mark.e2e
     @pytest.mark.timeout(180)
-    # Both gripper variants. Not the bare flange: the shipped homing
-    # sequence references the fitted gripper's driver, so a runtime
-    # configured with `Flange` refuses to start on its own config.
-    @pytest.mark.parametrize("fitted_gripper", ["MSG_small_motor_150mm_rail", "SSG48"])
+    @pytest.mark.parametrize(
+        "fitted_tool", ["Flange", "MSG_small_motor_150mm_rail", "SSG48"]
+    )
     async def test_tcp_agrees_with_a_live_daemon(
-        self, tmp_path: Path, fitted_gripper: str
+        self, tmp_path: Path, fitted_tool: str
     ) -> None:
         """The client's TCP and the runtime's TCP are the same point.
 
@@ -293,9 +292,9 @@ class TestToolTransforms:
         Waldo Commander reads the pose from the runtime and the preview from
         this backend, so a variant, frame or unit the two resolve differently
         is a frame that drifts.  Checked at several configurations against a
-        real ``par6d --sim`` fitted with each gripper in turn — the daemon's
-        URDF variant follows ``[robot].active_gripper``, so each run
-        exercises a different tool tree on both sides.
+        real ``par6d --sim`` fitted with each tool in turn through
+        ``select_tool``, as a user fits one, so each run exercises a different
+        tool tree on both sides.
 
         Both position and orientation, each side decoded in its own
         documented convention: STATUS carries the pose as a matrix, while
@@ -306,11 +305,15 @@ class TestToolTransforms:
         from par6.robot import Robot as Par6Robot
 
         client_robot = Par6Robot()
-        client_robot.set_active_tool(fitted_gripper)
-        live = LiveDaemon.start(tmp_path, active_gripper=fitted_gripper)
+        client_robot.set_active_tool(fitted_tool)
+        live = LiveDaemon.start(tmp_path)
         try:
             async with live.client() as client:
                 assert await client.wait_status(lambda s: s.link_ok == 1, timeout=30.0)
+                await client.reset()
+                index = await client.select_tool(fitted_tool)
+                assert index >= 0
+                assert await client.wait_command(index), "select_tool never completed"
                 for angles_deg in AGREEMENT_POSES_DEG:
                     await settle_at(client, angles_deg)
                     # One STATUS frame: the joint angles and the pose the
@@ -326,13 +329,13 @@ class TestToolTransforms:
                     assert np.allclose(
                         T_client[:3, 3] * 1000.0, T_runtime[:3, 3], atol=1e-3
                     ), (
-                        f"{fitted_gripper} at {angles_deg}: client TCP "
+                        f"{fitted_tool} at {angles_deg}: client TCP "
                         f"{T_client[:3, 3] * 1000.0} mm vs runtime {T_runtime[:3, 3]} mm"
                     )
                     assert np.allclose(
                         T_client[:3, :3], T_runtime[:3, :3], atol=1e-6
                     ), (
-                        f"{fitted_gripper} at {angles_deg}: client and runtime "
+                        f"{fitted_tool} at {angles_deg}: client and runtime "
                         f"disagree about the tool orientation\n{T_client}\n{T_runtime}"
                     )
         finally:
@@ -468,19 +471,17 @@ def _tree_digest(
 
 
 class TestPackagedData:
-    def test_config_copies_are_fresh(self) -> None:
-        """python/par6/_data must match what scripts/sync_pkg_data.py produces
-        from the repo sources (same pattern as protocol/constants.py).  TOMLs
-        and meshes are byte copies; ``.urdf`` files go through the script's
-        ``packaged_bytes`` rewrite, so the guard compares against that."""
-        if not (REPO_ROOT / "config").is_dir():
-            pytest.skip("repo-root config/ not present (installed package)")
-        stale_msg = "packaged data is stale — run scripts/sync_pkg_data.py"
-        assert _tree_digest(DATA_DIR / "config", ("*.toml",)) == _tree_digest(
-            REPO_ROOT / "config", ("*.toml",)
-        ), stale_msg
-        packaged_bytes = _sync_script().packaged_bytes
+    def test_packaged_urdfs_are_fresh(self) -> None:
+        """python/par6/_data/URDF must match what scripts/sync_pkg_data.py
+        produces from the repo assets (same pattern as protocol/constants.py).
+        Meshes are byte copies; ``.urdf`` files go through the script's
+        ``packaged_bytes`` rewrite, so the guard compares against that.  The
+        config needs no guard: the package holds its only copy."""
         src_urdf = REPO_ROOT / "assets" / "par6_description" / "URDF"
+        if not src_urdf.is_dir():
+            pytest.skip("repo assets not present (installed package)")
+        stale_msg = "packaged data is stale — run scripts/sync_pkg_data.py"
+        packaged_bytes = _sync_script().packaged_bytes
         for tree in TREES:
             # Only urdf/, srdf/ + meshes/ are packaged (the URDFs reference
             # nothing outside meshes/); ROS scaffolding and alternate jaw

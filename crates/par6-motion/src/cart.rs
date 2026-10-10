@@ -14,8 +14,8 @@
 //!
 //! Corner rounding ([`corner_trims`]) is shared by the cartesian and the
 //! joint-space blend paths: it is the ABB zone rule — a corner radius is
-//! clamped to half of each adjacent segment, and two adjacent zones that
-//! would overlap are scaled down together until they do not.
+//! clamped to half of each adjacent segment, which is also what keeps two
+//! adjacent zones from overlapping.
 
 use glam::{DMat3, DQuat, DVec3};
 
@@ -238,13 +238,35 @@ impl CartSampling {
 /// `max_points`, leaving every piece at least one interval.
 fn fit_budget(counts: &mut [usize], max_points: usize) {
     let total: usize = counts.iter().sum();
-    let budget = max_points.max(counts.len() + 1);
-    if total < budget {
+    let allowed = max_points.max(counts.len() + 1) - 1;
+    if total <= allowed {
         return;
     }
-    let factor = (budget - 1) as f64 / total as f64;
-    for c in counts.iter_mut() {
-        *c = ((*c as f64 * factor).round() as usize).max(1);
+    let factor = allowed as f64 / total as f64;
+    let exact: Vec<f64> = counts.iter().map(|&c| c as f64 * factor).collect();
+    for (c, x) in counts.iter_mut().zip(&exact) {
+        *c = (x.floor() as usize).max(1);
+    }
+    // The one-interval floor can still overshoot; the longest pieces give
+    // it back. Then the floors' leftovers go where rounding cut deepest.
+    let mut sum: usize = counts.iter().sum();
+    while sum > allowed {
+        let i = (0..counts.len())
+            .max_by_key(|&i| counts[i])
+            .expect("pieces");
+        counts[i] -= 1;
+        sum -= 1;
+    }
+    while sum < allowed {
+        let short = |i: usize| exact[i] - counts[i] as f64;
+        let i = (0..counts.len())
+            .max_by(|&a, &b| short(a).total_cmp(&short(b)))
+            .expect("pieces");
+        if short(i) <= 0.0 {
+            break;
+        }
+        counts[i] += 1;
+        sum += 1;
     }
 }
 
@@ -678,8 +700,8 @@ pub struct Trim {
 /// waypoint (`seg_lengths.len() - 1` of them). The ABB zone rule, ported
 /// from parol6 (`motion/geometry.py`,
 /// `build_composite_cartesian_path`): a radius never eats more than half
-/// of either adjacent segment, and two zones sharing a segment are
-/// scaled down together until they fit inside it.
+/// of either adjacent segment, so two zones sharing a segment meet at
+/// most in its middle.
 ///
 /// Returns the per-segment trims and the clamped radii.
 pub fn corner_trims(
@@ -697,7 +719,7 @@ pub fn corner_trims(
             ),
         });
     }
-    let mut clamped: Vec<f64> = radii
+    let clamped: Vec<f64> = radii
         .iter()
         .enumerate()
         .map(|(i, r)| {
@@ -706,15 +728,6 @@ pub fn corner_trims(
                 .min(seg_lengths[i + 1] / 2.0)
         })
         .collect();
-    for i in 0..clamped.len().saturating_sub(1) {
-        let total = clamped[i] + clamped[i + 1];
-        let len = seg_lengths[i + 1];
-        if total > len && total > 0.0 {
-            let factor = len / total;
-            clamped[i] *= factor;
-            clamped[i + 1] *= factor;
-        }
-    }
     let mut trims = vec![Trim::default(); seg_lengths.len()];
     for (i, r) in clamped.iter().enumerate() {
         if *r <= 0.0 {
@@ -1049,9 +1062,12 @@ mod tests {
             })
             .fold(f64::INFINITY, f64::min)
     }
-
+    /// An arc lies on its circle in its plane, passes through its via and
+    /// lands on its end exactly; the via decides which way round it goes;
+    /// an end on the start (or a settle error either side of it) is one
+    /// full lap; three collinear points have no circle and are refused.
     #[test]
-    fn arc_lies_on_its_circle_and_passes_through_the_via() {
+    fn an_arc_follows_its_circle_the_way_its_via_says() {
         // Quarter circle of radius 0.2 m in the XY plane about the
         // origin, via at 45°.
         let r = 0.2;
@@ -1070,8 +1086,6 @@ mod tests {
             assert!((p.z - 0.3).abs() < 1e-9, "point {p:?} left the arc plane");
         }
         assert!(closest(&path, position(&at(45.0))) < 1e-3, "missed the via");
-        // The end pose is reached exactly, and the sweep took the short
-        // way (nothing beyond the quarter turn).
         let end = position(path.last().expect("non-empty"));
         assert!(end.distance(position(&at(90.0))) < 1e-9);
         assert!(
@@ -1079,16 +1093,13 @@ mod tests {
                 .all(|m| position(m).x >= -1e-9 && position(m).y >= -1e-9),
             "the arc swept the long way round"
         );
-    }
 
-    #[test]
-    fn arc_through_a_far_via_takes_the_long_way_and_a_repeated_start_closes_the_circle() {
+        // A via at 270° makes the way from 0° to 90° the LONG way.
         let r = 0.15;
         let at = |deg: f64| {
             let a: f64 = deg.to_radians();
             pose(r * a.cos(), 0.4, 0.25 + r * a.sin(), 0.0, 0.0, 0.0)
         };
-        // Via at 270°: the way from 0° to 90° through it is the LONG way.
         let long = arc(&at(0.0), &at(270.0), &at(90.0), sampling()).expect("arc");
         assert!(
             closest(&long, position(&at(270.0))) < 1e-3,
@@ -1099,39 +1110,16 @@ mod tests {
             "not the long way"
         );
 
-        // end == start: the whole circle, through the diametrically
-        // opposite via.
-        let full = arc(&at(0.0), &at(180.0), &at(0.0), sampling()).expect("full circle");
-        for deg in [0.0, 90.0, 180.0, 270.0] {
-            assert!(
-                closest(&full, position(&at(deg))) < 2e-3,
-                "the full circle missed {deg}°"
-            );
-        }
-        let end = position(full.last().expect("non-empty"));
-        assert!(
-            end.distance(position(&at(0.0))) < 1e-9,
-            "the circle did not close"
-        );
-    }
-
-    #[test]
-    fn a_full_circle_survives_an_end_that_missed_the_start() {
-        // move_c's end pose comes from FK of the MEASURED joints, so it
-        // lands a settle error away from the start the client asked to
-        // come back to — either side of it. Both must still be one lap.
-        let r = 0.05;
-        let at = |deg: f64| {
-            let a: f64 = deg.to_radians();
-            pose(r * a.cos(), 0.4, 0.25 + r * a.sin(), 0.0, 0.0, 0.0)
-        };
+        // end == start is the whole circle through the opposite via. A
+        // move_c end comes from FK of the MEASURED joints, so it lands a
+        // settle error away from the start, either side: still one lap.
         let start = at(0.0);
         let circumference = std::f64::consts::TAU * r;
         for miss in [0.0, 3e-4, -3e-4] {
             let mut end = start;
             end[11] += miss;
-            let path = arc(&start, &at(180.0), &end, sampling()).expect("full circle");
-            let length: f64 = path
+            let full = arc(&start, &at(180.0), &end, sampling()).expect("full circle");
+            let length: f64 = full
                 .windows(2)
                 .map(|w| position(&w[1]).distance(position(&w[0])))
                 .sum();
@@ -1142,23 +1130,30 @@ mod tests {
             );
             for deg in [90.0, 180.0, 270.0] {
                 assert!(
-                    closest(&path, position(&at(deg))) < 2e-3,
+                    closest(&full, position(&at(deg))) < 2e-3,
                     "the circle missed {deg}° after a {:.1} mm miss",
                     miss * 1000.0
                 );
             }
+            if miss == 0.0 {
+                let last = position(full.last().expect("non-empty"));
+                assert!(
+                    last.distance(position(&start)) < 1e-9,
+                    "the circle did not close"
+                );
+            }
         }
-    }
 
-    #[test]
-    fn collinear_arc_points_are_refused() {
-        let a = pose(0.1, 0.2, 0.3, 0.0, 0.0, 0.0);
-        let b = pose(0.2, 0.2, 0.3, 0.0, 0.0, 0.0);
-        let c = pose(0.4, 0.2, 0.3, 0.0, 0.0, 0.0);
-        let e = arc(&a, &b, &c, sampling()).expect_err("collinear points have no arc");
+        let collinear = arc(
+            &pose(0.1, 0.2, 0.3, 0.0, 0.0, 0.0),
+            &pose(0.2, 0.2, 0.3, 0.0, 0.0, 0.0),
+            &pose(0.4, 0.2, 0.3, 0.0, 0.0, 0.0),
+            sampling(),
+        )
+        .expect_err("collinear points have no arc");
         assert!(
-            matches!(e, MotionError::InvalidInput { what: "via", .. }),
-            "unexpected error: {e}"
+            matches!(collinear, MotionError::InvalidInput { what: "via", .. }),
+            "unexpected error: {collinear}"
         );
     }
 
@@ -1181,38 +1176,96 @@ mod tests {
                 position(w)
             );
         }
-        // A spline is not the polyline: between the second and third
-        // waypoints it bows away from the straight chord.
-        let (a, b) = (position(&wps[1]), position(&wps[2]));
-        let bow = path
+        // A spline is not the polyline: every segment bows away from its
+        // own chord, measured over that segment's samples alone.
+        let at_wp: Vec<usize> = wps
             .iter()
-            .map(|m| {
-                let p = position(m);
-                let d = b - a;
-                let t = ((p - a).dot(d) / d.dot(d)).clamp(0.0, 1.0);
-                p.distance(a + d * t)
+            .map(|w| {
+                (0..path.len())
+                    .min_by(|&i, &j| {
+                        let (pi, pj) = (position(&path[i]), position(&path[j]));
+                        pi.distance(position(w))
+                            .total_cmp(&pj.distance(position(w)))
+                    })
+                    .expect("non-empty")
             })
-            .fold(0.0f64, f64::max);
-        assert!(bow > 2e-3, "spline did not curve: max bow {bow} m");
+            .collect();
+        for seg in 0..wps.len() - 1 {
+            let (a, b) = (position(&wps[seg]), position(&wps[seg + 1]));
+            let d = b - a;
+            let bow = path[at_wp[seg]..=at_wp[seg + 1]]
+                .iter()
+                .map(|m| {
+                    let p = position(m);
+                    let t = ((p - a).dot(d) / d.dot(d)).clamp(0.0, 1.0);
+                    p.distance(a + d * t)
+                })
+                .fold(0.0f64, f64::max);
+            assert!(
+                bow > 2e-3,
+                "segment {seg} is a straight chord: max bow {bow} m"
+            );
+        }
     }
-
+    /// Between two waypoints the tool turns along the shortest rotation
+    /// from one waypoint's orientation to the next — per segment, not one
+    /// slerp end to end — and gets there a little at a time. Waypoints
+    /// off one line, unevenly spaced, turning about different axes.
     #[test]
     fn spline_orientation_slerps_through_the_waypoint_orientations() {
         let wps = [
-            pose(0.0, 0.35, 0.2, 0.0, 0.0, 0.0),
-            pose(0.1, 0.35, 0.2, 0.0, 0.0, std::f64::consts::FRAC_PI_2),
-            pose(0.2, 0.35, 0.2, 0.0, 0.0, std::f64::consts::PI),
+            pose(0.0, 0.35, 0.20, 0.0, 0.0, 0.0),
+            pose(0.03, 0.38, 0.24, 0.5, 0.0, 0.0),
+            pose(0.15, 0.33, 0.22, 0.5, 0.6, 0.0),
+            pose(0.20, 0.30, 0.30, 0.5, 0.6, -0.8),
         ];
         let path = spline(&wps, sampling()).expect("spline");
-        let last = rotation(path.last().expect("non-empty"));
-        assert!(last.angle_between(rotation(&wps[2])) < 1e-9);
-        // Monotone turn: no wrap through the short arc backwards.
-        let q0 = rotation(&wps[0]);
-        let mut prev = 0.0;
-        for m in &path {
-            let a = q0.angle_between(rotation(m));
-            assert!(a >= prev - 1e-9, "orientation reversed: {a} after {prev}");
-            prev = a;
+        let at_wp: Vec<usize> = wps
+            .iter()
+            .map(|w| {
+                (0..path.len())
+                    .min_by(|&i, &j| {
+                        let (pi, pj) = (position(&path[i]), position(&path[j]));
+                        pi.distance(position(w))
+                            .total_cmp(&pj.distance(position(w)))
+                    })
+                    .expect("non-empty")
+            })
+            .collect();
+        let pitch = path
+            .windows(2)
+            .map(|w| rotation(&w[0]).angle_between(rotation(&w[1])))
+            .fold(0.0f64, f64::max);
+        for (k, w) in wps.iter().enumerate() {
+            let off = rotation(&path[at_wp[k]]).angle_between(rotation(w));
+            assert!(
+                off <= pitch,
+                "waypoint {k}'s orientation is {off} rad from the nearest sample's"
+            );
+        }
+        for seg in 0..wps.len() - 1 {
+            let (qa, qb) = (rotation(&wps[seg]), rotation(&wps[seg + 1]));
+            let span = qa.angle_between(qb);
+            let samples = &path[at_wp[seg]..=at_wp[seg + 1]];
+            // The samples either side of each waypoint may sit on the
+            // neighbouring segment.
+            for m in &samples[1..samples.len() - 1] {
+                let q = rotation(m);
+                let detour = qa.angle_between(q) + q.angle_between(qb) - span;
+                assert!(
+                    detour < 1e-6,
+                    "segment {seg}: an orientation off the arc from one waypoint to the \
+                     next ({detour} rad of detour)"
+                );
+            }
+            let step = samples
+                .windows(2)
+                .map(|w| rotation(&w[0]).angle_between(rotation(&w[1])))
+                .fold(0.0f64, f64::max);
+            assert!(
+                step < 0.5 * span,
+                "segment {seg}: turns {step} of its {span} rad in one sample"
+            );
         }
     }
 
@@ -1314,31 +1367,40 @@ mod tests {
         assert!(closest(&rounded, position(&wps[2])) < 1e-9);
     }
 
+    /// A requested radius larger than its segments allow rounds the
+    /// corner exactly as the largest radius that fits: half the shorter
+    /// segment, or half a middle segment two corners share.
     #[test]
     fn corner_radii_are_clamped_to_the_segments_they_round() {
-        // A 100 mm and a 40 mm segment with a 90 mm requested radius:
-        // half the shorter segment is the binding constraint.
-        let (trims, clamped) = corner_trims(&[0.1, 0.04], &[0.09]).expect("trims");
-        assert!(
-            (clamped[0] - 0.02).abs() < 1e-12,
-            "clamped to {}",
-            clamped[0]
-        );
-        assert!((trims[0].exit - 0.2).abs() < 1e-12);
-        assert!((trims[1].entry - 0.5).abs() < 1e-12);
+        let same = |a: &[Pose], b: &[Pose]| {
+            a.len() == b.len()
+                && a.iter()
+                    .zip(b)
+                    .all(|(x, y)| x.iter().zip(y).all(|(u, v)| (u - v).abs() < 1e-12))
+        };
+        // A 100 mm and a 40 mm segment, 90 mm asked: 20 mm fits.
+        let l = [
+            pose(0.0, 0.35, 0.25, 0.0, 0.0, 0.0),
+            pose(0.1, 0.35, 0.25, 0.0, 0.0, 0.0),
+            pose(0.1, 0.35, 0.29, 0.0, 0.0, 0.0),
+        ];
+        let asked = blended_polyline(&l, &[0.09], sampling()).expect("clamped");
+        let fits = blended_polyline(&l, &[0.02], sampling()).expect("fits");
+        assert!(same(&asked, &fits), "a 90 mm radius did not round as 20 mm");
 
-        // Two zones sharing a 100 mm middle segment, 60 mm each: both
-        // scale down so they meet rather than overlap.
-        let (trims, clamped) = corner_trims(&[0.2, 0.1, 0.2], &[0.06, 0.06]).expect("trims");
-        assert!(
-            (clamped[0] - 0.05).abs() < 1e-12,
-            "clamped to {}",
-            clamped[0]
-        );
-        assert!((clamped[1] - 0.05).abs() < 1e-12);
-        assert!((trims[1].entry + trims[1].exit - 1.0).abs() < 1e-12);
+        // Two corners sharing a 100 mm middle segment, 60 mm each: 50 mm
+        // each, meeting in its middle.
+        let z = [
+            pose(0.0, 0.35, 0.25, 0.0, 0.0, 0.0),
+            pose(0.2, 0.35, 0.25, 0.0, 0.0, 0.0),
+            pose(0.2, 0.35, 0.35, 0.0, 0.0, 0.0),
+            pose(0.0, 0.35, 0.35, 0.0, 0.0, 0.0),
+        ];
+        let asked = blended_polyline(&z, &[0.06, 0.06], sampling()).expect("clamped");
+        let fits = blended_polyline(&z, &[0.05, 0.05], sampling()).expect("fits");
+        assert!(same(&asked, &fits), "60 mm radii did not round as 50 mm");
 
-        let err = corner_trims(&[0.1, 0.1], &[]).expect_err("radius count is checked");
+        let err = blended_polyline(&l, &[], sampling()).expect_err("radius count is checked");
         assert!(matches!(err, MotionError::InvalidInput { .. }), "{err}");
     }
 
@@ -1367,10 +1429,7 @@ mod tests {
                 .any(|q| q[0] > 0.75 && q[0] < 1.0 && q[1] > 1e-6),
             "the corner was traversed one joint at a time"
         );
-    }
 
-    #[test]
-    fn a_corner_with_one_trim_zeroed_is_still_sampled() {
         // The caller sizes the two trims from independent TCP distances, so
         // a wrist-roll leg (the TCP sits on J6's axis and does not move)
         // arrives with the incoming trim zeroed and the outgoing one live.
@@ -1419,12 +1478,26 @@ mod tests {
             assert!(position(m).distance(position(&a)) < 1e-12);
         }
         assert!(rotation(path.last().unwrap()).angle_between(rotation(&b)) < 1e-9);
-    }
 
-    /// The multi-segment metric folds rotation into path length as
-    /// √(t² + (w·θ)²): a pure twist is priced at w·θ metres, a mixed
-    /// piece at the hypotenuse — never the max form the MOVE_L pitch
-    /// keeps.
+        // A segment that both moves and turns: its length and angle are
+        // the endpoints', and its middle is halfway along both.
+        let start = pose(0.1, 0.0, 0.2, 0.0, 0.0, 0.0);
+        let end = pose(0.2, 0.05, 0.2, 0.0, 0.0, std::f64::consts::FRAC_PI_2);
+        let seg = LineSegment::new(&start, &end);
+        assert!((seg.length_m() - (0.1f64.powi(2) + 0.05f64.powi(2)).sqrt()).abs() < 1e-12);
+        assert!((seg.angle_rad() - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
+        let mid = seg.sample(0.5);
+        assert!(position(&mid).distance(DVec3::new(0.15, 0.025, 0.2)) < 1e-12);
+        let halfway = pose(0.0, 0.0, 0.0, 0.0, 0.0, std::f64::consts::FRAC_PI_4);
+        assert!(rotation(&mid).angle_between(rotation(&halfway)) < 1e-9);
+        for (g, w) in seg.sample(1.0).iter().zip(end.iter()) {
+            assert!((g - w).abs() < 1e-9);
+        }
+    }
+    /// The multi-segment paths fold rotation into path length as
+    /// √(t² + (w·θ)²): a pure twist is priced at w·θ metres, a mixed piece
+    /// at the hypotenuse; MOVE_L's line keeps the max of two independent
+    /// pitches. Read off the samples each path actually emits.
     #[test]
     fn the_weighted_metric_prices_rotation_as_path_length() {
         let s = CartSampling {
@@ -1432,46 +1505,82 @@ mod tests {
             rotation: RotationPitch::Weighted(0.15),
             max_points: 4000,
         };
-        assert_eq!(s.intervals(0.01, 0.0), 5);
-        assert_eq!(s.intervals(0.0, 0.1), 8, "0.1 rad at 0.15 m/rad = 15 mm");
+        let a = pose(0.1, 0.2, 0.3, 0.0, 0.0, 0.0);
+        // 10 mm and 0.1 rad: hypot(10, 15) mm is ten 2 mm pitches, where
+        // max(5, 8) would be eight and the translation alone five.
+        let mixed = pose(0.11, 0.2, 0.3, 0.0, 0.0, 0.1);
+        let twist = pose(0.1, 0.2, 0.3, 0.0, 0.0, 0.1);
+        let pieces = |path: Vec<Pose>| path.len() - 1;
         assert_eq!(
-            s.intervals(0.01, 0.1),
-            10,
-            "hypot(10, 15) mm, not max(5, 8)"
+            pieces(blended_polyline(&[a, mixed], &[], s).expect("polyline")),
+            10
         );
-        assert_eq!(s.intervals(0.0, 0.0), 1, "a degenerate piece still samples");
+        assert_eq!(
+            pieces(blended_polyline(&[a, twist], &[], s).expect("polyline")),
+            8,
+            "0.1 rad at 0.15 m/rad = 15 mm"
+        );
+        // Two such pieces in a spline: 36.06 mm of metric, nineteen
+        // pitches (max would give fifteen).
+        let further = pose(0.12, 0.2, 0.3, 0.0, 0.0, 0.2);
+        assert_eq!(pieces(spline(&[a, mixed, further], s).expect("spline")), 19);
 
         let ind = CartSampling {
             step_m: 0.01,
             rotation: RotationPitch::Independent(0.034906585),
             max_points: 4000,
         };
-        assert_eq!(ind.intervals(0.02, 0.0), 2);
+        let far = pose(0.12, 0.2, 0.3, 0.0, 0.0, 0.07);
         assert_eq!(
-            ind.intervals(0.0, 0.07),
+            pieces(line(&a, &far, ind)),
             3,
-            "rotation on its own 2-degree pitch"
+            "the max of 2 translation and 3 rotation pitches"
         );
-        assert_eq!(ind.intervals(0.02, 0.07), 3, "the max of the two counts");
     }
 
     #[test]
     fn the_sample_budget_bounds_a_long_path() {
-        let wps: Vec<Pose> = (0..50)
-            .map(|i| pose(0.01 * i as f64, 0.35, 0.25, 0.0, 0.0, 0.0))
-            .collect();
+        // A power-of-two pitch keeps every leg exactly three pitches long.
+        let pitch = 1.0 / 1024.0;
         let s = CartSampling {
-            step_m: 0.0001,
+            step_m: pitch,
             rotation: RotationPitch::Independent(0.05),
-            max_points: 300,
+            max_points: 280,
         };
-        let radii = vec![0.002; wps.len() - 2];
-        let path = blended_polyline(&wps, &radii, s).expect("path");
-        assert!(
-            path.len() <= 300 && path.len() > 50,
-            "budgeted path has {} points",
-            path.len()
-        );
+        // A hundred three-pitch legs ask for 301 points; scaling each down
+        // by 279/300 and rounding would give every leg its 3 back.
+        let straight: Vec<Pose> = (0..=100)
+            .map(|i| pose(3.0 * pitch * i as f64, 0.35, 0.25, 0.0, 0.0, 0.0))
+            .collect();
+        // Uneven pieces: one long leg among short ones, corners rounded.
+        let uneven: Vec<Pose> = [0.0, 0.002, 0.004, 0.40, 0.402, 0.404]
+            .iter()
+            .enumerate()
+            .map(|(i, x)| pose(*x, 0.35 + 0.001 * (i % 2) as f64, 0.25, 0.0, 0.0, 0.0))
+            .collect();
+        for (wps, radii) in [
+            (&straight, vec![0.0; straight.len() - 2]),
+            (&uneven, vec![0.0005; uneven.len() - 2]),
+        ] {
+            let path = blended_polyline(wps, &radii, s).expect("path");
+            assert!(
+                path.len() <= s.max_points,
+                "a {}-point budget gave {} points",
+                s.max_points,
+                path.len()
+            );
+            assert_eq!(path.first(), wps.first(), "the path starts at its start");
+            assert_eq!(path.last(), wps.last(), "the path ends at its end");
+        }
+        let path = blended_polyline(&straight, &vec![0.0; straight.len() - 2], s).expect("path");
+        for w in &straight {
+            assert!(
+                path.iter()
+                    .any(|p| [3, 7, 11].iter().all(|&k| (p[k] - w[k]).abs() < 1e-12)),
+                "the sharp corner at x = {} stays on the path",
+                w[3]
+            );
+        }
     }
 
     /// `exp` and `log` must invert each other across the range the
@@ -1503,21 +1612,15 @@ mod tests {
                 .fold(0.0, f64::max);
             assert!(worst < 1e-9, "case {i}: round trip off by {worst}");
         }
-    }
 
-    /// The tangent is a screw: scaling it traces a path that starts at
-    /// the identity, ends at the pose, and — for a pure translation —
-    /// stays exactly on the straight line between them. This is the
-    /// property the cartesian streaming limiter is built on.
-    #[test]
-    fn scaling_a_tangent_traces_the_screw_between_its_endpoints() {
-        let target = pose(0.3, -0.2, 0.1, 0.0, 0.0, 0.0);
-        let tangent = se3_log(&target);
+        // The zero tangent is the identity, and a pure translation's
+        // tangent scales along the straight line to it: the property the
+        // cartesian streaming limiter is built on.
+        assert_eq!(se3_exp(&[0.0; 6]), pose(0.0, 0.0, 0.0, 0.0, 0.0, 0.0));
+        let tangent = se3_log(&pose(0.3, -0.2, 0.1, 0.0, 0.0, 0.0));
         for k in 0..=10 {
             let s = k as f64 / 10.0;
-            let scaled: [f64; 6] = std::array::from_fn(|i| s * tangent[i]);
-            let p = translation(&se3_exp(&scaled));
-            // Exactly on the chord, because there is no rotation.
+            let p = translation(&se3_exp(&tangent.map(|v| s * v)));
             for (axis, &end) in [0.3, -0.2, 0.1].iter().enumerate() {
                 assert!(
                     (p[axis] - s * end).abs() < 1e-12,
@@ -1526,18 +1629,6 @@ mod tests {
                 );
             }
         }
-        // With rotation the screw still has to land on both endpoints.
-        let turned = pose(0.3, -0.2, 0.1, 0.4, -0.3, 0.9);
-        let t2 = se3_log(&turned);
-        let zero: [f64; 6] = [0.0; 6];
-        assert_eq!(translation(&se3_exp(&zero)), [0.0, 0.0, 0.0]);
-        let end = se3_exp(&t2);
-        let worst = turned
-            .iter()
-            .zip(end.iter())
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f64::max);
-        assert!(worst < 1e-12, "screw misses its endpoint by {worst}");
     }
 
     /// Between two straight segments the cubic corner is the quadratic

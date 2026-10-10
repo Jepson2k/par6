@@ -31,6 +31,13 @@ pub trait GravityModel: Send {
     /// back to the caller. An implementation with no payload notion says
     /// so here, in one line, deliberately.
     fn set_payload(&mut self, mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>);
+
+    /// Whether `gravity` describes the arm at all. Checks that compare
+    /// measured holding torque against G(q) (the post-homing reference
+    /// check) are meaningless against a placeholder and skip themselves.
+    fn describes_arm(&self) -> bool {
+        true
+    }
 }
 
 /// Zero-torque model: gravity compensation contributes nothing.
@@ -40,6 +47,10 @@ pub struct ZeroGravity;
 impl GravityModel for ZeroGravity {
     fn gravity(&mut self, _q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
         out.fill(0.0);
+    }
+
+    fn describes_arm(&self) -> bool {
+        false
     }
 
     /// Nothing to carry it: this model compensates no gravity at all, so

@@ -65,6 +65,7 @@ jobs:
         run: pixi run test-rust
       - run: pixi run test-collision-cost
       - run: pixi run test-timing
+      - run: pixi run test-stream-timing
       - name: upload failure logs
         if: failure()
         uses: actions/upload-artifact@v4

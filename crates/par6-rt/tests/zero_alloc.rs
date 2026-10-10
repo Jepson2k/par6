@@ -9,7 +9,8 @@ use std::sync::mpsc;
 
 use par6_bus::sim::scene::{Scene, Tool};
 use par6_bus::sim::SimBus;
-use par6_rt::hooks::{ClampStream, RampJog};
+use par6_rt::adapters::{MotionJog, MotionStream};
+use par6_rt::hooks::ClampStream;
 use par6_rt::{
     sample_ring, CompletionPolicy, Mode, NoFk, RtCommand, RtCore, RtHooks, Sample, SampleMeta,
     SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity, MAX_JOINTS,
@@ -54,11 +55,21 @@ fn assert_no_allocs<F: FnMut()>(mut window: F, ctx: &str) {
 
 #[test]
 fn steady_state_ticks_allocate_nothing() {
-    let bundle = {
+    let mut bundle = {
         let path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
         par6_config::ConfigBundle::load(&path).expect("PAR6 config bundle")
     };
+    // Every config re-send also carries the par6-firmware frames a
+    // self-calibrated drive is configured with.
+    for j in &mut bundle.robot.joints {
+        j.ripple = vec![par6_config::RippleHarmonic {
+            harmonic: 2,
+            a_ma: 40,
+            b_ma: -25,
+        }];
+        j.velocity_window = Some(16);
+    }
     let robot = &bundle.robot;
     let dt = robot.robot.tick_dt_s;
     let (tx, rx) = mpsc::channel();
@@ -68,8 +79,8 @@ fn steady_state_ticks_allocate_nothing() {
     let (mut producer, consumer) = sample_ring(4096);
     let hooks = RtHooks {
         gravity: Box::new(ZeroGravity),
-        jog: Box::new(RampJog::new(robot)),
-        stream: Box::new(ClampStream::new(robot)),
+        jog: Box::new(MotionJog::from_config(robot).expect("jog engine")),
+        stream: Box::new(MotionStream::from_config(robot).expect("stream limiter")),
         stream_shaped: Box::new(ClampStream::new(robot)),
         settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
         estop: Box::new(gpio),
@@ -131,20 +142,34 @@ fn steady_state_ticks_allocate_nothing() {
         "config re-send shots",
     );
 
-    // EXEC playback window: samples hold the measured pose; the ring was
-    // filled BEFORE the window (try_push is allocation-free, but the
-    // measurement isolates the tick itself).
+    // EXEC playback window: a program swinging J0 harder than its
+    // acceleration limit allows at full speed, so the clock is held back
+    // by the rate bisection throughout, and the speed and pause
+    // transitions below run through it too; the ring was filled BEFORE
+    // the window (try_push is allocation-free, but the measurement
+    // isolates the tick itself).
     core.set_homed(true);
     tx.send(RtCommand::Enable).unwrap();
     core.tick(dt, false);
     tx.send(RtCommand::SetMode(Mode::Exec)).unwrap();
     core.tick(dt, false);
     assert_eq!(handles.snapshots.latest().mode, Mode::Exec);
-    let q = handles.snapshots.latest().q;
-    for _ in 0..1000 {
+    let mut q = handles.snapshots.latest().q;
+    let a_lim = robot.joints[0]
+        .limits
+        .for_mode(par6_config::LimitMode::Exec)
+        .acceleration_rad_s2;
+    let omega = 2.5;
+    let (q0, amplitude) = (q[0], 1.5 * a_lim / (omega * omega));
+    let mut qd = [0.0; MAX_JOINTS];
+    let pushed = 3500;
+    for k in 0..pushed {
+        let t = k as f64 * dt;
+        q[0] = q0 + amplitude * (omega * t).sin();
+        qd[0] = amplitude * omega * (omega * t).cos();
         let s = Sample {
             q,
-            qd: [0.0; MAX_JOINTS],
+            qd,
             tau_ff: [0.0; MAX_JOINTS],
             inertia_velocity: [0.0; MAX_JOINTS],
             start: None,
@@ -163,7 +188,7 @@ fn steady_state_ticks_allocate_nothing() {
         "EXEC playback",
     );
     assert!(
-        handles.snapshots.latest().exec.samples_remaining < 1000,
+        handles.snapshots.latest().exec.samples_remaining < pushed,
         "playback actually consumed samples"
     );
 
@@ -176,16 +201,17 @@ fn steady_state_ticks_allocate_nothing() {
         tx.send(command).unwrap();
         assert_no_allocs(
             || {
-                for _ in 0..robot.ticks(robot.motion.execution_override_transition_s * 1.1) {
+                for _ in 0..robot.ticks(robot.motion.execution_override_transition_s * 2.0) {
                     hb.feed();
                     core.tick(dt, false);
                 }
             },
             "EXEC speed and pause transitions",
         );
-        assert_eq!(
-            handles.snapshots.latest().exec.applied_scale,
-            expected_scale
+        let applied = handles.snapshots.latest().exec.applied_scale;
+        assert!(
+            (applied - expected_scale).abs() < 1e-3,
+            "the transition ran: scale {applied} against {expected_scale}"
         );
     }
 

@@ -29,17 +29,10 @@ const APPROACH_RAD: f64 = 0.05;
 /// different lever arm at each pose.
 const SPREAD_RAD: f64 = 0.5;
 
-/// The shipped config, at its real tick rate.
-///
-/// Every other daemon test re-ticks to 50 Hz so a loaded CI box can hold
-/// the deadline, but the torque plant cannot be slowed down like that and
-/// still be measured: at 20 ms per bus tick the drivers' 1 kHz loops are
-/// integrated so coarsely that the joints limit-cycle, and the mean
-/// current a pose is held with is chatter and friction rather than
-/// gravity. Measured that way the wrist reads about a newton-metre where
-/// gravity is zero, which is the whole quantity under test.
+/// The driver and physics substeps retain their firmware cadence when
+/// STATUS/command ticks are retimed for a development machine.
 fn test_config() -> PathBuf {
-    shipped_config()
+    common::retimed_config("gravity-identification", 0.02)
 }
 
 #[test]
@@ -47,9 +40,13 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
     let config = test_config();
     let bundle = par6_config::ConfigBundle::load(&config).expect("config");
     let robot = &bundle.robot;
-    let gripper = bundle.active_gripper();
-    // No tool: the gripper the plant swings is the unknown load.
+    let gripper = bundle.active_tool();
+    // No tool: the gripper the plant swings is the unknown load. The arm's
+    // identified correction is part of the arm, in this model as in the
+    // daemon's, so the fit is left only the tool to find.
     let mut kin = Kin::load_arm(&assets_dir(), None).expect("gravity model");
+    kin.set_gravity_correction(&robot.gravity_correction)
+        .expect("the config's gravity correction");
     let carried_kg = gripper
         .map(|g| g.kinematics.mass_kg)
         .expect("a fitted gripper");
@@ -58,7 +55,7 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
         "the fitted gripper must have mass to find"
     );
     let variant = GripperVariant::resolve(
-        &robot.robot.active_gripper.to_ascii_uppercase(),
+        &robot.robot.active_tool.to_ascii_uppercase(),
         gripper.and_then(|g| g.urdf_variant.as_deref()),
     );
     let mut collision = Collision::load(&assets_dir(), variant, 0.0).expect("collision world");
@@ -118,6 +115,15 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
             );
         }
 
+        // The controller compensates a load the plant does not carry.
+        // Sampling idle feedforward would identify this declaration,
+        // not the physical gripper. Position feedback must supply the
+        // correction while each measurement is taken.
+        client
+            .set_payload(0.8, [0.0, 0.0, 0.05], None)
+            .await
+            .expect("biased controller payload");
+
         let protocol = par6d::calibrate::Protocol {
             speed: 1.0,
             approach_rad: APPROACH_RAD,
@@ -131,9 +137,31 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
         client.close_joined().await;
         samples
     });
-    daemon.shutdown();
+    daemon
+        .shutdown()
+        .expect("the daemon's threads exit cleanly");
 
-    let fit = gravity::fit_payload(&mut kin, &samples, 1e-4).expect("fit");
+    let mut truth = par6d::kin::load_gravity_kin(&assets_dir(), gripper).unwrap();
+    for s in &samples {
+        let mut expected = [0.0; NQ];
+        truth.gravity(&s.q, &mut expected).unwrap();
+        println!("q={:?} measured={:?} expected={expected:?}", s.q, s.tau);
+    }
+    // Fit on two poses in three and judge on the third: a fit that only
+    // reproduces the torques it was given proves nothing about the load.
+    let (held_out, training): (Vec<_>, Vec<_>) = samples
+        .iter()
+        .cloned()
+        .enumerate()
+        .partition(|(k, _)| k % 3 == 2);
+    let training: Vec<_> = training.into_iter().map(|(_, s)| s).collect();
+    let held_out: Vec<_> = held_out.into_iter().map(|(_, s)| s).collect();
+    assert!(
+        !held_out.is_empty() && training.len() >= 3,
+        "{} poses cannot be split into a fit and a check",
+        samples.len()
+    );
+    let fit = gravity::fit_payload(&mut kin, &training, 1e-4).expect("fit");
     println!(
         "carried {carried_kg:.4} kg, identified {:.4} kg at com {:?}\n\
          residual {:.4} Nm, against {:.4} Nm with an empty model\n\
@@ -168,6 +196,80 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
         "swinging the wrist must measure the mass, determined {:?}",
         fit.determined
     );
+
+    // The poses it never saw: the fitted load must explain their torque
+    // as well as it explains its own, and far better than no load.
+    let rms = |kin: &mut Kin| {
+        let mut sum = 0.0;
+        let mut n = 0.0;
+        for s in &held_out {
+            let mut g = [0.0; NQ];
+            kin.gravity(&s.q, &mut g).expect("gravity");
+            for (got, want) in g.iter().zip(&s.tau) {
+                sum += (got - want).powi(2);
+                n += 1.0;
+            }
+        }
+        (sum / n).sqrt()
+    };
+    let unloaded = rms(&mut kin);
+    kin.set_tool(fit.mass, fit.com, None)
+        .expect("the fitted load");
+    let predicted = rms(&mut kin);
+    assert!(
+        predicted < 0.5 * unloaded,
+        "the fit predicts the held-out poses to {predicted:.4} Nm, against {unloaded:.4} Nm \
+         with no load: it learned its training poses, not the load"
+    );
+}
+
+/// A payload is measured against the arm the daemon runs, its own gravity
+/// correction included: the torques of the corrected arm carrying nothing
+/// fit no payload.
+#[test]
+fn a_payload_fit_charges_nothing_to_the_arms_own_correction() {
+    // The last body's mass term: the correction a payload fit could most
+    // easily mistake for a load.
+    const CORRECTION_KG: f64 = 0.3;
+    let mut correction = [0.0; 4 * NQ];
+    correction[4 * (NQ - 1)] = CORRECTION_KG;
+    let corrected = common::retimed_config("payload-own-correction", 0.02);
+    std::fs::write(
+        corrected.with_file_name("local.toml"),
+        format!("gravity_correction = {correction:?}\n"),
+    )
+    .expect("write the overlay");
+    let model = |config: &PathBuf| {
+        par6d::kin::estimation_model(Some(config), Some(&assets_dir()), None, None)
+            .expect("estimation model")
+            .kin
+    };
+    let mut truth = model(&test_config());
+    truth
+        .set_gravity_correction(&correction)
+        .expect("the correction installs");
+
+    let bundle = par6_config::ConfigBundle::load(&shipped_config()).expect("config");
+    let samples: Vec<gravity::GravitySample> = (0..24)
+        .map(|k| {
+            let mut q = [0.0; NQ];
+            for (j, (q, joint)) in q.iter_mut().zip(&bundle.robot.joints).enumerate() {
+                let (lo, hi) = (joint.limits.soft_min_rad, joint.limits.soft_max_rad);
+                let phase = (k as f64 + 1.0) * (j as f64 + 1.0) * 0.7;
+                *q = 0.5 * (lo + hi) + 0.3 * (hi - lo) * phase.sin();
+            }
+            let mut tau = [0.0; NQ];
+            truth.gravity(&q, &mut tau).expect("gravity");
+            gravity::GravitySample { q, tau }
+        })
+        .collect();
+
+    let fit = gravity::fit_payload(&mut model(&corrected), &samples, 1e-6).expect("fit");
+    assert!(
+        fit.mass.abs() < 0.01 * CORRECTION_KG,
+        "the fit charged {:.3} kg of the arm's own {CORRECTION_KG} kg correction to the payload",
+        fit.mass
+    );
 }
 
 /// `plan_poses` refuses a pose whose APPROACH would leave the window,
@@ -182,7 +284,7 @@ fn planned_poses_keep_their_approach_offsets_inside_the_window() {
     let bundle = par6_config::ConfigBundle::load(&shipped_config()).expect("config");
     let robot = &bundle.robot;
     let mut collision =
-        par6d::kin::estimation_model(Some(&shipped_config()), Some(&assets_dir()), None)
+        par6d::kin::estimation_model(Some(&shipped_config()), Some(&assets_dir()), None, None)
             .expect("estimation model")
             .collision;
 
@@ -228,7 +330,7 @@ fn planned_poses_keep_their_approach_offsets_inside_the_window() {
     for q in &poses {
         for dir in [0.0, 1.0, -1.0] {
             for j in 0..NQ {
-                let probe = if par6d::calibrate::WRIST_JOINTS.contains(&j) {
+                let probe = if par6d::calibrate::APPROACH_JOINTS.contains(&j) {
                     q[j] + dir * APPROACH_RAD
                 } else {
                     q[j]
@@ -250,13 +352,14 @@ fn planned_poses_keep_their_approach_offsets_inside_the_window() {
     }
 }
 
-/// A failed estimate puts the declared payload back.
+/// A failed estimate leaves the declared payload standing.
 ///
-/// `estimate` clears the declaration so it measures against an unloaded
-/// model. An arm holding a declared 1.2 kg part that is asked for an
-/// estimate somewhere the wrist has no room must not be left
-/// compensating for nothing — the failure arrives at the caller, the
-/// gravity model does not change underneath it.
+/// `estimate` measures with the existing declaration in place and only
+/// replaces it once a valid fit is ready. An arm holding a declared
+/// 1.2 kg part that is asked for an estimate somewhere the wrist has no
+/// room must not be left compensating for anything else — the failure
+/// arrives at the caller, the gravity model does not change underneath
+/// it.
 #[test]
 fn a_failed_estimate_leaves_the_declared_payload_standing() {
     const DECLARED_KG: f64 = 1.2;
@@ -292,11 +395,11 @@ fn a_failed_estimate_leaves_the_declared_payload_standing() {
             .expect("the payload is declared");
 
         let mut model =
-            par6d::kin::estimation_model(Some(&model_config), Some(&assets_dir()), None)
+            par6d::kin::estimation_model(Some(&model_config), Some(&assets_dir()), None, None)
                 .expect("estimation model");
 
         // A spread no wrist has room for: the run fails in planning,
-        // before any motion, with the declaration already cleared.
+        // before any motion.
         let err = par6d::calibrate::estimate(&client, &mut model, 6.0, 1e-6, true)
             .await
             .expect_err("an unplannable spread must fail");
@@ -308,7 +411,9 @@ fn a_failed_estimate_leaves_the_declared_payload_standing() {
         client.close_joined().await;
         (err, carried)
     });
-    daemon.shutdown();
+    daemon
+        .shutdown()
+        .expect("the daemon's threads exit cleanly");
 
     let (err, (mass, com)) = outcome;
     assert!(

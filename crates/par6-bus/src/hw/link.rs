@@ -3,7 +3,9 @@
 //!
 //! The sampler runs on its own thread because netlink round-trips
 //! allocate and block — the RT tick only ever does a relaxed atomic load
-//! ([`LinkMonitor::health`]). Without it, bus-off is invisible to the
+//! ([`LinkMonitor::health`]), except for the one [`cycle`] a silent boot
+//! asks for, when no drive answers and nothing is driven. Without the
+//! sampler, bus-off is invisible to the
 //! runtime: the kernel auto-restart (100 ms) lands between the 10-tick
 //! stale warning and the 50-tick disconnect latch, so freshness alone
 //! never sees the outage.
@@ -49,6 +51,26 @@ pub enum OpenError {
         /// Netlink failure detail.
         detail: String,
     },
+    /// The TX queue is shorter than the configured length and could not be
+    /// raised. Fatal rather than a warning: the boot configuration burst is
+    /// longer than a short queue, so the run would start, home the arm, and
+    /// then fail mid-motion with "TX queue full" -- which on 2026-09-21 left
+    /// the shoulder and elbow unparked.
+    #[error(
+        "CAN interface '{iface}' has a {found}-frame TX queue, under the {want} configured, \
+             and it could not be raised ({detail}); the configuration burst would be dropped. \
+             Run with CAP_NET_ADMIN, or `ip link set {iface} txqueuelen {want}`"
+    )]
+    TxQueue {
+        /// Interface name from the config.
+        iface: String,
+        /// What the kernel reports now.
+        found: u32,
+        /// What the config asks for.
+        want: u32,
+        /// Why raising it failed.
+        detail: String,
+    },
     /// The interface is down and bringing it up failed (bring-up needs
     /// `CAP_NET_ADMIN`).
     #[error(
@@ -81,12 +103,65 @@ pub enum OpenError {
     },
 }
 
+/// Take the interface down and back up at the configured timing: the
+/// recovery for a controller that came up error-passive and answers no
+/// node until its error counters are reset by a link restart.
+pub(super) fn cycle(cfg: &BusConfig) -> Result<(), OpenError> {
+    let iface = CanInterface::open(&cfg.interface).map_err(|e| OpenError::NoInterface {
+        iface: cfg.interface.clone(),
+        detail: e.to_string(),
+    })?;
+    let fail = |detail: String| OpenError::BringUp {
+        iface: cfg.interface.clone(),
+        bitrate: cfg.bitrate,
+        detail,
+    };
+    iface
+        .bring_down()
+        .map_err(|e| fail(format!("link down: {e}")))?;
+    bring_up_timed(&iface, cfg, &fail)?;
+    log::info!(
+        "CAN interface '{}' cycled: {} bps, restart-ms {}",
+        cfg.interface,
+        cfg.bitrate,
+        cfg.restart_ms
+    );
+    Ok(())
+}
+
+/// Bitrate/restart-ms (on interfaces that have bit timing), up, then the
+/// TX queue length — the shared tail of a first bring-up and a cycle.
+fn bring_up_timed(
+    iface: &CanInterface,
+    cfg: &BusConfig,
+    fail: &impl Fn(String) -> OpenError,
+) -> Result<(), OpenError> {
+    let details = iface
+        .details()
+        .map_err(|e| fail(format!("querying interface details: {e}")))?;
+    // Virtual interfaces have no bit timing; a bitrate/restart-ms set on
+    // one fails, and there is nothing to time.
+    if details.can.bit_timing_const.is_some() {
+        iface
+            .set_bitrate(cfg.bitrate, None::<u32>)
+            .map_err(|e| fail(format!("set bitrate {}: {e}", cfg.bitrate)))?;
+        iface
+            .set_restart_ms(cfg.restart_ms)
+            .map_err(|e| fail(format!("set restart-ms {}: {e}", cfg.restart_ms)))?;
+    }
+    iface
+        .bring_up()
+        .map_err(|e| fail(format!("link up: {e}")))?;
+    ensure_txqueuelen(cfg)
+}
+
 /// Bring the configured interface into its operating state (up at the
 /// configured bitrate), if it is not already there.
 ///
-/// An interface that is already up is left running: only its bitrate is
-/// checked (mismatch is an error, not a silent re-time). A down
-/// interface is taken through down → bitrate/restart-ms → up →
+/// An interface that is already up is left running: its bitrate is
+/// checked (mismatch is an error, not a silent re-time) and its TX queue
+/// is raised to the configured length, which carries no timing meaning.
+/// A down interface is taken through down → bitrate/restart-ms → up →
 /// txqueuelen. Virtual interfaces (vcan) report no bit timing at all;
 /// they are accepted as-is.
 pub(super) fn ensure_up(cfg: &BusConfig) -> Result<(), OpenError> {
@@ -114,6 +189,13 @@ pub(super) fn ensure_up(cfg: &BusConfig) -> Result<(), OpenError> {
                 });
             }
         }
+        // The queue length is not a timing property, so unlike the
+        // bitrate it is safe to set on a running bus — and it has to be:
+        // an interface someone else brought up carries whatever default
+        // they left, and a 10-frame queue drops the boot configuration
+        // burst outright ("TX queue full", seen on this arm 2026-09-19
+        // after can0 came back up outside this process).
+        ensure_txqueuelen(cfg)?;
         log::info!(
             "CAN interface '{}' already up ({} bps)",
             cfg.interface,
@@ -130,20 +212,7 @@ pub(super) fn ensure_up(cfg: &BusConfig) -> Result<(), OpenError> {
     iface
         .bring_down()
         .map_err(|e| fail(format!("link down: {e}")))?;
-    // Virtual interfaces have no bit timing; a bitrate/restart-ms set on
-    // one fails, and there is nothing to time.
-    if details.can.bit_timing_const.is_some() {
-        iface
-            .set_bitrate(cfg.bitrate, None::<u32>)
-            .map_err(|e| fail(format!("set bitrate {}: {e}", cfg.bitrate)))?;
-        iface
-            .set_restart_ms(cfg.restart_ms)
-            .map_err(|e| fail(format!("set restart-ms {}: {e}", cfg.restart_ms)))?;
-    }
-    iface
-        .bring_up()
-        .map_err(|e| fail(format!("link up: {e}")))?;
-    set_txqueuelen(&cfg.interface, cfg.txqueuelen);
+    bring_up_timed(&iface, cfg, &fail)?;
     log::info!(
         "CAN interface '{}' brought up: {} bps, restart-ms {}",
         cfg.interface,
@@ -154,20 +223,77 @@ pub(super) fn ensure_up(cfg: &BusConfig) -> Result<(), OpenError> {
 }
 
 /// Raise the interface TX queue (the kernel drops silently once it is
-/// full). A tuning knob, not correctness: failure is logged, not fatal.
+/// full) and read it back, because setting it is best-effort and its
+/// failure is not visible until the bus is busy. A queue already at least
+/// as long is left alone.
 ///
 /// Set through `SIOCSIFTXQLEN` rather than sysfs: the sysfs file is
 /// root-owned, so an unprivileged service user is refused before its
 /// `CAP_NET_ADMIN` is even consulted, while the ioctl honours the
 /// capability — the same path `ifconfig txqueuelen` takes.
-fn set_txqueuelen(iface: &str, len: u32) {
-    match txqueuelen_ioctl(iface, len) {
-        Ok(()) => log::info!("CAN interface '{iface}': txqueuelen {len}"),
-        Err(e) => log::warn!(
-            "CAN interface '{iface}': could not set txqueuelen to {len} ({e}); \
-             a long config burst may be dropped by the kernel TX queue"
-        ),
+///
+/// An interface someone else brought up carries whatever default they left,
+/// and a 10-frame queue drops the boot configuration burst outright. Setting
+/// it and only logging the failure meant the run started anyway, homed the
+/// arm, and died mid-motion with "TX queue full" -- on 2026-09-21 that left
+/// the shoulder and elbow unparked. Refuse before anything moves instead.
+fn ensure_txqueuelen(cfg: &BusConfig) -> Result<(), OpenError> {
+    let want = cfg.txqueuelen;
+    let iface = &cfg.interface;
+    let detail = match txqueuelen_get(iface) {
+        Ok(found) if found >= want => String::new(),
+        _ => match txqueuelen_ioctl(iface, want) {
+            Ok(()) => String::new(),
+            Err(e) => e.to_string(),
+        },
+    };
+    match txqueuelen_get(iface) {
+        Ok(found) if found >= want => {
+            log::info!("CAN interface '{iface}': txqueuelen {found}");
+            Ok(())
+        }
+        Ok(found) => Err(OpenError::TxQueue {
+            iface: iface.clone(),
+            found,
+            want,
+            detail: if detail.is_empty() {
+                "read back short".to_owned()
+            } else {
+                detail
+            },
+        }),
+        // The queue cannot be read: trust the set, and let a short queue
+        // announce itself the old way rather than refusing to run at all.
+        Err(e) => {
+            log::warn!("CAN interface '{iface}': could not read back txqueuelen ({e})");
+            Ok(())
+        }
     }
+}
+
+fn txqueuelen_get(iface: &str) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+
+    let name = iface.as_bytes();
+    // SAFETY: ifreq is plain data; a zeroed value is a valid (empty) request.
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    if name.len() >= req.ifr_name.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "interface name too long",
+        ));
+    }
+    for (dst, src) in req.ifr_name.iter_mut().zip(name) {
+        *dst = *src as libc::c_char;
+    }
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    // SAFETY: SIOCGIFTXQLEN fills a fully initialised ifreq that outlives it.
+    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFTXQLEN, &mut req) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the kernel wrote the length into the union's leading int.
+    Ok(unsafe { req.ifr_ifru.ifru_metric } as u32)
 }
 
 fn txqueuelen_ioctl(iface: &str, len: u32) -> std::io::Result<()> {
@@ -289,8 +415,118 @@ impl Drop for LinkMonitor {
     }
 }
 
+/// What the monitor carries from one sample to the next.
+#[derive(Debug, Default)]
+struct Sampler {
+    previous: LinkState,
+    counters: Option<xstats::CanDeviceStats>,
+    counters_missing_logged: bool,
+    /// The kernel's restart counter is lifetime-absolute; what the daemon
+    /// reports is relative to the first sample it took.
+    restart_base: Option<u32>,
+}
+
+impl Sampler {
+    /// Fold one sample into `shared`: the link state, and the device
+    /// counters when there was a query to make (`None` = no ifindex or no
+    /// socket). Returns whether the query failed and should be re-opened.
+    fn absorb(
+        &mut self,
+        iface: &str,
+        state: LinkState,
+        counters: Option<std::io::Result<Option<xstats::CanDeviceStats>>>,
+        shared: &Shared,
+    ) -> bool {
+        let mut failed = false;
+        let mut kernel_restarts = None;
+        match counters {
+            Some(Ok(Some(now))) => {
+                kernel_restarts = Some(now.restarts);
+                if let Some(prev) = self.counters {
+                    let d = xstats::counter_deltas(&prev, &now);
+                    if d.rebased {
+                        log::info!(
+                            "CAN interface '{iface}': counters re-based (interface re-created)"
+                        );
+                        self.restart_base = None;
+                    } else {
+                        // The kernel state is reported as it is. A
+                        // bus-off the auto-restart already recovered
+                        // from is carried as an event count for the
+                        // RT latch, so it neither masquerades as the
+                        // current state nor masks a real edge seen in
+                        // the same sample.
+                        if d.bus_off > 0 {
+                            log::error!(
+                                "CAN interface '{iface}': {} bus-off event(s) between samples",
+                                d.bus_off
+                            );
+                            shared
+                                .bus_off_events
+                                .fetch_add(d.bus_off, Ordering::Relaxed);
+                        }
+                        if d.error_passive > 0 && state == LinkState::Up {
+                            log::warn!(
+                                "CAN interface '{iface}': {} error-passive transition(s) \
+                                 between samples",
+                                d.error_passive
+                            );
+                        }
+                    }
+                }
+                self.counters = Some(now);
+            }
+            Some(Ok(None)) => {
+                if !self.counters_missing_logged {
+                    log::debug!(
+                        "CAN interface '{iface}': no device counters (vcan or old kernel); \
+                         state-only monitoring"
+                    );
+                    self.counters_missing_logged = true;
+                }
+                self.counters = None;
+            }
+            // A failed sample keeps the last good baseline, so an event
+            // inside the gap still shows in the next delta.
+            Some(Err(e)) => {
+                log::debug!("CAN link monitor '{iface}': xstats query failed ({e})");
+                failed = true;
+            }
+            None => {}
+        }
+        match kernel_restarts {
+            // The kernel's own auto-restart counter is authoritative,
+            // reported relative to the daemon's first sample.
+            Some(r) => {
+                let base = *self.restart_base.get_or_insert(r);
+                shared
+                    .restarts
+                    .store(r.saturating_sub(base), Ordering::Relaxed);
+            }
+            // Without counters a restart is counted where it is
+            // observable: the bus-off -> recovered edge the 100 ms
+            // auto-restart produces.
+            None => {
+                if self.previous == LinkState::BusOff && state != LinkState::BusOff {
+                    shared.restarts.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        if self.previous == LinkState::BusOff && state != LinkState::BusOff {
+            log::warn!("CAN interface '{iface}' recovered from bus-off");
+        } else if self.previous != LinkState::BusOff && state == LinkState::BusOff {
+            log::error!("CAN interface '{iface}' is BUS-OFF");
+        } else if self.previous != LinkState::ErrorPassive && state == LinkState::ErrorPassive {
+            log::warn!("CAN interface '{iface}' is error-passive");
+        }
+        self.previous = state;
+        shared.state.store(state_code(state), Ordering::Relaxed);
+        shared.samples.fetch_add(1, Ordering::Relaxed);
+        failed
+    }
+}
+
 fn sample_loop(iface: &str, nl: CanInterface, shared: &Shared, stop: &AtomicBool) {
-    let mut previous = LinkState::Unknown;
     // Cumulative-counter side channel: catches a bus-off that fires and
     // auto-recovers BETWEEN two state samples, which the state reads
     // straight through. Unavailable (vcan, old kernels) degrades to the
@@ -298,11 +534,7 @@ fn sample_loop(iface: &str, nl: CanInterface, shared: &Shared, stop: &AtomicBool
     let ifidx = xstats::ifindex(iface)
         .map_err(|e| log::debug!("CAN link monitor '{iface}': no ifindex ({e})"))
         .ok();
-    let mut counters: Option<xstats::CanDeviceStats> = None;
-    let mut counters_missing_logged = false;
-    // The kernel's restart counter is lifetime-absolute; what the daemon
-    // reports is relative to the first sample it took.
-    let mut restart_base: Option<u32> = None;
+    let mut sampler = Sampler::default();
     let mut query: Option<xstats::Query> = None;
     while !stop.load(Ordering::Relaxed) {
         let state = match nl.state() {
@@ -317,103 +549,95 @@ fn sample_loop(iface: &str, nl: CanInterface, shared: &Shared, stop: &AtomicBool
                 LinkState::Unknown
             }
         };
-        let mut kernel_restarts = None;
-        if let Some(idx) = ifidx {
+        let counters = ifidx.and_then(|idx| {
             if query.is_none() {
                 query = xstats::Query::open()
                     .map_err(|e| log::debug!("CAN link monitor '{iface}': netlink socket ({e})"))
                     .ok();
             }
-            match query.as_mut().map(|q| q.sample(idx)) {
-                Some(Ok(Some(now))) => {
-                    kernel_restarts = Some(now.restarts);
-                    if let Some(prev) = counters {
-                        let d = xstats::counter_deltas(&prev, &now);
-                        if d.rebased {
-                            log::info!(
-                                "CAN interface '{iface}': counters re-based (interface re-created)"
-                            );
-                            restart_base = None;
-                        } else {
-                            // The kernel state is reported as it is. A
-                            // bus-off the auto-restart already recovered
-                            // from is carried as an event count for the
-                            // RT latch, so it neither masquerades as the
-                            // current state nor masks a real edge seen in
-                            // the same sample.
-                            if d.bus_off > 0 {
-                                log::error!(
-                                    "CAN interface '{iface}': {} bus-off event(s) between samples",
-                                    d.bus_off
-                                );
-                                shared
-                                    .bus_off_events
-                                    .fetch_add(d.bus_off, Ordering::Relaxed);
-                            }
-                            if d.error_passive > 0 && state == LinkState::Up {
-                                log::warn!(
-                                    "CAN interface '{iface}': {} error-passive transition(s) \
-                                     between samples",
-                                    d.error_passive
-                                );
-                            }
-                        }
-                    }
-                    counters = Some(now);
-                }
-                Some(Ok(None)) => {
-                    if !counters_missing_logged {
-                        log::debug!(
-                            "CAN interface '{iface}': no device counters (vcan or old kernel); \
-                             state-only monitoring"
-                        );
-                        counters_missing_logged = true;
-                    }
-                    counters = None;
-                }
-                // A failed sample keeps the last good baseline, so an
-                // event inside the gap still shows in the next delta; the
-                // socket is re-opened for the next round.
-                Some(Err(e)) => {
-                    log::debug!("CAN link monitor '{iface}': xstats query failed ({e})");
-                    query = None;
-                }
-                None => {}
-            }
+            query.as_mut().map(|q| q.sample(idx))
+        });
+        // A failed query is re-opened for the next round.
+        if sampler.absorb(iface, state, counters, shared) {
+            query = None;
         }
-        match kernel_restarts {
-            // The kernel's own auto-restart counter is authoritative,
-            // reported relative to the daemon's first sample.
-            Some(r) => {
-                let base = *restart_base.get_or_insert(r);
-                shared
-                    .restarts
-                    .store(r.saturating_sub(base), Ordering::Relaxed);
-            }
-            // Without counters a restart is counted where it is
-            // observable: the bus-off -> recovered edge the 100 ms
-            // auto-restart produces.
-            None => {
-                if previous == LinkState::BusOff && state != LinkState::BusOff {
-                    shared.restarts.fetch_add(1, Ordering::Relaxed);
-                }
-            }
-        }
-        if previous == LinkState::BusOff && state != LinkState::BusOff {
-            log::warn!("CAN interface '{iface}' recovered from bus-off");
-        } else if previous != LinkState::BusOff && state == LinkState::BusOff {
-            log::error!("CAN interface '{iface}' is BUS-OFF");
-        } else if previous != LinkState::ErrorPassive && state == LinkState::ErrorPassive {
-            log::warn!("CAN interface '{iface}' is error-passive");
-        }
-        previous = state;
-        shared.state.store(state_code(state), Ordering::Relaxed);
-        shared.samples.fetch_add(1, Ordering::Relaxed);
 
         let mut waited = Duration::ZERO;
         while waited < SAMPLE_PERIOD && !stop.load(Ordering::Relaxed) {
             std::thread::sleep(STOP_POLL);
             waited += STOP_POLL;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use xstats::CanDeviceStats;
+
+    fn published(shared: &Shared) -> (LinkState, u32, u32) {
+        (
+            state_from_code(shared.state.load(Ordering::Relaxed)),
+            shared.restarts.load(Ordering::Relaxed),
+            shared.bus_off_events.load(Ordering::Relaxed),
+        )
+    }
+
+    /// A bus-off that fires and auto-recovers between two samples reaches
+    /// the published health only through the device counters; restarts
+    /// are reported relative to the first sample, a failed query keeps
+    /// the baseline, and a re-created interface re-bases instead of
+    /// alarming.
+    #[test]
+    fn counter_samples_publish_bus_off_events_and_relative_restarts() {
+        let shared = Shared::default();
+        let mut s = Sampler::default();
+        let mut c = CanDeviceStats {
+            bus_error: 40,
+            restarts: 7,
+            ..CanDeviceStats::default()
+        };
+        let sample =
+            |s: &mut Sampler, state, c: Option<std::io::Result<Option<CanDeviceStats>>>| {
+                s.absorb("can0", state, c, &shared)
+            };
+        assert!(!sample(&mut s, LinkState::Up, Some(Ok(Some(c)))));
+        assert_eq!(published(&shared), (LinkState::Up, 0, 0));
+
+        c.bus_off += 2;
+        c.restarts += 2;
+        sample(&mut s, LinkState::Up, Some(Ok(Some(c))));
+        assert_eq!(published(&shared), (LinkState::Up, 2, 2));
+
+        assert!(
+            sample(
+                &mut s,
+                LinkState::Up,
+                Some(Err(std::io::Error::other("timeout")))
+            ),
+            "a failed query asks to be re-opened"
+        );
+        c.bus_off += 1;
+        sample(&mut s, LinkState::Up, Some(Ok(Some(c))));
+        assert_eq!(
+            published(&shared).2,
+            3,
+            "an event inside a failed sample still shows in the next delta"
+        );
+
+        // Down/up re-creates the counters: bus_error alone went backward,
+        // so the advanced bus_off is a new baseline, not an event.
+        let recreated = CanDeviceStats {
+            bus_error: 0,
+            bus_off: c.bus_off + 5,
+            ..c
+        };
+        sample(&mut s, LinkState::Up, Some(Ok(Some(recreated))));
+        assert_eq!(published(&shared), (LinkState::Up, 0, 3));
+
+        // Without counters, a restart is the bus-off -> recovered edge.
+        sample(&mut s, LinkState::BusOff, None);
+        sample(&mut s, LinkState::Up, None);
+        assert_eq!(published(&shared), (LinkState::Up, 1, 3));
     }
 }

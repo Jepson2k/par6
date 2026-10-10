@@ -99,48 +99,77 @@ fn a_pure_translation_is_followed_along_a_straight_tcp_line() {
     );
 }
 
+/// `R(φ)` about the unit axis `u` (Rodrigues), row-major.
+fn rot_about(u: [f64; 3], phi: f64) -> [[f64; 3]; 3] {
+    let k = [[0.0, -u[2], u[1]], [u[2], 0.0, -u[0]], [-u[1], u[0], 0.0]];
+    let (s, c) = phi.sin_cos();
+    std::array::from_fn(|r| {
+        std::array::from_fn(|col| {
+            let k2: f64 = (0..3).map(|m| k[r][m] * k[m][col]).sum();
+            f64::from(u8::from(r == col)) + s * k[r][col] + (1.0 - c) * k2
+        })
+    })
+}
+
+/// A point carried by the screw about the line through `c` along `u`:
+/// turned `φ` about it and advanced `pitch·φ` along it.
+fn on_helix(p: [f64; 3], c: [f64; 3], u: [f64; 3], pitch: f64, phi: f64) -> [f64; 3] {
+    let r = rot_about(u, phi);
+    let d = [p[0] - c[0], p[1] - c[1], p[2] - c[2]];
+    std::array::from_fn(|i| (0..3).map(|m| r[i][m] * d[m]).sum::<f64>() + c[i] + pitch * phi * u[i])
+}
+
 /// With rotation in the move the path is the screw rather than a
 /// straight line, and it still has to land on both endpoints and turn
-/// one way. Ruckig phase-synchronizes the six tangent components when
-/// it can and falls back to time synchronization when the linear and
-/// angular ceilings bind differently, so the path is the exact geodesic
-/// in the first case and a bounded approximation of it in the second —
-/// which is the deviation this pins down.
+/// one way. The target is built as a known helix about a known axis
+/// (Chasles: any rigid motion is one), and the path is checked against
+/// that helix, written here without the library's own SE(3) maps.
+/// Ruckig phase-synchronizes the six tangent components when it can and
+/// falls back to time synchronization when the linear and angular
+/// ceilings bind differently, so the path is the exact helix in the
+/// first case and a bounded approximation of it in the second — which
+/// is the deviation this pins down.
 #[test]
 fn a_move_that_turns_follows_the_screw_and_lands_on_both_endpoints() {
     let (mut exec, _limits, _dt) = setup();
-    let start = at(0.30, 0.05, 0.25);
-    // A target reached by a known screw about the start pose.
-    let tangent = [0.08, -0.05, 0.04, 0.25, -0.18, 0.40];
-    let end = cart::se3_mul(&start, &cart::se3_exp(&tangent));
+    let p0 = [0.30, 0.05, 0.25];
+    let start = at(p0[0], p0[1], p0[2]);
+    let n = (0.3f64 * 0.3 + 0.5 * 0.5 + 0.8 * 0.8).sqrt();
+    let u = [0.3 / n, -0.5 / n, 0.8 / n];
+    let (c, pitch, theta) = ([0.25, 0.0, 0.20], 0.05, 0.6);
+    let r_end = rot_about(u, theta);
+    let p_end = on_helix(p0, c, u, pitch, theta);
+    let end: Pose = std::array::from_fn(|k| {
+        let (row, col) = (k / 4, k % 4);
+        match (row, col) {
+            (3, 3) => 1.0,
+            (3, _) => 0.0,
+            (_, 3) => p_end[row],
+            _ => r_end[row][col],
+        }
+    });
     exec.activate(&start);
     exec.set_target(&end).unwrap();
 
-    let total_rot = (tangent[3].powi(2) + tangent[4].powi(2) + tangent[5].powi(2)).sqrt();
+    // The start is unrotated, so the angle turned is read off the trace.
+    let turned = |m: &Pose| ((m[0] + m[5] + m[10] - 1.0) / 2.0).clamp(-1.0, 1.0).acos();
     let mut prev_rot = 0.0;
     let mut worst_off_screw = 0.0f64;
     let mut last = start;
     let mut finished = false;
     for _ in 0..20_000 {
         let s = exec.step().unwrap();
-        let local = cart::se3_log(&cart::se3_mul(&cart::se3_inverse(&start), &s.pose));
-        let rot = (local[3].powi(2) + local[4].powi(2) + local[5].powi(2)).sqrt();
+        let rot = turned(&s.pose);
         assert!(
-            rot >= prev_rot - 1e-12,
+            rot >= prev_rot - 1e-9,
             "the wrist reversed: {rot} after {prev_rot}"
         );
         prev_rot = rot;
-        // Distance from the exact screw: the closest point on it is the
-        // one at this tick's share of the total rotation.
-        let s_frac = if total_rot > 0.0 {
-            rot / total_rot
-        } else {
-            0.0
-        };
-        let on_screw: [f64; 6] = std::array::from_fn(|i| s_frac * tangent[i]);
+        // The closest point of the helix is the one at this tick's share
+        // of the rotation.
         worst_off_screw = worst_off_screw.max(dist(
             cart::translation(&s.pose),
-            cart::translation(&cart::se3_mul(&start, &cart::se3_exp(&on_screw))),
+            on_helix(p0, c, u, pitch, rot),
         ));
         last = s.pose;
         if s.finished {
@@ -156,8 +185,8 @@ fn a_move_that_turns_follows_the_screw_and_lands_on_both_endpoints() {
         .fold(0.0, f64::max);
     assert!(worst_end < 1e-9, "missed the target pose by {worst_end}");
     assert!(
-        (prev_rot - total_rot).abs() < 1e-9,
-        "turned {prev_rot} rad of a {total_rot} rad move"
+        (prev_rot - theta).abs() < 1e-9,
+        "turned {prev_rot} rad of a {theta} rad move"
     );
     // Sub-millimetre: close enough that the joint layer's own limits
     // dominate, and a regression to joint interpolation would blow it.
@@ -167,18 +196,23 @@ fn a_move_that_turns_follows_the_screw_and_lands_on_both_endpoints() {
     );
 }
 
-/// A stop sheds the velocity the TCP has; it does not go back for the
-/// ground it covered.
+/// A stop sheds the velocity the TCP has, inside the distance its
+/// acceleration and jerk ceilings need to, short of the target it was
+/// heading for; it does not go back for the ground it covered.
 #[test]
 fn release_brakes_to_rest_without_reversing() {
-    let (mut exec, _limits, dt) = setup();
+    let (mut exec, limits, dt) = setup();
     let start = at(0.35, 0.10, 0.20);
+    let target_x = 0.60;
     exec.activate(&start);
-    exec.set_target(&at(0.60, 0.10, 0.20)).unwrap();
-    for _ in 0..40 {
+    exec.set_target(&at(target_x, 0.10, 0.20)).unwrap();
+    for _ in 0..39 {
         exec.step().unwrap();
     }
+    let before = cart::translation(&exec.step().unwrap().pose);
     let at_release = cart::translation(&exec.step().unwrap().pose);
+    let v = dist(at_release, before) / dt;
+    assert!(v > 0.01, "the TCP is moving when released: {v} m/s");
 
     exec.release();
     let mut prev = at_release;
@@ -202,6 +236,23 @@ fn release_brakes_to_rest_without_reversing() {
     assert!(
         prev[0] > at_release[0],
         "braking has to cover ground, not freeze"
+    );
+    // The worst case under the ceilings: swing the acceleration from
+    // +a to -a at the jerk limit, carrying the speed that swing adds,
+    // then shed the rest at -a.
+    let (a, j) = (limits.linear_acceleration, limits.linear_jerk);
+    let swing = 2.0 * a / j;
+    let v_peak = v + a * a / (2.0 * j);
+    let bound = v_peak * swing + v_peak * v_peak / (2.0 * a);
+    let braked = prev[0] - at_release[0];
+    assert!(
+        braked <= bound,
+        "braked over {braked} m from {v} m/s; the ceilings allow {bound} m"
+    );
+    assert!(
+        prev[0] < target_x - 1e-3,
+        "the release ran on to the target: rested at x = {}",
+        prev[0]
     );
 }
 

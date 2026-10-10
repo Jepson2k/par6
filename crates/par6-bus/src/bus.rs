@@ -2,8 +2,9 @@
 //! to talk to motor drivers, backend-agnostic (SocketCAN, closed-loop
 //! sim, loopback).
 
-use par6_config::{GripperConfig, RobotConfig};
+use par6_config::{RobotConfig, ToolConfig};
 
+use crate::types::CaptureBuffer;
 use crate::types::{
     BusError, BusState, DriveTune, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId,
     PollAction,
@@ -97,7 +98,7 @@ pub trait DriverBus {
     fn boot_configure(
         &mut self,
         robot: &RobotConfig,
-        gripper: Option<&GripperConfig>,
+        gripper: Option<&ToolConfig>,
         repeats: u8,
     ) -> Result<(), BusError>;
 
@@ -110,7 +111,9 @@ pub trait DriverBus {
     /// limit; the watchdog is untouched) and push it now, `repeats`
     /// passes — the live half of `SET_PID_GAINS`. Because the STORED
     /// config changes, every later resend (reconnect, FLASHING exit)
-    /// carries the new tune too. Unknown nodes are refused.
+    /// carries the new tune too. Unknown nodes are refused. With `repeats = 0`,
+    /// only update the stored tune; callers can send each field through
+    /// [`PollAction::ConfigFrame`] without bursting onto the motion bus.
     fn retune_node(&mut self, node: NodeId, tune: &DriveTune, repeats: u8) -> Result<(), BusError>;
 
     /// Commissioning: rename `node` to `new_id` (cmd 11), one frame. The
@@ -122,6 +125,40 @@ pub trait DriverBus {
     /// Commissioning: ask `node` to persist its running configuration to
     /// NVM (cmd 13), one frame.
     fn save_config(&mut self, node: NodeId) -> Result<(), BusError>;
+
+    /// Commissioning: tell `node` which tool it is built into (cmd 36,
+    /// `ToolConfig::can_tool_id`), one frame; it reads back in the
+    /// node's device info at once and survives a power cycle after a
+    /// [`save_config`](Self::save_config).
+    fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError>;
+
+    /// Set `node`'s ripple feedforward (cmd 40): the harmonics fill its slots
+    /// in order and the rest are cleared, sent now and kept for the node's
+    /// reconnect resend. At most `RIPPLE_SLOTS` harmonics.
+    fn set_ripple(
+        &mut self,
+        node: NodeId,
+        ripple: &[par6_config::RippleHarmonic],
+    ) -> Result<(), BusError>;
+
+    /// Set `node`'s speed filter window (cmd 41), sent now and kept for the
+    /// node's reconnect resend.
+    fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError>;
+
+    /// Have `node` send its whole capture (cmd 42) as the same replies a
+    /// [`PollAction::CaptureRead`] gets, paced by the drive; they land in
+    /// [`DriverBus::capture`] as they arrive. Pairs the bus drops are read
+    /// back one at a time afterwards.
+    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError>;
+
+    /// Start a loop-rate capture on `node` (cmd 38): `wanted` samples of the
+    /// velocity its loop acts on and Iq, one every `divisor` control loops,
+    /// from the next loop. Read back with [`PollAction::CaptureRead`]
+    /// overrides into [`capture`](Self::capture).
+    fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError>;
+
+    /// What the capture reads have assembled for `node` so far.
+    fn capture(&self, node: NodeId) -> Option<&CaptureBuffer>;
 
     /// Send a Limits frame (cmd 20: velocity limit ticks/s + current
     /// limit mA), `repeats` times. Homing uses this to drop a node to its
@@ -166,4 +203,28 @@ pub trait DriverBus {
     /// Last known kernel link health (bus-off/error-passive/restarts,
     /// sampled off the RT thread at ~1 Hz on hardware backends).
     fn link_health(&self) -> LinkHealth;
+
+    /// The arm's fitted tool changed (`select_tool`): the gripper node's
+    /// freshness starts over for the new tool. A driven jaw's limits arrive
+    /// through [`Self::retune_node`]; the simulator also refits its plant
+    /// and gripper drive so it swings and answers as the tool the
+    /// controller models.
+    fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>);
+
+    /// Cycle the physical link once because the boot scan found NO node
+    /// at all — the whole-bus silence of a controller that came up
+    /// error-passive, not a missing drive. Returns whether a cycle was
+    /// performed; the caller re-runs [`Self::boot_configure`] once the
+    /// link has settled after a `true`. Blocks on netlink: called only
+    /// while no node answers, so nothing on the bus is being driven.
+    /// Backends without a link to cycle answer `false`.
+    fn recover_link(&mut self) -> bool {
+        false
+    }
+
+    /// Whether this bus is a simulation: its drives are whatever the
+    /// runtime last fitted, and say nothing about the arm.
+    fn simulated(&self) -> bool {
+        false
+    }
 }

@@ -6,7 +6,27 @@ mod common;
 
 use common::Rig;
 use par6_bus::{ErrorFlags, Reply, TxRecord};
+use par6_rt::errors::CLEAR_SETTLE_S;
+use par6_rt::timing::{RECOMPUTE_EVERY, WARMUP_TICKS, WINDOW};
 use par6_rt::{ArmState, ErrorCode, Mode, RtCommand, StreamSetpoint, DEBOUNCE_READS};
+
+/// The core's windows at the rig's tick, from the config seconds.
+struct Windows {
+    stale: u32,
+    lost: u32,
+    /// Past the clear settle, by the tick the wipe lands on.
+    settle: u32,
+}
+
+fn windows(rig: &Rig) -> Windows {
+    let robot = common::bundle().robot;
+    let ticks = |s: f64| (s / rig.dt).round() as u32;
+    Windows {
+        stale: ticks(robot.bus.stale_warn_s),
+        lost: ticks(robot.bus.lost_s),
+        settle: ticks(CLEAR_SETTLE_S).max(1) + 2,
+    }
+}
 
 fn has_error(rig: &mut Rig, code: ErrorCode, joint: Option<u8>) -> bool {
     rig.snap()
@@ -27,16 +47,41 @@ fn clear_error_count(rig: &mut Rig, node: u8) -> usize {
 
 #[test]
 fn estop_lifecycle_debounce_latch_reaction_clear_and_relatch() {
+    // The first read seeds the debouncer: a line LOW at boot latches on
+    // the very first ticks, and a HIGH line never produces a boot-glitch
+    // e-stop from zero-initialized state.
+    let mut rig = Rig::with_estop_low();
+    rig.tick_n(2);
+    assert!(
+        has_error(&mut rig, ErrorCode::Estop, None),
+        "low at boot reads pressed immediately (seeded, no debounce wait)"
+    );
+    let mut rig = Rig::new();
+    rig.tick_n(4 * DEBOUNCE_READS);
+    assert!(
+        !has_error(&mut rig, ErrorCode::Estop, None),
+        "high at boot must not glitch a false e-stop"
+    );
+
     let mut rig = Rig::new();
     rig.ready();
+    let w = windows(&rig);
+    let press = |rig: &mut Rig, low: bool| {
+        rig.estop_line
+            .store(!low, std::sync::atomic::Ordering::Relaxed);
+    };
 
+    // A bounce shorter than the debounce restarts the count.
+    press(&mut rig, true);
+    rig.tick_n(DEBOUNCE_READS - 2);
+    press(&mut rig, false);
+    rig.tick();
     // Press: the level must hold DEBOUNCE_READS consecutive reads.
-    rig.estop_line
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+    press(&mut rig, true);
     rig.tick_n(DEBOUNCE_READS - 1);
     assert!(
         !has_error(&mut rig, ErrorCode::Estop, None),
-        "still debouncing"
+        "still debouncing — the bounce restarted the count"
     );
     rig.tick();
     let s = rig.snap();
@@ -70,7 +115,7 @@ fn estop_lifecycle_debounce_latch_reaction_clear_and_relatch() {
     let gripper_node = rig.gripper_node;
     assert_eq!(clear_error_count(&mut rig, gripper_node), 3);
     assert!(rig.snap().error_active, "latch persists through settle");
-    rig.tick_n(40); // > round(0.152 / 0.004) = 38
+    rig.tick_n(w.settle);
     let s = rig.snap();
     assert!(!s.error_active, "latch wiped after settle");
     assert_eq!(s.mode, Mode::Idle, "auto recovery to IDLE");
@@ -82,7 +127,7 @@ fn estop_lifecycle_debounce_latch_reaction_clear_and_relatch() {
     rig.tick_n(DEBOUNCE_READS + 1);
     // Clearing while still pressed re-latches immediately after the wipe.
     rig.cmd(RtCommand::ClearErrors);
-    rig.tick_n(45);
+    rig.tick_n(w.settle);
     assert!(
         has_error(&mut rig, ErrorCode::Estop, None),
         "still-pressed line re-latches after the wipe"
@@ -91,35 +136,12 @@ fn estop_lifecycle_debounce_latch_reaction_clear_and_relatch() {
         .store(true, std::sync::atomic::Ordering::Relaxed);
     rig.tick_n(DEBOUNCE_READS + 1);
     rig.cmd(RtCommand::ClearErrors);
-    rig.tick_n(45);
+    rig.tick_n(w.settle);
     rig.cmd(RtCommand::Enable);
     assert_eq!(rig.snap().state, ArmState::Enabled);
-}
 
-#[test]
-fn boot_with_line_low_seeds_pressed_and_line_high_never_glitches() {
-    // First-read seeding: a LOW line at boot must latch on the very
-    // first ticks — and a HIGH line must never produce a boot-glitch
-    // e-stop from zero-initialized debouncer state.
-    let mut rig = Rig::with_estop_low();
-    rig.tick_n(2);
-    assert!(
-        has_error(&mut rig, ErrorCode::Estop, None),
-        "low at boot reads pressed immediately (seeded, no debounce wait)"
-    );
-
-    let mut rig = Rig::new();
-    rig.tick_n(20);
-    assert!(
-        !has_error(&mut rig, ErrorCode::Estop, None),
-        "high at boot must not glitch a false e-stop"
-    );
-}
-
-#[test]
-fn software_estop_latches_under_its_own_key() {
-    let mut rig = Rig::new();
-    rig.ready();
+    // The software e-stop latches under its own key, and dropping the
+    // flag alone does not clear it.
     rig.cmd(RtCommand::SetSoftEstop(true));
     rig.tick();
     let s = rig.snap();
@@ -130,13 +152,11 @@ fn software_estop_latches_under_its_own_key() {
     );
     assert_eq!(s.mode, Mode::ActiveError);
     assert_eq!(s.state, ArmState::Disabled);
-
-    // Dropping the flag alone does not clear the latch.
     rig.cmd(RtCommand::SetSoftEstop(false));
     rig.tick_n(5);
     assert!(has_error(&mut rig, ErrorCode::SwEstop, None));
     rig.cmd(RtCommand::ClearErrors);
-    rig.tick_n(45);
+    rig.tick_n(w.settle);
     assert!(!rig.snap().error_active);
     assert_eq!(rig.snap().mode, Mode::Idle);
 }
@@ -186,10 +206,21 @@ fn per_type_flags_are_trusted_only_with_the_live_fault_bit() {
     );
     let gripper_node = rig.gripper_node;
     assert_eq!(clear_error_count(&mut rig, gripper_node), 3, "+ gripper");
-    rig.tick_n(45);
+    rig.tick_n(windows(&rig).settle);
     let s = rig.snap();
     assert!(!s.error_active, "cleared in one press");
     assert_eq!(s.mode, Mode::Idle);
+
+    // The clear forgot the old flags: the live bit coming back on its own,
+    // with no fresh report, has nothing per-type to latch.
+    rig.fault_nodes = 1 << 2;
+    rig.tick_n(2);
+    assert!(
+        !has_error(&mut rig, ErrorCode::Current, Some(2)),
+        "the flags read before the clear latched again"
+    );
+    rig.fault_nodes = 0;
+    rig.tick_n(2);
 
     // A stale re-report WITHOUT the live bit stays ignored...
     rig.core
@@ -208,52 +239,66 @@ fn per_type_flags_are_trusted_only_with_the_live_fault_bit() {
 
 #[test]
 fn freshness_stale_warns_lost_latches_and_invalidates_homing() {
-    let mut rig = Rig::new();
-    rig.ready();
-    let stale_ticks = 10u32; // 0.04 s at 250 Hz (config)
-    let lost_ticks = 50u32; // 0.2 s
+    for dt in [0.004, 0.01] {
+        let mut rig = Rig::at_tick_dt(dt);
+        rig.ready();
+        let w = windows(&rig);
 
-    // Silence node 3 past the stale threshold: warning, self-clears.
-    rig.skip_nodes = 1 << 3;
-    rig.tick_n(stale_ticks + 2);
-    assert!(has_error(&mut rig, ErrorCode::CanStale, Some(3)));
-    assert!(!rig.snap().error_active, "stale is a warning");
-    assert!(rig.snap().homed, "stale does not invalidate homing");
-    rig.clear_tx();
-    rig.skip_nodes = 0;
-    rig.tick_n(3);
-    assert!(
-        !has_error(&mut rig, ErrorCode::CanStale, Some(3)),
-        "self-cleared"
-    );
+        // Silence node 3 past the stale threshold: a warning that clears
+        // itself.
+        rig.skip_nodes = 1 << 3;
+        rig.tick_n(w.stale - 1);
+        assert!(
+            !has_error(&mut rig, ErrorCode::CanStale, Some(3)),
+            "dt {dt}: stale before its window"
+        );
+        rig.tick_n(3);
+        assert!(has_error(&mut rig, ErrorCode::CanStale, Some(3)), "dt {dt}");
+        assert!(!rig.snap().error_active, "stale is a warning");
+        assert!(rig.snap().homed, "stale does not invalidate homing");
+        rig.clear_tx();
+        rig.skip_nodes = 0;
+        rig.tick_n(3);
+        assert!(
+            !has_error(&mut rig, ErrorCode::CanStale, Some(3)),
+            "self-cleared"
+        );
 
-    // Reconnect edge re-sends that node's stored config.
-    let passes = rig.config_passes_for(3);
-    assert!(passes >= 1, "config re-sent on the stale→fresh edge");
+        // Reconnect edge re-sends that node's stored config.
+        let passes = rig.config_passes_for(3);
+        assert!(passes >= 1, "config re-sent on the stale→fresh edge");
 
-    // Silence past the lost threshold: LATCHED error, homing invalidated.
-    rig.skip_nodes = 1 << 3;
-    rig.tick_n(lost_ticks + 2);
-    let s = rig.snap();
-    assert!(has_error(&mut rig, ErrorCode::CanLost, Some(3)));
-    assert!(s.error_active);
-    assert!(!s.homed, "disconnect while homed invalidates homing");
-    assert_eq!(s.mode, Mode::ActiveError);
+        // Silence past the lost threshold: LATCHED error, homing
+        // invalidated.
+        rig.skip_nodes = 1 << 3;
+        rig.tick_n(w.lost - 1);
+        assert!(
+            !has_error(&mut rig, ErrorCode::CanLost, Some(3)),
+            "dt {dt}: lost before its window"
+        );
+        rig.tick_n(3);
+        let s = rig.snap();
+        assert!(has_error(&mut rig, ErrorCode::CanLost, Some(3)), "dt {dt}");
+        assert!(s.error_active);
+        assert!(!s.homed, "disconnect while homed invalidates homing");
+        assert_eq!(s.mode, Mode::ActiveError);
 
-    // Frames resuming do NOT clear the lost latch...
-    rig.skip_nodes = 0;
-    rig.tick_n(10);
-    assert!(has_error(&mut rig, ErrorCode::CanLost, Some(3)));
-    // ...only the user clear does (which also resets the bus-side latch).
-    rig.cmd(RtCommand::ClearErrors);
-    rig.tick_n(45);
-    assert!(!rig.snap().error_active);
-    assert_eq!(rig.snap().mode, Mode::Idle);
-    rig.tick_n(10);
-    assert!(
-        !has_error(&mut rig, ErrorCode::CanLost, Some(3)),
-        "does not re-latch once frames flow again"
-    );
+        // Frames resuming do NOT clear the lost latch...
+        rig.skip_nodes = 0;
+        rig.tick_n(w.stale);
+        assert!(has_error(&mut rig, ErrorCode::CanLost, Some(3)));
+        // ...only the user clear does (which also resets the bus-side
+        // latch).
+        rig.cmd(RtCommand::ClearErrors);
+        rig.tick_n(w.settle);
+        assert!(!rig.snap().error_active);
+        assert_eq!(rig.snap().mode, Mode::Idle);
+        rig.tick_n(w.lost);
+        assert!(
+            !has_error(&mut rig, ErrorCode::CanLost, Some(3)),
+            "does not re-latch once frames flow again"
+        );
+    }
 }
 
 /// Clearing errors on a node that is STILL off the bus must not silence
@@ -273,8 +318,12 @@ fn freshness_stale_warns_lost_latches_and_invalidates_homing() {
 fn clearing_a_still_dead_node_re_latches_and_still_resends_its_config() {
     let mut rig = Rig::new();
     rig.ready();
-    let lost_ticks = 50u32; // bus.lost_s = 0.2 s at 250 Hz (config)
-    let settle_ticks = 45u32; // > round(0.152 / 0.004) = 38
+    let w = windows(&rig);
+    let (lost_ticks, settle_ticks) = (w.lost, w.settle);
+    assert!(
+        settle_ticks < lost_ticks,
+        "the wipe lands inside the lost window, or this tells nothing apart"
+    );
 
     // J3's connector works loose: the node goes silent and latches.
     rig.skip_nodes = 1 << 3;
@@ -288,10 +337,15 @@ fn clearing_a_still_dead_node_re_latches_and_still_resends_its_config() {
     rig.tick_n(settle_ticks);
     assert!(!rig.snap().error_active, "the clear wipes the latch");
 
-    // ...and then the still-silent joint must come back on its own within
-    // the lost window. The health surface may not go quiet on a joint
-    // that is off the bus.
-    rig.tick_n(lost_ticks);
+    // ...and then the still-silent joint must come back on its own once
+    // the lost window has run from the clear — not before. The health
+    // surface may not go quiet on a joint that is off the bus.
+    rig.tick_n(lost_ticks - settle_ticks - 2);
+    assert!(
+        !has_error(&mut rig, ErrorCode::CanLost, Some(3)),
+        "re-latched before a lost window had passed since the clear"
+    );
+    rig.tick_n(4);
     let s = rig.snap();
     assert!(
         has_error(&mut rig, ErrorCode::CanLost, Some(3)),
@@ -331,56 +385,88 @@ fn clearing_a_still_dead_node_re_latches_and_still_resends_its_config() {
 
 #[test]
 fn degradation_bands_warn_then_hard_latch_from_injected_periods() {
-    let dt = 0.004;
-    let mut rig = Rig::new();
-    rig.ready();
+    for dt in [0.004, 0.01] {
+        let mut rig = Rig::at_tick_dt(dt);
+        rig.ready();
+        let w = windows(&rig);
+        let bands = common::bundle().robot.loop_timing();
+        let sustain = (bands.critical_sustain_s / dt).round() as u64;
+        let flush = WINDOW as u64 + RECOMPUTE_EVERY;
+        let band_errors = |rig: &mut Rig| {
+            (
+                has_error(rig, ErrorCode::LoopDegraded, None),
+                has_error(rig, ErrorCode::LoopCritical, None),
+            )
+        };
 
-    // Warmup at nominal periods: no bands evaluated, nothing latched.
-    for _ in 0..900 {
-        rig.tick_period(dt);
-    }
-    assert!(!has_error(&mut rig, ErrorCode::LoopDegraded, None));
+        // Warmup: periods slow enough to latch, and nothing is judged
+        // before the window is trusted.
+        let critical = dt * (bands.critical_factor + 0.1);
+        let booted = rig.snap().tick;
+        for _ in booted + 1..WARMUP_TICKS {
+            rig.tick_period(critical);
+            assert_eq!(
+                band_errors(&mut rig),
+                (false, false),
+                "dt {dt}: judged in warmup"
+            );
+        }
 
-    // 7% slow: DEGRADED warning — never critical, never disabling.
-    for _ in 0..600 {
-        rig.tick_period(dt * 1.07);
-    }
-    let s = rig.snap();
-    assert!(has_error(&mut rig, ErrorCode::LoopDegraded, None));
-    assert!(!s.error_active, "degraded is a self-clearing warning");
-    assert_eq!(s.mode, Mode::Idle);
+        // Past warmup the band warns at once and latches LOOP_CRITICAL
+        // when the sustain has run, not before.
+        for _ in 0..sustain - 1 {
+            rig.tick_period(critical);
+        }
+        let (degraded, latched) = band_errors(&mut rig);
+        assert!(degraded && !latched, "dt {dt}: critical before the sustain");
+        rig.tick_period(critical);
+        rig.tick_period(critical);
+        let s = rig.snap();
+        assert!(
+            has_error(&mut rig, ErrorCode::LoopCritical, None),
+            "dt {dt}"
+        );
+        assert!(s.error_active);
+        assert_eq!(s.state, ArmState::Disabled);
+        assert_eq!(s.mode, Mode::ActiveError);
 
-    // Recovery: the warning clears itself once p99 drops back.
-    for _ in 0..600 {
-        rig.tick_period(dt);
-    }
-    assert!(
-        !has_error(&mut rig, ErrorCode::LoopDegraded, None),
-        "warning self-clears"
-    );
+        // The latch outlives recovery of the loop; only user clear ends it.
+        for _ in 0..flush {
+            rig.tick_period(dt);
+        }
+        assert!(has_error(&mut rig, ErrorCode::LoopCritical, None));
+        rig.cmd(RtCommand::ClearErrors);
+        for _ in 0..w.settle {
+            rig.tick_period(dt);
+        }
+        assert!(!rig.snap().error_active);
+        assert_eq!(rig.snap().mode, Mode::Idle);
 
-    // 20% slow sustained ≥1 s: LOOP_CRITICAL hard latch → DISABLED +
-    // ACTIVE_ERROR.
-    for _ in 0..(250 + 600) {
-        rig.tick_period(dt * 1.2);
+        // Slow inside the degraded band only: a self-clearing warning,
+        // never critical, never disabling.
+        let degraded = dt * (bands.degraded_factor + bands.critical_factor) / 2.0;
+        for _ in 0..flush + 2 * sustain {
+            rig.tick_period(degraded);
+            assert!(
+                !has_error(&mut rig, ErrorCode::LoopCritical, None),
+                "dt {dt}"
+            );
+        }
+        let s = rig.snap();
+        assert!(
+            has_error(&mut rig, ErrorCode::LoopDegraded, None),
+            "dt {dt}"
+        );
+        assert!(!s.error_active, "degraded is a self-clearing warning");
+        assert_eq!(s.mode, Mode::Idle);
+        for _ in 0..flush {
+            rig.tick_period(dt);
+        }
+        assert!(
+            !has_error(&mut rig, ErrorCode::LoopDegraded, None),
+            "warning self-clears"
+        );
     }
-    let s = rig.snap();
-    assert!(has_error(&mut rig, ErrorCode::LoopCritical, None));
-    assert!(s.error_active);
-    assert_eq!(s.state, ArmState::Disabled);
-    assert_eq!(s.mode, Mode::ActiveError);
-
-    // The latch outlives recovery of the loop; only user clear ends it.
-    for _ in 0..700 {
-        rig.tick_period(dt);
-    }
-    assert!(has_error(&mut rig, ErrorCode::LoopCritical, None));
-    rig.cmd(RtCommand::ClearErrors);
-    for _ in 0..45 {
-        rig.tick_period(dt);
-    }
-    assert!(!rig.snap().error_active);
-    assert_eq!(rig.snap().mode, Mode::Idle);
 }
 
 /// The stream watchdog must be SATISFIABLE by a live stream at every

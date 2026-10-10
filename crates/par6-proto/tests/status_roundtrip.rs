@@ -6,23 +6,86 @@
 //! and the decoder the only reader, so a mismatch shows up as a broadcast
 //! that silently never arrives rather than as a failure anyone can see.
 
-use par6_proto::{decode_status, DriveHealthWire, Status, StatusEncoder};
+use par6_proto::{
+    decode_status, make_error, ActionState, ControllerMode, DriveHealthWire, ErrorCode, HomingWire,
+    LinkHealthWire, LoopHealthWire, Status, StatusEncoder, ToolState, ToolStatusWire, UNATTRIBUTED,
+};
 
-/// A status with every variable-length slot non-trivially populated, so a
-/// slot whose encoded arity drifts from what the decoder expects is caught
-/// here rather than by an arm that has stopped reporting in the field.
+/// A status with every slot set to something other than its default and
+/// different from every neighbour of the same type, so a slot whose
+/// encoded arity drifts from what the decoder expects, or whose value
+/// lands in the wrong slot, is caught here rather than by an arm that has
+/// stopped reporting in the field.
 fn populated() -> Status {
     Status {
+        proto_version: par6_proto::PROTO_VERSION,
+        controller_id: 77,
         seq: 4242,
-        session_id: u64::MAX - 1,
+        mono_time_ns: 9_000_000_123,
+        link_ok: 1,
+        data_age_ms: 17,
+        pose: std::array::from_fn(|i| 0.5 + i as f64),
         angles: [1.0, -2.0, 3.5, -4.25, 5.125, -6.0625],
-        torques: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
-        torques_ext: [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6],
-        tcp_speed: 12.5,
+        speeds: [0.01, -0.02, 0.03, -0.04, 0.05, -0.06],
         io: vec![0, 1, 0, 1, 1],
+        action_current: "move_l".to_owned(),
+        action_state: ActionState::Executing,
+        joint_en: std::array::from_fn(|i| (i % 2) as u8),
+        cart_en_wrf: std::array::from_fn(|i| ((i + 1) % 2) as u8),
+        cart_en_trf: std::array::from_fn(|i| u8::from(i % 3 == 0)),
+        executing_index: 12,
+        completed_index: 11,
+        last_checkpoint: "pick".to_owned(),
+        error: Some(make_error(
+            ErrorCode::MotnCancelled,
+            11,
+            &[("scope", "stop")],
+        )),
+        queued_segments: 3,
+        queued_duration: 4.5,
+        action_params: "[0.1]".to_owned(),
+        tool_status: Some(ToolStatusWire {
+            key: "GRIPPER".to_owned(),
+            state: ToolState::Active,
+            engaged: true,
+            part_detected: true,
+            fault_code: -3,
+            positions: vec![0.25],
+            channels: vec![0.5, 0.75],
+            variant_key: "wide".to_owned(),
+        }),
+        tcp_speed: 12.5,
+        simulator_active: true,
+        collision_active: false,
+        collision_pairs: vec![("forearm".to_owned(), "cage".to_owned())],
+        scene_epoch: 9,
+        accepted_index: 13,
+        homed: true,
+        torques: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
+        mode: ControllerMode::Homing,
+        enabled: true,
+        gravity_comp: false,
+        warnings: vec![make_error(
+            ErrorCode::TrajNearSingularity,
+            UNATTRIBUTED,
+            &[],
+        )],
+        link_health: LinkHealthWire {
+            state: 2,
+            restarts: 4,
+            tx_errors: 5,
+            rx_frames: 6,
+        },
+        homing: HomingWire {
+            active: true,
+            sequence_step: 2,
+            joints: vec![(1, 2), (3, 4)],
+        },
+        torques_ext: [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6],
+        paused: true,
         drive_health: DriveHealthWire {
-            temperatures_c: vec![41.0, 42.0, f64::NAN, 44.0],
-            currents_ma: vec![100.0, 200.0, 300.0, f64::NAN],
+            temperatures_c: vec![41.0, 42.0, 43.0, 44.0],
+            currents_ma: vec![100.0, 200.0, 300.0, 400.0],
             bus_voltage_v: Some(23.8),
             faults: vec![
                 vec![],
@@ -31,52 +94,69 @@ fn populated() -> Status {
                 vec!["encoder".to_owned(), "overcurrent".to_owned()],
             ],
         },
-        ..Status::default()
+        loop_health: LoopHealthWire {
+            p99_period_s: 0.0041,
+            overruns: 8,
+        },
+        session_id: u64::MAX - 1,
     }
+}
+
+fn round_trip(s: &Status) -> Status {
+    let mut encoder = StatusEncoder::new();
+    decode_status(encoder.encode(s)).expect("the encoder's own output must decode")
 }
 
 #[test]
 fn every_status_slot_survives_encode_and_decode() {
     let sent = populated();
-    let mut encoder = StatusEncoder::new();
-    let bytes = encoder.encode(&sent);
-    let got = decode_status(bytes).expect("the encoder's own output must decode");
+    assert_eq!(round_trip(&sent), sent);
+    // Neighbouring flags differ above; flipped, each one is read for
+    // itself rather than for a value it shares with its slot's default.
+    let mut flipped = populated();
+    for flag in [
+        &mut flipped.simulator_active,
+        &mut flipped.collision_active,
+        &mut flipped.homed,
+        &mut flipped.enabled,
+        &mut flipped.gravity_comp,
+        &mut flipped.paused,
+        &mut flipped.homing.active,
+    ] {
+        *flag = !*flag;
+    }
+    assert_eq!(round_trip(&flipped), flipped);
 
-    assert_eq!(got.seq, sent.seq);
-    assert_eq!(got.session_id, sent.session_id);
-    assert_eq!(got.angles, sent.angles);
-    assert_eq!(got.torques_ext, sent.torques_ext);
-    assert_eq!(got.io, sent.io);
-    assert_eq!(
-        got.drive_health.faults, sent.drive_health.faults,
-        "per-drive fault labels must survive the wire, including the empty \
-         slots that say a drive is healthy rather than unreported"
-    );
-    assert_eq!(
-        got.drive_health.bus_voltage_v,
-        sent.drive_health.bus_voltage_v
-    );
-    assert_eq!(
-        got.drive_health.currents_ma.len(),
-        sent.drive_health.currents_ma.len()
-    );
     // NaN marks a register a drive has not answered; it has to stay NaN
     // rather than arriving as a plausible zero.
+    let mut unanswered = populated();
+    unanswered.drive_health.temperatures_c[2] = f64::NAN;
+    unanswered.drive_health.currents_ma[3] = f64::NAN;
+    let got = round_trip(&unanswered);
     assert!(got.drive_health.temperatures_c[2].is_nan());
     assert!(got.drive_health.currents_ma[3].is_nan());
-}
 
-#[test]
-fn a_bus_with_no_drives_still_round_trips() {
-    let s = Status {
+    // A newer daemon's STATUS, with fields appended past the ones this
+    // codec knows (a nested one among them), still decodes to them.
+    let mut newer = Vec::new();
+    par6_proto::encode_status_into(&sent, &mut newer);
+    assert_eq!(newer[0], 0xDC, "STATUS_LEN no longer encodes as array16");
+    let longer = (par6_proto::STATUS_LEN as u16) + 2;
+    newer[1..3].copy_from_slice(&longer.to_be_bytes());
+    newer.extend_from_slice(&[0x92, 0x01, 0x92, 0xa1, b'x', 0xc3]); // [1, ["x", true]]
+    newer.push(0x07);
+    assert_eq!(
+        decode_status(&newer).expect("appended fields are skipped"),
+        sent
+    );
+
+    // A bus with no drives reports empty lists, not missing ones.
+    let bare = round_trip(&Status {
         seq: 7,
         ..Status::default()
-    };
-    let mut encoder = StatusEncoder::new();
-    let bytes = encoder.encode(&s);
-    let got = decode_status(bytes).expect("an empty drive_health must decode");
-    assert!(got.drive_health.faults.is_empty());
-    assert!(got.drive_health.temperatures_c.is_empty());
+    });
+    assert!(bare.drive_health.faults.is_empty());
+    assert!(bare.drive_health.temperatures_c.is_empty());
 }
 
 #[test]
@@ -136,11 +216,8 @@ fn an_older_daemons_status_still_reports_its_version() {
         Some(4),
         "the version must be readable from the datagram decode_status refused"
     );
-}
 
-/// The peek claims nothing for a datagram that is not a STATUS.
-#[test]
-fn peeking_a_version_rejects_other_messages() {
+    // ...and it claims nothing for a datagram that is not a STATUS.
     assert_eq!(par6_proto::peek_status_proto_version(&[]), None);
     assert_eq!(
         par6_proto::peek_status_proto_version(&[0x90]),

@@ -268,6 +268,15 @@ pub trait Planner: Send {
         Vec::new()
     }
 
+    /// The tool the runtime was just fitted with, `(tool, variant)`, taken
+    /// once: by a `start`, or by `poll` when the gripper drive reports
+    /// another. A swap is made when its command starts, so the command
+    /// plane follows this rather than the command's answer, which a stop
+    /// can still turn into a cancellation.
+    fn take_fitted_tool(&mut self) -> Option<(String, Option<String>)> {
+        None
+    }
+
     /// Drop the latched collision verdict. The server calls this when it
     /// accepts a motion command, so a refusal's pairs never outlive the
     /// motion that produced them.
@@ -325,6 +334,13 @@ pub trait RtCommands: Send {
     /// or preemption can still cancel that sequence.
     fn stop_refused_stream(&mut self) -> bool {
         self.cancel_stream();
+        false
+    }
+
+    /// Whether the runtime is still bringing a refused stream to rest — a
+    /// stopping sequence it owns, which a later stop or queued motion has
+    /// to cancel. Changes nothing.
+    fn refusal_in_progress(&mut self) -> bool {
         false
     }
 
@@ -421,6 +437,10 @@ pub trait RtCommands: Send {
     /// Commissioning: persist a drive's running configuration
     /// (`SAVE_CONFIG`). Gated like `set_can_id`.
     fn save_config(&mut self, node: u8);
+
+    /// Commissioning: tell a gripper drive which tool it is built into
+    /// and have it saved (`SET_TOOL_ID`). Gated like `set_can_id`.
+    fn set_tool_id(&mut self, node: u8, tool_id: u8);
 
     /// Kick a bus rescan; the snapshot's `bus_scan_epoch` advances once
     /// every id has been pinged and the answers have landed.

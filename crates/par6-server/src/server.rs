@@ -185,9 +185,16 @@ struct Pending {
 enum PostEffect {
     None,
     Checkpoint(String),
-    /// `select_tool` can only ever name the fitted tool (validated at
-    /// accept time), so the variant is the part that actually changes.
-    SelectVariant(Option<String>),
+    /// `select_tool` names the tool to fit and, optionally, the variant$
+    /// within it. Both land at their turn in the queue, so moves admitted
+    /// before the swap were planned against the old tool and moves after
+    /// it against the new one.
+    SelectTool {
+        /// Registry key of the tool to fit.
+        tool: String,
+        /// Jaw/variant key within it; `None` = the tool default.
+        variant: Option<String>,
+    },
     /// `set_tcp_offset` lands at its turn in the queue: moves admitted
     /// before it were planned against the old frame, moves after it are
     /// planned against the new one, and a blend chain can never fold
@@ -765,7 +772,7 @@ impl<R: RtCommands> Core<R> {
         if matches!(cmd, Command::ConfigBundle) {
             let ci = &self.cfg.config_info;
             let bytes = ci.robot_toml.len()
-                + ci.grippers
+                + ci.tools
                     .iter()
                     .map(|(name, text)| name.len() + text.len())
                     .sum::<usize>();
@@ -842,6 +849,7 @@ impl<R: RtCommands> Core<R> {
                     hw_ver: info.map_or(0, |d| d.hw_ver),
                     sw_ver: info.map_or(0, |d| d.sw_ver),
                     serial: info.map_or(0, |d| d.serial),
+                    tool_id: info.map_or(0, |d| d.tool_id),
                 }
             })
             .collect();
@@ -1083,6 +1091,30 @@ impl<R: RtCommands> Core<R> {
             C::SaveConfig(p) => self
                 .commissioning_gate(p.node, p.force, "save_config")
                 .map(|()| self.runtime.rt.save_config(p.node)),
+            C::SetToolId(p) => self
+                .commissioning_gate(p.node, p.force, "set_tool_id")
+                .and_then(|()| {
+                    // An id no configured tool carries refuses the next boot,
+                    // and another tool's fits that tool: only the ids the
+                    // config knows, or 0 to unprovision, unless forced.
+                    if p.force || p.tool_id == 0 || self.cfg.tool_ids.contains(&p.tool_id) {
+                        Ok(())
+                    } else {
+                        Err(make_error(
+                            ErrorCode::CommValidationError,
+                            UNATTRIBUTED,
+                            &[(
+                                "detail",
+                                &format!(
+                                    "no configured tool carries tool id {}; configured ids {:?} \
+                                     (or 0 to unprovision, or force)",
+                                    p.tool_id, self.cfg.tool_ids
+                                ),
+                            )],
+                        ))
+                    }
+                })
+                .map(|()| self.runtime.rt.set_tool_id(p.node, p.tool_id)),
             C::SetStatusRate(p) => {
                 match status_rate_fault(1.0 / self.cfg.config_info.tick_dt_s, p.hz) {
                     Some(error) => Err(error),
@@ -1338,8 +1370,12 @@ impl<R: RtCommands> Core<R> {
             _ => {
                 if let Some(superseded) = self.active_stream.take() {
                     // Type change: cancel and flush the stale backlog of
-                    // the previous stream before starting fresh.
-                    self.runtime.rt.cancel_stream();
+                    // the previous stream before starting fresh — unless a
+                    // refusal is still putting the arm down, which owns it
+                    // against a new kind of stream as against the old.
+                    if !self.runtime.rt.refusal_in_progress() {
+                        self.runtime.rt.cancel_stream();
+                    }
                     self.drain_stream_backlog(superseded);
                 }
                 // The setpoint reaches the RT before the cancellations
@@ -1347,8 +1383,15 @@ impl<R: RtCommands> Core<R> {
                 // queue's worth of COMPLETE writes.
                 let dropped = self.drop_planned(true);
                 let outcome = self.runtime.rt.stream(&cmd);
+                // A refusal the runtime is still bringing to rest is a
+                // stream too: a move queued behind it cancels it rather
+                // than running while it is put down, and the refusal is
+                // the stream's own, latched as a refused update is.
                 if outcome.is_ok() {
                     self.active_stream = Some(tag);
+                } else if self.runtime.rt.refusal_in_progress() {
+                    self.active_stream = Some(tag);
+                    refused_in_place = true;
                 }
                 self.complete_cancelled("a streaming preemption", dropped)
                     .await;
@@ -1394,17 +1437,21 @@ impl<R: RtCommands> Core<R> {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
-        if let Some(error) = self
-            .validate_registries(&cmd)
-            .or_else(|| self.validate_supported(&cmd))
-        {
-            self.reply(addr, &Reply::Error { req_id, error }).await;
-            return;
-        }
         let tool_stop = match &cmd {
             Command::ToolAction(p) if p.action == "stop" => Some(p.clone()),
             _ => None,
         };
+        // A tool stop acts at once, on the tool fitted now.
+        let refused = if tool_stop.is_some() {
+            self.validate_registries(&cmd)
+                .or_else(|| self.validate_supported(&cmd))
+        } else {
+            self.validate_queued(&cmd)
+        };
+        if let Some(error) = refused {
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
         if tool_stop.is_none() && self.pending.len() >= self.cfg.queue_capacity {
             let error = make_error(
                 ErrorCode::CommQueueFull,
@@ -1592,6 +1639,37 @@ impl<R: RtCommands> Core<R> {
         validate_supported(&self.cfg, cmd)
     }
 
+    /// [`Self::validate_registries`] and [`Self::validate_supported`] for a
+    /// command queued now, against the tool fitted when its turn comes: the
+    /// last `select_tool` ahead of it in the queue, else the fitted one.
+    fn validate_queued(&self, cmd: &Command) -> Option<WireError> {
+        let ahead = self
+            .pending
+            .iter()
+            .rev()
+            .find_map(|p| match &p.cmd {
+                Command::SelectTool(s) => Some(s.tool_name.as_str()),
+                _ => None,
+            })
+            .or(match &self.executing {
+                Some(Executing {
+                    effect: PostEffect::SelectTool { tool, .. },
+                    ..
+                }) => Some(tool.as_str()),
+                _ => None,
+            });
+        let mut fitted;
+        let cfg = match ahead {
+            Some(tool) => {
+                fitted = self.cfg.clone();
+                fitted.fit_tool(tool);
+                &fitted
+            }
+            None => &self.cfg,
+        };
+        validate_registries(cfg, cmd).or_else(|| validate_supported(cfg, cmd))
+    }
+
     // ---- queue engine ------------------------------------------------------
 
     /// Offer the head of the queue to the planner.
@@ -1629,7 +1707,7 @@ impl<R: RtCommands> Core<R> {
         // starts, so it waits out a brake: a stop decelerates along the old
         // path and a released jog or stream ramps down, and a plan taken
         // mid-brake would start from where the arm no longer is.
-        if plans_from_pose(head.cmd.tag()) && self.arm_braking() {
+        if waits_for_rest(head.cmd.tag()) && self.arm_braking() {
             return;
         }
         if self.holding_for_blend() {
@@ -1667,6 +1745,7 @@ impl<R: RtCommands> Core<R> {
             PlanEvent::ToolOutcome(out) => self.on_tool_outcome(out).await,
             PlanEvent::ToolStarted { tag, result } => self.on_tool_started(tag, result).await,
             PlanEvent::ShapesApplied { tag, result } => self.on_shapes_applied(tag, result).await,
+            PlanEvent::ToolFitted { tool, variant } => self.adopt_tool_selection(&tool, variant),
         }
     }
 
@@ -1764,20 +1843,8 @@ impl<R: RtCommands> Core<R> {
                 match ex.effect {
                     PostEffect::None => {}
                     PostEffect::Checkpoint(label) => self.last_checkpoint = label,
-                    PostEffect::SelectVariant(variant) => {
-                        // A variant carries its own TCP frame, so an
-                        // offset measured against the old one describes
-                        // nothing once it changes — a real change clears
-                        // it, a re-selection of the same variant leaves
-                        // it alone (the client API documents the reset,
-                        // and it is what the parol6 runtime does).
-                        if variant != self.tool_variant {
-                            self.invalidate_attachments();
-                            self.tcp_offset_mm = [0.0; 3];
-                            self.tcp_rotation_deg = [0.0; 3];
-                        }
-                        self.tool_variant = variant;
-                        self.sync_planner();
+                    PostEffect::SelectTool { tool, variant } => {
+                        self.adopt_tool_selection(&tool, variant);
                     }
                     PostEffect::TcpTransform(v) => {
                         self.tcp_offset_mm = [v[0], v[1], v[2]];
@@ -1839,6 +1906,34 @@ impl<R: RtCommands> Core<R> {
 
     /// Take the active command and the moves blended into its motion —
     /// the commands a cancellation of the running motion drops.
+    /// The command plane catching up with a tool swap the planner has
+    /// already made: STATUS, the tool-action gate and every later
+    /// `select_tool` compare against it.
+    fn adopt_tool_selection(&mut self, tool: &str, variant: Option<String>) {
+        let tool = self.cfg.fit_tool(tool);
+        // The config a client rebuilds from CONFIG_BUNDLE fits the tool the
+        // arm wears now, not the one it booted with.
+        let ci = &mut self.cfg.config_info;
+        if let Some(text) = par6_config::fitted_robot_toml(&ci.robot_toml, &tool) {
+            ci.robot_toml = text;
+            ci.fingerprint =
+                par6_config::config_fingerprint(&ci.robot_filename, &ci.robot_toml, &ci.tools);
+        }
+        // A different tool, or a different variant of the same one, carries
+        // its own TCP frame, so an offset measured against the old one
+        // describes nothing — a real change clears it, a re-selection
+        // leaves it alone (the client API documents the reset, and it is
+        // what the parol6 runtime does).
+        if variant != self.tool_variant || tool != self.tool {
+            self.invalidate_attachments();
+            self.tcp_offset_mm = [0.0; 3];
+            self.tcp_rotation_deg = [0.0; 3];
+        }
+        self.tool_variant = variant;
+        self.tool = tool;
+        self.sync_planner();
+    }
+
     fn drop_active(&mut self) -> Vec<(u64, SocketAddr)> {
         // A head whose plan is still being computed is active motion too.
         // It is not in `executing` yet — the planner has not answered —
@@ -2932,7 +3027,7 @@ impl<R: RtCommands> Core<R> {
                     fingerprint: ci.fingerprint.clone(),
                     robot_filename: ci.robot_filename.clone(),
                     robot_toml: ci.robot_toml.clone(),
-                    grippers: ci.grippers.clone(),
+                    tools: ci.tools.clone(),
                 }
             }
             _ => unreachable!("dispatch routes only QUERY commands here"),
@@ -2995,12 +3090,21 @@ impl<R: RtCommands> Core<R> {
 
 // ---- free helpers ----------------------------------------------------------
 
-/// Queued commands the planner plans from the arm's measured pose.
-fn plans_from_pose(cmd: CmdType) -> bool {
+/// Queued commands that wait for the arm to stop braking: the moves the
+/// planner plans from its measured pose, and a tool change, which re-models
+/// the arm under whatever it is doing.
+fn waits_for_rest(cmd: CmdType) -> bool {
     use CmdType as C;
     matches!(
         cmd,
-        C::MoveJ | C::MoveJPose | C::MoveL | C::MoveC | C::MoveS | C::MoveP | C::Home
+        C::MoveJ
+            | C::MoveJPose
+            | C::MoveL
+            | C::MoveC
+            | C::MoveS
+            | C::MoveP
+            | C::Home
+            | C::SelectTool
     )
 }
 
@@ -3056,10 +3160,12 @@ pub fn validate_registries(cfg: &ServerConfig, cmd: &Command) -> Option<WireErro
         .any(|t| t.eq_ignore_ascii_case(name.as_str()))
     {
         format!("unknown tool '{name}'; this runtime knows {:?}", cfg.tools)
-    } else if !cfg.fitted_tool.eq_ignore_ascii_case(name.as_str()) {
+    } else if matches!(cmd, Command::ToolAction(_))
+        && !cfg.fitted_tool.eq_ignore_ascii_case(name.as_str())
+    {
         format!(
             "tool '{name}' is not fitted; this runtime is running '{}' \
-             (change robot.active_gripper and restart par6d)",
+             (select it first)",
             cfg.fitted_tool
         )
     } else {
@@ -3323,7 +3429,10 @@ fn post_effect(cmd: &Command) -> PostEffect {
     }
     match cmd {
         Command::Checkpoint(p) => PostEffect::Checkpoint(p.label.clone()),
-        Command::SelectTool(p) => PostEffect::SelectVariant(p.variant_key.clone()),
+        Command::SelectTool(p) => PostEffect::SelectTool {
+            tool: p.tool_name.clone(),
+            variant: p.variant_key.clone(),
+        },
         Command::WriteIo(p) => PostEffect::WriteIo(p.port, p.value),
         _ => PostEffect::None,
     }
@@ -3369,6 +3478,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::SetPidGains => "set_pid_gains",
         T::SetCanId => "set_can_id",
         T::SaveConfig => "save_config",
+        T::SetToolId => "set_tool_id",
         T::SetStatusRate => "set_status_rate",
         T::StatusRate => "status_rate",
         T::BusScan => "bus_scan",

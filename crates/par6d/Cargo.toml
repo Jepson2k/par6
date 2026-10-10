@@ -35,6 +35,7 @@ sha2 = { workspace = true }
 libc = "0.2"
 
 [dev-dependencies]
+toml = { workspace = true }
 par6-proto = { workspace = true }
 par6-config = { workspace = true }
 env_logger = { workspace = true }
