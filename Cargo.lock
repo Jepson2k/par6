@@ -928,7 +928,6 @@ dependencies = [
  "sha2",
  "socketcan",
  "thiserror 2.0.20",
- "thread-priority",
  "tokio",
  "toml",
  "toml_edit",
