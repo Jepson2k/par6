@@ -88,7 +88,8 @@ resolving that enum everywhere it is used.
 
 See *Stop and failure policy* in `README.md`.
 Anything that moves the arm reads the e-stop line every control tick. In normal
-operation an e-stop or failure holds position under power.
+operation an e-stop or failure holds position under power; `par6-selfcal` alone parks
+and releases (its e-stop still holds).
 
 ## Rust rules
 

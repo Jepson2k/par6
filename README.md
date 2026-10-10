@@ -767,7 +767,7 @@ correction, and a floor at the mounting plane as its only keep-out. What one
 arm measured about itself — its
 calibration, the tool bolted on, the bench it stands on — lives in a
 `local.toml` holding only the keys it changes, layered over the shipped file
-at load by `par6d` and the Python client alike. It is the
+at load by `par6d`, the Python client and `par6-selfcal` alike. It is the
 file beside the robot TOML (`/etc/par6/local.toml` on the control box), or
 the one `--local-config` / `PAR6_LOCAL_CONFIG` names.
 
@@ -807,7 +807,71 @@ The runtime reports the merged config to clients, the tool files included, so
 a client rebuilding it from `CONFIG_BUNDLE` gets this arm's values, and
 `par6d --check-config` names both files it loaded.
 
-### The simulator
+### Calibrating the arm
+
+There are two, for two different things.
+
+**The arm: `par6-selfcal`.** Run it on a new arm, with `par6d` stopped and the
+tool off (the passive flange fitted). One run does everything, in this order:
+it homes the arm; cancels each joint's cogging and commutation ripple with a
+feedforward the drive adds against the rotor's electrical angle (fitted on a
+slow sweep, refined and judged at the 20 deg/s step, kept only when it removes
+at least a fifth of the ripple); tunes each joint's loops; qualifies the
+tuned set on the calibration poses; measures each joint's static friction (at
+the ready pose and with the arm out) and the base's compliance (a current
+chirp); and identifies each joint's friction while moving together with the
+arm's own link masses from the torque it holds at twenty poses (the links are
+3D printed, so they do not weigh what the vendor CAD says). Ripple comes before
+gains because an uncompensated first harmonic looks exactly like a loop
+oscillation at speed and would fail every speed verdict after it.
+
+The gains stage is the StepFOC manual procedure, automated: Kpv, then Kiv,
+then Kpp, each walked up a fixed lattice (Kpv 0.001·1.25ⁿ with Kiv keeping its
+ratio to it, Kiv 0.0001·1.5ⁿ, Kpp 2.5·2ⁿ to 20) from the point nearest the
+configured value while a ramped velocity pulse (a position step for Kpp) stays
+stable, then backed off one point for Kpv. Every accepted point is confirmed on
+the normal profile over the joint's checked travel, both ways, and steps down a
+point if that sweep runs away, reverses its speed error six times across
+±15 deg/s, or fails to hold or settle; lag is reported, not judged. The set is
+then held at the arm-out pose and at each joint's minimum- and maximum-inertia
+identification poses to the measurement's own stillness rule; a joint that
+shakes on the way steps Kpv down, one that will not hold still steps Kpp then
+Kiv down, and a joint that reaches the floor keeps its configured gains and is
+reported as such. The lattices are fixed so two runs land on the same points;
+a trial that runs away is caught within a tick, its joint held on the known
+good gains, and a drive that stays in a limit cycle there has its loop opened
+and closed again from rest.
+
+Nothing a joint cannot resolve stops the run: it keeps its configured value
+for that quantity and the report says why, which counts as complete for
+`--apply`. The arm may not stand still for more than a second anywhere in a
+run; every longer stop is printed as it ends, with what the run was doing,
+and totalled at the end. Shutdown retraces the checked legs back to the ready
+pose before parking joint by joint. Every run leaves a directory
+`selfcal-<nanoseconds>` under `--output-dir` (default `calibration-runs`) with
+its candidate `calibrated.toml`, `stages.tsv`, the per-tick `samples.csv` and
+`history.tsv`: the candidate's values beside the three most recent earlier runs
+in the same directory that measured them, with the change against the newest,
+printed at the end of the run and on demand with `--history <run-dir>` (no arm
+needed). The run reads the installed `/etc/par6/PAR6.toml` unless told
+otherwise, since a checkout's config is the generic PAR6. `--apply` writes the
+results into the arm's local overlay (`local.toml` beside the config, or
+`--local-config`), keeping a backup; the shipped config is never written. `--sim` runs the stages through the simulator to
+check the workflow runs end to end, and refuses `--apply`; gains and friction are
+tuned and validated on the arm only, never in the simulator.
+`--limits` (off by default) also finds each joint's velocity,
+acceleration and jerk limits: it scales the joint's EXEC limits up towards its
+hardware ceiling until a move's following error, landing or hold misses its
+requirement, or the current it needs plus the worst gravity the joint carries
+would exceed its current limit; with `--apply` those become the EXEC limits,
+written only where the search moved them. Speed ripple is reported beside each result and only fails a step past 10% of
+the commanded speed, because it does not grow with the limits. A jerk no probe move was
+limited by is only a lower bound, so it is reported and left as configured.
+The base's chirp (2 to 60 Hz) is recorded for estimating the arm's effective
+compliance outside selfcal. `--only <stage>` (repeatable) runs
+homing and just those stages, for development, and `--joint N` narrows the
+ripple and gains stages to some joints. Hardware runs need `sudo`; the ripple and gains stages need the par6
+STEPFOC firmware.
 
 The simulator is meant to be useful, not exact: collisions, picking up and
 carrying objects, payload, and the arm's give under load, with the arm's
@@ -817,6 +881,11 @@ not reproduce the arm's current ripple or vibration, and gains are never tuned
 in it. `continuous = true` in `[joints.limits]` marks a joint with no mechanical
 endstop (J6, Hall-homed): its software window bounds travel, one turn on J6, and
 `hard_min_rad`/`hard_max_rad` are only the homing-search envelope.
+
+**The tool: `estimate_payload()`.** With the tool fitted and `par6d` running,
+the client call holds a few wrist poses and fits the mass and centre of mass it
+is carrying, then declares them to the runtime. Run it whenever the tool or the
+load changes.
 
 ### The bus-grant signal
 
@@ -1146,6 +1215,12 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
   and elbow onto their homing endstops, then goes limp (`[shutdown] safe_park`).
 - **A dead daemon or CAN link drops the arm.** Each drive's own watchdog idles it; the
   firmware has no hold action. This is the accepted exception.
+- **`par6-selfcal` parks and releases** on a failure and at the end of a run: the area is
+  known clear and nothing is held, and a run may be on a bad tune that oscillates loudly
+  under a hold. Parking runs with its motion guards on.
+- **An e-stop during `par6-selfcal` holds the arm where it is**, on its configured gains
+  rather than a trial's. Once it is released the arm keeps holding until Ctrl-C asks for
+  the usual park and release; nothing moves on its own after a reset.
 
 ## Safety notes
 

@@ -348,6 +348,98 @@ pub fn fitted_robot_toml(robot_toml: &str, tool: &str) -> Option<String> {
     Some(doc.to_string())
 }
 
+/// A local overlay a tool edits in place — `par6-selfcal --apply` writing
+/// what it measured: what it does not set keeps its text, comments and
+/// all, and a joint the file does not name yet gets its own entry.
+pub struct LocalOverlay {
+    doc: toml_edit::DocumentMut,
+}
+
+impl LocalOverlay {
+    /// Parse an overlay's text; an empty text is an empty overlay.
+    pub fn parse(text: &str) -> Result<Self, ConfigError> {
+        let doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .map_err(|e| invalid("local overlay", e.to_string()))?;
+        Ok(Self { doc })
+    }
+
+    /// Set `key` in the table at `path` (the root when empty) to `values`.
+    pub fn set_array(
+        &mut self,
+        path: &[&str],
+        key: &str,
+        values: &[f64],
+    ) -> Result<(), ConfigError> {
+        let table = table_at(self.doc.as_table_mut(), path)?;
+        table[key] = toml_edit::value(values.iter().copied().collect::<toml_edit::Array>());
+        Ok(())
+    }
+
+    /// Set `key` in the table at `path` under the `[[joints]]` entry named
+    /// `joint`.
+    pub fn set_joint(
+        &mut self,
+        joint: &str,
+        path: &[&str],
+        key: &str,
+        value: impl Into<toml_edit::Value>,
+    ) -> Result<(), ConfigError> {
+        let table = table_at(self.joint(joint)?, path)?;
+        table[key] = toml_edit::value(value);
+        Ok(())
+    }
+
+    /// Drop `key` from the `[[joints]]` entry named `joint`, so the shipped
+    /// value stands again.
+    pub fn remove_joint_key(&mut self, joint: &str, key: &str) -> Result<(), ConfigError> {
+        self.joint(joint)?.remove(key);
+        Ok(())
+    }
+
+    fn joint(&mut self, joint: &str) -> Result<&mut toml_edit::Table, ConfigError> {
+        let entries = self
+            .doc
+            .entry("joints")
+            .or_insert(toml_edit::Item::ArrayOfTables(Default::default()))
+            .as_array_of_tables_mut()
+            .ok_or_else(|| invalid("joints", "the overlay's joints are not [[joints]] entries"))?;
+        let at = entries
+            .iter()
+            .position(|t| t.get("name").and_then(toml_edit::Item::as_str) == Some(joint));
+        let at = match at {
+            Some(at) => at,
+            None => {
+                let mut entry = toml_edit::Table::new();
+                entry["name"] = toml_edit::value(joint);
+                entries.push(entry);
+                entries.len() - 1
+            }
+        };
+        Ok(entries.get_mut(at).expect("found or pushed"))
+    }
+}
+
+impl std::fmt::Display for LocalOverlay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.doc.fmt(f)
+    }
+}
+
+fn table_at<'t>(
+    mut table: &'t mut toml_edit::Table,
+    path: &[&str],
+) -> Result<&'t mut toml_edit::Table, ConfigError> {
+    for (i, name) in path.iter().enumerate() {
+        table = table
+            .entry(name)
+            .or_insert(toml_edit::table())
+            .as_table_mut()
+            .ok_or_else(|| invalid(path[..=i].join("."), "is not a table"))?;
+    }
+    Ok(table)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +553,43 @@ mod tests {
         // A named file that is missing is refused, not skipped.
         assert!(local_overlay_from(&robot, Some(&dir.join("missing.toml")), None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_overlay_is_edited_in_place_and_merges_as_written() {
+        let text = "# This arm.\n\n\
+                    [[joints]]\nname = \"joint2\"\n[joints.gains]\n# tuned by hand\nkiv = 0.0005\n";
+        let mut overlay = LocalOverlay::parse(text).unwrap();
+        overlay
+            .set_array(&["sim"], "viscous_nm_s", &[0.1, 0.2])
+            .unwrap();
+        overlay.set_array(&[], "gravity_scale", &[1.0]).unwrap();
+        overlay
+            .set_joint("joint2", &["gains"], "kpv", 0.02)
+            .unwrap();
+        overlay
+            .set_joint("joint5", &["limits", "exec"], "velocity_rad_s", 7.7)
+            .unwrap();
+        let ripple: toml_edit::Array = [1.0, 2.0].into_iter().collect();
+        overlay.set_joint("joint5", &[], "ripple", ripple).unwrap();
+        overlay.remove_joint_key("joint5", "ripple").unwrap();
+        let written = overlay.to_string();
+        assert!(
+            written.contains("# This arm.") && written.contains("# tuned by hand"),
+            "comments survive the edit:\n{written}"
+        );
+
+        let mut base = table(
+            "gravity_scale = [1.0, 1.0]\n[sim]\nviscous_nm_s = [0.0, 0.0]\ncoulomb_nm = [0.5]\n\
+             [[joints]]\nname = \"joint2\"\n[joints.gains]\nkpv = 0.01\nkiv = 0.001\nkpp = 3.0\n\
+             [[joints]]\nname = \"joint5\"\n[joints.limits.exec]\nvelocity_rad_s = 1.0\n",
+        );
+        merge(&mut base, table(&written), "").unwrap();
+        let want = table(
+            "gravity_scale = [1.0]\n[sim]\nviscous_nm_s = [0.1, 0.2]\ncoulomb_nm = [0.5]\n\
+             [[joints]]\nname = \"joint2\"\n[joints.gains]\nkpv = 0.02\nkiv = 0.0005\nkpp = 3.0\n\
+             [[joints]]\nname = \"joint5\"\n[joints.limits.exec]\nvelocity_rad_s = 7.7\n",
+        );
+        assert_eq!(base, want);
     }
 }

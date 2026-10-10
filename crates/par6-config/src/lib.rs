@@ -41,13 +41,14 @@ pub use homing::{
 pub use io::{IoConfig, IoLine, MAX_IO_LINES};
 pub use overlay::{
     config_fingerprint, effective_robot_toml, effective_tool_tomls, fitted_robot_toml,
-    local_overlay, LOCAL_CONFIG_ENV, LOCAL_CONFIG_NAME,
+    local_overlay, LocalOverlay, LOCAL_CONFIG_ENV, LOCAL_CONFIG_NAME,
 };
 pub use robot::{
     BusConfig, ControlMode, DriverType, Gains, JogDefaults, JogProfile, JointConfig, JointLimits,
     KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits, MotionConfig, ProtocolConfig,
-    ResolvedLimits, RippleHarmonic, RobotConfig, RobotSection, ScanConfig, SimConfig,
-    StreamDefaults, TimingConfig, WatchdogAction, MAX_OPEN_RETRY_S, MAX_RIPPLE_HARMONICS,
+    ResolvedLimits, RippleHarmonic, RobotConfig, RobotSection, ScanConfig, SelfcalConfig,
+    SimConfig, StreamDefaults, TimingConfig, WatchdogAction, MAX_OPEN_RETRY_S,
+    MAX_RIPPLE_HARMONICS,
 };
 
 use std::path::Path;
@@ -565,6 +566,46 @@ mod tests {
         );
     }
 
+    /// A config with no `[selfcal]` table loads, with exactly what an empty
+    /// table would give it. The table only configures the standalone
+    /// calibration binary, so its absence — any config written before it
+    /// existed — is no reason to refuse to run the arm.
+    #[test]
+    fn a_config_without_a_selfcal_table_loads_with_its_defaults() {
+        let with_table = |empty: bool| {
+            TempConfig::new(move |file, text| {
+                if file != "PAR6.toml" {
+                    return text.to_owned();
+                }
+                let mut out = String::new();
+                let mut in_selfcal = false;
+                for line in text.split_inclusive('\n') {
+                    let t = line.trim_start();
+                    if t.starts_with('[') {
+                        in_selfcal = t.starts_with("[selfcal]");
+                        if in_selfcal && empty {
+                            out.push_str("[selfcal]\n");
+                        }
+                    }
+                    if !in_selfcal {
+                        out.push_str(line);
+                    }
+                }
+                out
+            })
+        };
+        let absent = with_table(false);
+        let empty = with_table(true);
+        let text = std::fs::read_to_string(absent.robot()).expect("read");
+        assert!(
+            !text.contains("[selfcal]"),
+            "the fixture must actually drop the table"
+        );
+        let absent =
+            ConfigBundle::load(&absent.robot()).expect("a config without [selfcal] must load");
+        let empty = ConfigBundle::load(&empty.robot()).expect("an empty [selfcal] must load");
+        assert_eq!(absent.robot.selfcal, empty.robot.selfcal);
+    }
     #[test]
     fn bundle_resolves_gripper_dependent_offsets() {
         // The tool also lists J0, which is not gripper-dependent: its own
