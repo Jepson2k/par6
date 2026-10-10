@@ -233,6 +233,21 @@ impl LoopbackBus {
         });
     }
 
+    /// The gripper drive answering the boot's identity probe with
+    /// `tool_id`, which the core holds BOOTING for.
+    pub fn report_tool(&mut self, gripper_node: NodeId, tool_id: u8) {
+        self.inject(
+            false,
+            Reply::DeviceInfo {
+                node: gripper_node,
+                info: DeviceInfo {
+                    tool_id,
+                    ..Default::default()
+                },
+            },
+        );
+    }
+
     fn ensure_ready(&self) -> Result<(), BusError> {
         if !self.configured {
             return Err(BusError::NotConfigured);

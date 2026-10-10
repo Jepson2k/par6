@@ -202,7 +202,7 @@ pub fn is_timeout(e: &std::io::Error) -> bool {
 pub fn redirect_bus_grant() {
     static ONCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let dir = ONCE.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("par6-test-shm-{}", std::process::id()));
+        let dir = scratch_shm_base().join(format!("par6-test-shm-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("scratch shm dir");
         // SAFETY: set before any daemon in this binary reads it, and
         // always to the same value.
@@ -325,12 +325,24 @@ impl Drop for Par6dChild {
     }
 }
 
+/// Where the test rigs' bus-grant segments live: the runtime's
+/// shared-memory filesystem, since a write to ordinary disk there can
+/// stall the snapshot fan-out that publishes them.
+fn scratch_shm_base() -> PathBuf {
+    let shm = PathBuf::from("/dev/shm");
+    if cfg!(target_os = "linux") && shm.is_dir() {
+        shm
+    } else {
+        std::env::temp_dir()
+    }
+}
+
 /// A fresh directory for one spawned daemon's bus-grant segments, so no
 /// two of them, and no in-process rig, ever share a claim.
 pub fn private_shm_dir() -> PathBuf {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::env::temp_dir().join(format!("par6-child-shm-{}-{n}", std::process::id()));
+    let dir = scratch_shm_base().join(format!("par6-child-shm-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("child shm dir");
     dir
 }
@@ -718,6 +730,9 @@ impl Client {
 
     /// Drain whatever replies are already buffered into the stash.
     pub fn drain(&mut self) {
+        self.sock
+            .set_nonblocking(true)
+            .expect("nonblocking reply socket");
         while let Some(r) = self.try_recv() {
             if let Reply::Complete {
                 index,
@@ -729,6 +744,9 @@ impl Client {
                 self.completes.push((index, ok, detail, verdict));
             }
         }
+        self.sock
+            .set_nonblocking(false)
+            .expect("blocking reply socket");
     }
 }
 

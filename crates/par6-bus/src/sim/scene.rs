@@ -23,10 +23,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use mujoco_rs::prelude::{MjModel, MjSpec, MjtGeom, MjtJoint, SpecItem, SpecObject};
-use mujoco_rs::wrappers::mj_editing::MjsGeom;
+use mujoco_rs::wrappers::mj_editing::{MjsGeom, MjtLimited};
 use par6_proto::{Physical, Shape};
 
 use super::map::JointMap;
+
+/// Name prefix of each arm joint's motor rotor (body and joint), present
+/// when its drivetrain has a stiffness.
+pub const ROTOR_PREFIX: &str = "par6/rotor/";
+
+/// Name prefix of the tendon that is each compliant drivetrain's spring.
+pub const TRANSMISSION_PREFIX: &str = "par6/transmission/";
 
 /// MJCF joint names of the six arm joints, in config order.
 pub const ARM_JOINTS: [&str; 6] = [
@@ -101,8 +108,12 @@ pub struct JointTuning {
     pub damping: f64,
     /// Coulomb friction at the joint \[N·m\], as measured there.
     pub frictionloss: f64,
-    /// Config hard limits \[rad\].
-    pub range: [f64; 2],
+    /// The joint's endstops \[rad\]; `None` on a continuous joint.
+    pub endstops: Option<(f64, f64)>,
+    /// Drivetrain stiffness between motor and link \[Nm/rad\]; 0 = rigid.
+    pub transmission_nm_rad: f64,
+    /// Damping of that drivetrain spring \[Nm·s/rad\].
+    pub transmission_damping_nm_s: f64,
 }
 
 impl JointTuning {
@@ -112,13 +123,19 @@ impl JointTuning {
         motor_jm_kg_m2: f64,
         viscous_nm_s: f64,
         coulomb_nm: f64,
+        transmission: (f64, f64),
     ) -> Self {
         let g = map.dyn_gear;
+        let armature = g * g * motor_jm_kg_m2;
+        let (stiffness, ratio) = transmission;
         Self {
-            armature: g * g * motor_jm_kg_m2,
+            armature,
             damping: viscous_nm_s,
             frictionloss: coulomb_nm,
-            range: [map.hard_lo_rad, map.hard_hi_rad],
+            endstops: map.endstops,
+            transmission_nm_rad: stiffness,
+            // The rotor swings on the spring against a far heavier link.
+            transmission_damping_nm_s: 2.0 * ratio * (stiffness * armature).sqrt(),
         }
     }
 }
@@ -587,18 +604,32 @@ impl Scene {
         }
 
         for (name, tuning) in ARM_JOINTS.iter().zip(joints) {
+            // A compliant drivetrain moves the rotor inertia onto its own
+            // coordinate, which the encoder reads and the motor drives,
+            // tied to the link by a spring; drivetrain friction stays on
+            // the link.
+            let k = tuning.transmission_nm_rad;
+            let compliant = k > 0.0;
             let joint = spec.joint_mut(name).ok_or_else(|| SceneError::Missing {
                 kind: "joint",
                 name: (*name).to_owned(),
             })?;
-            joint.set_armature(tuning.armature);
+            joint.set_armature(if compliant { 0.0 } else { tuning.armature });
             joint.set_frictionloss(tuning.frictionloss);
             let mut damping = *joint.damping();
             damping.fill(0.0);
             damping[0] = tuning.damping;
             joint.with_damping(damping);
-            joint.with_range(tuning.range);
-            // The config hard limits are the plant's endstops: a stiff,
+            match tuning.endstops {
+                Some((lo, hi)) => {
+                    joint.with_range([lo, hi]);
+                    joint.with_limited(MjtLimited::mjLIMITED_TRUE);
+                }
+                None => {
+                    joint.with_limited(MjtLimited::mjLIMITED_FALSE);
+                }
+            }
+            // For limited joints, the range defines a stiff,
             // critically damped limit constraint (reference time two
             // substeps) that admits sub-milliradian penetration at the
             // homing currents.
@@ -610,6 +641,36 @@ impl Scene {
             // per second under the shoulder's load.
             *joint.solref_friction_mut() = [2.0 * timestep, 1.0];
             *joint.solimp_friction_mut() = [0.9999, 0.9999, 0.001, 0.5, 2.0];
+            if !compliant {
+                continue;
+            }
+            let rotor = format!("{ROTOR_PREFIX}{name}");
+            let body = spec.world_body_mut().add_body().with_name(&rotor);
+            // MuJoCo needs a positive body inertia; the armature carries
+            // the rotor's.
+            body.set_mass(1e-6);
+            body.with_inertia([1e-9; 3]);
+            body.set_explicitinertial(true);
+            let rotor_joint = body
+                .add_joint()
+                .with_name(&rotor)
+                .with_type(MjtJoint::mjJNT_HINGE)
+                .with_axis([0.0, 0.0, 1.0])
+                .with_armature(tuning.armature)
+                .with_limited(MjtLimited::mjLIMITED_FALSE);
+            // The landing clamp holds the rotor through its friction too,
+            // at the same impedance as the link's.
+            *rotor_joint.solref_friction_mut() = [2.0 * timestep, 1.0];
+            *rotor_joint.solimp_friction_mut() = [0.9999, 0.9999, 0.001, 0.5, 2.0];
+            let tendon = spec
+                .add_tendon()
+                .with_name(&format!("{TRANSMISSION_PREFIX}{name}"))
+                .with_stiffness([k, 0.0, 0.0])
+                .with_damping([tuning.transmission_damping_nm_s, 0.0, 0.0])
+                .with_springlength([0.0; 2])
+                .with_limited(MjtLimited::mjLIMITED_FALSE);
+            tendon.wrap_joint(&rotor, 1.0);
+            tendon.wrap_joint(name, -1.0);
         }
 
         let (stiffness, damping) = build.lateral;

@@ -700,15 +700,18 @@ impl VirtualDriver {
     /// teleported pose (about a thousand ticks after a fast jog) and
     /// rings, violating the teleport contract that the arm lands exactly
     /// where the client asked. The latched motion command goes with it,
-    /// replaced by a position hold at the new wire reading `pos_ticks`:
+    /// replaced by a position hold at the new wire reading `pos_ticks`
+    /// already putting out `hold_ma`, the current the landed load takes:
     /// until the runtime's next frame re-commands the joint it stays
-    /// held — a limp tick lets a wrist loaded past its gearbox's holding
-    /// friction back-drive a degree before the feedforward arrives.
-    pub fn reseed_hold(&mut self, pos_ticks: f64) {
+    /// held, as a drive that had been holding there would — a limp tick
+    /// lets a wrist loaded past its gearbox's holding friction back-drive
+    /// a degree before the feedforward arrives, and a cold one sags a
+    /// milliradian onto its drivetrain while its current loop catches up.
+    pub fn reseed_hold(&mut self, pos_ticks: f64, hold_ma: f64) {
         self.loop_phase = 0.0;
         self.last_drive = PlantCmd {
-            current_ma: 0.0,
-            ff_ma: 0.0,
+            current_ma: hold_ma,
+            ff_ma: hold_ma,
             vel_limit_ticks_s: self.vel_limit,
             idle: false,
         };
@@ -717,14 +720,14 @@ impl VirtualDriver {
         self.previous_encoder = None;
         self.measured_velocity = 0.0;
         self.integral_ma = 0.0;
-        self.iq_ma = 0.0;
+        self.iq_ma = hold_ma;
         self.iq_err_sum = 0.0;
         self.reset_velocity_filter();
-        self.cur_out_ma = 0.0;
+        self.cur_out_ma = hold_ma;
         self.mode = Mode::Position {
             pos: pos_ticks,
             speed: 0.0,
-            cur_ff: 0.0,
+            cur_ff: hold_ma,
         };
     }
 

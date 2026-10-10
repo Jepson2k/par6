@@ -879,10 +879,8 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
     // the server's job: the bridge is fire-and-forget and has no reply
     // channel to refuse on.
     for (slot, joint) in cfg.joint_hard_limits_deg.iter_mut().zip(&robot.joints) {
-        *slot = (
-            joint.limits.hard_min_rad.to_degrees(),
-            joint.limits.hard_max_rad.to_degrees(),
-        );
+        let (lo, hi) = joint.limits.travel_rad();
+        *slot = (lo.to_degrees(), hi.to_degrees());
     }
     cfg.profiles = crate::planner::profile_names();
     cfg.initial_profile = crate::planner::DEFAULT_PROFILE.to_owned();

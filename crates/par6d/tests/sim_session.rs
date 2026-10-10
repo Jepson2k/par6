@@ -1120,14 +1120,29 @@ fn flashing_window_over_protocol_v2() {
     assert_eq!(err.code, ErrorCode::CommValidationError as u16);
     c.ok(&Command::Stop(Stop { clear_queue: true }));
     c.drain();
-    rig.wait_status("at rest after the stop", |s| {
-        s.executing_index < 0 && s.speeds.iter().all(|v| v.abs() < 1e-3)
-    });
 
     // From rest with the assertion: acked once the mode is FLASHING, and
     // the silent bus reads as a stale link — the wire really is handed
-    // to the flasher.
-    c.ok(&enter);
+    // to the flasher. STATUS does not say when the brake STOP started has
+    // run out, so the entry is retried until the RT admits it.
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        match c.request(&enter) {
+            Reply::Ok { index: None, .. } => break,
+            Reply::Error { error, .. }
+                if error.code == ErrorCode::CommValidationError as u16
+                    && error.cause.contains("enter_flashing needs an arm at rest:") =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the stopped arm never became eligible for FLASHING: {}",
+                    error.cause
+                );
+                let _ = rig.recv_status();
+            }
+            other => panic!("unexpected maintenance entry reply: {other:?}"),
+        }
+    }
     assert_eq!(
         frames_later(&rig, 1).mode,
         ControllerMode::Flashing,
@@ -2936,10 +2951,7 @@ fn select_tool_fits_a_different_tool() {
 /// The move the arm's base was probed with — a 60° septic from the ready
 /// pose, timed for half J1's EXEC speed — then a two-second hold, through
 /// the runtime's own executor. The arm runs it with no ring and rests at
-/// 0.26°/s RMS afterwards. On a rigid arm the base's velocity loop has no
-/// phase margin at the shipped gains and rings at the current rails
-/// through the whole move; the scene's fork compliance is what keeps the
-/// simulated base as quiet as the arm's.
+/// 0.26°/s RMS afterwards; the simulated base is held to the same.
 #[test]
 fn the_base_moves_quietly_through_the_runtime_at_the_config_gains() {
     // The config tick and a status per tick: a ring at the base's

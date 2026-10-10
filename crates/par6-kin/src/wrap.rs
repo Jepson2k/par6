@@ -18,7 +18,7 @@ use std::f64::consts::TAU;
 /// accumulate.
 ///
 /// Which branch is picked matters as much as picking one: a window
-/// wider than 2π (PAR6's J6 spans 7.99 rad) admits several, and
+/// wider than 2π admits several, and
 /// choosing the wrong one would command a full unnecessary turn and
 /// look exactly like an IK branch flip to the caller's continuity
 /// guard. Preferring the branch nearest `seed` — the previous waypoint
@@ -90,10 +90,10 @@ mod tests {
         assert!((wrapped - (84.75 - 13.0 * TAU)).abs() < 1e-12, "{wrapped}");
         assert!(wrapped > 2.8647335);
 
-        // A window wider than 2π (PAR6's J6 spans 7.99 rad) admits several
-        // branches; the one that does not spin the joint away from where it
-        // already is has to win, or wrapping would manufacture the very
-        // branch flip the caller's continuity guard exists to catch.
+        // A window wider than 2π admits several branches; the one that
+        // does not spin the joint away from where it already is has to
+        // win, or wrapping would manufacture the very branch flip the
+        // caller's continuity guard exists to catch.
         let (min, max) = (-0.85, 7.14);
         assert!((wrap_to_window(0.5, 6.2, min, max) - (0.5 + TAU)).abs() < 1e-12);
         assert!((wrap_to_window(0.5 + TAU, 0.1, min, max) - 0.5).abs() < 1e-12);

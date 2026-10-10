@@ -1,5 +1,6 @@
 //! A teleport re-seeds the plant and re-bases the runtime's reference in
-//! one step, so the plant's ground truth, the runtime's published `q` and
+//! one step, so the plant's motor-side ground truth (where the encoders
+//! read; a loaded link lags it through its drivetrain), the runtime's published `q` and
 //! the requested pose must be the same angles from the very first tick
 //! after — for every joint, from any pose, including ones whose wrapped
 //! encoder reading sits far from the boot calibration.
@@ -114,9 +115,9 @@ fn land_at(
         for k in 0..250 {
             // Replies consumed this tick were queued before begin_tick advances
             // the plant. Compare the encoder with that sampling instant.
-            let sampled_truth = core.bus_mut().true_joint_rad();
+            let sampled_truth = core.bus_mut().true_motor_rad();
             core.tick(dt, false);
-            let truth = core.bus_mut().true_joint_rad();
+            let truth = core.bus_mut().true_motor_rad();
             let s = handles.snapshots.latest();
             for i in 0..MAX_JOINTS {
                 // Without gravity feedforward the finite-stiffness drive may

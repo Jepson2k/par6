@@ -541,6 +541,13 @@ fn the_simulated_run_lands_where_the_plan_says_and_shows_the_tracking_error() {
 /// welding it to the TCP — both would be claims physics could contradict.
 #[test]
 fn a_run_grasps_lifts_and_drops_a_world_object() {
+    // A light block and one ten times heavier: the drivetrains give under
+    // the extra load, and the grip and the lift must carry it all the same.
+    grasps_lifts_and_drops(0.05);
+    grasps_lifts_and_drops(0.5);
+}
+
+fn grasps_lifts_and_drops(mass: f64) {
     let config = test_config();
     let mut session = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     session.set_gripper_calibrated(true);
@@ -565,7 +572,7 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
             ShapeLayer::Program,
             &[
                 shape("stand", [0.04, 0.04, 0.01], 0.005, None),
-                shape("block", [0.036, 0.036, 0.06], 0.04, Some(0.05)),
+                shape("block", [0.036, 0.036, 0.06], 0.04, Some(mass)),
             ],
         )
         .expect("world applied");
@@ -618,7 +625,7 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
     assert!(
         !batch.objects.iter().any(|t| t.name == "stand"),
         "a massless shape is a fixture welded into the world, not a body \
-         with a pose to track: {:?}",
+             with a pose to track: {:?}",
         batch.objects.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 
@@ -634,11 +641,11 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
     );
     assert!(
         raised > held + 0.05,
-        "friction against the closed jaws must carry the block up: {held} -> {raised}"
+        "friction against the closed jaws must carry the {mass} kg block up: {held} -> {raised}"
     );
     assert!(
         dropped < raised - 0.05,
-        "opening the jaws must drop it: held at {raised}, ended at {dropped}"
+        "opening the jaws must drop the {mass} kg block: held at {raised}, ended at {dropped}"
     );
 
     // The jaws report the hold themselves, and the contact solver has

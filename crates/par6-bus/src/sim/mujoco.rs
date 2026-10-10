@@ -127,8 +127,11 @@ pub(crate) struct MujocoPlant {
     qvel: Vec<f64>,
     qfrc: Vec<f64>,
     /// Joint inertias at the boot pose \[kg·m²\], the mass-matrix
-    /// diagonal (idle damping).
+    /// diagonal: what the idle brake is sized on.
     inertia: Vec<f64>,
+    /// Each motor DOF's own viscous damping \[Nm·s/rad\], which the idle
+    /// brake adds to.
+    damping: Vec<f64>,
     /// This substep's dense mass matrix and acceleration, all DOFs: what
     /// the rest of the arm's motion loads a joint with.
     mass: Vec<f64>,
@@ -136,6 +139,8 @@ pub(crate) struct MujocoPlant {
     /// Reflected motor Coulomb loss per arm joint \[N·m\] — the scene's
     /// compiled `frictionloss`, the floor of the drivetrain friction.
     coulomb: Vec<f64>,
+    /// The load each motor carried at the last landing \[N·m\].
+    load_nm: Vec<f64>,
     /// Assumed powered load support per arm joint \[N·m\].
     hold: Vec<f64>,
     /// This substep's drivetrain friction per arm joint \[N·m\].
@@ -222,46 +227,26 @@ impl MujocoPlant {
             .iter()
             .map(|&a| model.dof_frictionloss()[a])
             .collect();
+        let damping: Vec<f64> = layout
+            .motor
+            .iter()
+            .map(|&m| model.dof_damping()[m])
+            .collect();
 
         let mut data = MjData::new(Box::new(model));
 
         // Boot pose: scene defaults, arm at q0, jaws at the boot byte.
         let mut qpos = data.qpos().to_vec();
-        for (&a, &q) in layout.adr.iter().zip(q0) {
-            qpos[a] = q;
+        for (j, &q) in q0.iter().enumerate() {
+            qpos[layout.adr[j]] = q;
+            qpos[layout.motor[j]] = q;
         }
         if let Some(jaw) = layout.jaw {
             qpos[jaw] = byte_to_m(JAW_INIT_BYTE);
             qpos[jaw + 1] = -byte_to_m(JAW_INIT_BYTE);
         }
-
-        // Joint inertia for the idle brake: the mass-matrix diagonal at
-        // the boot pose, every other DOF held. A one-step torque probe
-        // would swing the arm's flex instead of the arm.
         data.reset();
         data.qpos_mut().copy_from_slice(&qpos);
-        data.forward();
-        let mut mass = vec![0.0; nv * nv];
-        data.full_m(&mut mass)
-            .expect("mass-matrix buffer sized to nv*nv");
-        let inertia: Vec<f64> = layout.adr.iter().map(|&a| mass[a * nv + a]).collect();
-        for (j, m) in inertia.iter().enumerate() {
-            assert!(*m > 0.0, "non-positive inertia on arm joint {j}");
-        }
-        // A spring stepped explicitly is only stable while its period
-        // clears the step: past this the flex blows up instead of
-        // ringing, and the config says nothing about the arm's inertia.
-        for &a in &layout.passive {
-            let model = data.model();
-            let jnt = model.dof_jntid()[a] as usize;
-            let k = model.jnt_stiffness()[jnt];
-            let name = model.id_to_name(MjtObj::mjOBJ_JOINT, jnt);
-            assert!(
-                k * ts * ts < mass[a * nv + a],
-                "{name:?} at {k} Nm/rad is too stiff for the {ts} s step; the limit is {} Nm/rad",
-                mass[a * nv + a] / (ts * ts)
-            );
-        }
         let mut plant = Self {
             data,
             n,
@@ -270,10 +255,12 @@ impl MujocoPlant {
             qpos,
             qvel: vec![0.0; nv],
             qfrc: vec![0.0; nv],
-            inertia,
-            mass,
+            inertia: vec![0.0; n],
+            damping,
+            mass: vec![0.0; nv * nv],
             qacc: vec![0.0; nv],
             coulomb,
+            load_nm: vec![0.0; n],
             hold: holding_nm.to_vec(),
             friction: vec![0.0; n],
             cmds: vec![
@@ -300,6 +287,46 @@ impl MujocoPlant {
             open_at: None,
         };
         plant.index_objects();
+        plant.sag_onto_drivetrains();
+        // Joint inertia for the idle brake: the mass-matrix diagonal at
+        // the boot pose, every other DOF held. A one-step torque probe
+        // would swing the arm's flex instead of the arm.
+        plant
+            .data
+            .full_m(&mut plant.mass)
+            .expect("mass-matrix buffer sized to nv*nv");
+        for j in 0..n {
+            let a = plant.layout.adr[j];
+            plant.inertia[j] = plant.mass[a * nv + a];
+            assert!(
+                plant.inertia[j] > 0.0,
+                "non-positive inertia on arm joint {j}"
+            );
+        }
+        // A spring stepped explicitly is only stable while its period
+        // clears the step: past this the flex blows up instead of
+        // ringing, and the config says nothing about the arm's inertia.
+        // The forks' hinges and the drivetrains' rotors alike.
+        let model = plant.data.model();
+        let hinges = plant.layout.passive.iter().map(|&a| {
+            let jnt = model.dof_jntid()[a] as usize;
+            let name = model.id_to_name(MjtObj::mjOBJ_JOINT, jnt);
+            (a, model.jnt_stiffness()[jnt], name.map(str::to_owned))
+        });
+        let rotors = (0..n)
+            .filter(|&j| plant.layout.stiffness[j] > 0.0)
+            .map(|j| {
+                let name = format!("{}{}", scene::ROTOR_PREFIX, scene::ARM_JOINTS[j]);
+                (plant.layout.motor[j], plant.layout.stiffness[j], Some(name))
+            });
+        for (dof, k, name) in hinges.chain(rotors) {
+            let inertia = plant.mass[dof * nv + dof];
+            assert!(
+                k * ts * ts < inertia,
+                "{name:?} at {k} Nm/rad is too stiff for the {ts} s step; the limit is {} Nm/rad",
+                inertia / (ts * ts)
+            );
+        }
         plant
     }
 
@@ -309,14 +336,58 @@ impl MujocoPlant {
     /// would throw away. The boot inertia stays: the idle brake needs
     /// its order of magnitude, not the pose.
     pub fn reseed(&mut self, q0: &[f64]) {
+        self.place(q0);
+        self.sag_onto_drivetrains();
+    }
+
+    /// Land links and motors at `q0`, at rest, the arm's passive
+    /// structure unstrained.
+    fn place(&mut self, q0: &[f64]) {
         assert_eq!(q0.len(), self.n, "a pose needs one angle per arm joint");
         for (j, &q) in q0.iter().enumerate() {
             self.land(self.layout.adr[j], q);
+            self.land(self.layout.motor[j], q);
         }
-        // The arm's passive structure lands unstrained.
         for k in 0..self.layout.passive.len() {
             let a = self.layout.passive[k];
             self.land(a, self.data.model().qpos_spring()[a]);
+        }
+    }
+
+    /// Hang each compliant link where its drivetrain spring holds it under
+    /// gravity, its motor where it was placed: a landing is already at rest
+    /// instead of sagging into place as the drives catch it.
+    fn sag_onto_drivetrains(&mut self) {
+        self.data.forward();
+        self.correction_load();
+        for j in 0..self.n {
+            let a = self.layout.adr[j];
+            let load = self.data.qfrc_bias()[a] - self.correction_qfrc[a];
+            self.load_nm[j] = load;
+            let k = self.layout.stiffness[j];
+            if k > 0.0 {
+                let q = self.qpos[a] - load / k;
+                self.qpos[a] = q;
+                self.data.qpos_mut()[a] = q;
+            }
+        }
+    }
+
+    /// The torque each motor carries at the pose the arm last landed at
+    /// \[Nm, joint side\]: what a drive holding there is already putting
+    /// out.
+    pub fn landed_load_nm(&self, j: usize) -> f64 {
+        self.load_nm[j]
+    }
+
+    /// Put the links at `q_link` \[rad\] with the motors where they are:
+    /// a rebuilt plant carrying the deflection the old one had, so a tool
+    /// change loads the drivetrains as bolting a tool on does, instead of
+    /// re-landing them.
+    pub fn carry_links(&mut self, q_link: &[f64]) {
+        assert_eq!(q_link.len(), self.n, "a pose needs one angle per arm joint");
+        for (j, &q) in q_link.iter().enumerate() {
+            self.land(self.layout.adr[j], q);
         }
     }
 
@@ -333,6 +404,12 @@ impl MujocoPlant {
     /// plant's state rather than back through the encoder conversion.
     pub fn joint_rad(&self, j: usize) -> f64 {
         self.qpos[self.layout.adr[j]]
+    }
+
+    /// Arm joint `j`'s motor angle, joint side \[rad\]: the link's on a
+    /// rigid drivetrain, ahead of it by load over stiffness on a compliant one.
+    pub fn motor_rad(&self, j: usize) -> f64 {
+        self.qpos[self.layout.motor[j]]
     }
 
     /// Rebuild the model from `spec` in place (MuJoCo's `mj_recompile`),
@@ -497,17 +574,21 @@ impl MujocoPlant {
     /// at rest: `qfrc_bias` with every velocity zero, which leaves only
     /// gravity. The controller computes the same quantity from the URDF
     /// through Pinocchio, and the two models must agree — see par6d's
-    /// `dynamics_conformance` suite. Leaves the plant at `q`, at rest.
+    /// `dynamics_conformance` suite. Leaves the plant landed at `q`.
     pub fn gravity_at(&mut self, q: &[f64]) -> Vec<f64> {
-        self.reseed(q);
+        self.place(q);
         self.data.qvel_mut().fill(0.0);
         self.data.forward();
         self.correction_load();
-        self.layout
+        let gravity = self
+            .layout
             .adr
             .iter()
             .map(|&a| self.data.qfrc_bias()[a] - self.correction_qfrc[a])
-            .collect()
+            .collect();
+        // At `q` itself, then landed there as any pose is.
+        self.sag_onto_drivetrains();
+        gravity
     }
 
     /// Gravity's generalized force on the `correction`, at the kinematics
@@ -539,9 +620,9 @@ impl MujocoPlant {
     /// Measured motor state of arm joint `j` (position ticks, speed
     /// ticks/s).
     pub fn motor_state(&self, j: usize, map: &JointMap) -> (f64, f64) {
-        let a = self.layout.adr[j];
-        let pos = f64::from(map.conv.motor_ticks(self.qpos[a]));
-        let vel = map.conv.motor_speed_ticks_s(self.qvel[a]);
+        let m = self.layout.motor[j];
+        let pos = f64::from(map.conv.motor_ticks(self.qpos[m]));
+        let vel = map.conv.motor_speed_ticks_s(self.qvel[m]);
         (pos, vel)
     }
 
@@ -625,25 +706,23 @@ impl MujocoPlant {
         // changes, and the Jacobians behind it cost more than the physics
         // they would refine.
         self.correction_load();
-        // The correction is the whole applied force on every DOF the plant
-        // does not drive; the driven ones are overwritten each substep.
-        self.qfrc.copy_from_slice(&self.correction_qfrc);
         for _ in 0..substeps as u32 {
             self.bias.copy_from_slice(self.data.qfrc_bias());
+            // The correction is the whole applied force on every DOF the
+            // plant does not drive; the driven ones add theirs.
+            self.qfrc.copy_from_slice(&self.correction_qfrc);
             for j in 0..self.n {
                 let map = &maps[j];
-                let a = self.layout.adr[j];
+                let (a, m) = (self.layout.adr[j], self.layout.motor[j]);
                 let (pos, vel) = self.motor_state(j, map);
                 self.cmds[j] = drivers[j].loop_step(pos + map.report_offset, vel, fw_steps);
                 let cmds = &self.cmds;
-                let v = self.qvel[a];
                 let motor = supply_scale * cmds[j].current_ma / map.factor_ma_per_nm;
                 let external = -loads_ma[j] / map.factor_ma_per_nm;
-                let mut t = motor + external;
-                if cmds[j].idle {
-                    t -= supply_scale * IDLE_RATE * self.inertia[j] * v;
-                }
-                self.qfrc[a] = t + self.correction_qfrc[a];
+                // The motor drives its own DOF and the load acts on the
+                // link: one slot on a rigid drivetrain.
+                self.qfrc[a] += external;
+                self.qfrc[m] += motor;
                 // The load is what acts on the joint besides the motor:
                 // MuJoCo's bias (its sign is the force that cancels it),
                 // the gravity correction and the injected external load.
@@ -658,11 +737,29 @@ impl MujocoPlant {
                 self.friction[j] =
                     drivetrain_friction(self.coulomb[j], supply_scale * hold, motor, load);
             }
-            // SAFETY: only per-DOF friction values change; the model's
-            // sizes and layout are untouched, so the data stays valid.
+            // SAFETY: only per-DOF friction and damping values change; the
+            // model's sizes and layout are untouched, so the data stays
+            // valid.
             let frictionloss = unsafe { self.data.model_mut() }.dof_frictionloss_mut();
-            for (&a, &f) in self.layout.adr.iter().zip(&self.friction) {
-                frictionloss[a] = f;
+            for j in 0..self.n {
+                let (a, m) = (self.layout.adr[j], self.layout.motor[j]);
+                frictionloss[a] = self.friction[j];
+                // A landed rotor is held with its link.
+                if m != a {
+                    frictionloss[m] = if clamp_arm { LANDING_CLAMP_NM } else { 0.0 };
+                }
+            }
+            // Damping on the motor's DOF, which the integrator treats
+            // implicitly: no brake is too stiff for the step.
+            let damping = unsafe { self.data.model_mut() }.dof_damping_mut();
+            for j in 0..self.n {
+                // An idle drive brakes its motor.
+                let idle = if self.cmds[j].idle {
+                    supply_scale * IDLE_RATE * self.inertia[j]
+                } else {
+                    0.0
+                };
+                damping[self.layout.motor[j]] = self.damping[j] + idle;
             }
             let mut jaw_vt = 0.0;
             if let Some(JawDrive::Active {
@@ -698,17 +795,23 @@ impl MujocoPlant {
             // held base pulls at the base), and inside the friction limit
             // it goes nowhere.
             for j in 0..self.n {
-                let a = self.layout.adr[j];
+                let (a, m) = (self.layout.adr[j], self.layout.motor[j]);
                 let vlim = self.cmds[j].vel_limit_ticks_s.abs()
                     * (std::f64::consts::TAU / f64::from(maps[j].encoder_max_counts))
                     / maps[j].gear_ratio;
+                // The driver limits its own motor (no supply, no driver to
+                // enforce it); a compliant link follows through the spring.
+                if supply_scale > 0.0 {
+                    let v = self.qvel[m].clamp(-vlim, vlim);
+                    if v != self.qvel[m] {
+                        self.qvel[m] = v;
+                        self.data.qvel_mut()[m] = v;
+                    }
+                }
                 let v = self.qvel[a];
-                // No supply, no driver to enforce its velocity limit.
-                let limited = if supply_scale > 0.0 {
-                    v.clamp(-vlim, vlim)
-                } else {
-                    v
-                };
+                if v == 0.0 || v.abs() >= STICK_RAD_S {
+                    continue;
+                }
                 let row = &self.mass[a * nv..(a + 1) * nv];
                 let coupling: f64 = row
                     .iter()
@@ -717,13 +820,13 @@ impl MujocoPlant {
                     .filter(|(k, _)| *k != a)
                     .map(|(_, (m, acc))| m * acc)
                     .sum();
-                let net = self.qfrc[a] - self.bias[a] - coupling;
-                let stuck =
-                    limited != 0.0 && limited.abs() < STICK_RAD_S && net.abs() <= self.friction[j];
-                let held = if stuck { 0.0 } else { limited };
-                if held != v {
-                    self.qvel[a] = held;
-                    self.data.qvel_mut()[a] = held;
+                // The link's passive forces load it too: its drivetrain
+                // spring and damper when compliant.
+                let passive = self.data.qfrc_passive()[a];
+                let net = self.qfrc[a] + passive - self.bias[a] - coupling;
+                if net.abs() <= self.friction[j] {
+                    self.qvel[a] = 0.0;
+                    self.data.qvel_mut()[a] = 0.0;
                 }
             }
         }
@@ -756,6 +859,12 @@ impl MujocoPlant {
 struct Layout {
     /// Address of each arm joint.
     adr: Vec<usize>,
+    /// Address of each arm joint's motor, where the encoder reads and the
+    /// motor drives: its rotor on a compliant drivetrain, the link itself
+    /// on a rigid one.
+    motor: Vec<usize>,
+    /// Each arm joint's drivetrain stiffness \[Nm/rad\], 0 when rigid.
+    stiffness: Vec<f64>,
     /// Addresses of every other one-dof joint that is not a jaw: the arm's
     /// passive structure, which the plant never drives.
     passive: Vec<usize>,
@@ -788,6 +897,22 @@ fn check_layout(model: &MjModel, n: usize) -> Layout {
             address(id)
         })
         .collect();
+    let motor: Vec<usize> = scene::ARM_JOINTS[..n]
+        .iter()
+        .zip(&adr)
+        .map(|(name, &a)| joint_id(&format!("{}{name}", scene::ROTOR_PREFIX)).map_or(a, address))
+        .collect();
+    let stiffness: Vec<f64> = scene::ARM_JOINTS[..n]
+        .iter()
+        .map(|name| {
+            model
+                .name_to_id(
+                    MjtObj::mjOBJ_TENDON,
+                    &format!("{}{name}", scene::TRANSMISSION_PREFIX),
+                )
+                .map_or(0.0, |id| model.tendon_stiffness()[id])
+        })
+        .collect();
     let jaw = joint_id("jaw1_JOINT").map(address);
     if let Some(jaw) = jaw {
         assert!(
@@ -807,12 +932,18 @@ fn check_layout(model: &MjModel, n: usize) -> Layout {
                 );
                 let a = address(id);
                 let is_jaw = jaw.is_some_and(|j| a == j || a == j + 1);
-                if !is_jaw && !adr.contains(&a) {
+                if !is_jaw && !adr.contains(&a) && !motor.contains(&a) {
                     passive.push(a);
                 }
             }
             other => panic!("scene joint {id} has unsupported type {other:?}"),
         }
     }
-    Layout { adr, passive, jaw }
+    Layout {
+        adr,
+        motor,
+        stiffness,
+        passive,
+        jaw,
+    }
 }

@@ -133,7 +133,7 @@ struct ShutdownPark {
     /// The stream tracker's normal (soft) clamp, restored when the
     /// retreat ends.
     soft_bounds: ([f64; MAX_JOINTS], [f64; MAX_JOINTS]),
-    /// The clamp the retreat runs under: the hard limits, so a joint
+    /// The clamp the retreat runs under: each joint's travel, so one
     /// parked on its homing endstop can reach it.
     hard_bounds: ([f64; MAX_JOINTS], [f64; MAX_JOINTS]),
 }
@@ -150,8 +150,7 @@ impl ShutdownPark {
         for (i, j) in robot.joints.iter().enumerate().take(MAX_JOINTS) {
             soft.0[i] = j.limits.soft_min_rad;
             soft.1[i] = j.limits.soft_max_rad;
-            hard.0[i] = j.limits.hard_min_rad;
-            hard.1[i] = j.limits.hard_max_rad;
+            (hard.0[i], hard.1[i]) = j.limits.travel_rad();
         }
         let mut speed_fractions = [1.0; MAX_JOINTS];
         for (f, j) in speed_fractions.iter_mut().zip(&robot.joints) {
@@ -1146,6 +1145,24 @@ impl<B: DriverBus> RtCore<B> {
         }
         self.set_homed(true);
         self.reseed_motion_targets();
+        // The landed pose's own feedforward from its first tick. Ramped
+        // from the pose the arm left, the drives carry the difference on
+        // their loops meanwhile, and the landing creeps as those unwind.
+        self.refresh_gravity();
+        let applied = if self.gravity_applied() {
+            self.g
+        } else {
+            [0.0; MAX_JOINTS]
+        };
+        self.torque_slew.seed(&applied);
+    }
+
+    /// The gravity feedforward at the current `q`, scaled per joint.
+    fn refresh_gravity(&mut self) {
+        self.gravity.gravity(&self.q, &mut self.g);
+        for (g, scale) in self.g.iter_mut().zip(self.gravity_scale) {
+            *g *= scale;
+        }
     }
 
     /// Simulator/teleport path: re-aim every motion hold at the landed
@@ -1405,10 +1422,7 @@ impl<B: DriverBus> RtCore<B> {
         lap(&mut mark, &mut laps, 4);
 
         // Gravity: computed every tick, published always.
-        self.gravity.gravity(&self.q, &mut self.g);
-        for (g, scale) in self.g.iter_mut().zip(self.gravity_scale) {
-            *g *= scale;
-        }
+        self.refresh_gravity();
 
         // External torque: what the measured (filtered) torque carries
         // beyond the model's gravity — a contact, a payload the model

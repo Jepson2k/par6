@@ -135,11 +135,16 @@ pub struct ResolvedLimits {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JointLimits {
-    /// Mechanical endstop, negative side \[rad\].
+    /// Mechanically continuous rotation; software travel limits still apply.
+    #[serde(default)]
+    pub continuous: bool,
+    /// Mechanical endstop, negative side [rad], or nominal homing-search
+    /// envelope for a continuous joint.
     pub hard_min_rad: f64,
-    /// Mechanical endstop, positive side \[rad\].
+    /// Mechanical endstop, positive side [rad], or nominal homing-search
+    /// envelope for a continuous joint.
     pub hard_max_rad: f64,
-    /// Software limit, negative side \[rad\]; must sit inside the hard limits.
+    /// Software limit, negative side \[rad\], in the homed coordinate frame.
     pub soft_min_rad: f64,
     /// Software limit, positive side \[rad\].
     pub soft_max_rad: f64,
@@ -163,6 +168,19 @@ pub struct JointLimits {
 }
 
 impl JointLimits {
+    /// The mechanical endstops \[rad\]; `None` on a continuous joint,
+    /// whose `hard_*` is only its homing-search envelope.
+    pub fn endstops(&self) -> Option<(f64, f64)> {
+        (!self.continuous).then_some((self.hard_min_rad, self.hard_max_rad))
+    }
+
+    /// How far the joint can be placed \[rad\]: its endstops, or the
+    /// software window where it has none.
+    pub fn travel_rad(&self) -> (f64, f64) {
+        self.endstops()
+            .unwrap_or((self.soft_min_rad, self.soft_max_rad))
+    }
+
     /// Resolve the limits one mode actually runs under, applying the
     /// fall-back-to-ceiling rule field by field.
     pub fn for_mode(&self, mode: LimitMode) -> ResolvedLimits {
@@ -510,41 +528,38 @@ pub struct SimConfig {
     /// Supply-loss scenarios remove it when their supply envelope reaches zero.
     pub powered_support_nm: Vec<f64>,
     /// Lateral stiffness of the arm's forks \[Nm/rad\]: passive hinges on
-    /// the shoulder's and the elbow's driven bodies about the two axes
-    /// their joints do not turn, so a base swing bends or twists each
-    /// link whatever the pose. The base's chirp shows the arm is not rigid
-    /// about the base axis: an anti-resonance at 23 Hz and a resonance at
-    /// 32 Hz, whose ratio puts half the arm's inertia about that axis on
-    /// each side of a flex, which the mass table places between the elbow
-    /// and the forearm; with the arm out, the same swing goes through the
-    /// shoulder fork, and the chirp's response carries a faint 12–14 Hz
-    /// pair where a shoulder of the same stiffness puts its own mode at
-    /// the ready pose. The base's velocity loop crosses over at 19 Hz at
-    /// the ready pose and 9.5 Hz with the arm out, and these modes are
-    /// where the arm's base gets the phase margin a rigid arm lacks:
-    /// rigid, the simulated base rings at the current rails through every
-    /// move on the gains the arm runs quietly. Zero makes the arm rigid,
-    /// which is that plant: the simulator's base tests fail on it. The
-    /// plant refuses a stiffness its physics step cannot integrate.
+    /// the shoulder's and elbow's driven bodies about the two axes their
+    /// joints do not turn, fitted to the base chirp's response. Approximate:
+    /// it gives the base's velocity loop the phase margin a rigid arm lacks
+    /// (rigid, the simulated base rings at the current rails on the gains
+    /// the arm runs quietly), not a located compliance. Zero removes the
+    /// hinges. The plant refuses a stiffness its physics step cannot
+    /// integrate.
     pub arm_lateral_stiffness_nm_rad: f64,
-    /// Damping of that flex \[Nm·s/rad\].
+    /// Damping of those hinges \[Nm·s/rad\].
     pub arm_lateral_damping_nm_s: f64,
+    /// Drivetrain stiffness between each motor (where the encoder reads)
+    /// and its link \[Nm/rad, joint side\]; 0 = rigid. Loaded, the link
+    /// lags the encoder by torque over stiffness, as the arm's does.
+    pub transmission_stiffness_nm_rad: Vec<f64>,
+    /// Damping ratio of each drivetrain's motor-against-spring mode.
+    pub transmission_damping_ratio: f64,
 }
 
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
             motor_jm_kg_m2: vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6],
-            // A reference arm's, as par6-selfcal measured it on 2026-09-23:
+            // A reference arm's, as par6-selfcal measured it on 2026-10-01:
             // the simulator's model of a PAR6, not any one arm's calibration.
-            viscous_nm_s: vec![0.033145, 1.513348, 0.0, 0.0, 0.033714, 0.009957],
-            coulomb_nm: vec![0.2314, 0.9030, 2.2047, 0.1279, 0.0521, 0.0854],
+            viscous_nm_s: vec![0.29, 1.0, 0.34, 0.047, 0.023, 0.022],
+            coulomb_nm: vec![0.17, 0.95, 0.64, 0.066, 0.045, 0.079],
             powered_support_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
-            // From the base chirp of 2026-09-23 (par6-selfcal --belt-only,
-            // Flange): K = I_forearm · (2π·23.3 Hz)² at the elbow, ζ ≈ 0.15;
-            // the shoulder fork is given the same, unmeasured.
-            arm_lateral_stiffness_nm_rad: 612.0,
-            arm_lateral_damping_nm_s: 1.25,
+            // Fitted to the bare-flange arm's 8/12 Hz response.
+            arm_lateral_stiffness_nm_rad: 317.0,
+            arm_lateral_damping_nm_s: 1.85,
+            transmission_stiffness_nm_rad: vec![230.0, 4000.0, 1300.0, 70.0, 50.0, 150.0],
+            transmission_damping_ratio: 0.5,
         }
     }
 }
@@ -1121,6 +1136,14 @@ impl RobotConfig {
             self.validate_joint(i, j, &reserved)?;
         }
         self.homing.validate(self.joints.len())?;
+        for (i, (joint, home)) in self.joints.iter().zip(&self.homing.joints).enumerate() {
+            if joint.limits.continuous && home.strategy == crate::HomingStrategy::Stall {
+                return Err(invalid(
+                    format!("joints[{i}].limits.continuous"),
+                    "stall homing requires a mechanical endstop",
+                ));
+            }
+        }
         self.io.validate()?;
         self.validate_bus()?;
         self.validate_protocol()?;
@@ -1224,11 +1247,8 @@ impl RobotConfig {
                 "soft_min must be < soft_max",
             ));
         }
-        // NOTE: soft ⊆ hard is deliberately NOT enforced. The soft window of a
-        // wrapping joint lives in an unwrapped frame that can exceed the
-        // endstop coordinates (PAR6 J6: hard ±2π, soft −0.85..7.14). Soft
-        // limits are the authoritative motion bound; hard limits record the
-        // mechanical endstop positions.
+        // Soft limits use the homed frame; they need not lie inside the
+        // nominal search envelope of a continuous joint (PAR6 J6).
         for (v, name) in [
             (l.velocity_rad_s, "limits.velocity_rad_s"),
             (l.acceleration_rad_s2, "limits.acceleration_rad_s2"),
@@ -1436,6 +1456,10 @@ impl RobotConfig {
             (&sim.powered_support_nm, "sim.powered_support_nm"),
             (&sim.viscous_nm_s, "sim.viscous_nm_s"),
             (&sim.coulomb_nm, "sim.coulomb_nm"),
+            (
+                &sim.transmission_stiffness_nm_rad,
+                "sim.transmission_stiffness_nm_rad",
+            ),
         ] {
             if values.len() != self.joints.len() {
                 return Err(invalid(name, "must carry one entry per joint"));
@@ -1452,9 +1476,28 @@ impl RobotConfig {
                 "sim.arm_lateral_stiffness_nm_rad",
             ),
             (sim.arm_lateral_damping_nm_s, "sim.arm_lateral_damping_nm_s"),
+            (
+                sim.transmission_damping_ratio,
+                "sim.transmission_damping_ratio",
+            ),
         ] {
             if !(v.is_finite() && v >= 0.0) {
                 return Err(invalid(name, "must be finite and >= 0"));
+            }
+        }
+        // A compliant drivetrain's rotor carries the reflected motor
+        // inertia alone; without it the spring has nothing to swing.
+        for (i, (k, jm)) in sim
+            .transmission_stiffness_nm_rad
+            .iter()
+            .zip(&sim.motor_jm_kg_m2)
+            .enumerate()
+        {
+            if *k > 0.0 && !is_positive(*jm) {
+                return Err(invalid(
+                    "sim.motor_jm_kg_m2",
+                    format!("entry {i}: must be > 0 on a joint with a drivetrain stiffness"),
+                ));
             }
         }
         for (i, j) in self.joints.iter().enumerate() {
@@ -1523,6 +1566,12 @@ impl RobotConfig {
                     format!("joint {j} does not exist ({} joints)", self.joints.len()),
                 )
             })?;
+            if self.joints[usize::from(j)].limits.continuous {
+                return Err(invalid(
+                    "shutdown.endstop_joints",
+                    format!("joint {j}: a continuous joint has no mechanical endstop to park on"),
+                ));
+            }
             if jh.home_offset_gripper_dependent {
                 return Err(invalid(
                     "shutdown.endstop_joints",

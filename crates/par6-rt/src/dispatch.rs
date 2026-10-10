@@ -211,6 +211,12 @@ impl TorqueSlew {
         self.applied = [0.0; MAX_JOINTS];
     }
 
+    /// Take `applied` as the previous command: the next rate-limited
+    /// tick ramps from it.
+    pub fn seed(&mut self, applied: &[f64; MAX_JOINTS]) {
+        self.applied = *applied;
+    }
+
     /// Rate-limit `want` toward the previous command and record the result.
     fn step(&mut self, i: usize, want: f64) -> f64 {
         let prev = self.applied[i];

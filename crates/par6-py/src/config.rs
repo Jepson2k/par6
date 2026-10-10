@@ -142,14 +142,14 @@ impl Config {
             .collect()
     }
 
-    /// `(min, max)` hardware travel per joint \[rad\] — what `teleport`
-    /// is refused outside of.
+    /// `(min, max)` travel per joint \[rad\] — what `teleport` is
+    /// refused outside of.
     fn hard_limits_rad(&self) -> Vec<(f64, f64)> {
         self.bundle
             .robot
             .joints
             .iter()
-            .map(|j| (j.limits.hard_min_rad, j.limits.hard_max_rad))
+            .map(|j| j.limits.travel_rad())
             .collect()
     }
 

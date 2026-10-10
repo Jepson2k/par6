@@ -78,12 +78,15 @@ cmd = "cargo test"
 [tasks.test-collision-cost]
 cmd = "cargo test -p par6-kin --release --test collision_world per_waypoint_check_cost_is_reported -- --nocapture"
 
-# The shipped 250 Hz configuration end to end. Every other harness patches
-# tick_dt_s up for CI headroom; this soak is the one place the unpatched
-# 0.004 runs before it meets the arm. Release because an unoptimized RT loop
-# cannot hold a 4 ms period anywhere.
+# The shipped 250 Hz configuration end to end. Release because an
+# unoptimized RT loop cannot hold a 4 ms period anywhere.
 [tasks.test-timing]
 cmd = "cargo test -p par6d --release --test shipped_tick -- --nocapture"
+
+# The streaming collision workflow (braking, placement, the powered hold)
+# at the shipped 250 Hz. Release, for the same reason.
+[tasks.test-stream-timing]
+cmd = "cargo test -p par6d --release --test ffi_kinematics streaming_is_gated_by_the_collision_world_at_the_shipped_rate -- --exact --nocapture"
 
 # The python package, in one of the interpreter environments:
 #   pixi run -e py312 install-python && pixi run -e py312 test-python

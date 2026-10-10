@@ -342,8 +342,13 @@ kd = 0.002
 [joints.limits]
 hard_min_rad = -6.2831
 hard_max_rad = 6.2831
+# No mechanical endstop (Hall-homed); hard_* is the homing search envelope.
+# The software window keeps the wrist within one turn, up from the vendor's
+# lower bound: the tool's zero and park (pi) both lie inside it. A window
+# with an edge at zero sees a solver's rounding below it as a full turn.
+continuous = true
 soft_min_rad = -0.85
-soft_max_rad = 7.14
+soft_max_rad = 5.4331
 velocity_rad_s = 3.1
 acceleration_rad_s2 = 20.7
 jerk_rad_s3 = 10350.0
@@ -598,20 +603,33 @@ control_mode = "pid"
 # the base has, the simulated base limit-cycled at its current limit
 # whenever the arm was held extended, where the arm itself holds still.
 motor_jm_kg_m2 = [1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6]
-viscous_nm_s = [0.033145, 1.513348, 0.0, 0.0, 0.033714, 0.009957]  # reference arm, 2026-09-23
-coulomb_nm = [0.2314, 0.903, 2.2047, 0.1279, 0.0521, 0.0854]  # reference arm, 2026-09-23
+# Mean of par6-selfcal's friction fits on the reference arm, 2026-10-01
+# (two runs that agree). J1's Coulomb term is instead the median of its
+# sixteen breakaways at ready and with the arm out (2026-09-23 and 10-01):
+# the fit's 0.17 Nm sat below every direct measurement of the base, its
+# sliding friction with the arm out (0.46 Nm at 10 deg/s, 2026-10-07)
+# included.
+viscous_nm_s = [0.29, 1.0, 0.34, 0.047, 0.023, 0.022]
+coulomb_nm = [0.29, 0.95, 0.64, 0.066, 0.045, 0.079]
 # Assumed powered load support [Nm, joint side]: an empirical allowance a
 # plant without measured friction needed to hold the arm. This plant has the
 # friction above and the drives' own loops, and any support here would hide
 # load from the motor current that payload estimation reads, so it is zero.
 # A supply-loss scenario removes this support as its supply envelope decays.
 powered_support_nm = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-# The arm's lateral flex at the shoulder and elbow forks, from the base
-# chirp's 23/32 Hz anti-resonance/resonance (why it matters: see
-# SimConfig::arm_lateral_stiffness_nm_rad). The shoulder is given the
-# elbow's value, unmeasured. 0 = rigid.
-arm_lateral_stiffness_nm_rad = 612.0  # selfcal --belt-only, 2026-09-23
-arm_lateral_damping_nm_s = 1.25
+# Lateral flex of the shoulder and elbow forks, fitted to the bare-flange
+# arm's 8/12 Hz response. Approximate: it gives the base the phase margin a
+# rigid arm lacks, not a located compliance. 0 = rigid.
+arm_lateral_stiffness_nm_rad = 317.0
+arm_lateral_damping_nm_s = 1.85
+# Drivetrain stiffness per joint, motor (encoder) to link: the arm's apparent
+# wind-up stiffness from par6-selfcal's stiction stage, median over the
+# 2026-09/10 hardware runs. Approximate; it gives the sim the arm's sag and
+# give under load, not its exact vibration. 0 = rigid.
+transmission_stiffness_nm_rad = [230.0, 4000.0, 1300.0, 70.0, 50.0, 150.0]
+# With it the base's speed step draws the arm's current (peak 512 vs
+# 548-585 mA, ripple 97 vs 102-109 mA, hardware captures 2026-10-01).
+transmission_damping_ratio = 0.5
 
 [stream]
 command_timeout_s = 0.04

@@ -432,7 +432,7 @@ fn a_payload_fit_does_not_reabsorb_an_installed_arm_correction() {
 /// Poses spread across the joint limits, deterministic.
 fn spread_poses(n: usize) -> Vec<[f64; NQ]> {
     const LO: [f64; NQ] = [-2.8647335, -2.4407335, 1.9912665, -2.6147335, -1.73, -0.85];
-    const HI: [f64; NQ] = [2.8647335, -0.1122665, 6.5627335, 2.5547335, 1.6, 7.14];
+    const HI: [f64; NQ] = [2.8647335, -0.1122665, 6.5627335, 2.5547335, 1.6, 5.4331];
     let mut seed = 0x2545_F491_4F6C_DD1Du64;
     let mut rnd = move || {
         seed ^= seed << 13;

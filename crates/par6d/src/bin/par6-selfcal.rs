@@ -357,6 +357,15 @@ struct Captured {
     divisor: usize,
 }
 
+/// Where a stiction ramp broke the joint loose: the current there, its
+/// change from the ramp's start (the torque that wound the drivetrain up
+/// from its preloaded rest) and how far the encoder turned getting there.
+struct Breakaway {
+    current_ma: f64,
+    current_change_ma: f64,
+    windup_ticks: i64,
+}
+
 #[derive(Clone, Copy)]
 struct DragSample {
     position: f64,
@@ -691,8 +700,8 @@ const IDENT_HOLD_FRACTION: f64 = 0.6;
     about = "Home a PAR6, measure its mechanics and identify its link masses"
 )]
 struct Args {
-    /// The robot TOML par6d runs (default: as par6d finds it — PAR6_CONFIG,
-    /// a checkout's config/PAR6.toml, then /etc/par6/PAR6.toml).
+    /// The robot TOML (default: the installed /etc/par6/PAR6.toml; without
+    /// one, as par6d finds it).
     #[arg(env = "PAR6_CONFIG")]
     config: Option<PathBuf>,
     /// This arm's local overlay: layered over the config, and where
@@ -780,9 +789,9 @@ enum Event {
     FrictionQuality(u64, usize, f64, f64, f64, f64, usize),
     /// Breakaway at a labelled pose: the currents up and down \[mA\], the
     /// static friction they straddle \[Nm\], the gravity current the model
-    /// predicted against the one the pair measured \[mA\], the transmission
-    /// wind-up before the link moved \[motor ticks\] and the stiffness that
-    /// implies \[Nm/rad, joint side\].
+    /// predicted against the one the pair measured \[mA\], the encoder's
+    /// travel before the joint slid \[motor ticks\] and the apparent
+    /// stiffness over it \[Nm/rad, joint side\].
     Stiction(u64, usize, &'static str, f64, f64, f64, f64, f64, f64, f64),
     /// The belt chirp's outcome: the rotor's swing and drift over it
     /// \[deg\], and whether the travel bound stopped it.
@@ -1451,9 +1460,17 @@ impl Arm {
     fn hold_through_estop(&mut self) -> Result<()> {
         self.estop_holding = true;
         CANCEL.store(false, Ordering::Relaxed);
+        say!("E-STOP: holding position. Release it, then press Ctrl-C to park and release.");
+        // The button is most likely pressed on a trial gain that rings; the
+        // hold has to run on gains known to hold.
+        for j in 0..N {
+            let configured = self.bundle.robot.joints[j].gains;
+            if self.gains[j] != configured && self.gain_restore(j, configured).is_err() {
+                say!("E-STOP: J{} configured gains not confirmed", j + 1);
+            }
+        }
         let at: [i32; N] = std::array::from_fn(|j| self.pos(j).unwrap_or(self.hold[j]));
         self.hold = at;
-        say!("E-STOP: holding position. Release it, then press Ctrl-C to park and release.");
         let mut reminded = false;
         let outcome = loop {
             let engaged = self.estop_engaged();
@@ -2983,7 +3000,7 @@ impl Arm {
     /// the last `STICTION_WINDOW_S` than the ramp can wind a transmission --
     /// and the current is the one at the start of that window. The joint
     /// is caught there, held, then eased back to where it started.
-    fn breakaway(&mut self, j: usize, sign: f64) -> Result<Option<(f64, i64)>> {
+    fn breakaway(&mut self, j: usize, sign: f64) -> Result<Option<Breakaway>> {
         // Still first: the previous breakaway's return was still settling
         // when J3's ramp began, and the sliding test read that as a
         // breakaway at the balance current.
@@ -3033,7 +3050,11 @@ impl Arm {
                 && moved.abs() >= i64::from(STICTION_BREAK_TICKS)
                 && ramp.abs() >= STICTION_MIN_RAMP_ILIM * ilim
             {
-                found = Some((oldest_current, oldest_moved));
+                found = Some(Breakaway {
+                    current_ma: oldest_current,
+                    current_change_ma: oldest_current - balance,
+                    windup_ticks: oldest_moved,
+                });
                 break;
             }
         }
@@ -3079,23 +3100,34 @@ impl Arm {
             let model = f64::from(self.gravity_feedforward()[j]);
             let up = self.breakaway(j, 1.0)?;
             let down = self.breakaway(j, -1.0)?;
-            let (Some((up, up_windup)), Some((down, down_windup))) = (up, down) else {
+            let (Some(up), Some(down)) = (up, down) else {
                 self.emit(Event::Phase("no breakaway within the ramp", j));
                 continue;
             };
-            let static_nm = (up - down).abs() / 2.0 / factor;
-            let measured = (up + down) / 2.0;
-            // The motor turned this far, against the static friction, before
-            // the link moved: the transmission's wind-up, and the torque over
-            // it is the transmission's stiffness, joint side.
-            let windup = (up_windup.abs() + down_windup.abs()) as f64 / 2.0;
+            let static_nm = (up.current_ma - down.current_ma).abs() / 2.0 / factor;
+            let measured = (up.current_ma + down.current_ma) / 2.0;
+            // The motor turned this far before the link slid, under the
+            // torque the ramp added from its preloaded rest: the drivetrain's
+            // wind-up and, over it, the apparent stiffness, joint side.
+            let windup = (up.windup_ticks.abs() + down.windup_ticks.abs()) as f64 / 2.0;
+            let windup_nm =
+                (up.current_change_ma.abs() + down.current_change_ma.abs()) / 2.0 / factor;
             let stiffness = if windup >= 1.0 {
-                static_nm / (windup * self.per_tick(j).abs())
+                windup_nm / (windup * self.per_tick(j).abs())
             } else {
                 f64::NAN
             };
             self.emit(Event::Stiction(
-                self.tick, j, label, up, down, static_nm, model, measured, windup, stiffness,
+                self.tick,
+                j,
+                label,
+                up.current_ma,
+                down.current_ma,
+                static_nm,
+                model,
+                measured,
+                windup,
+                stiffness,
             ));
             *slot = Some(static_nm);
         }
@@ -3478,6 +3510,19 @@ impl Arm {
                 break 'poses;
             }
         }
+        // The way back is a leg of the qualification too: a candidate that
+        // runs away there gets the same recovery as one that does outbound.
+        if fault.is_none() {
+            if let Some(j) = self.pose_leg(ready, &mut trail, judged)? {
+                fault = Some((j, PoseFault::Motion));
+                // Landed at ready on an oscillation verdict: nothing to
+                // retrace. A runaway was already brought back to the leg's
+                // start, which the trail still ends at.
+                if trail.last() == Some(&ready) {
+                    trail.truncate(1);
+                }
+            }
+        }
         if let Some((j, _)) = fault {
             self.emit(Event::GainsNote(
                 self.tick,
@@ -3491,7 +3536,6 @@ impl Arm {
             }
             return Ok(fault);
         }
-        self.pose(ready)?;
         let fault = self.hold_fault("return from calibration-pose qualification", judged)?;
         if let Some(j) = fault {
             self.gain_configure(j, self.bundle.robot.joints[j].gains)?;
@@ -4847,8 +4891,9 @@ fn probe_span(
 ) -> Result<(f64, f64)> {
     let limits = &bundle.robot.joints[j].limits;
     let margin = bundle.robot.selfcal.approach_rad;
-    let low = limits.soft_min_rad.max(limits.hard_min_rad) + margin;
-    let high = limits.soft_max_rad.min(limits.hard_max_rad) - margin;
+    let (travel_lo, travel_hi) = limits.travel_rad();
+    let low = limits.soft_min_rad.max(travel_lo) + margin;
+    let high = limits.soft_max_rad.min(travel_hi) - margin;
     let mut reach = |direction: f64| -> Result<f64> {
         let mut at = ready;
         loop {
@@ -5527,9 +5572,9 @@ fn arm_kin(bundle: &ConfigBundle, assets: &Path) -> Result<par6_kin::Kin> {
 /// arm it pinned 7 of 24 parameters, and the model sagged with the arm
 /// horizontal, where nothing had been measured.
 ///
-/// Both limit sets because this arm's J6 declares a soft range wider than
-/// its hard one, and a pose drawn from the soft range alone drove it into
-/// the mechanical stop at full current.
+/// Inside the software window and the joint's travel both: a pose drawn
+/// from the window alone once drove a joint into its endstop at full
+/// current.
 fn identification_poses(
     bundle: &ConfigBundle,
     assets: &Path,
@@ -5548,8 +5593,9 @@ fn identification_poses(
     };
     let window = |j: usize| {
         let l = &bundle.robot.joints[j].limits;
-        let lo = l.soft_min_rad.max(l.hard_min_rad) + backoff;
-        let hi = l.soft_max_rad.min(l.hard_max_rad) - backoff;
+        let (travel_lo, travel_hi) = l.travel_rad();
+        let lo = l.soft_min_rad.max(travel_lo) + backoff;
+        let hi = l.soft_max_rad.min(travel_hi) - backoff;
         (lo, hi)
     };
     if let Some(j) = (0..N).find(|j| {
@@ -6282,10 +6328,15 @@ fn run(args: Args) -> Result<()> {
         }
     }
     // The shipped config describes the PAR6; this arm's own values, the
-    // ones a run measures, live in its overlay.
-    // Resolved as par6d resolves them, so a run calibrates, and --apply
-    // writes, the config the runtime actually loads.
-    let config = par6d::options::resolve_config_path(args.config.as_deref())?;
+    // ones a run measures, live in its overlay. A run calibrates, and
+    // --apply writes beside, the config the installed runtime loads: a
+    // checkout's config is the generic PAR6 and would start every stage
+    // from vendor values.
+    let installed = Path::new(par6d::options::INSTALLED_CONFIG);
+    let config = match args.config.as_deref() {
+        None if installed.is_file() => installed.to_path_buf(),
+        explicit => par6d::options::resolve_config_path(explicit)?,
+    };
     let existing = par6_config::local_overlay(&config, args.local_config.as_deref())?;
     let overlay = existing
         .clone()

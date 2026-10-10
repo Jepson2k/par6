@@ -240,7 +240,7 @@ impl SimBus {
     /// Override the true boot pose \[rad\], one entry per joint (default:
     /// the config boot-calibration pose, where each joint reads its
     /// `sector_home_offset`). Call before `boot_configure`; values are
-    /// clamped inside the hard limits.
+    /// clamped inside the endstops.
     pub fn set_initial_joint_rad(&mut self, q0: &[f64]) {
         self.initial_q = Some(q0.to_vec());
     }
@@ -265,7 +265,7 @@ impl SimBus {
     }
 
     /// Teleport the simulated arm to `q` \[rad\] (one entry per joint,
-    /// clamped inside the hard limits) after boot: the plant state moves
+    /// clamped inside the endstops) after boot: the plant state moves
     /// and the reported-position wrap re-bases onto the new pose, while
     /// the drivers, the gripper and the link state carry on. The arm
     /// appears at rest and stays held: the drivetrain clamps the landed
@@ -286,14 +286,17 @@ impl SimBus {
         }
         let mut clamped = [0.0; MAX_NODES];
         for (j, map) in self.maps.iter_mut().enumerate() {
-            clamped[j] = q[j].clamp(map.hard_lo_rad, map.hard_hi_rad);
+            clamped[j] = map.endstops.map_or(q[j], |(lo, hi)| q[j].clamp(lo, hi));
             map.reseed(clamped[j]);
-            // Held at the landed reading until re-commanded.
-            let wire = f64::from(map.conv.motor_ticks(clamped[j])) + map.report_offset;
-            self.drivers[j].reseed_hold(wire);
         }
-        let q = &clamped[..self.maps.len()];
-        self.plant_mut().reseed(q);
+        let n = self.maps.len();
+        self.plant_mut().reseed(&clamped[..n]);
+        // Held at the landed reading, carrying its load, until re-commanded.
+        for (j, (map, &q)) in self.maps.iter().zip(&clamped).enumerate().take(n) {
+            let wire = f64::from(map.conv.motor_ticks(q)) + map.report_offset;
+            let hold_ma = self.plant().landed_load_nm(j) * map.factor_ma_per_nm;
+            self.drivers[j].reseed_hold(wire, hold_ma);
+        }
         // Replies queued this tick describe the pose the arm just left;
         // drained under the re-based reference they would read as a jump
         // — and one tick of gravity feedforward for that phantom pose
@@ -430,14 +433,24 @@ impl SimBus {
         self.dropped_rx
     }
 
-    /// Ground truth: the plant's true joint angles \[rad\], one per arm
-    /// joint, straight from the physics state through the boot-frame
-    /// conversion — no `report_offset`, no runtime re-referencing. This
-    /// is the oracle the runtime's homed frame is tested against; nothing
-    /// on the wire can reach it.
+    /// Ground truth: the plant's true link angles \[rad\], one per arm
+    /// joint, straight from the physics state — no `report_offset`, no
+    /// runtime re-referencing, and nothing on the wire can reach it.
+    /// Where the arm physically is; the runtime's homed frame is tested
+    /// against [`true_motor_rad`](Self::true_motor_rad).
     pub fn true_joint_rad(&self) -> Vec<f64> {
         (0..self.drivers.len())
             .map(|j| self.plant().joint_rad(j))
+            .collect()
+    }
+
+    /// Ground truth on the motor side, where the encoders read \[rad,
+    /// joint side\]: the frame the runtime's reference lives in. It equals
+    /// [`true_joint_rad`](Self::true_joint_rad) on a rigid drivetrain; on
+    /// a compliant one the link lags it by its load over the stiffness.
+    pub fn true_motor_rad(&self) -> Vec<f64> {
+        (0..self.drivers.len())
+            .map(|j| self.plant().motor_rad(j))
             .collect()
     }
 
@@ -1126,12 +1139,18 @@ impl DriverBus for SimBus {
     }
 
     fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>) {
-        let q = self.true_joint_rad();
+        // Rebuilt where the encoders read, the links carried over as they
+        // hang: the new tool's weight loads the drivetrains from there.
+        let motors = self.true_motor_rad();
+        let links = self.true_joint_rad();
         let was = (self.scene.tool, self.tool);
         self.scene.tool = scene_tool(tool);
         self.tool = tool.map(tool_inertial);
-        match self.try_make_plant(robot, &q) {
-            Ok(plant) => self.plant = Some(plant),
+        match self.try_make_plant(robot, &motors) {
+            Ok(mut plant) => {
+                plant.carry_links(&links);
+                self.plant = Some(plant);
+            }
             Err(e) => {
                 log::error!("sim: no plant for the new tool ({e}); the previous one stays");
                 (self.scene.tool, self.tool) = was;
@@ -1389,7 +1408,7 @@ impl DriverBus for SimBus {
                 assert_eq!(q.len(), n, "initial pose length != joint count");
                 q.iter()
                     .zip(&robot.joints)
-                    .map(|(q, j)| q.clamp(j.limits.hard_min_rad, j.limits.hard_max_rad))
+                    .map(|(q, j)| j.limits.endstops().map_or(*q, |(lo, hi)| q.clamp(lo, hi)))
                     .collect()
             }
             None => robot
@@ -1713,7 +1732,16 @@ impl SimBus {
             .iter()
             .zip(&sim.motor_jm_kg_m2)
             .zip(sim.viscous_nm_s.iter().zip(&sim.coulomb_nm))
-            .map(|((map, jm), (b, tc))| scene::JointTuning::from_config(map, *jm, *b, *tc))
+            .zip(&sim.transmission_stiffness_nm_rad)
+            .map(|(((map, jm), (b, tc)), k)| {
+                scene::JointTuning::from_config(
+                    map,
+                    *jm,
+                    *b,
+                    *tc,
+                    (*k, sim.transmission_damping_ratio),
+                )
+            })
             .collect();
         let build = scene::Build {
             timestep: scene::timestep_for(self.dt),

@@ -108,7 +108,7 @@ def test_sync_facade_smoke(daemon):
 
         # The halt verbs on the sync tool are sends, not coroutines: each
         # comes back as the queued command's index.
-        client.select_tool(_cfg.fitted_tool_key())
+        client.select_tool(_cfg.Config(str(daemon.config)).active_tool())
         for verb in ("stop", "release"):
             assert getattr(client.tool, verb)() >= 0, verb
 

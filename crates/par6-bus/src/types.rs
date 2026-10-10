@@ -270,7 +270,7 @@ pub enum PollAction {
 }
 
 /// A loop-rate capture (cmd 38/39) as read back so far: the velocity the
-/// drive's loop acted on and the Iq it commanded, one row per sample. The
+/// drive's loop acted on and its measured Iq, one row per sample. The
 /// backend keeps one per node, sized once at boot, so a read on the tick
 /// path stores without allocating.
 #[derive(Debug, Clone, PartialEq, Eq)]

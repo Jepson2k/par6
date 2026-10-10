@@ -242,9 +242,12 @@ class TestPlannedMotion:
         Driven through the dry-run client — the plan under test is the one
         the runtime's own planner produces — with the config as the oracle.
         """
-        cfg = _cfg.config()
+        config_path = sim_config(tmp_path / "config", config_patch=_row_rate_tick)
+        # The host may have a commissioned overlay; this preview uses the
+        # isolated test config, so its limits must be the oracle too.
+        cfg = _cfg.Config(str(config_path))
         velocity = np.array(cfg.limits("exec")["velocity"])
-        start = _cfg.homing_ready_pose_rad()
+        start = np.array(cfg.homing_ready_pose_rad())
         # Long enough that speed, not the default half accel, bounds it.
         target = start + np.radians([60.0, -20.0, 30.0, 0.0, 40.0, 0.0])
         # Ticked at the record's row rate, so every tick is a row and the
@@ -252,9 +255,7 @@ class TestPlannedMotion:
         # average, which would smear a fast tick across several.
         client = Robot().create_dry_run_client(
             initial_joints_deg=np.degrees(start).tolist(),
-            config_path=str(
-                sim_config(tmp_path / "config", config_patch=_row_rate_tick)
-            ),
+            config_path=str(config_path),
         )
         dt = client._dt
         assert dt == pytest.approx(_ROW_DT_S)

@@ -15,7 +15,7 @@ use std::sync::{mpsc, Arc};
 
 use par6_bus::sim::SimBus;
 use par6_bus::spectral::codec::Readback;
-use par6_bus::spectral::{trunc_to_wire, JointConversion};
+use par6_bus::spectral::{torque_to_ma_factor, trunc_to_wire, JointConversion};
 use par6_bus::{
     BusState, ConfigKind, DriverBus, GripperCommand, GripperReply, HallState, JointCommand,
     LoopbackBus, NodeState, Pack, PollAction, Reply, TxRecord,
@@ -151,10 +151,12 @@ fn a_home_after_a_tool_change_homes_as_the_tool_now_fitted() {
     core.set_gripper_tool(Some(&flange), driven.robot.bus.gripper_node, 1);
     core.set_tool_home_offset(4, flanged.effective_home_offset(4).expect("J4 offset"));
     core.tick(core.tick_dt_s(), false);
-    assert_eq!(
-        handles.snapshots.latest().q[4],
-        before,
-        "the encoder reads the same angle whatever tool is bolted on"
+    // The drivetrain gives a little under the new tool's weight; the
+    // tools' home offsets differ by about 0.19 rad.
+    let after = handles.snapshots.latest().q[4];
+    assert!(
+        (after - before).abs() < 0.01,
+        "the encoder reads the same angle whatever tool is bolted on: {before} -> {after}"
     );
     let changed = home(&mut core, &mut handles, &tx);
 
@@ -544,9 +546,9 @@ fn a_joint_still_travelling_on_pass_two_is_not_a_stall() {
     );
 }
 
-/// A loaded J0 — a load of 0.8× its homing current opposing its approach,
-/// so the drive sits near its homing current the whole time it seeks —
-/// reaches the same endstop reference as a free one. Each approach
+/// A loaded J0 — a load of 0.8× the homing current its own friction leaves,
+/// opposing its approach, so the drive sits near its homing current the
+/// whole time it seeks — reaches the same endstop reference as a free one. Each approach
 /// starts with the current saturated and the rotor barely moving, the
 /// full stall signature, which only the startup guard keeps from
 /// latching at the start pose.
@@ -563,7 +565,16 @@ fn a_loaded_joint_spinning_up_is_not_a_stall() {
     assert_eq!(free, SeqStatus::Complete, "the free joint homes");
     let free_ref = i64::from(h.conv[0].motor_ticks(eff));
 
-    let load_ma = 0.8 * jh.current_ma;
+    let joint = &bundle.robot.joints[0];
+    let friction_ma = bundle.robot.sim.coulomb_nm[0]
+        * torque_to_ma_factor(
+            joint.gear_ratio,
+            joint.gear_efficiency,
+            joint.kt_nm_a,
+            joint.dir,
+        )
+        .abs();
+    let load_ma = 0.8 * (jh.current_ma - friction_ma);
     let mut approach = None;
     let (loaded, h) = home_j0(&bundle, start, |cmd, _, _| {
         let v = f64::from(cmd.vel.unwrap_or(0));

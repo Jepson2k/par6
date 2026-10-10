@@ -39,31 +39,21 @@ fn move_command(client: &Client) -> Command {
     })
 }
 
-async fn receive_request<F>(mut request: Pin<&mut F>, sink: &UdpSocket) -> Vec<u8>
+async fn receive_request<F>(request: Pin<&mut F>, sink: &UdpSocket) -> Vec<u8>
 where
     F: Future<Output = Result<Option<u64>, ClientError>>,
 {
     let mut bytes = [0; 2048];
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if let Poll::Ready(result) = poll_once(request.as_mut()).await {
-            panic!("Unacknowledged request ended before send: {result:?}");
-        }
-        match sink.try_recv(&mut bytes) {
-            Ok(n) => {
-                let (_, command) = par6_proto::decode_command(&bytes[..n]).unwrap();
-                assert!(matches!(command, Command::MoveJ(_)));
-                return bytes[..n].to_vec();
-            }
-            Err(error) if error.kind() == ErrorKind::WouldBlock => {
-                assert!(Instant::now() < deadline, "No command datagram arrived");
-                // Keep the virtual clock fixed while the real I/O driver
-                // handles readiness; only the test advances retry timers.
-                tokio::task::yield_now().await;
-            }
-            Err(error) => panic!("UDP receive failed: {error}"),
-        }
-    }
+    // Both futures register their readiness with the executor, so the
+    // current-thread runtime's I/O driver gets to run.
+    let n = tokio::select! {
+        biased;
+        received = sink.recv(&mut bytes) => received.expect("UDP receive"),
+        result = request => panic!("Unacknowledged request ended before receive: {result:?}"),
+    };
+    let (_, command) = par6_proto::decode_command(&bytes[..n]).unwrap();
+    assert!(matches!(command, Command::MoveJ(_)));
+    bytes[..n].to_vec()
 }
 
 async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {

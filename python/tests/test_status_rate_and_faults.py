@@ -17,7 +17,7 @@ from live_daemon import LiveDaemon, requires_par6d
 
 from par6.client import AsyncRobotClient, RobotError
 
-pytestmark = requires_par6d
+pytestmark = [pytest.mark.e2e, requires_par6d]
 
 
 async def _observed_hz(client: AsyncRobotClient, frames: int = 30) -> float:

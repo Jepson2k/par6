@@ -63,6 +63,7 @@ running the command in its `run:` line:
 | `pixi run lint` | `cargo fmt --check` and `clippy -D warnings` |
 | `pixi run test-rust` | `cargo test` |
 | `pixi run test-timing` | the shipped 250 Hz soak, release |
+| `pixi run test-stream-timing` | the streaming collision workflow at 250 Hz, release |
 | `pixi run test-collision-cost` | the per-waypoint collision cost, uncaptured |
 | `pixi run install-python` | `pip install -e python[dev]` |
 | `pixi run lint-python` | pre-commit (ruff, ruff-format, ty, hygiene) |
@@ -210,7 +211,7 @@ Waldo Commander (NiceGUI frontend, unchanged)
    └─ RT thread (SCHED_FIFO 99, alloc-free): fixed-rate tick (`tick_dt_s`, shipped
         250 Hz) — CAN RX → state → gravity comp G(q) → mode dispatch → CAN TX →
         state snapshot
-   bus backends: SocketCAN (Spectral/STEPFOC) | closed-loop dynamics sim (Pinocchio ABA)
+   bus backends: SocketCAN (Spectral/STEPFOC) | closed-loop dynamics sim (MuJoCo)
 ```
 
 There is one numerics stack. Kinematics, dynamics and collision run on **Pinocchio and
@@ -852,11 +853,12 @@ its candidate `calibrated.toml`, `stages.tsv`, the per-tick `samples.csv` and
 `history.tsv`: the candidate's values beside the three most recent earlier runs
 in the same directory that measured them, with the change against the newest,
 printed at the end of the run and on demand with `--history <run-dir>` (no arm
-needed). `--apply` writes the results into the arm's local overlay
-(`local.toml` beside the config, or `--local-config`), keeping a backup; the
-shipped config is never written. Stages other than ripple and gains can use `--sim`,
-which refuses `--apply`; nothing about tuning is developed or tested in the
-simulator.
+needed). The run reads the installed `/etc/par6/PAR6.toml` unless told
+otherwise, since a checkout's config is the generic PAR6. `--apply` writes the
+results into the arm's local overlay (`local.toml` beside the config, or
+`--local-config`), keeping a backup; the shipped config is never written. `--sim` runs the stages through the simulator to
+check the workflow runs end to end, and refuses `--apply`; gains and friction are
+tuned and validated on the arm only, never in the simulator.
 `--limits` (off by default) also finds each joint's velocity,
 acceleration and jerk limits: it scales the joint's EXEC limits up towards its
 hardware ceiling until a move's following error, landing or hold misses its
@@ -865,14 +867,20 @@ would exceed its current limit; with `--apply` those become the EXEC limits,
 written only where the search moved them. Speed ripple is reported beside each result and only fails a step past 10% of
 the commanded speed, because it does not grow with the limits. A jerk no probe move was
 limited by is only a lower bound, so it is reported and left as configured.
-The base's chirp (2 to 60 Hz) is recorded for fitting the arm's compliance
-outside selfcal — the anti-resonance/resonance pair it showed is what
-`[sim] arm_lateral_stiffness_nm_rad` carries. `--only <stage>` (repeatable) runs
+The base's chirp (2 to 60 Hz) is recorded for estimating the arm's effective
+compliance outside selfcal. `--only <stage>` (repeatable) runs
 homing and just those stages, for development, and `--joint N` narrows the
 ripple and gains stages to some joints. Hardware runs need `sudo`; the ripple and gains stages need the par6
-STEPFOC firmware. The earlier injected and periodic identification methods were
-removed; the [development notes](docs/development/2026-09-28-periodic-tuning.md)
-record why.
+STEPFOC firmware.
+
+The simulator is meant to be useful, not exact: collisions, picking up and
+carrying objects, payload, and the arm's give under load, with the arm's
+measured friction and wind-up stiffness (`[sim] transmission_stiffness_nm_rad`
+is a spring between each motor, where the encoder reads, and its link). It does
+not reproduce the arm's current ripple or vibration, and gains are never tuned
+in it. `continuous = true` in `[joints.limits]` marks a joint with no mechanical
+endstop (J6, Hall-homed): its software window bounds travel, one turn on J6, and
+`hard_min_rad`/`hard_max_rad` are only the homing-search envelope.
 
 **The tool: `estimate_payload()`.** With the tool fitted and `par6d` running,
 the client call holds a few wrist poses and fits the mass and centre of mass it
@@ -1210,9 +1218,9 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
 - **`par6-selfcal` parks and releases** on a failure and at the end of a run: the area is
   known clear and nothing is held, and a run may be on a bad tune that oscillates loudly
   under a hold. Parking runs with its motion guards on.
-- **An e-stop during `par6-selfcal` holds the arm where it is.** Once it is released the
-  arm keeps holding until Ctrl-C asks for the usual park and release; nothing moves on its
-  own after a reset.
+- **An e-stop during `par6-selfcal` holds the arm where it is**, on its configured gains
+  rather than a trial's. Once it is released the arm keeps holding until Ctrl-C asks for
+  the usual park and release; nothing moves on its own after a reset.
 
 ## Safety notes
 

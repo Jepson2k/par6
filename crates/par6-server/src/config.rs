@@ -121,12 +121,12 @@ pub struct ServerConfig {
     pub profiles: Vec<String>,
     /// Profile active at startup (and after `reset_state`).
     pub initial_profile: String,
-    /// Per-joint hard travel window \[degrees\], `(min, max)` in wire
-    /// units and kinematic order. `teleport` is refused outside it: the
-    /// runtime cannot place a joint there, and clamping into range put
-    /// the arm somewhere the client never asked for and reported
-    /// success. Unbounded by default so a config that declares no limits
-    /// constrains nothing.
+    /// Per-joint travel \[degrees\], `(min, max)` in wire units and
+    /// kinematic order: the endstops, or the software window of a joint
+    /// without them. `teleport` is refused outside it: the runtime cannot
+    /// place a joint there, and clamping into range put the arm somewhere
+    /// the client never asked for and reported success. Unbounded by
+    /// default so a config that declares no limits constrains nothing.
     pub joint_hard_limits_deg: [(f64, f64); NUM_JOINTS],
     /// Installation-layer collision shapes (persistent keep-outs,
     /// reported by the SHAPES query alongside the program layer).

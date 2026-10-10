@@ -215,7 +215,10 @@ impl Rig {
         let pose = std::array::from_fn(|i| robot.joints[i].sector_home_offset_rad);
         let node_of = std::array::from_fn(|i| robot.joints[i].node_id);
         let gripper_node = robot.bus.gripper_node;
-        let (core, handles) = RtCore::new(&bundle, LoopbackBus::new(), hooks).expect("core");
+        let (mut core, handles) = RtCore::new(&bundle, LoopbackBus::new(), hooks).expect("core");
+        if let Some(tool_id) = bundle.active_tool().and_then(|t| t.can_tool_id) {
+            core.bus_mut().report_tool(gripper_node, tool_id);
+        }
         Self {
             core,
             handles,

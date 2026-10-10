@@ -156,6 +156,9 @@ pub fn load_config(
     Ok((bundle, local))
 }
 
+/// Where the deploy bundle installs the robot TOML on a control box.
+pub const INSTALLED_CONFIG: &str = "/etc/par6/PAR6.toml";
+
 /// Resolve the robot TOML path: the explicit choice when given, else the
 /// first existing default location. The error names every path tried.
 pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
@@ -182,7 +185,7 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
             candidates.push(dir.join("../../../config/PAR6.toml"));
         }
     }
-    candidates.push(PathBuf::from("/etc/par6/PAR6.toml"));
+    candidates.push(PathBuf::from(INSTALLED_CONFIG));
     for c in &candidates {
         if c.is_file() {
             return Ok(c.clone());

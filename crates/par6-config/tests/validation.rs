@@ -12,6 +12,29 @@ fn shipped() -> String {
     std::fs::read_to_string(&path).expect("shipped PAR6.toml")
 }
 
+#[test]
+fn a_continuous_joint_cannot_home_by_pressing_against_an_endstop() {
+    let field = refused_field(
+        load_with(
+            "hard_min_rad = -2.952",
+            "continuous = true\nhard_min_rad = -2.952",
+        ),
+        "stall homing without a mechanical endstop",
+    );
+    assert_eq!(field, "joints[0].limits.continuous");
+}
+
+#[test]
+fn a_continuous_joint_cannot_park_on_an_endstop() {
+    let field = refused_field(
+        load_with("endstop_joints = [1, 2]", "endstop_joints = [1, 2, 5]"),
+        "parking the continuous wrist on a nonexistent mechanical endstop",
+    );
+    assert_eq!(field, "shutdown.endstop_joints");
+    load_with("endstop_joints = [1, 2]", "endstop_joints = [1, 2]")
+        .expect("the shoulder and elbow have mechanical endstops");
+}
+
 /// Load the shipped config with one line rewritten.
 fn load_with(from: &str, to: &str) -> Result<RobotConfig, ConfigError> {
     let text = shipped();

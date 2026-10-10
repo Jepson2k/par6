@@ -1567,6 +1567,10 @@ enum Standoff {
     /// ([`STANDOFF_TRAVEL_BUDGET_S`]).
     Braking {
         goal: [f64; MAX_JOINTS],
+        /// World-frame direction `[linear, angular]` of the Cartesian motion
+        /// this refusal stopped, so a held approach cannot restart the brake
+        /// while steering away or alongside stays possible.
+        refused_motion: Option<[f64; 6]>,
         until_tick: u64,
     },
     /// Travelling the last stretch onto the solved standoff. `best` is the
@@ -1910,6 +1914,7 @@ impl RtCommands for RtBridge {
                             servo_target: None,
                             standoff: Some(Standoff::Braking {
                                 goal: la,
+                                refused_motion: None,
                                 until_tick,
                             }),
                             jog: [0.0; MAX_JOINTS],
@@ -2025,6 +2030,7 @@ impl RtCommands for RtBridge {
                             if gate.blocked(&snap.q, &target)?.is_some() {
                                 a.standoff = Some(Standoff::Braking {
                                     goal: target,
+                                    refused_motion: None,
                                     until_tick: snap.tick + standoff_budget_ticks(gate.tick_dt_s()),
                                 });
                             }
@@ -2117,7 +2123,11 @@ impl RtCommands for RtBridge {
                         // arm is parked on it.
                         deadline: Instant::now() + self.servo_grace(),
                         servo_target: None,
-                        standoff: Some(Standoff::Braking { goal, until_tick }),
+                        standoff: Some(Standoff::Braking {
+                            goal,
+                            refused_motion: None,
+                            until_tick,
+                        }),
                         jog: [0.0; MAX_JOINTS],
                         world_epoch,
                         cart: None,
@@ -2298,11 +2308,6 @@ impl RtCommands for RtBridge {
                     Some(ActiveStream {
                         kind: StreamKind::CartJog,
                         cart: Some(state),
-                        servo: None,
-                        parked: false,
-                        still: 0,
-                        still_tick: 0,
-                        stepped_tick: 0,
                         ..
                     }) => state.commanded(),
                     _ => self.cart.snapshots.latest().q,
@@ -2339,6 +2344,14 @@ impl RtCommands for RtBridge {
                     .stream
                     .as_ref()
                     .and_then(|a| placement_target(a, &snap_q));
+                let refused_jog = sh.stream.as_ref().and_then(|a| match a.standoff {
+                    Some(Standoff::Braking {
+                        goal,
+                        refused_motion,
+                        ..
+                    }) => refused_motion.map(|motion| (goal, motion, a.world_epoch)),
+                    _ => None,
+                });
                 drop(sh);
                 let twisting = twist.iter().any(|v| *v != 0.0);
                 let mut took_over = false;
@@ -2346,7 +2359,40 @@ impl RtCommands for RtBridge {
                     let mut held = CartJogProbe { q: to, ..probe };
                     if let Ok(la) = cart_jog_stop(&mut self.cart.kin, &self.cart.gate, &mut held) {
                         let mut gate = self.cart.gate.lock().unwrap();
-                        if gate.blocked(&to, &la)?.is_some() {
+                        let blocked = gate.blocked(&to, &la)?.is_some();
+                        let approaching = if let Some((goal, previous, world_epoch)) =
+                            refused_jog.filter(|_| !blocked)
+                        {
+                            // The measurement can trail the refused setpoint
+                            // far enough to look clear again. Keep owning the
+                            // refused direction, not every direction that
+                            // happens to approach a different, clear obstacle.
+                            let requested =
+                                world_cart_twist(&mut self.cart.kin, &to, twist, p.frame)
+                                    .map_err(|e| servo_refused("JOG_L", &e))?;
+                            // Linear and angular parts each in units of
+                            // their full speed.
+                            let scale = |j: usize| {
+                                if j < 3 {
+                                    motion.jog_l_linear_max_m_s
+                                } else {
+                                    motion.jog_l_angular_max_rad_s
+                                }
+                            };
+                            let dot: f64 = (0..6)
+                                .map(|j| previous[j] * requested[j] / scale(j).powi(2))
+                                .sum();
+                            dot > 0.0
+                                && !gate.inside_world(&to)?
+                                // A world update can remove the obstruction
+                                // before braking has finished; until one
+                                // does, the refused segment still stands.
+                                && (gate.epoch() == world_epoch
+                                    || gate.blocked(&to, &goal)?.is_some())
+                        } else {
+                            false
+                        };
+                        if blocked || approaching {
                             let refusal = gate.standing_refusal();
                             drop(gate);
                             if let Some(a) = self.shared.lock().unwrap().stream.as_mut() {
@@ -2369,6 +2415,7 @@ impl RtCommands for RtBridge {
                 if let Some(la) = probed {
                     let mut gate = self.cart.gate.lock().unwrap();
                     if let Some(pairs) = gate.blocked(&q, &la)? {
+                        let refused_motion = world_motion(&mut self.cart.kin, &q, &la).ok();
                         let refusal = gate.refuse(pairs);
                         let world_epoch = gate.epoch();
                         let until_tick = self.cart.snapshots.latest().tick
@@ -2383,6 +2430,7 @@ impl RtCommands for RtBridge {
                             servo_target: None,
                             standoff: Some(Standoff::Braking {
                                 goal: la,
+                                refused_motion,
                                 until_tick,
                             }),
                             jog: [0.0; MAX_JOINTS],
@@ -2715,17 +2763,7 @@ impl RtCommands for RtBridge {
                     log::error!("teleport: sim tool re-seed failed: {e}");
                 }
             }
-            for (i, joint) in robot.joints.iter().enumerate() {
-                // The re-seeded sim reports the wrapped boot reading
-                // first; re-base the core's conversion so that reading
-                // maps exactly to the teleported angle.
-                let conv = par6_bus::spectral::JointConversion::from_config(joint);
-                let true0 = conv.motor_ticks(q[i]);
-                let wrapped0 = true0.rem_euclid(1i32 << joint.encoder_bits);
-                core.set_joint_reference(i, wrapped0, q[i]);
-            }
-            core.reseed_motion_targets();
-            core.set_homed(true);
+            core.adopt_landed_pose(robot, &q);
             log::info!("teleport applied: {q:?} rad, homed=true");
         }));
     }
@@ -2892,18 +2930,7 @@ impl RtBridge {
                 );
                 return;
             }
-            for (i, joint) in robot.joints.iter().enumerate() {
-                // Same re-basing the teleport path uses: the re-seeded
-                // sim reports the WRAPPED boot reading first, so the
-                // conversion has to be told which revolution it is on
-                // before that reading is interpreted.
-                let conv = par6_bus::spectral::JointConversion::from_config(joint);
-                let true0 = conv.motor_ticks(q[i]);
-                let wrapped0 = true0.rem_euclid(1i32 << joint.encoder_bits);
-                core.set_joint_reference(i, wrapped0, q[i]);
-            }
-            core.reseed_motion_targets();
-            core.set_homed(true);
+            core.adopt_landed_pose(robot, &q);
             log::info!("bus backend: simulator, seeded at {q:?} rad");
             shared.lock().unwrap().bus_outcome = Some(Ok(()));
         }));
@@ -3179,12 +3206,14 @@ pub(crate) fn housekeeping_loop(
                         // rest, and solve the standoff again toward where it
                         // was headed. A layer re-sent unchanged, or one
                         // nowhere near, leaves the placement running.
+                        // Braking keeps the epoch its refusal was judged
+                        // under: the command plane compares against it.
                         let epoch = gate.lock().unwrap().epoch();
                         if epoch != a.world_epoch {
-                            a.world_epoch = epoch;
                             if let Standoff::Placing { stop, .. }
                             | Standoff::Settling { stop, .. } = phase
                             {
+                                a.world_epoch = epoch;
                                 let clear = gate
                                     .lock()
                                     .unwrap()
@@ -3211,6 +3240,7 @@ pub(crate) fn housekeeping_loop(
                                     // rests in.
                                     a.standoff = Some(Standoff::Braking {
                                         goal: stop,
+                                        refused_motion: None,
                                         until_tick: snap.tick + standoff_budget_ticks(dt),
                                     });
                                     a.still = 0;
@@ -3320,6 +3350,22 @@ pub(crate) fn housekeeping_loop(
                                     .zip(stop.iter())
                                     .all(|(q, s)| (q - s).abs() <= STANDOFF_ARRIVED_RAD)
                                 {
+                                    // EXEC already holds this standoff (a held
+                                    // direction re-pressed after its grace):
+                                    // an IDLE damping phase would let go of it.
+                                    if holding
+                                        && !gate
+                                            .lock()
+                                            .unwrap()
+                                            .inside_world(&snap.q)
+                                            .unwrap_or(true)
+                                    {
+                                        a.standoff = None;
+                                        a.parked = true;
+                                        a.servo_target = Some(stop);
+                                        a.deadline = now + servo_grace;
+                                        break 'stream;
+                                    }
                                     link.send(RtCommand::SetMode(Mode::Idle));
                                     a.servo_target = None;
                                     a.standoff = Some(Standoff::Settling {
@@ -3498,6 +3544,9 @@ pub(crate) fn housekeeping_loop(
                                     a.parked = true;
                                     a.servo_target = Some(stop);
                                     a.deadline = now + servo_grace;
+                                    // A powered hold: IDLE has no position
+                                    // authority to keep the standoff with.
+                                    link.send(RtCommand::SetMode(Mode::Exec));
                                     break 'stream;
                                 }
                                 // Off the standoff: place it again, from rest
@@ -3618,8 +3667,10 @@ pub(crate) fn housekeeping_loop(
                                 a.servo_target = None;
                                 a.standoff = Some(Standoff::Braking {
                                     goal: la,
+                                    refused_motion: None,
                                     until_tick: snap.tick + standoff_budget_ticks(dt),
                                 });
+                                a.world_epoch = gate.lock().unwrap().epoch();
                                 a.deadline = now + servo_grace;
                                 continue 'housekeeping;
                             }
@@ -3682,6 +3733,7 @@ pub(crate) fn housekeeping_loop(
                                 collision_stop(&link, &gate, "servo", pairs);
                                 a.standoff = Some(Standoff::Braking {
                                     goal: la,
+                                    refused_motion: None,
                                     until_tick: snap.tick + standoff_budget_ticks(dt),
                                 });
                                 a.servo_target = None;
@@ -3732,7 +3784,10 @@ pub(crate) fn housekeeping_loop(
                         }
                         // Keep the RT stream watchdog fed between client
                         // datagrams (its timeout is shorter than the grace).
-                        if let Some(t) = a.servo_target {
+                        if let Some(t) = a
+                            .servo_target
+                            .filter(|_| !a.parked || snap.mode == Mode::Stream)
+                        {
                             stream_input.lock().unwrap().send(&StreamSetpoint {
                                 q: t,
                                 speed: a.scale.0,
@@ -3814,7 +3869,13 @@ pub(crate) fn housekeeping_loop(
                                         }
                                         Ok(Some(pairs)) => {
                                             collision_stop(&link, &gate, "jog_l", pairs);
-                                            refused_at = Some(la);
+                                            // The motion actually stopped: a
+                                            // released or reversed jog still
+                                            // carries the approach it braked.
+                                            refused_at = Some((
+                                                la,
+                                                world_motion(&mut kin, &before, &la).ok(),
+                                            ));
                                         }
                                         Err(e) => {
                                             // Stop without a collision verdict:
@@ -3843,15 +3904,17 @@ pub(crate) fn housekeeping_loop(
                         }
                         // Braked, then placed on the standoff, as a joint
                         // jog is.
-                        if let Some(goal) = refused_at {
+                        if let Some((goal, refused_motion)) = refused_at {
                             a.kind = StreamKind::Servo;
                             a.cart = None;
                             a.releasing = false;
                             a.servo_target = None;
                             a.standoff = Some(Standoff::Braking {
                                 goal,
+                                refused_motion,
                                 until_tick: snap.tick + standoff_budget_ticks(dt),
                             });
+                            a.world_epoch = gate.lock().unwrap().epoch();
                             a.deadline = now + servo_grace;
                             continue 'housekeeping;
                         }
@@ -4291,9 +4354,43 @@ pub(crate) fn project_cart_jog(
     probe: &mut CartJogProbe,
     dt_s: f64,
 ) -> Result<([f64; MAX_JOINTS], [f64; MAX_JOINTS]), String> {
-    let mut v = probe.twist;
-    if probe.frame == par6_proto::Frame::Trf {
-        let pose = kin.fk(&probe.q)?;
+    let v = world_cart_twist(kin, &probe.q, probe.twist, probe.frame)?;
+    let qd = kin.twist_to_qd(&probe.q, &v)?;
+    for (j, q) in probe.q.iter_mut().enumerate() {
+        *q = (*q + qd[j] * dt_s).clamp(probe.soft_min[j], probe.soft_max[j]);
+    }
+    Ok((probe.q, qd))
+}
+
+/// World-frame tool motion `[linear, angular]` from `from` to `to`.
+fn world_motion(
+    kin: &mut crate::kin::CartKin,
+    from: &[f64; MAX_JOINTS],
+    to: &[f64; MAX_JOINTS],
+) -> Result<[f64; 6], String> {
+    use par6_motion::cart::{se3_inverse, se3_log, se3_mul, translation};
+    let a = kin.fk(from)?;
+    let b = kin.fk(to)?;
+    let w = se3_log(&se3_mul(&b, &se3_inverse(&a)));
+    let (ta, tb) = (translation(&a), translation(&b));
+    Ok([
+        tb[0] - ta[0],
+        tb[1] - ta[1],
+        tb[2] - ta[2],
+        w[3],
+        w[4],
+        w[5],
+    ])
+}
+
+fn world_cart_twist(
+    kin: &mut crate::kin::CartKin,
+    q: &[f64; MAX_JOINTS],
+    mut v: [f64; 6],
+    frame: par6_proto::Frame,
+) -> Result<[f64; 6], String> {
+    if frame == par6_proto::Frame::Trf {
+        let pose = kin.fk(q)?;
         let rot = |vec: [f64; 3]| {
             [
                 pose[0] * vec[0] + pose[1] * vec[1] + pose[2] * vec[2],
@@ -4305,11 +4402,7 @@ pub(crate) fn project_cart_jog(
         let ang = rot([v[3], v[4], v[5]]);
         v = [lin[0], lin[1], lin[2], ang[0], ang[1], ang[2]];
     }
-    let qd = kin.twist_to_qd(&probe.q, &v)?;
-    for (j, q) in probe.q.iter_mut().enumerate() {
-        *q = (*q + qd[j] * dt_s).clamp(probe.soft_min[j], probe.soft_max[j]);
-    }
-    Ok((probe.q, qd))
+    Ok(v)
 }
 
 #[cfg(test)]

@@ -43,6 +43,13 @@ fn a_swapped_bus_re_runs_the_boot_sequence_and_drops_the_old_arms_state() {
         rig.core
             .replace_bus(LoopbackBus::new())
             .expect("the loopback backend configures");
+        // The boot gate discards the old bus's identity; the new bus must
+        // report the fitted tool itself.
+        let configured = bundle();
+        rig.core.bus_mut().report_tool(
+            configured.robot.bus.gripper_node,
+            configured.active_tool().unwrap().can_tool_id.unwrap(),
+        );
 
         // Immediately after: a different arm, and the core says so rather
         // than carrying the old one's beliefs into the new readings.
