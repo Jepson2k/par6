@@ -992,7 +992,9 @@ ExecStart=
 ExecStart=/usr/local/bin/par6d --sim
 ```
 
-`--sim` runs unprivileged with no SCHED_FIFO and no CPU pin.
+`--sim` asks for the same `SCHED_FIFO` priority and core. Where the box refuses
+`SCHED_FIFO` it warns and runs unpinned at ordinary priority, since a thread
+held to one core at ordinary priority cannot move off it when that core is busy.
 
 ### 4. Post-install check
 

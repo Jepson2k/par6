@@ -529,9 +529,11 @@ pub struct RtCore<B: DriverBus> {
     // Consecutive-failure streaks drive the disconnect latch below.
     bus_tx_failures: u32,
     /// Scheduling setup outcome recorded by the run loop (SCHED_FIFO
-    /// applied, CPU pinned) — published through `LoopStats`.
+    /// applied, CPU pinned) — published through `LoopStats` — and whether
+    /// the setup has run at all.
     rt_fifo: bool,
     rt_pinned: bool,
+    rt_sched_recorded: bool,
     /// Per-node self-heal one-shot (indexed by error index): armed while
     /// the node is fresh, fired once when it goes stale/lost, re-armed on
     /// recovery.
@@ -793,6 +795,7 @@ impl<B: DriverBus> RtCore<B> {
             bus_tx_failures: 0,
             rt_fifo: false,
             rt_pinned: false,
+            rt_sched_recorded: false,
             self_heal_armed: [true; crate::NUM_NODES],
             bus_rx_failures: 0,
             config_resend_failures: 0,
@@ -1077,6 +1080,12 @@ impl<B: DriverBus> RtCore<B> {
     pub fn record_rt_sched(&mut self, fifo: bool, pinned: bool) {
         self.rt_fifo = fifo;
         self.rt_pinned = pinned;
+        self.rt_sched_recorded = true;
+    }
+
+    /// Whether the run loop has set its thread's scheduling up yet.
+    pub fn rt_sched_recorded(&self) -> bool {
+        self.rt_sched_recorded
     }
 
     /// Shutdown phase 1: force the standing halt. Any working mode drops
