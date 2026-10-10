@@ -5,7 +5,6 @@
 use par6_bus::{Freshness, GripperState, LinkHealth, NodeState};
 use par6_config::MAX_IO_LINES;
 
-use crate::drift_lock::DriftLockStatus;
 use crate::gripper_settle::ToolStatus;
 use crate::{MAX_JOINTS, NUM_NODES};
 
@@ -15,9 +14,8 @@ pub enum Mode {
     /// Startup: bus scan + selfcheck, then requests IDLE.
     #[default]
     Booting,
-    /// At rest. Homed ∧ enabled ∧ grav-on = torque-only gravity hold
-    /// (the `[freedrive]` drift lock, when configured, re-holds a still
-    /// arm's pose on top of it); otherwise active zero-velocity/zero-current.
+    /// At rest. Homed ∧ enabled ∧ grav-on = torque-only gravity hold;
+    /// otherwise active zero-velocity/zero-current.
     Idle,
     /// Hard-error latch state: active zero-velocity hold, DISABLED.
     ActiveError,
@@ -259,9 +257,10 @@ pub enum HomingPhase {
     Backoff = 3,
     /// Pausing between passes.
     Pause = 4,
-    /// Releasing to the reference position.
+    /// Easing off the endstop under the configured release current.
     Release = 5,
-    /// Waiting for the reading to settle / latch.
+    /// Coming to rest after the hit, then waiting for the reading to
+    /// settle / latch.
     Settle = 6,
     /// Driving the configured post-home move.
     PostMove = 7,
@@ -532,11 +531,11 @@ pub struct StateSnapshot {
     pub jog: JogStatus,
     /// Streaming live state.
     pub stream: StreamStatus,
-    /// Freedrive drift-lock live state (all zero unless configured on).
-    pub drift_lock: DriftLockStatus,
     /// Node ids that have answered on the bus this boot (bit per id):
     /// the boot scan plus every frame since, configured or not.
     pub bus_nodes: u16,
+    /// The bus is a simulation (see `DriverBus::simulated`).
+    pub bus_simulated: bool,
     /// Bumped once each `RescanBus` has pinged every id and settled.
     pub bus_scan_epoch: u32,
     /// The opt-in tick profile (all zero unless switched on).
@@ -609,8 +608,8 @@ impl Default for StateSnapshot {
             exec: ExecStatus::default(),
             jog: JogStatus::default(),
             stream: StreamStatus::default(),
-            drift_lock: DriftLockStatus::default(),
             bus_nodes: 0,
+            bus_simulated: false,
             bus_scan_epoch: 0,
             tick_profile: TickProfile::default(),
             io_lines: [0; MAX_IO_LINES],

@@ -30,6 +30,7 @@ below works on a laptop and in CI.
 - [Development setup](#development-setup)
 - [Deploying to the control box](#deploying-to-the-control-box)
 - [Known divergences from parol6](#known-divergences-from-parol6)
+- [Stop and failure policy](#stop-and-failure-policy)
 - [Safety notes](#safety-notes)
 - [License](#license)
 
@@ -62,6 +63,7 @@ running the command in its `run:` line:
 | `pixi run lint` | `cargo fmt --check` and `clippy -D warnings` |
 | `pixi run test-rust` | `cargo test` |
 | `pixi run test-timing` | the shipped 250 Hz soak, release |
+| `pixi run test-stream-timing` | the streaming collision workflow at 250 Hz, release |
 | `pixi run test-collision-cost` | the per-waypoint collision cost, uncaptured |
 | `pixi run install-python` | `pip install -e python[dev]` |
 | `pixi run lint-python` | pre-commit (ruff, ruff-format, ty, hygiene) |
@@ -209,7 +211,7 @@ Waldo Commander (NiceGUI frontend, unchanged)
    └─ RT thread (SCHED_FIFO 99, alloc-free): fixed-rate tick (`tick_dt_s`, shipped
         250 Hz) — CAN RX → state → gravity comp G(q) → mode dispatch → CAN TX →
         state snapshot
-   bus backends: SocketCAN (Spectral/STEPFOC) | closed-loop dynamics sim (Pinocchio ABA)
+   bus backends: SocketCAN (Spectral/STEPFOC) | closed-loop dynamics sim (MuJoCo)
 ```
 
 There is one numerics stack. Kinematics, dynamics and collision run on **Pinocchio and
@@ -235,7 +237,7 @@ daemon runs, so a preview cannot disagree with the runtime — it *is* the runti
 | `crates/par6-py` | the `par6._par6` Python extension (PyO3 over par6-client + the preview) |
 | `cpp/` | the Pinocchio/coal/TOPPRA C-ABI shim |
 | `python/` | the `par6` pip package (waldoctl backend) |
-| `python/par6/_data/` | generated copy of `config/` + the URDF/MJCF assets, written by `scripts/sync_pkg_data.py` and enforced fresh by a test: edit `config/PAR6.toml`, never this. A consumer hashing the packaged model (WC's simulation case reports do) sees those hashes change whenever the config does, including when a stale copy is brought back into line |
+| `python/par6/_data/` | the runtime config (`config/` is a symlink to `_data/config/`) + the URDF/MJCF assets, copied by `scripts/sync_pkg_data.py` and enforced fresh by a test. A consumer hashing the packaged model (WC's simulation case reports do) sees those hashes change whenever the config or the assets do |
 | `python/par6/panel/` | the control box front panel service (`par6-panel`) and the preflight check (`par6-preflight`) |
 | `assets/` | PAR6 URDF, SRDF and meshes from Source Robotics — see `assets/NOTICE` |
 
@@ -338,11 +340,7 @@ One tick, in order:
    one source.
 4. **Mode dispatch** — one of IDLE / HOMING / JOG / STREAM / EXEC / SAFETY_STOP /
    FLASHING produces this tick's setpoints. IDLE on a homed, enabled arm with
-   gravity comp on is freedrive: torque-only `G(q)`, no position hold. The opt-in
-   `[freedrive] drift_lock` re-holds the pose once the arm has been still (the
-   drive's impedance frame plus a clamped integral) and lets go the tick a joint
-   moves, so a slightly wrong gravity model stops sagging the arm without the
-   operator ever fighting a hold.
+   gravity comp on is freedrive: torque-only `G(q)`, no position hold.
 5. **CAN TX** — one motion pack per joint, plus any queued control frame.
 6. **Snapshot** — publish state to the command plane's reader slot.
 
@@ -406,6 +404,7 @@ re-freeze. See `CLAUDE.md`.
 | `RUCKIG` (default) | jerk-limited point-to-point and streaming; the profile blends are built on |
 | `TRAPEZOID` | velocity-limited point-to-point |
 | `QUINTIC` | point-to-point with zero velocity **and** acceleration at both ends; no cruise, does not blend |
+| `SEPTIC` | point-to-point with zero velocity, acceleration **and** jerk at both ends, jerk-limited; no cruise, does not blend |
 | `TOPPRA` | time-optimal retiming of a cartesian waypoint path |
 
 Every cartesian move rides one pipeline: the geometry produces a pose list, seeded IK
@@ -455,9 +454,10 @@ may not **add** one. Planned paths are walked at 0.02 rad joint pitch along the
 same interpolant used for fractional-speed playback, including every joint
 turning point. Soft limits are checked at those extrema as well as the stored
 samples. World changes recheck the remaining interpolated path, including while
-paused. Streams are
-projected one velocity-scaled lookahead ahead, so a faster jog stops further from
-contact.
+paused. A stream is refused once where it would come to rest, if released now,
+reaches the clearance; the arm is then braked and placed on the clearance, so a
+refused jog rests on it at any speed, and a jog held toward the keep-out leaves it
+there.
 
 Colliding geometry is reported in waldoctl's vocabulary: bare URDF link names for the
 arm and tool, `shape:<name>` for a program keep-out, `install:<name>` for an
@@ -670,6 +670,7 @@ Precedence throughout is **CLI flag > `PAR6_*` environment variable > robot TOML
 | Variable | Effect |
 |---|---|
 | `PAR6_CONFIG` | robot TOML path (`--config`) |
+| `PAR6_LOCAL_CONFIG` | this arm's local overlay (`--local-config`; default `local.toml` beside the robot TOML) |
 | `PAR6_ASSETS` | `par6_description` tree with the URDFs (`--assets`) |
 | `PAR6_COMMAND_PORT` | command UDP port; `0` = ephemeral (`--port`) |
 | `PAR6_BIND` | command-socket bind address (`--bind`) |
@@ -757,6 +758,65 @@ is the misreading a test is there to catch, so `python/tests/test_firmware.py`
 covers the CRC, the frame layout and what a release must refuse, and stops
 there. A bench flash is part of bringing up a new drive; treat an image that
 has never been flashed on hardware as untested.
+
+### Local overlay
+
+The shipped `PAR6.toml` describes the PAR6: vendor gains and limits except
+where the PAR6 itself needs otherwise (each such value says why), no gravity
+correction, and a floor at the mounting plane as its only keep-out. What one
+arm measured about itself — its
+calibration, the tool bolted on, the bench it stands on — lives in a
+`local.toml` holding only the keys it changes, layered over the shipped file
+at load by `par6d` and the Python client alike. It is the
+file beside the robot TOML (`/etc/par6/local.toml` on the control box), or
+the one `--local-config` / `PAR6_LOCAL_CONFIG` names.
+
+Tables merge key by key. An array of named tables (`[[joints]]`,
+`[[installation_shapes]]`) merges entry by entry by `name`, so an overlay sets
+one joint's gain or adds one shape without restating the rest; every entry it
+writes must carry the `name` it changes. `[[homing.joints]]`, one entry per
+joint, merges by position, so an empty entry leaves that joint as shipped. Any
+other value — an ordered list like `[[homing.sequence]]` included — replaces
+the shipped one whole. A tool file layers the same way: a `[[tools]]` entry
+named after the tool merges over that tool's file, and an entry for a tool no
+file defines is refused.
+
+```toml
+[robot]
+active_tool = "MSG_small_motor_200mm_rail"
+
+[[joints]]
+name = "joint2"
+[joints.gains]
+kiv = 0.0005
+
+# The bench this arm stands on, in place of the shipped floor.
+[[installation_shapes]]
+name = "floor"
+kind = "box"
+params = [6.0, 6.0, 0.2]
+pose = [0.0, 0.0, -0.11, 0.0, 0.0, 0.0]
+
+[[tools]]
+name = "MSG_small_motor_200mm_rail"
+[tools.driver]
+ilim_ma = 900.0
+```
+
+The runtime reports the merged config to clients, the tool files included, so
+a client rebuilding it from `CONFIG_BUNDLE` gets this arm's values, and
+`par6d --check-config` names both files it loaded.
+
+### The simulator
+
+The simulator is meant to be useful, not exact: collisions, picking up and
+carrying objects, payload, and the arm's give under load, with the arm's
+measured friction and wind-up stiffness (`[sim] transmission_stiffness_nm_rad`
+is a spring between each motor, where the encoder reads, and its link). It does
+not reproduce the arm's current ripple or vibration, and gains are never tuned
+in it. `continuous = true` in `[joints.limits]` marks a joint with no mechanical
+endstop (J6, Hall-homed): its software window bounds travel, one turn on J6, and
+`hard_min_rad`/`hard_max_rad` are only the homing-search envelope.
 
 ### The bus-grant signal
 
@@ -929,18 +989,29 @@ Layout after install:
 |---|---|
 | `/usr/local/bin/par6d` | the runtime binary |
 | `/usr/local/lib/par6/*.so` | the Pinocchio shim + its runtime closure (rpath target) |
-| `/etc/par6/PAR6.toml` | robot config (`PAR6_CONFIG` in the unit) |
+| `/etc/par6/PAR6.toml` | robot config as shipped (`PAR6_CONFIG` in the unit) |
 | `/etc/par6/grippers/*.toml` | gripper configs |
+| `/etc/par6/local.toml` | this arm's own values, layered over the robot config (yours; no install writes it) |
 | `/usr/share/par6/par6_description` | URDF/meshes — the kinematics and collision models |
 | `/etc/systemd/system/par6d.service` | the unit |
 | `/var/lib/par6` | `StateDirectory`, the working directory |
 
-An existing `/etc/par6/*.toml` is **kept** on re-install (tuning survives
-upgrades); pass `--force-config` to overwrite. `--no-restart` installs without
-touching the running service.
+The shipped config is **replaced** on every install, so an upgrade never runs
+a stale copy; a file that differs is kept beside it as
+`*.previous-<timestamp>`. This arm's calibration and installation live in
+`/etc/par6/local.toml`, which no install writes (see *Local overlay*). Until
+that file exists, an install refuses to replace a `PAR6.toml` that differs
+from the shipped one: move the arm's own values into `local.toml` first, or
+create it empty if the arm has none. `--no-restart` installs without touching
+the running service.
 
-> Restarting `par6d` stops the arm and clears the queue. `install.sh` stops the
-> service before swapping the binary unless `--no-restart` is given.
+> Restarting `par6d` clears the queue and, on a homed and enabled arm, first
+> drives it to its park pose (`[shutdown] safe_park`, on in the shipped config):
+> every joint at once at `velocity_limit_rad_s`, the shoulder and elbow onto
+> their endstops, with no keep-out or contact check on the way. Clear the arm's
+> path, or set `safe_park = false` in `local.toml`, before restarting it near
+> a fixture. `install.sh` stops the service before swapping the binary unless
+> `--no-restart` is given.
 
 ### 3. The unit
 
@@ -1062,9 +1133,25 @@ Deliberate, and unlikely to change:
 
 Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
 
+## Stop and failure policy
+
+- **Anything that moves the arm reads the e-stop line** (ESTOP_1) every control tick, and
+  refuses to start if it cannot.
+- **In normal operation an e-stop or any failure holds the arm where it is**, under power:
+  the runtime drops to ACTIVE_ERROR, a zero-velocity hold, and nothing moves until the
+  operator resets. Holding under power is a protective stop (IEC 60204-1 category 2); an
+  emergency stop is category 0 or 1 by that standard, but the PAR6 has no brakes, and
+  removing power would drop the arm.
+- **A normal shutdown puts the arm down**: `par6d` retreats to its safe park, the shoulder
+  and elbow onto their homing endstops, then goes limp (`[shutdown] safe_park`).
+- **A dead daemon or CAN link drops the arm.** Each drive's own watchdog idles it; the
+  firmware has no hold action. This is the accepted exception.
+
 ## Safety notes
 
-- **Restarting `par6d` stops the arm and clears the queue.** `scripts/deploy/install.sh`
+- **Restarting `par6d` parks the arm, then clears the queue.** A homed, enabled arm
+  drives to its park pose on exit (`[shutdown] safe_park`, on in the shipped
+  config) with no keep-out or contact check on the way. `scripts/deploy/install.sh`
   stops the service before swapping the binary unless `--no-restart` is given.
 - **A refused command is not a stopped arm.** Fire-and-forget refusals latch as the
   standing error; check `error()` or the STATUS broadcast rather than assuming a send
@@ -1073,7 +1160,12 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
   `reset()` does not return until the RT has actually answered, because "the enable was
   queued" is not "the arm will move".
 - **Homing references the arm.** Planned motion is refused before it; jogging is not, so
-  an arm can be driven clear of an obstruction before it is referenced.
+  an arm can be driven clear of an obstruction before it is referenced. A completed
+  sequence is still refused when the ready-pose holding torque contradicts the gravity
+  model by more than `homing.reference_check_nm` (a stall seek that latched short of its
+  endstop); the joint reports `HOMING_FAILED` in its `Finished` phase. A boot scan that
+  hears no drive at all cycles the CAN interface once and re-scans before latching
+  `CAN_LOST` — the signature of a controller that came up error-passive.
 - **aarch64 kinematics are built but not validated** — the shim's numerics have never
   been executed on that ISA ([#31](https://github.com/Jepson2k/par6/issues/31)).
 - The vendor runtime (RCB-Runtime) and the Spectral firmware are GPL: they are

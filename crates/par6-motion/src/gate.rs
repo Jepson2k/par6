@@ -144,24 +144,21 @@ mod tests {
             .collect()
     }
 
-    /// A profile that saturates its acceleration limit exactly is a
-    /// correct profile, and the gate has to let it through — otherwise
-    /// the tolerance is doing nothing and every hard move is refused.
+    /// The gate lets a profile that rides its limit exactly through —
+    /// otherwise the tolerance does nothing and every hard move is
+    /// refused — and refuses a stream that steps hard at one interior
+    /// sample, naming the worst step (the first of equals), each joint
+    /// judged against its own limit.
     #[test]
-    fn a_stream_that_rides_the_limit_is_allowed_through() {
+    fn the_gate_passes_the_limit_and_names_the_worst_step_past_it() {
         let limits = [4.0; NUM_JOINTS];
         let ramp: Vec<f64> = (0..50).map(|k| k as f64 * 4.0 * DT).collect();
         assert!(check_commanded_accel(rows(&ramp), &limits, DT, ACCEL_TOLERANCE).is_ok());
-    }
 
-    /// The failure the gate exists for: a stream that is fine on average
-    /// and fine at its endpoints, but steps hard at one interior sample.
-    #[test]
-    fn one_bulging_sample_refuses_the_whole_stream() {
-        let limits = [4.0; NUM_JOINTS];
-        let mut ramp: Vec<f64> = (0..50).map(|k| k as f64 * 4.0 * DT).collect();
-        ramp[30] += 0.5; // a spike between two otherwise legal samples
-        let err = check_commanded_accel(rows(&ramp), &limits, DT, ACCEL_TOLERANCE)
+        // Fine on average and at its endpoints, one spike in between.
+        let mut spiked = ramp.clone();
+        spiked[30] += 0.5;
+        let err = check_commanded_accel(rows(&spiked), &limits, DT, ACCEL_TOLERANCE)
             .expect_err("the spike must be refused");
         let MotionError::CommandedAccelExceeded {
             joint,
@@ -178,41 +175,35 @@ mod tests {
             "should name the value it saw: {commanded}"
         );
         assert!((limit - 4.0).abs() < 1e-12);
-    }
 
-    /// It reports the worst offender, not the first one it walks past —
-    /// the number an operator needs is how far out the stream got.
-    #[test]
-    fn the_reported_violation_is_the_worst_one() {
-        let limits = [4.0; NUM_JOINTS];
-        let mut ramp: Vec<f64> = vec![0.0; 40];
-        ramp[10] = 0.1;
-        ramp[11] = 0.1;
-        ramp[20] = 0.4;
-        ramp[21] = 0.4;
-        let err = check_commanded_accel(rows(&ramp), &limits, DT, ACCEL_TOLERANCE)
-            .expect_err("both steps are past the limit");
-        let MotionError::CommandedAccelExceeded { sample, .. } = err else {
-            panic!("wrong error: {err}");
+        // The worst offender, not the first one walked past: the number
+        // an operator needs is how far out the stream got. Of equal
+        // steps, the first.
+        let worst = |steps: &[(usize, f64)]| {
+            let mut v = vec![0.0; 40];
+            for &(k, x) in steps {
+                v[k] = x;
+            }
+            match check_commanded_accel(rows(&v), &limits, DT, ACCEL_TOLERANCE) {
+                Err(MotionError::CommandedAccelExceeded { sample, .. }) => sample,
+                other => panic!("both steps are past the limit: {other:?}"),
+            }
         };
-        assert_eq!(sample, 20, "the 0.4 step is four times the 0.1 one");
-    }
+        assert_eq!(worst(&[(10, 0.1), (11, 0.1), (20, 0.4), (21, 0.4)]), 20);
+        assert_eq!(worst(&[(20, 0.4), (30, -0.4)]), 20, "a tie names the first");
 
-    /// Each joint is judged against its own limit, so a slow joint's
-    /// legal step is not measured against a fast joint's budget.
-    #[test]
-    fn joints_are_judged_against_their_own_limits() {
+        // A slow joint's step is measured against its own budget.
         let mut limits = [4.0; NUM_JOINTS];
         limits[1] = 0.5;
         let step = 0.01; // 2.5 rad/s^2 over one tick
-        let mut a = [0.0; NUM_JOINTS];
         let mut b = [0.0; NUM_JOINTS];
         b[0] = step;
-        assert!(check_commanded_accel(vec![a, b], &limits, DT, ACCEL_TOLERANCE).is_ok());
-        a[1] = 0.0;
-        b = [0.0; NUM_JOINTS];
+        assert!(
+            check_commanded_accel(vec![[0.0; NUM_JOINTS], b], &limits, DT, ACCEL_TOLERANCE).is_ok()
+        );
+        let mut b = [0.0; NUM_JOINTS];
         b[1] = step;
-        let err = check_commanded_accel(vec![a, b], &limits, DT, ACCEL_TOLERANCE)
+        let err = check_commanded_accel(vec![[0.0; NUM_JOINTS], b], &limits, DT, ACCEL_TOLERANCE)
             .expect_err("joint 1 cannot take that step");
         let MotionError::CommandedAccelExceeded { joint, .. } = err else {
             panic!("wrong error: {err}");

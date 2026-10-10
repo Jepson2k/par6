@@ -16,6 +16,7 @@
 #include <Eigen/Dense>
 
 #include <cmath>
+#include <cstddef>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -547,5 +548,31 @@ par6_status par6_kin_set_tool(par6_kin *h, double mass, const double *com3,
 }
 
 int32_t par6_shim_abi_version(void) { return PAR6_SHIM_ABI_VERSION; }
+
+int32_t par6_shim_layout(uint64_t *out, int32_t n) {
+    const uint64_t layout[] = {
+        sizeof(par6_tool_params),
+        offsetof(par6_tool_params, transform),
+        offsetof(par6_tool_params, mass),
+        offsetof(par6_tool_params, com),
+        offsetof(par6_tool_params, inertia),
+        sizeof(par6_shape),
+        offsetof(par6_shape, kind),
+        offsetof(par6_shape, n_params),
+        offsetof(par6_shape, params),
+        offsetof(par6_shape, pose),
+        offsetof(par6_shape, margin),
+        sizeof(par6_shape_placement),
+        offsetof(par6_shape_placement, name),
+        offsetof(par6_shape_placement, parent_frame),
+        offsetof(par6_shape_placement, allowed_contacts),
+        offsetof(par6_shape_placement, n_allowed_contacts),
+    };
+    const int32_t count = static_cast<int32_t>(sizeof(layout) / sizeof(layout[0]));
+    for (int32_t i = 0; i < count && i < n; ++i) {
+        out[i] = layout[i];
+    }
+    return count;
+}
 
 } // extern "C"

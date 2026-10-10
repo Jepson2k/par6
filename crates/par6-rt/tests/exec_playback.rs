@@ -1,6 +1,6 @@
 //! EXEC ring playback through the full core: all three completion
-//! policies, the blend-continues bypass, the strict-timeout error, pause
-//! semantics, and the exec link watchdog.
+//! policies, the strict-timeout error, pause semantics, and the exec link
+//! watchdog.
 
 mod common;
 
@@ -10,22 +10,28 @@ use par6_rt::{
 };
 
 /// Push `n` samples for command `index` ramping J0 from `from` by `step`
-/// per sample; `blend` marks every sample's segment as blending onward;
-/// `last` marks the final sample as the program end.
-fn push_cmd(rig: &mut Rig, index: u32, from: f64, step: f64, n: usize, blend: bool, last: bool) {
+/// per sample; `last` marks the final sample as the program end.
+fn push_cmd(rig: &mut Rig, index: u32, from: f64, step: f64, n: usize, last: bool) {
+    push_samples(rig, index, from, step, 0.0, n, last);
+}
+
+/// [`push_cmd`] with each sample carrying velocity `qd0` on J0 — a
+/// program that moves as its samples say it does.
+fn push_samples(rig: &mut Rig, index: u32, from: f64, step: f64, qd0: f64, n: usize, last: bool) {
     let mut q = rig.pose;
+    let mut qd = [0.0; MAX_JOINTS];
+    qd[0] = qd0;
     for k in 0..n {
         q[0] = from + step * (k + 1) as f64;
         let s = Sample {
             q,
-            qd: [0.0; MAX_JOINTS],
+            qd,
             tau_ff: [0.0; MAX_JOINTS],
             inertia_velocity: [0.0; MAX_JOINTS],
             start: None,
             meta: SampleMeta {
                 command_index: index,
                 checkpoint_id: index,
-                blend_continues: blend,
                 is_last: last && k == n - 1,
             },
         };
@@ -53,7 +59,7 @@ fn playback_pops_one_sample_per_tick_and_holds_when_starved() {
     let mut rig = Rig::new();
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0, 0.001, 10, false, false);
+    push_cmd(&mut rig, 1, q0, 0.001, 10, false);
     let start = rig.snap().tick;
     rig.tick_n(15);
 
@@ -83,8 +89,8 @@ fn commanded_policy_completes_at_the_last_sample_without_holding() {
     let q0 = rig.pose[0];
     // Target far from the measured pose: a settling policy would hold
     // here; commanded must not.
-    push_cmd(&mut rig, 1, q0, 0.02, 5, false, false);
-    push_cmd(&mut rig, 2, q0 + 0.1, 0.02, 5, false, true);
+    push_cmd(&mut rig, 1, q0, 0.02, 5, false);
+    push_cmd(&mut rig, 2, q0 + 0.1, 0.02, 5, true);
     let start = rig.snap().tick;
     rig.tick_n(13);
 
@@ -107,10 +113,10 @@ fn settled_policy_holds_until_tracking_then_resumes() {
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
     let target = q0 + 0.05;
-    push_cmd(&mut rig, 1, q0, 0.01, 5, false, false);
+    push_cmd(&mut rig, 1, q0, 0.01, 5, false);
     // Command 2 holds at the same target so its own final settle can
     // complete once the measured pose tracks.
-    push_cmd(&mut rig, 2, target, 0.0, 5, false, true);
+    push_cmd(&mut rig, 2, target, 0.0, 5, true);
     rig.tick_n(8);
 
     // Boundary reached with the measured pose 0.05 rad off: settling.
@@ -140,14 +146,29 @@ fn settled_policy_holds_until_tracking_then_resumes() {
     assert!(!s.error_active);
 }
 
+/// The configured settle window, in ticks at the rig's rate.
+fn settle_timeout(rig: &Rig) -> u32 {
+    (common::bundle().robot.motion.settle_timeout_s / rig.dt).round() as u32
+}
+
 #[test]
 fn settled_timeout_completes_without_error_strict_timeout_latches() {
-    // Settled: 500-tick timeout then complete anyway.
+    // Settled: the configured timeout, then complete anyway — and not a
+    // tick before it.
     let mut rig = Rig::new();
     enter_exec(&mut rig);
+    let timeout = settle_timeout(&rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, false, true);
-    rig.tick_n(4 + 500 + 5);
+    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, true);
+    rig.tick_n(4);
+    assert!(rig.snap().exec.settling, "the ring has run out: settling");
+    rig.tick_n(timeout - 2);
+    let s = rig.snap();
+    assert!(
+        s.exec.settling && s.exec.completed_index == 0,
+        "still inside the window"
+    );
+    rig.tick_n(4);
     let s = rig.snap();
     assert_eq!(s.exec.completed_index, 1, "timeout completes under settled");
     assert!(!s.error_active, "settled timeout is NOT an error");
@@ -157,8 +178,10 @@ fn settled_timeout_completes_without_error_strict_timeout_latches() {
     let mut rig = Rig::with_policy(CompletionPolicy::Strict);
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, false, true);
-    rig.tick_n(4 + 500 + 5);
+    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, true);
+    rig.tick_n(4 + timeout - 2);
+    assert!(!rig.snap().error_active, "strict: still inside the window");
+    rig.tick_n(4);
     let s = rig.snap();
     let latched = s
         .errors
@@ -191,16 +214,19 @@ fn settled_timeout_completes_without_error_strict_timeout_latches() {
 fn strict_settle_faults_on_stalled_progress_not_on_elapsed_time() {
     let mut rig = Rig::with_policy(CompletionPolicy::Strict);
     enter_exec(&mut rig);
+    let timeout = settle_timeout(&rig);
+    // Progress means closing by a tenth of the settle tolerance.
+    let floor = common::bundle().robot.motion.settle_tolerance_rad * 0.1;
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, false, true);
+    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, true);
     rig.tick_n(4);
     assert!(rig.snap().exec.settling, "the ring has run out: settling");
-    // Closing by 0.002 rad every 300 ticks: every step clears the
-    // progress floor (0.001 rad) inside the 500-tick timeout, so the
-    // clock keeps restarting although the move takes 9000 ticks.
+    // Closing by a little more than the floor every three fifths of the
+    // timeout: every step is progress inside the window, so the clock
+    // keeps restarting although the move takes eighteen windows.
     for k in 1..=30 {
-        rig.pose[0] = q0 + 0.002 * f64::from(k);
-        rig.tick_n(300);
+        rig.pose[0] = q0 + 1.2 * floor * f64::from(k);
+        rig.tick_n(timeout * 3 / 5);
         let s = rig.snap();
         assert!(
             !s.error_active,
@@ -214,16 +240,16 @@ fn strict_settle_faults_on_stalled_progress_not_on_elapsed_time() {
     assert_eq!(s.exec.completed_index, 1, "the slow settle completes");
     assert!(!s.error_active);
 
-    // Dithering by 0.0004 rad about the same spot never clears the floor:
-    // no progress, and the timeout latches.
+    // Dithering by under half the floor about the same spot never
+    // clears it: no progress, and the timeout latches.
     let mut rig = Rig::with_policy(CompletionPolicy::Strict);
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, false, true);
+    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, true);
     rig.tick_n(4);
     for k in 1..=6 {
-        rig.pose[0] = q0 + 0.0004 * f64::from(k % 2);
-        rig.tick_n(100);
+        rig.pose[0] = q0 + 0.4 * floor * f64::from(k % 2);
+        rig.tick_n(timeout / 5);
     }
     let s = rig.snap();
     assert!(
@@ -237,73 +263,98 @@ fn strict_settle_faults_on_stalled_progress_not_on_elapsed_time() {
 }
 
 #[test]
-fn blend_continues_bypasses_settling_across_the_boundary() {
-    let mut rig = Rig::new(); // Settled policy — the bypass must win
-    enter_exec(&mut rig);
-    let q0 = rig.pose[0];
-    // Command 1 blends into command 2; targets far from measured, so
-    // only the bypass can keep motion continuous.
-    push_cmd(&mut rig, 1, q0, 0.02, 5, true, false);
-    push_cmd(&mut rig, 2, q0 + 0.1, 0.02, 5, false, true);
-    let start = rig.snap().tick;
-    rig.tick_n(12);
-
-    let pos = j0_positions(&mut rig, start + 1);
-    let expected: Vec<i32> = (1..=10)
-        .map(|k| rig.conv[0].motor_ticks(q0 + 0.02 * k as f64))
-        .collect();
-    // No hold tick at the 1→2 boundary: blended corners stay
-    // velocity-continuous even under the settled policy.
-    assert_eq!(&pos[..10], &expected[..], "continuous through the blend");
-    let s = rig.snap();
-    assert_eq!(
-        s.exec.completed_index, 1,
-        "cmd 1 completed via blend bypass"
-    );
-    // The final (non-blended) boundary settles normally — measured is
-    // far off, so playback is holding there.
-    assert!(s.exec.settling, "final boundary settles under the policy");
-}
-
-#[test]
 fn pause_holds_in_place_with_the_ring_untouched() {
     let mut rig = Rig::new();
-    enter_exec(&mut rig);
-    let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0, 0.0, 1000, false, false);
-    rig.tick_n(10);
+    let transition = (common::bundle()
+        .robot
+        .motion
+        .execution_override_transition_s
+        / rig.dt)
+        .round() as u32;
+    let feed = |rig: &mut Rig, n: u32| {
+        for _ in 0..n {
+            rig.handles.heartbeat.feed();
+            rig.tick();
+        }
+    };
 
+    // A pause requested before a program starts stands: the operator who
+    // paused an idle arm expects the next program to begin held.
+    rig.ready();
     rig.cmd(RtCommand::ExecSetPaused(true));
-    for _ in 0..300 {
-        rig.handles.heartbeat.feed();
-        rig.tick();
-        if rig.snap().exec.paused {
+    rig.cmd(RtCommand::SetMode(Mode::Exec));
+    rig.tick();
+    assert_eq!(rig.snap().mode, Mode::Exec);
+    let q0 = rig.pose[0];
+    let step = 0.0005;
+    let qd0 = step / rig.dt;
+    push_samples(&mut rig, 1, q0, step, qd0, 3000, false);
+    rig.tick();
+    let before = rig.snap().exec.samples_remaining;
+    feed(&mut rig, 30);
+    let s = rig.snap();
+    assert!(s.exec.paused, "the standing pause survives EXEC entry");
+    assert_eq!(
+        s.exec.samples_remaining, before,
+        "playback must not consume the ring while paused"
+    );
+
+    // Un-pausing resumes playback, up to full speed.
+    rig.cmd(RtCommand::ExecSetPaused(false));
+    for _ in 0..4 * transition {
+        if rig.snap().exec.applied_scale == 1.0 {
             break;
         }
+        feed(&mut rig, 1);
+    }
+    assert_eq!(rig.snap().exec.applied_scale, 1.0, "back to full speed");
+    let before = rig.snap().q_commanded[0];
+    feed(&mut rig, 1);
+    assert!(
+        (rig.snap().q_commanded[0] - before - step).abs() < 1e-9,
+        "playback runs a sample a tick once resumed"
+    );
+
+    // Pausing a MOVING program ramps the speed down over the configured
+    // transition — never in a step, never backwards — and then holds
+    // where it stopped, with the ring untouched.
+    rig.cmd(RtCommand::ExecSetPaused(true));
+    let mut prev_q = rig.snap().q_commanded[0];
+    let mut prev_dq = step;
+    let mut ticks = 0;
+    while !rig.snap().exec.paused {
+        assert!(ticks <= 4 * transition, "the pause never reached a hold");
+        feed(&mut rig, 1);
+        ticks += 1;
+        let q = rig.snap().q_commanded[0];
+        let dq = q - prev_q;
+        assert!(
+            dq >= -1e-12 && dq <= prev_dq + 1e-12,
+            "tick {ticks}: the pause stepped from {prev_dq} to {dq} rad a tick"
+        );
+        prev_q = q;
+        prev_dq = dq;
     }
     assert!(
-        rig.snap().exec.paused,
-        "bounded deceleration reaches a hold"
+        ticks >= transition / 2,
+        "the pause stopped in {ticks} ticks against a {transition}-tick transition"
     );
-    let before = rig.snap().exec.samples_remaining;
-    let held = rig.last_joints()[0].pos.unwrap();
-    rig.tick_n(30);
+    let held = rig.snap();
+    let remaining = held.exec.samples_remaining;
+    feed(&mut rig, 30);
     let s = rig.snap();
     assert!(s.exec.paused);
     assert_eq!(
-        s.exec.samples_remaining, before,
+        s.exec.samples_remaining, remaining,
         "ring untouched while paused"
     );
-    assert_eq!(rig.last_joints()[0].pos.unwrap(), held, "holds in place");
+    assert_eq!(s.q_commanded[0], held.q_commanded[0], "holds in place");
     assert_eq!(rig.last_joints()[0].vel, Some(0), "zero velocity hold");
 
     rig.cmd(RtCommand::ExecSetPaused(false));
-    for _ in 0..300 {
-        rig.handles.heartbeat.feed();
-        rig.tick();
-    }
+    feed(&mut rig, transition + 20);
     assert!(
-        rig.snap().exec.samples_remaining < before,
+        rig.snap().exec.samples_remaining < remaining,
         "playback resumed"
     );
 
@@ -325,30 +376,37 @@ fn pause_holds_in_place_with_the_ring_untouched() {
 
 #[test]
 fn exec_link_watchdog_latches_after_heartbeat_silence_with_samples_pending() {
-    let mut rig = Rig::new();
-    enter_exec(&mut rig);
-    let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0, 0.0001, 2000, false, false);
+    for dt in [0.004, 0.01] {
+        let mut rig = Rig::at_tick_dt(dt);
+        enter_exec(&mut rig);
+        let silence = (par6_rt::EXEC_HEARTBEAT_TIMEOUT_S / dt).round() as u32;
+        let q0 = rig.pose[0];
+        push_cmd(&mut rig, 1, q0, 0.0001, 2000, false);
+        let lost = |rig: &mut Rig| {
+            rig.snap()
+                .errors
+                .as_slice()
+                .iter()
+                .any(|e| e.code == ErrorCode::ExecLinkLost)
+        };
 
-    // Fed heartbeat: no error while playing.
-    for _ in 0..200 {
-        rig.handles.heartbeat.feed();
-        rig.tick();
+        // Fed heartbeat: no error while playing.
+        for _ in 0..2 * silence {
+            rig.handles.heartbeat.feed();
+            rig.tick();
+        }
+        assert!(!rig.snap().error_active, "heartbeat keeps the link alive");
+
+        // Silence a little short of the timeout does not latch; past it,
+        // with samples still pending, EXEC_LINK_LOST does.
+        rig.tick_n(silence - 2);
+        assert!(!lost(&mut rig), "dt {dt}: latched before the timeout");
+        rig.tick_n(4);
+        let s = rig.snap();
+        assert!(lost(&mut rig), "dt {dt}: link watchdog latched");
+        assert!(s.error_active);
+        assert_eq!(s.mode, Mode::ActiveError);
     }
-    assert!(!rig.snap().error_active, "heartbeat keeps the link alive");
-
-    // 0.5 s of silence while samples are pending: EXEC_LINK_LOST latches.
-    rig.tick_n(130);
-    let s = rig.snap();
-    assert!(
-        s.errors
-            .as_slice()
-            .iter()
-            .any(|e| e.code == ErrorCode::ExecLinkLost),
-        "link watchdog latched"
-    );
-    assert!(s.error_active);
-    assert_eq!(s.mode, Mode::ActiveError);
 }
 
 /// A finished program leaves EXEC holding the last sample under the
@@ -361,7 +419,7 @@ fn gravity_comp_after_a_finished_program_floats_instead_of_holding() {
     let mut rig = Rig::with_policy(CompletionPolicy::Commanded);
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0, 0.02, 8, false, true);
+    push_cmd(&mut rig, 1, q0, 0.02, 8, true);
     rig.tick_n(3);
     assert_eq!(rig.snap().mode, Mode::Exec);
 
@@ -403,43 +461,6 @@ fn gravity_comp_after_a_finished_program_floats_instead_of_holding() {
     );
 }
 
-/// A pause requested before a program starts stands: the operator who
-/// paused an idle arm expects the next program to begin held, not to
-/// run because EXEC entry wiped the request.
-#[test]
-fn a_pause_requested_while_idle_holds_the_next_program() {
-    let mut rig = Rig::new();
-    rig.ready();
-    rig.cmd(RtCommand::ExecSetPaused(true));
-    rig.cmd(RtCommand::SetMode(Mode::Exec));
-    rig.tick();
-    assert_eq!(rig.snap().mode, Mode::Exec);
-    let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0, 0.001, 100, false, false);
-    rig.tick();
-    let before = rig.snap().exec.samples_remaining;
-    rig.tick_n(30);
-    let s = rig.snap();
-    assert!(s.exec.paused, "the standing pause survives EXEC entry");
-    assert_eq!(
-        s.exec.samples_remaining, before,
-        "playback must not consume the ring while paused"
-    );
-
-    rig.cmd(RtCommand::ExecSetPaused(false));
-    for _ in 0..300 {
-        rig.handles.heartbeat.feed();
-        rig.tick();
-        if rig.snap().exec.samples_remaining < before {
-            break;
-        }
-    }
-    assert!(
-        rig.snap().exec.samples_remaining < before,
-        "un-pausing resumes playback"
-    );
-}
-
 /// `stop()` on a moving program: the arm brakes ALONG the path — never
 /// reversing, never stepping — at no more than the joint acceleration
 /// limit, then holds where the brake ended with the rest of the program
@@ -472,7 +493,6 @@ fn a_stop_brakes_along_the_path_within_the_acceleration_limit_then_holds() {
             meta: SampleMeta {
                 command_index: 1,
                 checkpoint_id: 1,
-                blend_continues: false,
                 is_last: k == 1999,
             },
         };
@@ -567,7 +587,6 @@ fn a_jog_cutting_a_stop_short_leaves_nothing_for_the_hold_to_play() {
             meta: SampleMeta {
                 command_index: 1,
                 checkpoint_id: 1,
-                blend_continues: false,
                 is_last: k == 1999,
             },
         };

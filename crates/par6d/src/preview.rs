@@ -14,6 +14,7 @@ mod run;
 pub use record::TickBatch;
 pub use run::RunLimits;
 
+use crate::planner::PlannerSwap;
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
@@ -39,7 +40,6 @@ use par6_server::{
     QueuedCommand, ServerConfig, ShapeLayer,
 };
 
-use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{
     housekeeping_period, project_cart_jog, step_cart_jog, step_cart_servo, CartJogProbe,
     CartJogState, CartServoState, CoreLink, CoreOp, StreamGate,
@@ -48,6 +48,7 @@ use crate::daemon::{load_preview_kin, DaemonError};
 use crate::kin::{matrix_to_xyzrpy, CartKin};
 use crate::options::{resolve_config_path, Options};
 use crate::planner::{profile_names, Par6Planner, PlannedMotion, PlannerKin};
+use par6_rt::adapters::{MotionJog, MotionStream};
 use plan::PlanRecorder;
 
 /// Braking time a stream preview allows beyond the motion itself before it
@@ -151,9 +152,24 @@ pub struct ServoPreview {
     pub q: Vec<[f64; MAX_JOINTS]>,
     /// Commanded joint velocities per tick \[rad/s\].
     pub qd: Vec<[f64; MAX_JOINTS]>,
+    /// Nominal stopping projections of commanded positions, assuming ideal tracking.
+    pub q_stop: Vec<[f64; MAX_JOINTS]>,
+    /// Nominal stopping projections of the submitted targets, as checked by ServoJ.
+    pub target_stop: Vec<[f64; MAX_JOINTS]>,
     /// The tick the limiter first reported the LAST target reached, if
     /// it did inside the window.
     pub finished_tick: Option<usize>,
+}
+
+/// A tool's `calibrate` hold and jaw-move grace, in ticks.
+fn tool_ticks(tool: Option<&par6_config::ToolConfig>, dt: f64) -> (u64, u64) {
+    let driver = tool.and_then(|g| g.driver.as_ref());
+    (
+        driver.map_or(0, |d| (d.settle.calibrate_min_wait_s / dt).round() as u64),
+        driver.map_or(0, |d| {
+            ((d.settle.command_grace_s / dt).round() as u64).max(2)
+        }),
+    )
 }
 
 /// The offline session: a virtual arm plus the runtime's planner,
@@ -190,6 +206,10 @@ pub struct Preview {
     /// (`driver.settle.command_grace_s`, at least two): the floor on how
     /// long any tool action takes, however short its travel.
     tool_grace_ticks: u64,
+    /// The tool registry a `select_tool` looks its settle times up in.
+    bundle: Arc<par6_config::ConfigBundle>,
+    /// Where the planner leaves the models it rebuilt for a new tool.
+    tool_swap: crate::bridge::ToolMailbox,
     /// Queued moves waiting for the successor they blend into, each with
     /// its span in the commanded record.
     held: session::BlendQueue<(usize, Command)>,
@@ -276,16 +296,14 @@ impl Preview {
         };
         let config_path =
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
-        let bundle = par6_config::ConfigBundle::load(&config_path)?;
+        let (bundle, _) =
+            crate::options::load_config(&config_path, opts.local_config.as_deref(), None)?;
         let robot = &bundle.robot;
-        let stack = load_preview_kin(&opts, &config_path, robot, bundle.active_gripper())?;
-        let gripper_driver = bundle.active_gripper().and_then(|g| g.driver.as_ref());
-        let tool_calibrate_hold_ticks = gripper_driver.map_or(0, |d| {
-            (d.settle.calibrate_min_wait_s / robot.robot.tick_dt_s).round() as u64
-        });
-        let tool_grace_ticks = gripper_driver.map_or(0, |d| {
-            ((d.settle.command_grace_s / robot.robot.tick_dt_s).round() as u64).max(2)
-        });
+        let stack = load_preview_kin(&opts, &config_path, robot, bundle.active_tool())?;
+        let (tool_calibrate_hold_ticks, tool_grace_ticks) =
+            tool_ticks(bundle.active_tool(), robot.robot.tick_dt_s);
+        let tool_swap = crate::bridge::ToolMailbox::default();
+        let shared = Arc::new(bundle.clone());
 
         let (cmds_tx, cmds_rx) = mpsc::channel();
         let (ops_tx, ops_rx) = mpsc::channel();
@@ -303,9 +321,17 @@ impl Preview {
                 collision: stack.collision,
                 tool_offset: stack.tool_offset,
             },
+            PlannerSwap {
+                source: stack.source,
+                bundle: Arc::clone(&shared),
+                tools: Arc::clone(&tool_swap),
+            },
         )?;
 
-        let mut snap = StateSnapshot::default();
+        let mut snap = StateSnapshot {
+            bus_simulated: true,
+            ..Default::default()
+        };
         for (out, rad) in snap.q.iter_mut().zip(robot.robot.park_pose_rad.iter()) {
             *out = *rad;
         }
@@ -339,6 +365,8 @@ impl Preview {
             ready_pose,
             tool_calibrate_hold_ticks,
             tool_grace_ticks,
+            bundle: shared,
+            tool_swap,
             held: session::BlendQueue::default(),
             profile: cfg.initial_profile.clone(),
             tool: cfg.fitted_tool.clone(),
@@ -366,6 +394,7 @@ impl Preview {
             gate: StreamGate::new(
                 stack.gate_collision,
                 &jog_limits,
+                &robot.jog,
                 crate::daemon::position_loop_gains(robot),
                 robot.robot.tick_dt_s,
             ),
@@ -688,6 +717,8 @@ impl Preview {
         let mut out = ServoPreview {
             q: Vec::with_capacity(targets.len() * hold),
             qd: Vec::with_capacity(targets.len() * hold),
+            q_stop: Vec::with_capacity(targets.len() * hold),
+            target_stop: Vec::with_capacity(targets.len() * hold),
             finished_tick: None,
         };
         let last = targets.len().saturating_sub(1);
@@ -700,6 +731,9 @@ impl Preview {
                 if i == last && out.finished_tick.is_none() && self.stream.at_target() {
                     out.finished_tick = Some(out.q.len());
                 }
+                out.q_stop.push(self.gate.motion_lookahead(&q, &qd));
+                out.target_stop
+                    .push(self.gate.motion_lookahead(target, &qd));
                 out.q.push(q);
                 out.qd.push(qd);
             }
@@ -1220,10 +1254,10 @@ impl Preview {
         fractions[..NUM_JOINTS].copy_from_slice(&speeds);
         // The runtime admits a jog only if where it will be one lookahead
         // horizon ahead clears the world (`RtBridge`'s jog admission).
-        if let Some(error) = self.jog_blocked(&fractions) {
+        let scale = accel.unwrap_or(1.0);
+        if let Some(error) = self.jog_blocked(&fractions, scale) {
             return self.refuse(error);
         }
-        let scale = accel.unwrap_or(1.0);
         self.jog.set_accel_scale(scale);
         self.jog_accel_scale = scale;
         // The RT ramps from rest on JOG mode ENTRY, not per datagram: a
@@ -1238,12 +1272,48 @@ impl Preview {
         let ticks = ((duration_s / self.dt).round() as usize).max(1);
         let mut q = self.snap.q;
         let mut trajectory = Vec::with_capacity(ticks);
+        let mut refused = None;
         for _ in 0..ticks {
             let mut q_out = [0.0; MAX_JOINTS];
             let mut qd_out = [0.0; MAX_JOINTS];
             self.jog.tick(&q, &mut q_out, &mut qd_out);
             q = q_out;
             trajectory.push(q);
+            // The runtime's per-tick re-check, from the motion the jog has.
+            if let Ok((la, Some(pairs))) = self.gate.jog_verdict(&q, &q, &qd_out, &fractions, scale)
+            {
+                refused = Some((pairs, la));
+                break;
+            }
+        }
+        if let Some((pairs, goal)) = refused {
+            // Braked, then placed on the standoff, as the runtime does;
+            // the stop latches the verdict STATUS reports.
+            self.gate.refuse(pairs);
+            self.jog.release();
+            for _ in 0..((10.0 / self.dt) as usize) {
+                let mut q_out = [0.0; MAX_JOINTS];
+                let mut qd_out = [0.0; MAX_JOINTS];
+                self.jog.tick(&q, &mut q_out, &mut qd_out);
+                q = q_out;
+                trajectory.push(q);
+                if qd_out.iter().all(|v| *v == 0.0) {
+                    break;
+                }
+            }
+            self.jog_streaming = false;
+            if let Ok(stop) = self.gate.standoff(&q, &goal) {
+                while q
+                    .iter()
+                    .zip(stop.iter())
+                    .any(|(a, b)| (a - b).abs() > crate::bridge::STANDOFF_ARRIVED_RAD)
+                {
+                    q = crate::bridge::creep_toward(&q, &stop);
+                    trajectory.push(q);
+                }
+            }
+            let rows = trajectory.len();
+            return self.finish_stream(trajectory, trajectory_duration(rows, self.dt));
         }
         self.finish_stream(trajectory, trajectory_duration(ticks, self.dt))
     }
@@ -1374,12 +1444,12 @@ impl Preview {
     /// The runtime's jog admission check: where the commanded speeds put
     /// the arm one lookahead horizon from here must not collide, or from
     /// inside a keep-out must not deepen it.
-    fn jog_blocked(&mut self, fractions: &[f64; MAX_JOINTS]) -> Option<WireError> {
+    fn jog_blocked(&mut self, fractions: &[f64; MAX_JOINTS], accel: f64) -> Option<WireError> {
         let q = self.snap.q;
-        let la = self.gate.jog_lookahead(&q, fractions);
-        match self.gate.blocked(&q, &la) {
-            Ok(Some(pairs)) => Some(self.gate.refuse(pairs)),
-            Ok(None) => None,
+        let qd = crate::bridge::jog_velocity(&self.snap);
+        match self.gate.jog_verdict(&q, &q, &qd, fractions, accel) {
+            Ok((_, Some(pairs))) => Some(self.gate.refuse(pairs)),
+            Ok((_, None)) => None,
             Err(e) => Some(e),
         }
     }
@@ -1724,14 +1794,35 @@ impl Preview {
             // the line changes, as the runtime's post-effect drives it.
             Command::WriteIo(p) => self.io_levels[usize::from(p.port)] = p.value,
             Command::SelectTool(p) => {
-                // A variant carries its own TCP frame: a real change clears
-                // the offset, a re-selection leaves it alone.
-                if p.variant_key != self.tool_variant {
+                let tool = self.cfg.fit_tool(&p.tool_name);
+                // A tool or variant carries its own TCP frame: a real change
+                // clears the offset, a re-selection leaves it alone.
+                if p.variant_key != self.tool_variant || tool != self.tool {
                     self.invalidate_attachments();
                     self.tcp_offset_mm = [0.0; 3];
                     self.tcp_rotation_deg = [0.0; 3];
                 }
                 self.tool_variant = p.variant_key.clone();
+                self.tool = tool;
+                // The planner rebuilt its own models when it took the
+                // command; the jog solver and the stream gate are this
+                // session's to adopt, as the bridge's threads do live.
+                if let Ok(mut swap) = self.tool_swap.lock() {
+                    if let Some(kin) = swap.housekeeping.take() {
+                        self.cart = kin;
+                    }
+                    if let Some(c) = swap.gate_collision.take() {
+                        self.gate.set_collision(c);
+                    }
+                    swap.bridge = None;
+                }
+                let fitted = self
+                    .bundle
+                    .tools
+                    .iter()
+                    .find(|g| g.name.eq_ignore_ascii_case(&self.tool));
+                (self.tool_calibrate_hold_ticks, self.tool_grace_ticks) =
+                    tool_ticks(fitted, self.dt);
                 self.sync_planner();
             }
             Command::ToolAction(p) => match p.action.as_str() {

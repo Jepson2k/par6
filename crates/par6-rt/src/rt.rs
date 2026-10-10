@@ -81,20 +81,37 @@ impl<B: DriverBus> RtCore<B> {
 
     /// Deliberate exit path, run ONCE after the final `run()` returns on
     /// process shutdown (not on the op-application breaks): the
-    /// configured retreat to the rest pose (off unless `[shutdown]
-    /// safe_park` asks for it; its timeout logs and moves on), then halt
+    /// configured retreat to the rest pose (`[shutdown] safe_park`, on by
+    /// default; a joint-space move with no keep-out or contact check, and
+    /// its timeout logs and moves on), then halt
     /// to IDLE and tick until the arm measures at rest (bounded by
     /// [`SHUTDOWN_SETTLE_BUDGET_S`]), then one SAFETY_STOP tick so the
     /// last frame on the bus idles the drives on purpose. In FLASHING
     /// the bus is silent by contract and the whole sequence is skipped.
+    /// Ticks are paced in real time.
     pub fn shutdown_stop(&mut self) {
+        let dt_ns = (self.tick_dt_s() * 1e9).round() as u64;
+        let mut deadline = monotonic_ns();
+        self.shutdown_stop_paced(|| {
+            deadline += dt_ns;
+            let now = monotonic_ns();
+            if now < deadline {
+                sleep_until(deadline);
+            } else {
+                deadline = now;
+            }
+        });
+    }
+
+    /// [`Self::shutdown_stop`] with `pace` called after each tick that
+    /// leaves the arm still moving — the wall clock in production, nothing
+    /// under a virtual clock.
+    pub fn shutdown_stop_paced(&mut self, mut pace: impl FnMut()) {
         if self.mode() == crate::Mode::Flashing {
             return;
         }
         let dt = self.tick_dt_s();
-        let dt_ns = (dt * 1e9).round() as u64;
         if self.shutdown_park_begin() {
-            let mut deadline = monotonic_ns();
             let mut reached = false;
             for _ in 0..self.shutdown_park_timeout_ticks() {
                 if self.shutdown_park_feed() {
@@ -102,13 +119,7 @@ impl<B: DriverBus> RtCore<B> {
                     break;
                 }
                 self.tick(dt, false);
-                deadline += dt_ns;
-                let now = monotonic_ns();
-                if now < deadline {
-                    sleep_until(deadline);
-                } else {
-                    deadline = now;
-                }
+                pace();
             }
             if !reached {
                 log::warn!("shutdown: retreat timed out; halting where the arm is");
@@ -117,19 +128,12 @@ impl<B: DriverBus> RtCore<B> {
         }
         let budget = (SHUTDOWN_SETTLE_BUDGET_S / dt).ceil() as u32;
         self.shutdown_halt();
-        let mut deadline = monotonic_ns();
         for _ in 0..budget {
             self.tick(dt, false);
             if self.at_rest() {
                 break;
             }
-            deadline += dt_ns;
-            let now = monotonic_ns();
-            if now < deadline {
-                sleep_until(deadline);
-            } else {
-                deadline = now;
-            }
+            pace();
         }
         self.shutdown_limp();
         self.tick(dt, false);
@@ -196,7 +200,7 @@ fn setup_realtime(opts: &RunOptions) -> (bool, bool) {
 /// would then run at ordinary priority — the one thing this setup exists
 /// to prevent. The ceiling the box allows is worth far more than the
 /// number the config named.
-fn permitted_priority(asked: u8, ceiling: Option<u8>) -> u8 {
+pub fn permitted_priority(asked: u8, ceiling: Option<u8>) -> u8 {
     match ceiling {
         Some(0) => {
             log::error!(
@@ -219,11 +223,24 @@ fn permitted_priority(asked: u8, ceiling: Option<u8>) -> u8 {
 }
 
 /// The highest SCHED_FIFO priority this process may ask for, from its
-/// soft `RLIMIT_RTPRIO`. `None` when the limit cannot be read, which is
-/// not a reason to refuse the request — it is only a reason not to lower
-/// it. An unlimited process reports the highest priority Linux has.
+/// soft `RLIMIT_RTPRIO`. `None` when the limit cannot be read or does not
+/// bind, which is not a reason to refuse the request — it is only a
+/// reason not to lower it. An unlimited process reports the highest
+/// priority Linux has.
+///
+/// Root reports `None` whatever the limit says, because `RLIMIT_RTPRIO`
+/// does not apply to a process holding CAP_SYS_NICE. That is not a corner
+/// case: `sudo` on this box hands the child `RLIMIT_RTPRIO` 0 where the
+/// invoking user had 98, so reading the limit literally would clamp every
+/// privileged run to priority 0 — which `setup_realtime` then declines to
+/// ask for, leaving the control loop at ordinary scheduling priority. A
+/// hardware run is exactly the case that is privileged.
 #[cfg(target_os = "linux")]
-fn rtprio_ceiling() -> Option<u8> {
+pub fn rtprio_ceiling() -> Option<u8> {
+    // SAFETY: geteuid reads process credentials and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        return None;
+    }
     let mut lim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -239,12 +256,12 @@ fn rtprio_ceiling() -> Option<u8> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rtprio_ceiling() -> Option<u8> {
+pub fn rtprio_ceiling() -> Option<u8> {
     None
 }
 
 #[cfg(unix)]
-fn set_fifo_priority(prio: u8) -> Result<(), String> {
+pub fn set_fifo_priority(prio: u8) -> Result<(), String> {
     use thread_priority::{
         set_thread_priority_and_policy, thread_native_id, RealtimeThreadSchedulePolicy,
         ThreadPriority, ThreadPriorityValue, ThreadSchedulePolicy,
@@ -259,12 +276,12 @@ fn set_fifo_priority(prio: u8) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn set_fifo_priority(_prio: u8) -> Result<(), String> {
+pub fn set_fifo_priority(_prio: u8) -> Result<(), String> {
     Err("SCHED_FIFO is unix-only".into())
 }
 
 #[cfg(target_os = "linux")]
-fn lock_memory() -> Result<(), String> {
+pub fn lock_memory() -> Result<(), String> {
     // SAFETY: mlockall takes only flags and touches no caller memory.
     if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } == 0 {
         Ok(())
@@ -274,12 +291,12 @@ fn lock_memory() -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn lock_memory() -> Result<(), String> {
+pub fn lock_memory() -> Result<(), String> {
     Err("mlockall is linux-only".into())
 }
 
 #[cfg(target_os = "linux")]
-fn pin_to_cpu(cpu: usize) -> Result<(), String> {
+pub fn pin_to_cpu(cpu: usize) -> Result<(), String> {
     // SAFETY: CPU_* macros operate on a locally owned, zeroed cpu_set_t;
     // sched_setaffinity(0, …) targets the calling thread only.
     unsafe {
@@ -295,12 +312,12 @@ fn pin_to_cpu(cpu: usize) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pin_to_cpu(_cpu: usize) -> Result<(), String> {
+pub fn pin_to_cpu(_cpu: usize) -> Result<(), String> {
     Err("CPU pinning is linux-only".into())
 }
 
 #[cfg(target_os = "linux")]
-fn monotonic_ns() -> u64 {
+pub fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -311,7 +328,7 @@ fn monotonic_ns() -> u64 {
 }
 
 #[cfg(target_os = "linux")]
-fn sleep_until(deadline_ns: u64) {
+pub fn sleep_until(deadline_ns: u64) {
     let ts = libc::timespec {
         tv_sec: (deadline_ns / 1_000_000_000) as libc::time_t,
         tv_nsec: (deadline_ns % 1_000_000_000) as libc::c_long,
@@ -330,7 +347,7 @@ fn sleep_until(deadline_ns: u64) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn monotonic_ns() -> u64 {
+pub fn monotonic_ns() -> u64 {
     use std::time::Instant;
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = *START.get_or_init(Instant::now);
@@ -338,7 +355,7 @@ fn monotonic_ns() -> u64 {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn sleep_until(deadline_ns: u64) {
+pub fn sleep_until(deadline_ns: u64) {
     let now = monotonic_ns();
     if deadline_ns > now {
         std::thread::sleep(std::time::Duration::from_nanos(deadline_ns - now));

@@ -57,9 +57,9 @@ fn respects_and_saturates_limits_on_multi_dof_path() {
     // Dense sweep: limits hold everywhere (small tolerance for the
     // discretized profile, same 1.001 factor toppra's own tests use), the
     // sampled position path is consistent with the sampled velocities, and
-    // the profile is tight — time-optimality saturates at least one
-    // constraint over most of the trajectory, which a merely-feasible
-    // conservative profile would fail.
+    // the profile is tight — time-optimality puts some constraint within
+    // 1 % of its limit nearly everywhere, which a profile built against
+    // even slightly conservative limits cannot.
     let m = 4000usize;
     let dt = dur / m as f64;
     let mut q_prev = vec![0.0; nq];
@@ -90,14 +90,14 @@ fn respects_and_saturates_limits_on_multi_dof_path() {
             );
             ratio = ratio.max(qd[j].abs() / vel[j]).max(qdd[j].abs() / acc[j]);
         }
-        if ratio >= 0.95 {
+        if ratio >= 0.99 {
             saturated += 1;
         }
         q_prev.copy_from_slice(&q);
     }
     let frac = saturated as f64 / m as f64;
     assert!(
-        frac > 0.6,
+        frac > 0.95,
         "only {frac:.2} of samples near a constraint — not time-optimal"
     );
 
@@ -105,7 +105,7 @@ fn respects_and_saturates_limits_on_multi_dof_path() {
     // numerical derivative of sampled q, and qdd that of qd (kinks at the
     // internal grid boundaries make the qd difference quotient off by up to
     // ~max_acc * h, jumps make the qdd one locally meaningless — hence the
-    // acc-scaled tolerance and the small outlier allowance).
+    // acc-scaled tolerance, and an allowance of one jump per joint).
     let h = dur / 200_000.0;
     let mut lo = vec![0.0; nq];
     let mut hi = vec![0.0; nq];
@@ -135,7 +135,7 @@ fn respects_and_saturates_limits_on_multi_dof_path() {
         }
     }
     assert!(
-        qdd_outliers < probes * nq / 20,
+        qdd_outliers <= nq,
         "qdd disagrees with d(qd)/dt at {qdd_outliers} of {} probes",
         probes * nq
     );

@@ -431,11 +431,10 @@ mod tests {
         let back = WireError::decode(&mut r).unwrap();
         r.finish().unwrap();
         assert_eq!(back, e);
-    }
 
-    #[test]
-    fn make_error_without_params_keeps_placeholders_visible() {
-        let e = make_error(ErrorCode::CommValidationError, UNATTRIBUTED, &[]);
-        assert!(e.cause.contains("{detail}"));
+        {
+            let e = make_error(ErrorCode::CommValidationError, UNATTRIBUTED, &[]);
+            assert!(e.cause.contains("{detail}"));
+        }
     }
 }

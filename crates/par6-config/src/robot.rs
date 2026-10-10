@@ -47,6 +47,22 @@ pub enum WatchdogAction {
 /// Cascade-PID and impedance-PD gains pushed to a driver at boot.
 ///
 /// Field names match the vendor XML tags (KPP/KPV/KIV/KPIQ/KIIQ/KP/KD),
+/// One harmonic of a joint's ripple feedforward: `a_ma cos(h phase) +
+/// b_ma sin(h phase)` \[mA\], phase being the rotor's electrical angle.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RippleHarmonic {
+    /// Harmonic of the electrical angle, 1 or more.
+    pub harmonic: u8,
+    /// Cosine amplitude \[mA\].
+    pub a_ma: i16,
+    /// Sine amplitude \[mA\].
+    pub b_ma: i16,
+}
+
+/// Most ripple harmonics a drive holds.
+pub const MAX_RIPPLE_HARMONICS: usize = 8;
+
 /// lowercased.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -119,11 +135,16 @@ pub struct ResolvedLimits {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct JointLimits {
-    /// Mechanical endstop, negative side \[rad\].
+    /// Mechanically continuous rotation; software travel limits still apply.
+    #[serde(default)]
+    pub continuous: bool,
+    /// Mechanical endstop, negative side [rad], or nominal homing-search
+    /// envelope for a continuous joint.
     pub hard_min_rad: f64,
-    /// Mechanical endstop, positive side \[rad\].
+    /// Mechanical endstop, positive side [rad], or nominal homing-search
+    /// envelope for a continuous joint.
     pub hard_max_rad: f64,
-    /// Software limit, negative side \[rad\]; must sit inside the hard limits.
+    /// Software limit, negative side \[rad\], in the homed coordinate frame.
     pub soft_min_rad: f64,
     /// Software limit, positive side \[rad\].
     pub soft_max_rad: f64,
@@ -147,6 +168,19 @@ pub struct JointLimits {
 }
 
 impl JointLimits {
+    /// The mechanical endstops \[rad\]; `None` on a continuous joint,
+    /// whose `hard_*` is only its homing-search envelope.
+    pub fn endstops(&self) -> Option<(f64, f64)> {
+        (!self.continuous).then_some((self.hard_min_rad, self.hard_max_rad))
+    }
+
+    /// How far the joint can be placed \[rad\]: its endstops, or the
+    /// software window where it has none.
+    pub fn travel_rad(&self) -> (f64, f64) {
+        self.endstops()
+            .unwrap_or((self.soft_min_rad, self.soft_max_rad))
+    }
+
     /// Resolve the limits one mode actually runs under, applying the
     /// fall-back-to-ceiling rule field by field.
     pub fn for_mode(&self, mode: LimitMode) -> ResolvedLimits {
@@ -230,6 +264,16 @@ pub struct JointConfig {
     pub sector_home_offset_rad: f64,
     /// Controller gains pushed at boot.
     pub gains: Gains,
+    /// Ripple feedforward pushed at boot (cmd 40, par6 firmware): the current
+    /// that cancels this joint's cogging and commutation ripple, as harmonics
+    /// of the rotor's electrical angle. Measured by `par6-selfcal`; empty
+    /// sends nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ripple: Vec<RippleHarmonic>,
+    /// The drive's speed filter length in control loops (cmd 41, par6
+    /// firmware), pushed at boot; omitted keeps the drive's own (20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub velocity_window: Option<u8>,
     /// Position limits + kinodynamic ceiling + per-mode blocks.
     pub limits: JointLimits,
 }
@@ -247,10 +291,15 @@ pub struct RobotSection {
     /// Standby pose the arm is parked in before torque-losing maintenance
     /// (firmware flashing) \[rad\], one entry per joint.
     pub park_pose_rad: Vec<f64>,
-    /// Name of the active gripper — must match a `grippers/*.toml` name.
-    /// Drives kt/stroke/homing offsets AND the driver type that firmware
-    /// flashing checks against.
-    pub active_gripper: String,
+    /// Name of the fitted tool — must match a `tools/*.toml` name. Drives
+    /// kt/stroke/homing offsets AND the driver type that firmware flashing
+    /// checks against.
+    ///
+    /// Not every tool is a gripper: the bare flange is a tool with no jaw
+    /// and no driver. The old `active_gripper` spelling still loads, so a
+    /// config already on disk keeps working.
+    #[serde(alias = "active_gripper")]
+    pub active_tool: String,
     /// Where torque constants come from at boot.
     pub kt_source: KtSource,
 }
@@ -455,34 +504,62 @@ fn default_config_resend_offsets_s() -> Vec<f64> {
 /// per-second attempt count from it.
 pub const MAX_OPEN_RETRY_S: f64 = 3600.0;
 
-/// Torque-level sim plant parameters (feature `sim-dynamics`): the
-/// motor-referred rotor dynamics the vendor models
-/// (robots/PAR6.py dynamics table — values only, no code). Reflected
-/// through each joint's dynamics gear ratio G as G²·jm (inertia),
-/// G²·b (viscous) and G·tc (Coulomb). Ignored by the kinematic plant
-/// and by hardware.
+/// Torque-level sim plant parameters (feature `sim-dynamics`): the rotor
+/// inertia the vendor models (robots/PAR6.py dynamics table — values
+/// only, no code), reflected through each joint's dynamics gear ratio G
+/// as G²·jm, and the friction each joint shows its drive, joint side, as
+/// `par6-selfcal` measures it. Ignored by the kinematic plant and by
+/// hardware.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SimConfig {
     /// Motor rotor inertia per joint \[kg·m², motor side\].
     pub motor_jm_kg_m2: Vec<f64>,
-    /// Motor viscous friction \[Nm·s/rad, motor side\], shared.
-    pub motor_b_nm_s: f64,
-    /// Motor Coulomb friction \[Nm, motor side\], shared.
-    pub motor_tc_nm: f64,
+    /// Viscous friction per joint \[Nm·s/rad, joint side\]. What damps a
+    /// velocity loop that is only marginal on inertia: with a shared
+    /// motor-side guess an eighth of the arm's, the simulated base
+    /// limit-cycled at the current rails whenever the arm was held
+    /// extended, where the arm itself holds still.
+    pub viscous_nm_s: Vec<f64>,
+    /// Coulomb friction per joint \[Nm, joint side\].
+    pub coulomb_nm: Vec<f64>,
     /// Assumed powered load support per joint \[Nm, joint side\]. This
     /// empirical fit is not a measured passive-friction or brake parameter.
     /// Supply-loss scenarios remove it when their supply envelope reaches zero.
     pub powered_support_nm: Vec<f64>,
+    /// Lateral stiffness of the arm's forks \[Nm/rad\]: passive hinges on
+    /// the shoulder's and elbow's driven bodies about the two axes their
+    /// joints do not turn, fitted to the base chirp's response. Approximate:
+    /// it gives the base's velocity loop the phase margin a rigid arm lacks
+    /// (rigid, the simulated base rings at the current rails on the gains
+    /// the arm runs quietly), not a located compliance. Zero removes the
+    /// hinges. The plant refuses a stiffness its physics step cannot
+    /// integrate.
+    pub arm_lateral_stiffness_nm_rad: f64,
+    /// Damping of those hinges \[Nm·s/rad\].
+    pub arm_lateral_damping_nm_s: f64,
+    /// Drivetrain stiffness between each motor (where the encoder reads)
+    /// and its link \[Nm/rad, joint side\]; 0 = rigid. Loaded, the link
+    /// lags the encoder by torque over stiffness, as the arm's does.
+    pub transmission_stiffness_nm_rad: Vec<f64>,
+    /// Damping ratio of each drivetrain's motor-against-spring mode.
+    pub transmission_damping_ratio: f64,
 }
 
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
             motor_jm_kg_m2: vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6],
-            motor_b_nm_s: 1.0e-4,
-            motor_tc_nm: 0.02,
+            // A reference arm's, as par6-selfcal measured it on 2026-10-01:
+            // the simulator's model of a PAR6, not any one arm's calibration.
+            viscous_nm_s: vec![0.29, 1.0, 0.34, 0.047, 0.023, 0.022],
+            coulomb_nm: vec![0.17, 0.95, 0.64, 0.066, 0.045, 0.079],
             powered_support_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
+            // Fitted to the bare-flange arm's 8/12 Hz response.
+            arm_lateral_stiffness_nm_rad: 317.0,
+            arm_lateral_damping_nm_s: 1.85,
+            transmission_stiffness_nm_rad: vec![230.0, 4000.0, 1300.0, 70.0, 50.0, 150.0],
+            transmission_damping_ratio: 0.5,
         }
     }
 }
@@ -723,13 +800,13 @@ impl Default for LimitsSection {
     }
 }
 
-/// The shutdown retreat: an opt-in slow drive to a rest pose before the
-/// drives are idled, so an arm left mid-air by a process exit does not
-/// drop from wherever it was when the terminal limp frame lands.
+/// The shutdown retreat: a slow drive to a rest pose before the drives
+/// are idled, so an arm left mid-air by a process exit does not drop
+/// from wherever it was when the terminal limp frame lands.
 ///
-/// Off by default: a retreat is a motion, and a motion on shutdown must
-/// be asked for. Durations are seconds; the runtime converts with
-/// `round(s / dt)`.
+/// On by default: an exit that leaves the arm limp where it stands is
+/// the exception to ask for. Durations are seconds; the runtime converts
+/// with `round(s / dt)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ShutdownConfig {
@@ -749,72 +826,22 @@ pub struct ShutdownConfig {
     /// `robot.park_pose_rad` the homing return targets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safe_park_q: Option<Vec<f64>>,
+    /// Joints parked on their homing endstop instead of at the rest pose:
+    /// the ones that hold the arm up, so that going limp afterwards lets
+    /// them rest on the stop instead of dropping.
+    #[serde(default)]
+    pub endstop_joints: Vec<u8>,
 }
 
 impl Default for ShutdownConfig {
     fn default() -> Self {
         Self {
-            safe_park: false,
+            safe_park: true,
             tolerance_rad: 0.03,
             timeout_s: 15.0,
             velocity_limit_rad_s: 0.25,
             safe_park_q: None,
-        }
-    }
-}
-
-/// The freedrive drift lock: a hold the IDLE gravity feedforward gains
-/// once the arm has been still, so an arm whose gravity model is
-/// slightly off stops drifting from wherever the operator leaves it
-/// instead of sagging or rising until something stops it.
-///
-/// After `settle_s` of stillness the pose is captured and each joint is
-/// sent the drive's impedance (PD) frame at that pose — the per-joint
-/// `gains.kp`/`gains.kd` the jog PD pack uses, closed inside the drive
-/// at its own loop rate — with `G(q)` plus a slow clamped integral
-/// (`ki_nm_rad_s`, `integral_limit_nm`) on the pose error as the
-/// feedforward. Any measured joint speed above `release_rad_s`
-/// dissolves the lock and zeroes the integral on that same tick, back to
-/// the torque-only freedrive frame, so an operator pushing the arm never
-/// fights the integral; stillness for `settle_s` re-arms it at the NEW
-/// pose. The job is "stop drifting from here", not "return to where you
-/// were": a pose the arm sagged to before the lock armed is the pose it
-/// keeps.
-///
-/// The integral is the only term the runtime adds and it is clamped per
-/// joint, so the worst case of a stale hold is the drive's configured
-/// impedance plus a bounded, known torque. The lock cannot hide a bad
-/// gravity model: a standing non-zero integral is the bias the model is
-/// missing, published on the snapshot and as the difference between the
-/// commanded and gravity torques.
-///
-/// Off by default. Durations are seconds; the runtime converts with
-/// `round(s / dt)`.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct FreedriveConfig {
-    /// Arm the drift lock in freedrive (IDLE, homed, enabled, gravity
-    /// compensation on).
-    pub drift_lock: bool,
-    /// Measured joint speed above which the lock dissolves \[rad/s\]; the
-    /// arm must stay under it for `settle_s` to (re-)arm.
-    pub release_rad_s: f64,
-    /// Stillness required before the lock captures the pose \[s\].
-    pub settle_s: f64,
-    /// Integral gain on the pose error \[Nm/(rad·s)\].
-    pub ki_nm_rad_s: f64,
-    /// Per-joint clamp on the integral \[Nm\].
-    pub integral_limit_nm: f64,
-}
-
-impl Default for FreedriveConfig {
-    fn default() -> Self {
-        Self {
-            drift_lock: false,
-            release_rad_s: 0.08,
-            settle_s: 0.3,
-            ki_nm_rad_s: 1.0,
-            integral_limit_nm: 0.3,
+            endstop_joints: Vec::new(),
         }
     }
 }
@@ -823,6 +850,13 @@ impl Default for FreedriveConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RobotConfig {
+    /// Observable gravity correction [mass, mx, my, mz] per moving body.
+    /// Does not change nominal inertias or the declared payload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gravity_correction: Vec<f64>,
+    /// Per-joint gravity feedforward trim. Does not change motor torque constants.
+    #[serde(default = "default_gravity_scale")]
+    pub gravity_scale: [f64; 6],
     /// Identity and global timing.
     pub robot: RobotSection,
     /// Arm joints, in kinematic order.
@@ -853,12 +887,9 @@ pub struct RobotConfig {
     /// disabled.
     #[serde(default)]
     pub limits: LimitsSection,
-    /// Shutdown retreat. Omitted = no retreat.
+    /// Shutdown retreat. Omitted = the retreat to the park pose.
     #[serde(default)]
     pub shutdown: ShutdownConfig,
-    /// Freedrive drift lock. Omitted = no lock.
-    #[serde(default)]
-    pub freedrive: FreedriveConfig,
     /// Motion feel constants. Omitted = the shipped defaults.
     #[serde(default)]
     pub motion: MotionConfig,
@@ -872,6 +903,10 @@ pub struct RobotConfig {
     /// wire can remove them. Omitted = none.
     #[serde(default)]
     pub installation_shapes: Vec<par6_proto::Shape>,
+}
+
+fn default_gravity_scale() -> [f64; 6] {
+    [1.0; 6]
 }
 
 impl RobotConfig {
@@ -902,12 +937,30 @@ impl RobotConfig {
     }
 
     /// The pose the shutdown retreat drives to \[rad\]: `shutdown.safe_park_q`
-    /// when set, else `robot.park_pose_rad`.
-    pub fn safe_park_q(&self) -> &[f64] {
-        self.shutdown
+    /// when set, else `robot.park_pose_rad`, with every
+    /// `shutdown.endstop_joints` entry replaced by that joint's homing
+    /// endstop (its `home_offset_rad`).
+    pub fn safe_park_q(&self) -> Vec<f64> {
+        let mut q = self
+            .shutdown
             .safe_park_q
-            .as_deref()
-            .unwrap_or(&self.robot.park_pose_rad)
+            .clone()
+            .unwrap_or_else(|| self.robot.park_pose_rad.clone());
+        for &j in &self.shutdown.endstop_joints {
+            let j = usize::from(j);
+            if let (Some(slot), Some(h)) = (q.get_mut(j), self.homing.joints.get(j)) {
+                *slot = h.home_offset_rad;
+            }
+        }
+        q
+    }
+
+    /// Whether the shutdown retreat parks `joint` on its homing endstop.
+    pub fn parks_on_endstop(&self, joint: usize) -> bool {
+        self.shutdown
+            .endstop_joints
+            .iter()
+            .any(|&j| usize::from(j) == joint)
     }
 
     /// Convert a config time constant in seconds to ticks:
@@ -924,6 +977,27 @@ impl RobotConfig {
 
     /// Validate the whole tree; every error names its field.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if (!self.gravity_correction.is_empty() && self.gravity_correction.len() != 24)
+            || self
+                .gravity_correction
+                .iter()
+                .any(|v| !v.is_finite() || v.abs() > 10.0)
+        {
+            return Err(invalid(
+                "gravity_correction",
+                "requires 24 finite composite-link coefficients (or empty), magnitude at most 10",
+            ));
+        }
+        if self
+            .gravity_scale
+            .iter()
+            .any(|v| !v.is_finite() || *v <= 0.0 || *v > 2.0)
+        {
+            return Err(invalid(
+                "gravity_scale",
+                "requires six finite gains in (0, 2]",
+            ));
+        }
         let r = &self.robot;
         if !(r.tick_dt_s > 0.0 && r.tick_dt_s < 1.0) {
             return Err(invalid("robot.tick_dt_s", "must be in (0, 1) seconds"));
@@ -950,6 +1024,14 @@ impl RobotConfig {
             self.validate_joint(i, j, &reserved)?;
         }
         self.homing.validate(self.joints.len())?;
+        for (i, (joint, home)) in self.joints.iter().zip(&self.homing.joints).enumerate() {
+            if joint.limits.continuous && home.strategy == crate::HomingStrategy::Stall {
+                return Err(invalid(
+                    format!("joints[{i}].limits.continuous"),
+                    "stall homing requires a mechanical endstop",
+                ));
+            }
+        }
         self.io.validate()?;
         self.validate_bus()?;
         self.validate_protocol()?;
@@ -958,7 +1040,6 @@ impl RobotConfig {
         self.validate_limits()?;
         self.validate_motion()?;
         self.validate_shutdown()?;
-        self.validate_freedrive()?;
         self.validate_sim()?;
         Ok(())
     }
@@ -983,6 +1064,9 @@ impl RobotConfig {
         }
         if self.joints[..i].iter().any(|o| o.node_id == j.node_id) {
             return Err(invalid(f("node_id"), "duplicate node id"));
+        }
+        if self.joints[..i].iter().any(|o| o.name == j.name) {
+            return Err(invalid(f("name"), "duplicate joint name"));
         }
         if !(1..=24).contains(&j.encoder_bits) {
             return Err(invalid(f("encoder_bits"), "must be in 1..=24"));
@@ -1021,6 +1105,20 @@ impl RobotConfig {
         if j.velocity_limit_ticks_s <= 0.0 {
             return Err(invalid(f("velocity_limit_ticks_s"), "must be > 0"));
         }
+        if j.velocity_window.is_some_and(|w| !(4..=64).contains(&w)) {
+            return Err(invalid(f("velocity_window"), "must be 4..=64"));
+        }
+        if j.ripple.len() > MAX_RIPPLE_HARMONICS {
+            return Err(invalid(f("ripple"), "at most 8 harmonics"));
+        }
+        for r in &j.ripple {
+            if r.harmonic == 0 {
+                return Err(invalid(f("ripple"), "harmonic must be 1 or more"));
+            }
+            if f64::from(r.a_ma).abs() > j.ilim_ma || f64::from(r.b_ma).abs() > j.ilim_ma {
+                return Err(invalid(f("ripple"), "amplitude beyond ilim_ma"));
+            }
+        }
         if j.watchdog_timeout_ms == 0 {
             return Err(invalid(f("watchdog_timeout_ms"), "must be > 0"));
         }
@@ -1037,11 +1135,8 @@ impl RobotConfig {
                 "soft_min must be < soft_max",
             ));
         }
-        // NOTE: soft ⊆ hard is deliberately NOT enforced. The soft window of a
-        // wrapping joint lives in an unwrapped frame that can exceed the
-        // endstop coordinates (PAR6 J6: hard ±2π, soft −0.85..7.14). Soft
-        // limits are the authoritative motion bound; hard limits record the
-        // mechanical endstop positions.
+        // Soft limits use the homed frame; they need not lie inside the
+        // nominal search envelope of a continuous joint (PAR6 J6).
         for (v, name) in [
             (l.velocity_rad_s, "limits.velocity_rad_s"),
             (l.acceleration_rad_s2, "limits.acceleration_rad_s2"),
@@ -1247,6 +1342,12 @@ impl RobotConfig {
         for (values, name) in [
             (&sim.motor_jm_kg_m2, "sim.motor_jm_kg_m2"),
             (&sim.powered_support_nm, "sim.powered_support_nm"),
+            (&sim.viscous_nm_s, "sim.viscous_nm_s"),
+            (&sim.coulomb_nm, "sim.coulomb_nm"),
+            (
+                &sim.transmission_stiffness_nm_rad,
+                "sim.transmission_stiffness_nm_rad",
+            ),
         ] {
             if values.len() != self.joints.len() {
                 return Err(invalid(name, "must carry one entry per joint"));
@@ -1258,11 +1359,33 @@ impl RobotConfig {
             }
         }
         for (v, name) in [
-            (sim.motor_b_nm_s, "sim.motor_b_nm_s"),
-            (sim.motor_tc_nm, "sim.motor_tc_nm"),
+            (
+                sim.arm_lateral_stiffness_nm_rad,
+                "sim.arm_lateral_stiffness_nm_rad",
+            ),
+            (sim.arm_lateral_damping_nm_s, "sim.arm_lateral_damping_nm_s"),
+            (
+                sim.transmission_damping_ratio,
+                "sim.transmission_damping_ratio",
+            ),
         ] {
             if !(v.is_finite() && v >= 0.0) {
                 return Err(invalid(name, "must be finite and >= 0"));
+            }
+        }
+        // A compliant drivetrain's rotor carries the reflected motor
+        // inertia alone; without it the spring has nothing to swing.
+        for (i, (k, jm)) in sim
+            .transmission_stiffness_nm_rad
+            .iter()
+            .zip(&sim.motor_jm_kg_m2)
+            .enumerate()
+        {
+            if *k > 0.0 && !is_positive(*jm) {
+                return Err(invalid(
+                    "sim.motor_jm_kg_m2",
+                    format!("entry {i}: must be > 0 on a joint with a drivetrain stiffness"),
+                ));
             }
         }
         for (i, j) in self.joints.iter().enumerate() {
@@ -1324,6 +1447,26 @@ impl RobotConfig {
                 return Err(invalid(name, "must be > 0"));
             }
         }
+        for &j in &s.endstop_joints {
+            let jh = self.homing.joints.get(usize::from(j)).ok_or_else(|| {
+                invalid(
+                    "shutdown.endstop_joints",
+                    format!("joint {j} does not exist ({} joints)", self.joints.len()),
+                )
+            })?;
+            if self.joints[usize::from(j)].limits.continuous {
+                return Err(invalid(
+                    "shutdown.endstop_joints",
+                    format!("joint {j}: a continuous joint has no mechanical endstop to park on"),
+                ));
+            }
+            if jh.home_offset_gripper_dependent {
+                return Err(invalid(
+                    "shutdown.endstop_joints",
+                    format!("joint {j}: its endstop depends on the fitted tool; only a fixed home_offset_rad can be a rest"),
+                ));
+            }
+        }
         let q = self.safe_park_q();
         if q.len() != self.joints.len() {
             return Err(invalid(
@@ -1336,35 +1479,18 @@ impl RobotConfig {
             ));
         }
         for (i, (v, j)) in q.iter().zip(&self.joints).enumerate() {
-            if !v.is_finite() || *v < j.limits.soft_min_rad || *v > j.limits.soft_max_rad {
+            // An endstop is the mechanical stop itself, outside the soft
+            // range by design; anything else rests inside it.
+            let (lo, hi, band) = if self.parks_on_endstop(i) {
+                (j.limits.hard_min_rad, j.limits.hard_max_rad, "hard")
+            } else {
+                (j.limits.soft_min_rad, j.limits.soft_max_rad, "soft")
+            };
+            if !v.is_finite() || *v < lo || *v > hi {
                 return Err(invalid(
                     "shutdown.safe_park_q",
-                    format!(
-                        "joint {i}: {v} rad is outside the soft limits [{}, {}]",
-                        j.limits.soft_min_rad, j.limits.soft_max_rad
-                    ),
+                    format!("joint {i}: {v} rad is outside the {band} limits [{lo}, {hi}]"),
                 ));
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_freedrive(&self) -> Result<(), ConfigError> {
-        let f = &self.freedrive;
-        for (v, name) in [
-            (f.release_rad_s, "freedrive.release_rad_s"),
-            (f.integral_limit_nm, "freedrive.integral_limit_nm"),
-        ] {
-            if !is_positive(v) {
-                return Err(invalid(name, "must be > 0"));
-            }
-        }
-        for (v, name) in [
-            (f.settle_s, "freedrive.settle_s"),
-            (f.ki_nm_rad_s, "freedrive.ki_nm_rad_s"),
-        ] {
-            if !v.is_finite() || v < 0.0 {
-                return Err(invalid(name, "must be finite and >= 0"));
             }
         }
         Ok(())

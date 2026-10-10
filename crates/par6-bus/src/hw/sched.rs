@@ -29,7 +29,7 @@ use crate::types::{Freshness, NodeId, PollAction, PollKind, MAX_NODES};
 /// Shared with [`crate::sim`], which schedules its polls on the same
 /// rhythm — the same reason [`FreshnessClock`] lives here rather than in
 /// each backend.
-pub(crate) const DEVICE_INFO_PERIOD_SLOTS: u64 = 1006;
+pub const DEVICE_INFO_PERIOD_SLOTS: u64 = 1006;
 
 /// What one poll slot resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,9 +45,10 @@ pub(super) enum PollStep {
     },
 }
 
-/// Round-robin telemetry schedule: each target gets temperature /
-/// voltage / errors once every `3 × targets` slots, a device-info sweep
-/// replaces the round robin for `targets` slots every
+/// Round-robin telemetry schedule: each target gets one combined
+/// telemetry poll per cycle, or temperature / voltage / errors in three
+/// slots when it runs a firmware without the combined reply; a
+/// device-info sweep replaces the round robin for `targets` slots every
 /// [`DEVICE_INFO_PERIOD_SLOTS`], and a single-slot override queue
 /// preempts everything.
 ///
@@ -56,6 +57,10 @@ pub(super) enum PollStep {
 #[derive(Debug, Default)]
 pub(super) struct PollScheduler {
     targets: usize,
+    /// Targets polled the vendor way, three kinds a cycle.
+    legacy: Vec<bool>,
+    /// One cycle of the round robin, rebuilt when a target's way changes.
+    cycle: Vec<(usize, PollKind)>,
     cursor: u64,
     slot: u64,
     device_info_remaining: usize,
@@ -63,13 +68,45 @@ pub(super) struct PollScheduler {
 }
 
 impl PollScheduler {
-    /// Re-arm for `targets` poll targets (boot configuration).
+    /// Re-arm for `targets` poll targets (boot configuration), every one
+    /// on the combined poll until [`set_legacy`](Self::set_legacy) says
+    /// otherwise.
     pub(super) fn configure(&mut self, targets: usize) {
         self.targets = targets;
+        self.legacy = vec![false; targets];
+        // Room for every target on the vendor way, so a target changing
+        // its way at run time does not allocate on the tick.
+        self.cycle = Vec::with_capacity(3 * targets);
         self.cursor = 0;
         self.slot = 0;
         self.device_info_remaining = 0;
         self.override_slot = None;
+        self.rebuild_cycle();
+    }
+
+    /// Poll `target` the vendor way (three kinds a cycle) or the
+    /// combined way: a target's answer to the boot probe decides, and its
+    /// answers at run time after that.
+    pub(super) fn set_legacy(&mut self, target: usize, legacy: bool) {
+        if target < self.targets && self.legacy[target] != legacy {
+            self.legacy[target] = legacy;
+            self.rebuild_cycle();
+        }
+    }
+
+    fn rebuild_cycle(&mut self) {
+        self.cycle.clear();
+        for (target, &legacy) in self.legacy.iter().enumerate() {
+            if legacy {
+                self.cycle.extend([
+                    (target, PollKind::Temperature),
+                    (target, PollKind::Voltage),
+                    (target, PollKind::Errors),
+                ]);
+            } else {
+                self.cycle.push((target, PollKind::Telemetry));
+            }
+        }
     }
 
     /// Queue an override; it preempts the round robin for `repeats`
@@ -104,12 +141,7 @@ impl PollScheduler {
         if self.slot.is_multiple_of(DEVICE_INFO_PERIOD_SLOTS) {
             self.device_info_remaining = self.targets;
         }
-        let target = (self.cursor / 3) as usize % self.targets;
-        let kind = match self.cursor % 3 {
-            0 => PollKind::Temperature,
-            1 => PollKind::Voltage,
-            _ => PollKind::Errors,
-        };
+        let (target, kind) = self.cycle[self.cursor as usize % self.cycle.len()];
         self.cursor += 1;
         Some(PollStep::Poll { target, kind })
     }
@@ -254,6 +286,15 @@ impl FreshnessClock {
         self.last_rx_tick[n] = Some(tick);
     }
 
+    /// A different tool on the gripper node (`select_tool`): what was seen
+    /// of the old one, or its silence while a passive tool was fitted, says
+    /// nothing about the new one, which is SEEN NOW — it still latches
+    /// `lost_ticks` later if it never answers.
+    pub(crate) fn refit_gripper(&mut self, node: NodeId, tick: u64) {
+        self.clear_latch(node, tick);
+        self.last_gripper_rx_tick = Some(tick);
+    }
+
     /// Stamp every node SEEN NOW and drop every latch (FLASHING exit):
     /// the deliberately silent window must not read as a mass disconnect,
     /// while a node that did not survive the flash still latches
@@ -269,7 +310,7 @@ impl FreshnessClock {
 /// One pass = these seven frames to one node; one paced batch = one
 /// message type to every node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ConfigKind {
+pub enum ConfigKind {
     Watchdog,
     Limits,
     VoltageLimit,
@@ -277,6 +318,19 @@ pub(super) enum ConfigKind {
     CurrentGains,
     VelocityGains,
     PositionGains,
+}
+
+impl ConfigKind {
+    /// All configuration fields in the drive's boot order.
+    pub const ALL: [Self; 7] = CONFIG_ORDER;
+
+    /// This kind's position in [`Self::ALL`].
+    pub fn index(self) -> usize {
+        CONFIG_ORDER
+            .iter()
+            .position(|k| *k == self)
+            .expect("every kind is in CONFIG_ORDER")
+    }
 }
 
 /// The order the boot config load sends message types in.
@@ -291,7 +345,7 @@ pub(super) const CONFIG_ORDER: [ConfigKind; 7] = [
 ];
 
 /// Encode one configuration frame.
-pub(super) fn config_frame(kind: ConfigKind, c: &NodeConfig) -> CanFrame {
+pub(crate) fn config_frame(kind: ConfigKind, c: &NodeConfig) -> CanFrame {
     let node = c.node;
     match kind {
         ConfigKind::Watchdog => encode_watchdog(node, c.watchdog_ms, c.watchdog_action),
@@ -338,6 +392,11 @@ pub(super) fn boot_config_plan(configs: &[NodeConfig], repeats: u8, out: &mut Ve
             }
             out.push(BootStep::Pace);
         }
+        let extra: Vec<CanFrame> = configs.iter().flat_map(NodeConfig::extra_frames).collect();
+        if !extra.is_empty() {
+            out.extend(extra.into_iter().map(BootStep::Frame));
+            out.push(BootStep::Pace);
+        }
     }
 }
 
@@ -346,7 +405,6 @@ mod tests {
     use super::*;
     use crate::spectral::codec::{unpack_can_id, CommandId};
     use par6_config::{Gains, WatchdogAction};
-    use std::collections::{BTreeSet, HashMap};
 
     fn node_config(node: NodeId) -> NodeConfig {
         NodeConfig {
@@ -365,233 +423,9 @@ mod tests {
                 kiv: 6.0,
                 kpp: 7.0,
             },
+            ripple: [(0, 0, 0); 8],
+            velocity_window: None,
         }
-    }
-
-    /// Every target must get temperature, voltage and errors exactly once
-    /// per `3 × targets` slots — that cadence is what bounds the poll to
-    /// ONE frame per tick while still refreshing the ~84 ms telemetry.
-    #[test]
-    fn round_robin_covers_every_target_once_per_cycle() {
-        let targets = 7;
-        let mut s = PollScheduler::default();
-        s.configure(targets);
-        let mut seen: HashMap<(usize, PollKind), u32> = HashMap::new();
-        for _ in 0..(3 * targets) {
-            match s.step().expect("configured") {
-                PollStep::Poll { target, kind } => *seen.entry((target, kind)).or_default() += 1,
-                other => panic!("unexpected {other:?}"),
-            }
-        }
-        assert_eq!(seen.len(), 3 * targets);
-        assert!(seen.values().all(|&c| c == 1));
-        let covered: BTreeSet<usize> = seen.keys().map(|(t, _)| *t).collect();
-        assert_eq!(covered, (0..targets).collect::<BTreeSet<_>>());
-    }
-
-    /// The device-info sweep replaces the round robin for exactly one
-    /// slot per target, then the round robin resumes where it left off —
-    /// the sweep must never cost more than one frame in any tick.
-    #[test]
-    fn device_info_sweep_replaces_one_cycle_and_resumes() {
-        let targets = 7;
-        let mut s = PollScheduler::default();
-        s.configure(targets);
-        let mut kinds = Vec::new();
-        // Run past the first sweep boundary.
-        for _ in 0..(DEVICE_INFO_PERIOD_SLOTS + targets as u64 + 3) {
-            let PollStep::Poll { target, kind } = s.step().expect("configured") else {
-                panic!("no override queued");
-            };
-            kinds.push((target, kind));
-        }
-        let sweep: Vec<usize> = kinds
-            .iter()
-            .enumerate()
-            .filter(|(_, (_, k))| *k == PollKind::DeviceInfo)
-            .map(|(i, _)| i)
-            .collect();
-        assert_eq!(sweep.len(), targets, "one device-info frame per target");
-        // Contiguous, and immediately after the boundary slot.
-        assert_eq!(sweep[0], DEVICE_INFO_PERIOD_SLOTS as usize);
-        assert!(sweep.windows(2).all(|w| w[1] == w[0] + 1));
-        let swept: BTreeSet<usize> = sweep.iter().map(|i| kinds[*i].0).collect();
-        assert_eq!(swept, (0..targets).collect::<BTreeSet<_>>());
-        // The round robin picks up its own cursor, not the sweep's.
-        let before = kinds[DEVICE_INFO_PERIOD_SLOTS as usize - 1];
-        let after = kinds[DEVICE_INFO_PERIOD_SLOTS as usize + targets];
-        assert_eq!(
-            after,
-            match before.1 {
-                PollKind::Temperature => (before.0, PollKind::Voltage),
-                PollKind::Voltage => (before.0, PollKind::Errors),
-                _ => ((before.0 + 1) % targets, PollKind::Temperature),
-            }
-        );
-    }
-
-    /// An override owns the slot for exactly `repeats` steps, a later
-    /// override replaces an unfinished one (single slot), and the round
-    /// robin never loses a target across the interruption.
-    #[test]
-    fn override_preempts_for_its_repeats_then_yields() {
-        let mut s = PollScheduler::default();
-        s.configure(7);
-        s.step();
-        s.queue_override(PollAction::ClearError { node: 2 }, 3);
-        let mut steps = Vec::new();
-        for _ in 0..5 {
-            steps.push(s.step().expect("configured"));
-        }
-        assert_eq!(
-            steps
-                .iter()
-                .filter(|s| matches!(s, PollStep::Override(PollAction::ClearError { node: 2 })))
-                .count(),
-            3
-        );
-        assert!(matches!(steps[3], PollStep::Poll { .. }));
-        // Second target's temperature: slot 1 of the round robin (slot 0
-        // was consumed before the override).
-        assert_eq!(
-            steps[3],
-            PollStep::Poll {
-                target: 0,
-                kind: PollKind::Voltage
-            },
-            "the round robin resumes at its own cursor"
-        );
-        // Replacement: the pending 2 remaining repeats are dropped.
-        s.queue_override(PollAction::ClearError { node: 4 }, 2);
-        s.queue_override(
-            PollAction::Poll {
-                node: 1,
-                kind: PollKind::Kt,
-            },
-            1,
-        );
-        assert_eq!(
-            s.step(),
-            Some(PollStep::Override(PollAction::Poll {
-                node: 1,
-                kind: PollKind::Kt
-            }))
-        );
-        assert!(matches!(s.step(), Some(PollStep::Poll { .. })));
-    }
-
-    /// The three-layer freshness contract: warn at the stale threshold
-    /// (self-clearing), latch at the lost threshold (survives resumed
-    /// traffic), reconnect edge reported on stale→fresh.
-    #[test]
-    fn freshness_warns_then_latches_and_reports_reconnect_edges() {
-        let (stale, lost) = (10u64, 50u64);
-        let mut f = FreshnessClock::default();
-        f.configure(stale, lost);
-        assert_eq!(f.classify(0, 0), Freshness::Unknown);
-        assert_eq!(f.age(0, 0), u64::MAX);
-
-        assert!(
-            f.mark(0, 1, false),
-            "the first-ever frame IS an edge: a node that boots after the \
-             last scheduled config shot has missed every push it will get, \
-             and this edge is the only signal left to configure it"
-        );
-        assert_eq!(f.classify(0, 1), Freshness::Fresh);
-        assert!(
-            f.mark(5, 1, false) && !f.mark(5, 2, false),
-            "only the FIRST frame is the edge"
-        );
-        assert_eq!(f.classify(0, 1 + stale - 1), Freshness::Fresh);
-        assert_eq!(f.classify(0, 1 + stale), Freshness::Stale);
-        assert_eq!(f.age(0, 1 + stale), stale);
-
-        // A frame while stale clears the warning and reports the edge.
-        assert!(f.mark(0, 1 + stale, false));
-        assert_eq!(f.classify(0, 1 + stale), Freshness::Fresh);
-
-        // Reaching the lost threshold latches, and traffic does NOT clear it.
-        let t = 1 + stale + lost;
-        f.latch_lost(t);
-        assert_eq!(f.classify(0, t), Freshness::Lost);
-        f.mark(0, t, false);
-        assert_eq!(f.classify(0, t), Freshness::Lost, "lost is latched");
-        // Only the user clear path resets it.
-        f.clear_latch(0, t);
-        assert_eq!(f.classify(0, t), Freshness::Fresh);
-        f.mark(0, t, false);
-        assert_eq!(f.classify(0, t), Freshness::Fresh);
-
-        // A node that was never seen never latches, however long we run.
-        f.latch_lost(t + 10 * lost);
-        assert_eq!(f.classify(3, t + 10 * lost), Freshness::Unknown);
-
-        // The gripper reply ages on its own clock.
-        assert_eq!(f.gripper_age(t), u64::MAX, "never seen");
-        f.mark_gripper(t);
-        assert_eq!(f.gripper_age(t + 4), 4);
-
-        // Re-base (FLASHING exit) drops the latch and stamps SEEN NOW.
-        f.mark(1, t, false);
-        f.latch_lost(t + lost);
-        assert_eq!(f.classify(1, t + lost), Freshness::Lost);
-        f.rebase(t + lost);
-        assert_eq!(f.classify(1, t + lost), Freshness::Fresh);
-    }
-
-    /// Clearing a latch is "seen now", never "never seen": a node that is
-    /// still off the bus must re-latch on its own, and one that comes back
-    /// must still produce the stale→fresh edge that resends its config.
-    ///
-    /// Zeroing the observation instead is absorbing — `latch_lost` skips
-    /// `None` and only `mark` leaves it — so the clear would make a dead
-    /// node permanently un-reportable AND silently deny it its config
-    /// resend, leaving it on firmware defaults while the RT commands it.
-    /// The same applies to the FLASHING-exit re-base.
-    #[test]
-    fn clearing_a_latch_re_arms_the_lost_threshold_and_the_reconnect_edge() {
-        let (stale, lost) = (10u64, 50u64);
-        let mut f = FreshnessClock::default();
-        f.configure(stale, lost);
-        f.mark(2, 1, false);
-
-        // Node 2 goes silent and latches; the user clears it without
-        // fixing the cable.
-        let latched_at = 1 + lost;
-        f.latch_lost(latched_at);
-        assert_eq!(f.classify(2, latched_at), Freshness::Lost);
-        f.clear_latch(2, latched_at);
-
-        // Still silent: stale again after the warn window, and LOST again
-        // after the lost window — the health surface cannot go quiet on a
-        // joint that is off the bus.
-        f.latch_lost(latched_at + lost - 1);
-        assert_eq!(f.classify(2, latched_at + stale), Freshness::Stale);
-        assert_eq!(
-            f.classify(2, latched_at + lost - 1),
-            Freshness::Stale,
-            "one tick short of the window is still only a warning"
-        );
-        f.latch_lost(latched_at + lost);
-        assert_eq!(f.classify(2, latched_at + lost), Freshness::Lost);
-
-        // The cable is re-seated after a second clear: the node's return
-        // is a stale→fresh edge, so its stored config goes back out.
-        let cleared_at = latched_at + lost;
-        f.clear_latch(2, cleared_at);
-        assert!(
-            f.mark(2, cleared_at + stale, false),
-            "a node returning after a clear is a reconnect"
-        );
-
-        // FLASHING exit: same rule, robot-wide.
-        f.rebase(cleared_at);
-        f.latch_lost(cleared_at + lost);
-        assert_eq!(
-            f.classify(0, cleared_at + lost),
-            Freshness::Lost,
-            "a node that did not survive the flash still latches"
-        );
     }
 
     /// The boot load is batched BY MESSAGE TYPE with a pace between
@@ -646,22 +480,51 @@ mod tests {
         assert!(plan.is_empty());
     }
 
-    /// Config frames carry the stored values, so a reconnect resend
-    /// restores exactly what boot installed.
+    /// Config frames carry each joint's configured values, every kind of
+    /// them, so a reconnect resend restores exactly what boot installed.
     #[test]
     fn config_frames_carry_the_stored_values() {
-        let c = node_config(4);
-        let wd = config_frame(ConfigKind::Watchdog, &c);
-        assert_eq!(wd.payload(), &[0, 0, 0x13, 0x88, 0]); // 5000 ms BE + Idle
-        let lim = config_frame(ConfigKind::Limits, &c);
-        assert_eq!(&lim.payload()[0..4], &80000f32.to_be_bytes());
-        assert_eq!(&lim.payload()[4..8], &1200f32.to_be_bytes());
-        let vl = config_frame(ConfigKind::VoltageLimit, &c);
-        assert_eq!(vl.payload(), &6000u32.to_be_bytes());
-        let pd = config_frame(ConfigKind::PdGains, &c);
-        assert_eq!(&pd.payload()[0..4], &1f32.to_be_bytes());
-        assert_eq!(&pd.payload()[4..8], &2f32.to_be_bytes());
-        let pos = config_frame(ConfigKind::PositionGains, &c);
-        assert_eq!(pos.payload(), &7f32.to_be_bytes());
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+        let robot = par6_config::RobotConfig::load(&path).expect("PAR6.toml");
+        let be = |v: f64| (v as f32).to_be_bytes();
+        let pair = |a: f64, b: f64| [be(a), be(b)].concat();
+        for j in &robot.joints {
+            let c = NodeConfig::arm(j, WatchdogAction::Idle);
+            let payload = |kind| config_frame(kind, &c).payload().to_vec();
+            let g = &j.gains;
+            assert_eq!(
+                payload(ConfigKind::Watchdog),
+                [j.watchdog_timeout_ms.to_be_bytes().as_slice(), &[0]].concat(),
+                "{}: watchdog ms then the Idle action",
+                j.name
+            );
+            assert_eq!(
+                payload(ConfigKind::Limits),
+                pair(j.velocity_limit_ticks_s, j.ilim_ma),
+                "{}",
+                j.name
+            );
+            assert_eq!(
+                payload(ConfigKind::VoltageLimit),
+                j.voltage_limit_mv.to_be_bytes(),
+                "{}",
+                j.name
+            );
+            assert_eq!(payload(ConfigKind::PdGains), pair(g.kp, g.kd), "{}", j.name);
+            assert_eq!(
+                payload(ConfigKind::CurrentGains),
+                pair(g.kpiq, g.kiiq),
+                "{}",
+                j.name
+            );
+            assert_eq!(
+                payload(ConfigKind::VelocityGains),
+                pair(g.kpv, g.kiv),
+                "{}",
+                j.name
+            );
+            assert_eq!(payload(ConfigKind::PositionGains), be(g.kpp), "{}", j.name);
+        }
     }
 }

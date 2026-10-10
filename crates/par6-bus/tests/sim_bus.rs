@@ -14,13 +14,15 @@ use std::path::PathBuf;
 
 use par6_bus::sim::scene::{Scene, Tool};
 use par6_bus::sim::{FaultKind, SimBus};
-use par6_bus::spectral::codec::{pack_can_id, CanFrame, CommandId};
+use par6_bus::spectral::codec::{
+    pack_can_id, CanFrame, CommandId, CAPTURE_STATUS_CHANNEL, CAPTURE_VEL_SCALE,
+};
 use par6_bus::spectral::convert::{ticks_per_radian, JointConversion};
 use par6_bus::{
     BusState, DriverBus, FirmwareGripperCommand, Freshness, GripperCommand, JointCommand,
     ObjectDetection, PollAction, PollKind,
 };
-use par6_config::{GripperConfig, HomingStrategy, RobotConfig};
+use par6_config::{HomingStrategy, RobotConfig, ToolConfig};
 use par6_proto::{Layer, Physical, Shape};
 
 fn par6() -> RobotConfig {
@@ -28,10 +30,10 @@ fn par6() -> RobotConfig {
     RobotConfig::load(&path).expect("PAR6.toml")
 }
 
-fn msg_gripper() -> GripperConfig {
+fn msg_gripper() -> ToolConfig {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../config/grippers/MSG_small_motor_150mm_rail.toml");
-    GripperConfig::load(&path).expect("MSG gripper TOML")
+    ToolConfig::load(&path).expect("MSG gripper TOML")
 }
 
 /// A world shape at a world pose; `mass` `Some(None)` is a fixture,
@@ -106,7 +108,7 @@ struct Rig {
 }
 
 impl Rig {
-    fn boot(robot: &RobotConfig, gripper: Option<&GripperConfig>, q0: Option<&[f64]>) -> Self {
+    fn boot(robot: &RobotConfig, gripper: Option<&ToolConfig>, q0: Option<&[f64]>) -> Self {
         let mut bus = SimBus::new(scene());
         if let Some(q) = q0 {
             bus.set_initial_joint_rad(q);
@@ -131,6 +133,25 @@ impl Rig {
         self.bus.send_gripper(gripper).expect("gripper send");
         self.bus.poll_step().expect("poll_step");
         drained
+    }
+
+    /// A tick with the joint frames and the gripper slot but no telemetry
+    /// poll: what reaches a node is only what the tick's own frames say.
+    fn step_unpolled(&mut self, cmds: &[JointCommand], gripper: &GripperCommand) {
+        self.tick += 1;
+        self.bus.begin_tick(self.tick);
+        self.bus.drain_rx(&mut self.state).expect("drain_rx");
+        self.bus.send_joint_commands(cmds).expect("joint send");
+        self.bus.send_gripper(gripper).expect("gripper send");
+    }
+
+    /// A tick that sends only the telemetry poll: every reply drained the
+    /// tick after answers that poll alone.
+    fn step_poll_only(&mut self) {
+        self.tick += 1;
+        self.bus.begin_tick(self.tick);
+        self.bus.drain_rx(&mut self.state).expect("drain_rx");
+        self.bus.poll_step().expect("poll_step");
     }
 
     /// A tick with no bus traffic at all: no joint frames, no gripper
@@ -368,9 +389,8 @@ fn stall_endstop_signatures_and_release_preload() {
         "seated current {last_cur} mA does not press in the drive direction"
     );
 
-    // Release phase: current-only frame (cmd 2 DLC 2) at the config value
-    // relaxes the gearbox windup, moving the REPORTED encoder position —
-    // exactly what the release phase samples.
+    // Release phase: a current-only frame (cmd 2 DLC 2) at the config
+    // value, sampled where the release phase samples it.
     let rel = h.release.expect("J1 homing config carries a release phase");
     let rel_ticks = u64::from(robot.ticks(rel.duration_s));
     let sample_at = (rel_ticks as f64 * rel.sample_pct).round() as u64;
@@ -385,13 +405,19 @@ fn stall_endstop_signatures_and_release_preload() {
         }
     }
     let sampled = sampled.expect("release sample point inside the phase");
-    // The release current pulls AWAY from the stop, against the joint's
-    // load: the self-locking gearbox keeps the joint seated — it relaxes
-    // by at most the limit penetration and never leaves the stop...
+    // At this pose the release current unloads contact without lifting
+    // the arm from the stop: displacement is bounded by contact penetration.
     let relaxed = f64::from(sampled - rest) * -sign;
     assert!(
         (0.0..=50.0).contains(&relaxed),
         "release moved the reported position {relaxed} ticks (toward-stop positive)"
+    );
+    // The current frame drives the current it carries.
+    let driven = f64::from(rig.state.nodes[node].current_ma.unwrap());
+    assert!(
+        (driven - rel.current_ma).abs() <= 0.05 * rel.current_ma.abs(),
+        "the release frame asked for {} mA and the drive put out {driven} mA",
+        rel.current_ma
     );
     let seated = rig.bus.true_joint_rad()[j];
     assert!(
@@ -416,120 +442,186 @@ fn stall_endstop_signatures_and_release_preload() {
 #[test]
 fn hall_joint_trigger_edge_and_latched_position() {
     let robot = par6();
-    let dt = robot.robot.tick_dt_s;
-    let j = 5usize; // J5: the hall-strategy joint
-    let jc = &robot.joints[j];
-    let h = &robot.homing.joints[j];
-    assert_eq!(h.strategy, HomingStrategy::Hall);
-    let node = usize::from(jc.node_id);
-    let conv = JointConversion::from_config(jc);
-    let tau = std::f64::consts::TAU;
-
-    // The shipped PAR6 sequence nudges J5 to ~+0.6 and homes it from
-    // there with the DEFAULT config: direction 0 (positive motor, dir=1
-    // joint) moves the joint DOWN, away from `home_offset` itself — the
-    // physical sensor is met at its circular alias `home_offset − 2π`.
-    // Boot in the sequence's approach region — J1/J2 at the mid pose the
-    // sequence moves them to before the wrist homes, so the gripper sweeps
-    // clear of the pedestal — to prove the default band is reachable
-    // exactly as the vendor sequence drives it.
-    let sensor_alias = h.home_offset_rad - tau;
-    let mut q0 = calibration_pose(&robot);
-    q0[1] = -1.85;
-    q0[2] = 2.85;
-    q0[j] = 0.6;
-    let mut rig = Rig::boot(&robot, None, Some(&q0));
-    let true0 = conv.motor_ticks(q0[j]);
-    let emax = 1i32 << jc.encoder_bits;
-    let wrap_off = true0.rem_euclid(emax) - true0;
-
-    let sign = if h.direction == 1 { -1.0 } else { 1.0 };
-    let mut cmds = rig.idle_cmds();
-    cmds[j] = JointCommand::hall((sign * h.speed_ticks_s) as i32, 2);
-
-    // Phase 1 — default band from the homing config: approach off-sensor,
-    // then trigger with an edge and a latched position near the sensor.
-    let mut recs: Vec<(i32, bool, bool)> = Vec::new(); // (pos, trigger, edge)
-    let mut post_exit = 0u32;
-    for _ in 0..u64::from(robot.ticks(h.timeout_s)) {
-        rig.step(&cmds, &GripperCommand::NoGripper);
-        let ns = &rig.state.nodes[node];
-        let (Some(pos), Some(hall)) = (ns.position_ticks, ns.hall) else {
-            continue;
-        };
-        recs.push((pos, hall.trigger, hall.edge));
-        // Stop a few replies after the drive has crossed and left the band.
-        if hall.trigger && recs.iter().any(|(_, t, _)| !t) {
-            post_exit += 1;
-            if post_exit >= 5 {
-                break;
+    let joint = 5;
+    let node = usize::from(robot.joints[joint].node_id);
+    let speed = robot.homing.joints[joint].speed_ticks_s as i32;
+    let half_width = 0.04;
+    let conv = JointConversion::from_config(&robot.joints[joint]);
+    let tick_rad = conv.joint_speed_rad_s(1.0).abs();
+    // The edge is sampled once a tick and read back the tick after: it
+    // lands within two ticks' travel at the seek speed, plus the encoder's
+    // own couple of counts.
+    let step_rad = (2.0 * f64::from(speed) * robot.robot.tick_dt_s + 2.0) * tick_rad;
+    for starts_inside in [false, true] {
+        let mut pose = calibration_pose(&robot);
+        pose[1] = -1.85;
+        pose[2] = 2.85;
+        pose[joint] = 0.6;
+        let center = if starts_inside { 0.6 } else { 0.3 };
+        let expected_edge = center
+            + if starts_inside {
+                -half_width
+            } else {
+                half_width
+            };
+        let mut rig = Rig::boot(&robot, None, Some(&pose));
+        rig.bus.set_hall_trigger(joint, center, half_width);
+        let mut commands = rig.idle_cmds();
+        commands[joint] = JointCommand::hall(speed, 2);
+        let mut hit = false;
+        let mut first = None;
+        for _ in 0..robot.ticks(3.0) {
+            rig.state.nodes[node].hall = None;
+            rig.step(&commands, &GripperCommand::NoGripper);
+            if let Some(hall) = rig.state.nodes[node].hall {
+                first.get_or_insert(hall);
+                if hall.edge && !hall.trigger {
+                    hit = true;
+                    break;
+                }
             }
         }
-    }
-    let hit = recs
-        .iter()
-        .position(|(_, trigger, _)| !trigger)
-        .expect("hall never triggered within the homing timeout");
-    assert!(hit > 5, "started on the sensor — no off-sensor approach");
-    assert!(
-        recs[..hit]
-            .iter()
-            .all(|(_, trigger, edge)| *trigger && !edge),
-        "trigger/edge asserted during the off-sensor approach"
-    );
-    let (latched, _, edge) = recs[hit];
-    assert!(edge, "no edge bit on the band-entry reply");
-    assert_eq!(
-        recs.iter().filter(|(_, _, e)| *e).count(),
-        1,
-        "edge must be a one-shot on band entry"
-    );
-    // Position is latched AT trigger: frozen while the trigger is active
-    // even though the drive keeps moving through the band.
-    let in_band: Vec<_> = recs[hit..].iter().take_while(|(_, t, _)| !t).collect();
-    assert!(
-        in_band.iter().all(|(p, _, _)| *p == latched),
-        "in-band replies did not hold the latched position {latched}"
-    );
-    // The latch sits at the sensor (loose bound: the exact band half-width
-    // is the sim's default, asserted precisely in phase 2).
-    let latched_joint = conv.joint_rad(latched - wrap_off);
-    assert!(
-        (latched_joint - sensor_alias).abs() < 0.05,
-        "latched at {latched_joint} rad, sensor at {sensor_alias} rad"
-    );
-    // After the band, live positions resume past the latch.
-    let after = recs.last().unwrap();
-    assert!(after.1 && after.0 > latched, "live position did not resume");
-
-    // Phase 2 — a moved sensor (set_hall_trigger) triggers at the exact
-    // band-entry edge: joint decreasing enters at `center + half`.
-    let cur_joint = conv.joint_rad(recs.last().unwrap().0 - wrap_off);
-    let (center, half) = (cur_joint - 0.1, 0.02);
-    rig.bus.set_hall_trigger(j, center, half);
-    let mut latched2 = None;
-    for _ in 0..u64::from(robot.ticks(2.0)) {
-        rig.step(&cmds, &GripperCommand::NoGripper);
-        let ns = &rig.state.nodes[node];
-        if let (Some(pos), Some(hall)) = (ns.position_ticks, ns.hall) {
-            if hall.edge {
-                latched2 = Some(pos);
-                break;
+        assert!(
+            hit,
+            "any-edge mode must find an edge starting inside or outside the band"
+        );
+        let first = first.expect("a hall reply");
+        assert!(
+            first.trigger && !first.edge,
+            "entering Hall mode arms the search; it reports no edge it has not crossed: {first:?}"
+        );
+        let hit_angle = rig.bus.true_joint_rad()[joint];
+        assert!(
+            (hit_angle - expected_edge).abs() <= step_rad,
+            "triggered at {hit_angle}, expected physical edge {expected_edge} within \
+             {step_rad} rad; inside={starts_inside}"
+        );
+        let latched = rig.state.nodes[node]
+            .position_ticks
+            .expect("cmd 32 carries the latched position");
+        for tick in 0..robot.ticks(0.5) {
+            // Updating Hall-mode speed cannot re-arm an already latched edge.
+            commands[joint] = JointCommand::hall(if tick % 2 == 0 { speed } else { -speed }, 2);
+            rig.step(&commands, &GripperCommand::NoGripper);
+            let hall = rig.state.nodes[node].hall.unwrap();
+            assert!(
+                hall.edge && !hall.trigger,
+                "the edge remains latched until mode exit"
+            );
+        }
+        assert!(
+            (rig.bus.true_joint_rad()[joint] - hit_angle).abs() <= step_rad,
+            "the firmware holds at the edge instead of driving through it"
+        );
+        commands[joint] = JointCommand::velocity(-speed, 0);
+        for _ in 0..robot.ticks(0.3) {
+            rig.step(&commands, &GripperCommand::NoGripper);
+        }
+        let backed_off = rig.bus.true_joint_rad()[joint];
+        assert!(
+            backed_off > hit_angle + 0.1,
+            "leaving Hall mode permits an ordinary velocity backoff"
+        );
+        // The latched position is where the edge was: the motion replies
+        // since agree on the distance travelled from it.
+        commands[joint] = JointCommand::velocity(0, 0);
+        rig.state.nodes[node].position_ticks = None;
+        rig.step(&commands, &GripperCommand::NoGripper);
+        rig.step(&commands, &GripperCommand::NoGripper);
+        let now = rig.state.nodes[node]
+            .position_ticks
+            .expect("a motion reply");
+        let travelled = conv.joint_rad(now) - conv.joint_rad(latched);
+        let truly = rig.bus.true_joint_rad()[joint] - hit_angle;
+        assert!(
+            (travelled - truly).abs() <= step_rad,
+            "the latched position is {} rad off the edge",
+            travelled - truly
+        );
+        commands[joint] = JointCommand::hall(speed, 2);
+        let mut saw_armed = false;
+        let mut hit_again = false;
+        for _ in 0..robot.ticks(3.0) {
+            rig.state.nodes[node].hall = None;
+            rig.step(&commands, &GripperCommand::NoGripper);
+            if let Some(hall) = rig.state.nodes[node].hall {
+                saw_armed |= hall.trigger && !hall.edge;
+                if hall.edge && !hall.trigger {
+                    assert!(saw_armed, "re-entering Hall mode clears the old edge");
+                    hit_again = true;
+                    break;
+                }
             }
         }
+        assert!(
+            hit_again,
+            "a new approach finds a fresh edge after mode exit"
+        );
     }
-    let latched2 = latched2.expect("moved hall band never triggered");
-    let expected = conv.motor_ticks(center + half) + wrap_off;
-    let tol = h.speed_ticks_s * dt + 2.0; // one control step of travel
-    assert!(
-        f64::from((latched2 - expected).abs()) <= tol,
-        "latched {latched2}, expected band entry at {expected} (±{tol})"
-    );
 }
 
 // ---------------------------------------------------------------------------
 // 3. Driver watchdog: command silence → Idle (configured WatchdogAction)
 // ---------------------------------------------------------------------------
+
+/// A Hall reference is periodic; choosing the adjacent turn at boot must not
+/// introduce a mechanical stop inside the arm's commanded working range.
+#[test]
+fn hall_referenced_wrist_can_traverse_its_working_range_from_either_boot_turn() {
+    let robot = par6();
+    let joint = 5;
+    let node = usize::from(robot.joints[joint].node_id);
+    let dt = robot.robot.tick_dt_s;
+    for start in [0.0, std::f64::consts::PI] {
+        let mut q = robot.homing.ready_pose_rad(6).expect("ready pose");
+        q[joint] = start;
+        let mut rig = Rig::boot(&robot, None, Some(&q));
+        let mut conv = JointConversion::from_config(&robot.joints[joint]);
+        let mut commands = gravity_hold(&mut rig.bus, &robot, &q);
+        let home = &robot.homing.joints[joint];
+        commands[joint] = JointCommand::hall(home.speed_ticks_s as i32, 2);
+        let mut reference = None;
+        for _ in 0..robot.ticks(home.seek_timeout_s(&robot.joints[joint])) {
+            rig.step(&commands, &GripperCommand::NoGripper);
+            let state = &rig.state.nodes[node];
+            if state.hall.is_some_and(|hall| hall.edge && !hall.trigger) {
+                reference = state.position_ticks;
+                break;
+            }
+        }
+        conv.set_home(reference.expect("Hall reference"), home.home_offset_rad);
+        let true_home = rig.bus.true_joint_rad()[joint];
+        let mut from = home.home_offset_rad;
+        let limits = &robot.joints[joint].limits;
+        for (target, duration) in [
+            (limits.soft_min_rad + 0.05, 8.0),
+            (limits.soft_max_rad - 0.05, 18.0),
+        ] {
+            for k in 0..robot.ticks(duration + 1.0) {
+                let u = ((f64::from(k) + 1.0) * dt / duration).min(1.0);
+                let fraction = 10.0 * u.powi(3) - 15.0 * u.powi(4) + 6.0 * u.powi(5);
+                let speed = (target - from) / duration * 30.0 * u.powi(2) * (1.0 - u).powi(2);
+                commands[joint] = JointCommand::position(
+                    conv.motor_ticks(from + (target - from) * fraction),
+                    conv.motor_speed_ticks_s(speed).round() as i32,
+                    0,
+                );
+                rig.step(&commands, &GripperCommand::NoGripper);
+            }
+            let reported = conv.joint_rad(rig.state.nodes[node].position_ticks.expect("position"));
+            let actual = rig.bus.true_joint_rad()[joint];
+            assert!(
+                (reported - target).abs() < 0.03,
+                "J6 cannot reach its working range after Hall homing"
+            );
+            assert!(
+                (actual - true_home - target + home.home_offset_rad).abs() < 0.03,
+                "reported motion must agree with actual wrist travel"
+            );
+            from = target;
+        }
+    }
+}
 
 #[test]
 fn watchdog_silence_drops_driver_to_idle() {
@@ -538,9 +630,11 @@ fn watchdog_silence_drops_driver_to_idle() {
     let wd_ticks = u64::from(robot.ticks(f64::from(robot.joints[0].watchdog_timeout_ms) / 1000.0));
     let mut rig = Rig::boot(&robot, None, None);
 
+    let spin_up = u64::from(robot.ticks(0.5));
+    let past_window = wd_ticks + u64::from(robot.ticks(0.36));
     let mut cmds = rig.idle_cmds();
     cmds[0] = JointCommand::velocity(-8000, 0);
-    for _ in 0..120 {
+    for _ in 0..spin_up {
         rig.step(&cmds, &GripperCommand::NoGripper);
     }
     let speed = rig.state.nodes[0].speed_ticks_s.unwrap();
@@ -553,7 +647,8 @@ fn watchdog_silence_drops_driver_to_idle() {
     // carries a joint through the RT's homing pattern of idle frames plus
     // encoder polls.
     cmds[0] = JointCommand::default();
-    for _ in 0..(wd_ticks + 90) {
+    let polled_start = rig.state.nodes[0].position_ticks.unwrap();
+    for _ in 0..past_window {
         rig.bus.queue_poll_override(
             PollAction::Poll {
                 node: 0,
@@ -568,9 +663,10 @@ fn watchdog_silence_drops_driver_to_idle() {
         Freshness::Fresh,
         "polls keep freshness"
     );
-    let polled = rig.state.nodes[0].speed_ticks_s.unwrap();
+    let polled = f64::from(rig.state.nodes[0].position_ticks.unwrap() - polled_start)
+        / (past_window as f64 * robot.robot.tick_dt_s);
     assert!(
-        polled <= -6000,
+        polled <= -6000.0,
         "a polled driver holds its command ({polled}): firmware feeds the \
          watchdog on every answered RTR request"
     );
@@ -598,7 +694,7 @@ fn watchdog_silence_drops_driver_to_idle() {
         before_fire <= -6000,
         "driver dropped out {before_fire} before the configured watchdog window"
     );
-    for _ in 0..(wd_ticks + 90) {
+    for _ in 0..past_window {
         rig.step_silent();
     }
     rig.bus.queue_poll_override(
@@ -614,6 +710,25 @@ fn watchdog_silence_drops_driver_to_idle() {
     assert!(
         final_speed.abs() <= 60,
         "velocity {final_speed} did not decay to idle after the watchdog fired"
+    );
+    // Idle, not braking: the drive puts out no current, and a load turns
+    // the joint where a brake would hold it.
+    let rest = rig.state.nodes[0].position_ticks.unwrap();
+    rig.bus.set_joint_load_ma(0, 0.5 * robot.joints[0].ilim_ma);
+    for _ in 0..u64::from(robot.ticks(0.3)) {
+        rig.bus.queue_poll_override(
+            PollAction::Poll {
+                node: 0,
+                kind: PollKind::Encoder,
+            },
+            1,
+        );
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+    rig.bus.set_joint_load_ma(0, 0.0);
+    assert!(
+        (rig.state.nodes[0].position_ticks.unwrap() - rest).abs() > 200,
+        "a load must turn an idle joint; this one was held"
     );
     // The fire latches the watchdog + aggregate error flags and the
     // per-frame live err bit.
@@ -636,12 +751,15 @@ fn watchdog_silence_drops_driver_to_idle() {
     // Clear-error resets the flags; new commands re-arm the driver.
     rig.bus.send_clear_error(0, 3).unwrap();
     cmds[0] = JointCommand::velocity(-8000, 0);
-    for _ in 0..120 {
+    let resumed_start = rig.state.nodes[0].position_ticks.unwrap();
+    for _ in 0..spin_up {
         rig.step(&cmds, &GripperCommand::NoGripper);
     }
+    let resumed = f64::from(rig.state.nodes[0].position_ticks.unwrap() - resumed_start)
+        / (spin_up as f64 * robot.robot.tick_dt_s);
     assert!(
-        rig.state.nodes[0].speed_ticks_s.unwrap() <= -6000,
-        "drive did not resume after clear-error"
+        resumed <= -6000.0,
+        "drive did not resume after clear-error: mean {resumed} ticks/s"
     );
     assert!(!rig.state.nodes[0].live_error_bit, "err bit survived clear");
     rig.bus.queue_poll_override(
@@ -658,6 +776,48 @@ fn watchdog_silence_drops_driver_to_idle() {
         !flags.watchdog && !flags.error && flags.calibrated && flags.activated,
         "flags not reset by clear-error: {flags:?}"
     );
+
+    // Which frames feed it, stated against the firmware: the data packs
+    // that install a Controller_mode and answered REMOTE_FRAME polls.
+    // Idle (cmd 12) frames, and the gain/limit writes, do not — on the
+    // arm a config-only traffic pattern faults the driver, and the RT's
+    // homing pattern of idle frames plus encoder polls runs.
+    let errors = |rig: &mut Rig, cmds: &[JointCommand]| {
+        rig.bus.queue_poll_override(
+            PollAction::Poll {
+                node: 0,
+                kind: PollKind::Errors,
+            },
+            1,
+        );
+        rig.step(cmds, &GripperCommand::NoGripper);
+        rig.step(cmds, &GripperCommand::NoGripper);
+        rig.state.nodes[0].error_flags.unwrap()
+    };
+    for frames in ["idle", "config"] {
+        let mut rig = Rig::boot(&robot, None, None);
+        let mut cmds = rig.idle_cmds();
+        cmds[0] = JointCommand::velocity(-8000, 0);
+        for _ in 0..spin_up {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        cmds[0] = JointCommand::drop_to_idle();
+        for _ in 0..past_window {
+            if frames == "idle" {
+                rig.step_joints_only(&cmds);
+            } else {
+                rig.tick += 1;
+                rig.bus.begin_tick(rig.tick);
+                rig.bus.drain_rx(&mut rig.state).expect("drain_rx");
+                rig.bus.resend_node_config(0, 1).expect("config frames");
+            }
+        }
+        let flags = errors(&mut rig, &cmds);
+        assert!(
+            flags.watchdog,
+            "{frames} frames must not feed the watchdog (flags {flags:?})"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -751,10 +911,14 @@ fn wrong_dlc_frames_discarded_whole() {
     let mut rig = Rig::boot(&robot, Some(&gripper), None);
     let node = usize::from(robot.joints[3].node_id);
 
+    let speed = 5000;
+    // The commanded speed's travel per tick, which a frame that changed
+    // nothing leaves untouched.
+    let per_tick = f64::from(speed) * robot.robot.tick_dt_s;
     let mut cmds = rig.idle_cmds();
-    cmds[3] = JointCommand::velocity(5000, 0);
+    cmds[3] = JointCommand::velocity(speed, 0);
     let mut baseline = 0usize;
-    for _ in 0..120 {
+    for _ in 0..robot.ticks(0.5) {
         baseline = rig.step(&cmds, &GripperCommand::FirmwarePoll);
     }
     let p0 = rig.state.nodes[node].position_ticks.unwrap();
@@ -778,7 +942,7 @@ fn wrong_dlc_frames_discarded_whole() {
     );
     let gripper_pos_before = rig.state.gripper.reply.unwrap().position;
     let mut last_pos = p0;
-    for _ in 0..40 {
+    for _ in 0..robot.ticks(0.16) {
         rig.bus.inject_host_frame(&bad_motion);
         rig.bus.inject_host_frame(&bad_gripper);
         let drained = rig.step(&cmds, &GripperCommand::FirmwarePoll);
@@ -788,10 +952,11 @@ fn wrong_dlc_frames_discarded_whole() {
             "a malformed frame must still be answered (motor + gripper)"
         );
         let pos = rig.state.nodes[node].position_ticks.unwrap();
-        let step = pos - last_pos;
+        let step = f64::from(pos - last_pos);
         assert!(
-            (0..100).contains(&step),
-            "velocity drive disturbed by a wrong-DLC frame (step {step} ticks)"
+            (0.5 * per_tick..=2.0 * per_tick).contains(&step),
+            "velocity drive disturbed by a wrong-DLC frame (step {step} ticks, \
+             {per_tick} commanded)"
         );
         last_pos = pos;
     }
@@ -808,7 +973,7 @@ fn wrong_dlc_frames_discarded_whole() {
     // its watchdog on every RTR request it answers, which would mask what
     // this is testing. A wrong-DLC frame sets `Wrong_DL` and feeds
     // nothing, so the watchdog must still fire.
-    for _ in 0..(wd_ticks + 90) {
+    for _ in 0..wd_ticks + u64::from(robot.ticks(0.36)) {
         rig.bus.inject_host_frame(&bad_motion);
         rig.step_silent();
     }
@@ -904,7 +1069,7 @@ fn boot_wrap_sector_semantics_and_position_mode_in_wire_coords() {
     let mut cmds = rig.idle_cmds();
     cmds[j] = JointCommand::velocity(6000, 0);
     let mut prev = reported0;
-    for _ in 0..400 {
+    for _ in 0..robot.ticks(1.6) {
         rig.step(&cmds, &GripperCommand::NoGripper);
         let pos = rig.state.nodes[node].position_ticks.unwrap();
         assert!(pos >= prev, "reported position wrapped ({prev} → {pos})");
@@ -920,13 +1085,15 @@ fn boot_wrap_sector_semantics_and_position_mode_in_wire_coords() {
     let target = reported0 + 3000;
     cmds[j] = JointCommand::position(target, 0, 0);
     let mut positions = Vec::new();
-    for _ in 0..2500 {
+    for _ in 0..robot.ticks(10.0) {
         rig.step(&cmds, &GripperCommand::NoGripper);
         positions.push(rig.state.nodes[node].position_ticks.unwrap());
     }
+    // The loop's integral closes the error on a joint gravity does not
+    // load, to the encoder's own couple of counts.
     let last = *positions.last().unwrap();
     assert!(
-        (last - target).abs() <= 30,
+        (last - target).abs() <= 2,
         "position loop settled at {last}, commanded {target} — the driver \
          is not closing its loop in wire coordinates"
     );
@@ -936,67 +1103,162 @@ fn boot_wrap_sector_semantics_and_position_mode_in_wire_coords() {
         .max()
         .unwrap();
     assert!(
-        settle_band <= 10,
+        settle_band <= 2,
         "still moving at the end ({settle_band} ticks)"
     );
 
     // The periodic device-info sweep has covered every node by now
-    // (~1006 poll slots into the run).
+    // (~1006 poll slots into the run), each telling itself apart.
+    let mut serials = std::collections::BTreeSet::new();
     for joint in &robot.joints {
         let n = usize::from(joint.node_id);
         let info = rig.state.nodes[n]
             .device_info
             .unwrap_or_else(|| panic!("no device info for node {n} after the sweep"));
-        assert_eq!(info.serial, 1_000 + i32::from(joint.node_id));
+        assert!(serials.insert(info.serial), "node {n} repeats a serial");
     }
-}
 
-/// The vendor runtime's hold is a position frame with Speed=0 (last
-/// target, gravity current) — and the firmware's position mode treats the
-/// speed channel as a velocity FEEDFORWARD, so that frame still closes
-/// position error at full authority. A driver model that reads the speed
-/// channel as a per-command velocity cap freezes whatever error exists
-/// when a profile ends at speed 0: the plant settles short permanently
-/// (issues #22/#26).
-#[test]
-fn zero_speed_position_frames_still_close_position_error() {
-    let robot = par6();
-    let j = 0usize;
-    let node = usize::from(robot.joints[j].node_id);
+    // The vendor runtime's hold is a position frame with Speed=0 (last
+    // target, gravity current), and the speed channel is a velocity
+    // FEEDFORWARD, so that frame still closes position error at full
+    // authority from rest, with no velocity carried in. A driver that
+    // read it as a per-command velocity cap would freeze whatever error a
+    // profile left when it ended at speed 0 (issues #22/#26).
     let mut rig = Rig::boot(&robot, None, None);
     let idle = rig.idle_cmds();
     rig.step(&idle, &GripperCommand::NoGripper);
     rig.step(&idle, &GripperCommand::NoGripper);
     let start = rig.state.nodes[node].position_ticks.unwrap();
-
-    // The hold shape verbatim: a fixed position target, speed 0, no
-    // current feedforward — repeated every tick, as EXEC hold does.
     let target = start + 2000;
     let mut cmds = rig.idle_cmds();
     cmds[j] = JointCommand::position(target, 0, 0);
-    for _ in 0..2500 {
+    for _ in 0..robot.ticks(10.0) {
         rig.step(&cmds, &GripperCommand::NoGripper);
     }
     let last = rig.state.nodes[node].position_ticks.unwrap();
     assert!(
-        (last - target).abs() <= 30,
-        "a zero-speed position frame left {} ticks of error unclosed \
-         (settled at {last}, commanded {target}) — the speed channel is a \
-         feedforward, not a velocity cap",
+        (last - target).abs() <= 2,
+        "a zero-speed position frame left {} ticks of error unclosed",
         (last - target).abs(),
     );
 }
 
+/// The par6 firmware starts the velocity integral afresh when a position
+/// or velocity frame follows any other mode — after a current-mode
+/// release the vendor's drive re-applied the wind-up of the push before
+/// it, ~850 mA into the stop on a wrist — while position and velocity
+/// frames carry the integral on from each other.
+#[test]
+fn velocity_integral_restarts_after_another_mode_and_carries_across_the_cascade() {
+    let robot = par6();
+    let mut q0 = calibration_pose(&robot);
+    q0[0] = robot.joints[0].limits.hard_max_rad;
+    let mut rig = Rig::boot(&robot, None, Some(&q0));
+    let mut cmds = rig.idle_cmds();
+    let node = usize::from(robot.joints[0].node_id);
+    for mode in ["position", "current", "pd", "idle", "fault"] {
+        cmds[0] = JointCommand::velocity(8000, 0);
+        for _ in 0..robot.ticks(0.4) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        let loaded = rig.state.nodes[node].current_ma.unwrap();
+        assert!(
+            loaded > 1000,
+            "the blocked drive must accumulate effort: {loaded} mA"
+        );
+        let here = rig.state.nodes[node].position_ticks.unwrap();
+        cmds[0] = match mode {
+            "position" => JointCommand::position(here, 0, 0),
+            "pd" => {
+                let mut cmd = JointCommand::position(here, 0, 0);
+                cmd.pack = par6_bus::Pack::Pd;
+                cmd
+            }
+            "idle" => JointCommand::drop_to_idle(),
+            "fault" => {
+                rig.bus.inject_fault(node as u8, FaultKind::Estop);
+                JointCommand::velocity(0, 0)
+            }
+            _ => JointCommand::current(0),
+        };
+        for _ in 0..robot.ticks(0.02) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        if mode == "fault" {
+            assert_eq!(
+                rig.state.nodes[node].current_ma.unwrap(),
+                0,
+                "fault removes drive authority"
+            );
+            rig.bus.send_clear_error(node as u8, 3).unwrap();
+        }
+        cmds[0] = JointCommand::velocity(0, 0);
+        for _ in 0..robot.ticks(0.04) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        let resumed = rig.state.nodes[node].current_ma.unwrap();
+        if mode == "position" {
+            assert!(
+                resumed > loaded / 2,
+                "a position hold erased the velocity integral: {loaded} -> {resumed} mA"
+            );
+        } else {
+            assert!(
+                resumed < loaded / 4,
+                "mode {mode} carried the velocity integral into the next velocity frame: \
+                 {loaded} -> {resumed} mA"
+            );
+        }
+    }
+}
+
+/// Encoder differences are averaged over 3.2 ms by the drive; slowing
+/// the host bus must not turn that telemetry into continuous plant velocity.
+#[test]
+fn slow_motion_reports_the_drive_encoder_velocity_quantum() {
+    for dt in [0.004, 0.02, 0.003] {
+        let mut robot = par6();
+        robot.robot.tick_dt_s = dt;
+        let mut rig = Rig::boot(&robot, None, None);
+        let mut cmds = vec![JointCommand::velocity(0, 0); rig.joints];
+        for _ in 0..robot.ticks(1.0) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        let node = usize::from(robot.joints[0].node_id);
+        let start = rig.state.nodes[node].position_ticks.unwrap();
+        let mut moving_samples = 0;
+        for tick in 0..robot.ticks(2.0) {
+            let target = start + (145.0 * f64::from(tick) * dt).round() as i32;
+            cmds[0] = JointCommand::position(target, 145, 0);
+            rig.step(&cmds, &GripperCommand::NoGripper);
+            let v = rig.state.nodes[node].speed_ticks_s.unwrap();
+            moving_samples += usize::from(v != 0);
+            // Integer truncation of k / 0.0032 yields 0, 312, 625, 937, ...
+            // and the corresponding negative values.
+            assert!(
+                matches!(v.abs() % 625, 0 | 312),
+                "host dt {dt}: speed {v} ticks/s is outside the drive's encoder quantum"
+            );
+        }
+        let travelled = rig.state.nodes[node].position_ticks.unwrap() - start;
+        assert!(
+            (travelled - 290).abs() < 40 && moving_samples > 10,
+            "the slow profile must actually move: {travelled} ticks, {moving_samples} moving samples"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
-// 7a. Gripper firmware mode: calibrate, empty polls, moves, objects
+// 7a. Gripper firmware mode: calibrate, empty polls, moves
 // ---------------------------------------------------------------------------
 
 #[test]
 fn gripper_firmware_calibrate_empty_polls_and_moves() {
     let robot = par6();
     let mut gripper = msg_gripper();
-    // Short watchdog so completing calibration on polls alone PROVES the
-    // DLC-0 empty poll feeds it (375 calibration ticks >> 50).
+    // Short watchdog so completing calibration on empty polls alone —
+    // no telemetry RTR reaching the gripper meanwhile — PROVES the DLC-0
+    // empty poll feeds it (375 calibration ticks >> 50).
     gripper.driver.as_mut().unwrap().watchdog_timeout_ms = 200;
     let wd_ticks = u64::from(robot.ticks(0.2));
     let mut rig = Rig::boot(&robot, Some(&gripper), None);
@@ -1006,7 +1268,7 @@ fn gripper_firmware_calibrate_empty_polls_and_moves() {
     let run_calibration = |rig: &mut Rig| -> Option<u64> {
         rig.step(&cmds.clone(), &GripperCommand::Calibrate);
         for k in 1..=u64::from(robot.ticks(10.0)) {
-            rig.step(&cmds.clone(), &GripperCommand::FirmwarePoll);
+            rig.step_unpolled(&cmds.clone(), &GripperCommand::FirmwarePoll);
             if rig.state.gripper.reply.is_some_and(|r| r.calibrated) {
                 return Some(k);
             }
@@ -1025,7 +1287,7 @@ fn gripper_firmware_calibrate_empty_polls_and_moves() {
     // Breaking the mandatory every-tick poll mid-calibration halts the
     // sequence uncalibrated.
     rig.step(&cmds, &GripperCommand::Calibrate);
-    for _ in 0..20 {
+    for _ in 0..wd_ticks / 2 {
         rig.step(&cmds, &GripperCommand::FirmwarePoll);
     }
     // Genuine silence: no gripper frame AND no telemetry poll. An
@@ -1046,7 +1308,7 @@ fn gripper_firmware_calibrate_empty_polls_and_moves() {
     // A cmd-61 command overwrites an in-progress calibration: the move
     // runs, the calibration never completes.
     rig.step(&cmds, &GripperCommand::Calibrate);
-    for _ in 0..50 {
+    for _ in 0..wd_ticks {
         rig.step(&cmds, &GripperCommand::FirmwarePoll);
     }
     let move_to = |position: u8| {
@@ -1098,28 +1360,6 @@ fn gripper_firmware_calibrate_empty_polls_and_moves() {
         "the standing command is still asserted after arrival"
     );
     assert_eq!(r.current_ma, 0, "current at rest");
-
-    // An object between the jaws jams the close early: detection code 1,
-    // pressing at the commanded current.
-    for _ in 0..u64::from(robot.ticks(2.0)) {
-        rig.step(&cmds, &move_to(20)); // open first
-    }
-    rig.bus.set_gripper_object_closing(Some(180));
-    for _ in 0..u64::from(robot.ticks(2.0)) {
-        rig.step(&cmds, &move_to(252));
-    }
-    let r = rig.state.gripper.reply.unwrap();
-    assert_eq!(r.position, 180, "jaws passed through the object");
-    assert_eq!(r.object_detection, ObjectDetection::DetectedClosing);
-    assert_eq!(r.current_ma, 500, "pressing current is the commanded limit");
-    // Removing the object lets the replayed move finish.
-    rig.bus.set_gripper_object_closing(None);
-    for _ in 0..u64::from(robot.ticks(2.0)) {
-        rig.step(&cmds, &move_to(252));
-    }
-    let r = rig.state.gripper.reply.unwrap();
-    assert_eq!(r.position, 252);
-    assert_eq!(r.object_detection, ObjectDetection::ReachedNoObject);
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,6 +1417,33 @@ fn gripper_motor_mode_homing_stall() {
     assert!(
         travel >= 1000.0,
         "backoff did not detach from the endstop (moved {travel} ticks)"
+    );
+
+    // Pass 2 comes back at the vendor's `rehome_speed_factor` default of
+    // 0.3, stalls again, and lands where pass 1 did.
+    let slow = gh.speed_ticks_s * 0.3;
+    let again = JointCommand::velocity((sign * slow) as i32, 0);
+    let (_, rest2, peak2, _) = run_stall_approach(
+        &mut rig,
+        &mut cmds,
+        &GripperCommand::Motor(again),
+        None,
+        usize::from(gnode),
+        again,
+        slow,
+        gh.current_ma,
+        u64::from(robot.ticks(gh.timeout_s)),
+        dt,
+    );
+    assert!(
+        f64::from(peak2) >= 0.9 * gh.current_ma,
+        "pass 2 stall current peaked at {peak2} mA"
+    );
+    assert!(
+        (rest2 - rest).abs() <= gh.two_pass_max_diff_ticks as i32,
+        "pass 2 seated {} ticks from pass 1 (allowed {})",
+        rest2 - rest,
+        gh.two_pass_max_diff_ticks
     );
 }
 
@@ -1301,9 +1568,12 @@ fn teleport_reseeds_the_arm_without_rebooting_the_bus() {
     for (q, j) in target.iter_mut().zip(&robot.joints) {
         *q = (*q + 0.2).clamp(j.limits.hard_min_rad, j.limits.hard_max_rad);
     }
+    // Held on landing, as the runtime holds a teleport: the drivetrains
+    // land carrying their load, which an idle drive would let go of.
+    let held = gravity_hold(&mut rig.bus, &robot, &target);
     rig.bus.teleport_joint_rad(&target).expect("teleport");
-    rig.step(&cmds, &GripperCommand::FirmwarePoll);
-    rig.step(&cmds, &GripperCommand::FirmwarePoll);
+    rig.step(&held, &GripperCommand::FirmwarePoll);
+    rig.step(&held, &GripperCommand::FirmwarePoll);
 
     for (j, jc) in robot.joints.iter().enumerate() {
         let conv = JointConversion::from_config(jc);
@@ -1313,6 +1583,8 @@ fn teleport_reseeds_the_arm_without_rebooting_the_bus() {
         let got = rig.state.nodes[usize::from(jc.node_id)]
             .position_ticks
             .expect("position after teleport");
+        // Landed carrying its load: nothing to settle but the encoder's
+        // own count. A landing that did not take is half a radian out.
         assert!(
             (got - want).abs() <= 2,
             "joint {j} reported {got} ticks after a teleport to {want}"
@@ -1379,6 +1651,22 @@ fn released_drivers_have_no_static_powered_support() {
     assert!(
         (released.bus.true_joint_rad()[1] - q0[1]).abs() > 0.005,
         "the released shoulder did not yield to gravity"
+    );
+
+    // The control: powered, the same support does change the motion.
+    let hold = passive.idle_cmds();
+    robot.sim.powered_support_nm.fill(0.0);
+    let mut bare = Rig::boot(&robot, None, Some(&q0));
+    robot.sim.powered_support_nm.fill(1e6);
+    let mut supported = Rig::boot(&robot, None, Some(&q0));
+    for _ in 0..robot.ticks(1.0) {
+        bare.step(&hold, &GripperCommand::NoGripper);
+        supported.step(&hold, &GripperCommand::NoGripper);
+    }
+    assert_ne!(
+        bare.bus.true_joint_rad(),
+        supported.bus.true_joint_rad(),
+        "powered support must act on a powered driver"
     );
 }
 
@@ -1495,7 +1783,9 @@ fn declared_attachment_uses_the_flange_in_the_mujoco_model() {
             armature: 0.001,
             damping: 0.1,
             frictionloss: 0.01,
-            range: [j.limits.hard_min_rad, j.limits.hard_max_rad],
+            endstops: j.limits.endstops(),
+            transmission_nm_rad: 0.0,
+            transmission_damping_nm_s: 0.0,
         })
         .collect();
     let mut held = shape(
@@ -1518,6 +1808,7 @@ fn declared_attachment_uses_the_flange_in_the_mujoco_model() {
                     timestep: 0.001,
                     joints: &tuning,
                     tool: None,
+                    lateral: (0.0, 0.0),
                 },
                 &[&[], &[held.clone()]],
             )
@@ -1532,11 +1823,25 @@ fn declared_attachment_uses_the_flange_in_the_mujoco_model() {
             "attachment remained in world coordinates"
         );
         let mut data = MjData::new(Box::new(model));
-        data.forward();
-        let first = data.geom_xpos()[geom];
-        data.qpos_mut()[0] = 0.4;
-        data.forward();
-        assert_ne!(data.geom_xpos()[geom], first);
+        // The declared pose is the flange's: wherever the arm puts the
+        // flange, the shape sits that far out in the flange's own axes.
+        let declared = [0.03, 0.02, 0.25];
+        let mut seen = Vec::new();
+        for q0 in [0.0, 0.4] {
+            data.qpos_mut()[0] = q0;
+            data.forward();
+            let (origin, r) = (data.xpos()[flange], data.xmat()[flange]);
+            let want: [f64; 3] = std::array::from_fn(|i| {
+                origin[i] + (0..3).map(|k| r[3 * i + k] * declared[k]).sum::<f64>()
+            });
+            let got = data.geom_xpos()[geom];
+            assert!(
+                (0..3).all(|i| (got[i] - want[i]).abs() < 1e-9),
+                "{tool:?} at q0 = {q0}: the shape sits at {got:?}, the flange puts it at {want:?}"
+            );
+            seen.push(got);
+        }
+        assert_ne!(seen[0], seen[1], "the shape rides with the arm");
         assert_eq!(
             data.model().geom_contype()[geom],
             0,
@@ -1576,11 +1881,14 @@ fn hold_all(rig: &mut Rig, robot: &RobotConfig) -> Vec<JointCommand> {
 fn endstop_stall_signatures_hold_for_every_joint() {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    /// Approach lengths \[rad\]: the post-backoff re-approach and a long
-    /// first approach.
-    const APPROACHES_RAD: [f64; 2] = [0.08, 0.5];
-    /// How far off the true stop the seated joint may rest \[rad\].
-    const SEAT_TOL_RAD: f64 = 0.03;
+    /// Approaches: the post-backoff re-approach — short, at the vendor's
+    /// `rehome_speed_factor` default of 0.3 — and a long first approach at
+    /// full homing speed, as (length \[rad\], speed factor).
+    const APPROACHES: [(f64, f64); 2] = [(0.08, 0.3), (0.5, 1.0)];
+    /// How far off the configured hard limit the seated joint may rest
+    /// \[rad\]: the stop is the limit, and contact penetrates it by well
+    /// under a milliradian.
+    const SEAT_TOL_RAD: f64 = 1e-3;
 
     let robot = par6();
     let dt = robot.robot.tick_dt_s;
@@ -1597,7 +1905,7 @@ fn endstop_stall_signatures_hold_for_every_joint() {
         let ticks_rise = conv.motor_ticks(hi) > conv.motor_ticks(lo);
         let stop_rad = if (sign > 0.0) == ticks_rise { hi } else { lo };
         let into = if stop_rad == hi { -1.0 } else { 1.0 };
-        for approach in APPROACHES_RAD {
+        for (approach, factor) in APPROACHES {
             let mut q0 = calibration_pose(&robot);
             q0[j] = (stop_rad + into * approach).clamp(lo + 0.01, hi - 0.01);
             let mut rig = Rig::boot(&robot, None, Some(&q0));
@@ -1609,7 +1917,8 @@ fn endstop_stall_signatures_hold_for_every_joint() {
                     4,
                 )
                 .unwrap();
-            let drive = JointCommand::velocity((sign * h.speed_ticks_s) as i32, 0);
+            let speed = h.speed_ticks_s * factor;
+            let drive = JointCommand::velocity((sign * speed) as i32, 0);
             let mut cmds = hold_all(&mut rig, &robot);
             let outcome = catch_unwind(AssertUnwindSafe(|| {
                 run_stall_approach(
@@ -1619,7 +1928,7 @@ fn endstop_stall_signatures_hold_for_every_joint() {
                     Some(j),
                     usize::from(jc.node_id),
                     drive,
-                    h.speed_ticks_s,
+                    speed,
                     h.current_ma,
                     u64::from(robot.ticks(h.timeout_s)),
                     dt,
@@ -1659,6 +1968,18 @@ fn endstop_stall_signatures_hold_for_every_joint() {
     for r in &rows {
         eprintln!("{r}");
     }
+    let stall_joints = robot
+        .homing
+        .joints
+        .iter()
+        .filter(|h| h.strategy == HomingStrategy::Stall)
+        .count();
+    assert!(stall_joints > 0, "the arm has stall-homed joints");
+    assert_eq!(
+        rows.len(),
+        APPROACHES.len() * stall_joints,
+        "every approach ran"
+    );
     assert!(
         failures.is_empty(),
         "endstop stall table failed on {} of {} approaches:\n{}",
@@ -1684,6 +2005,33 @@ fn close_cmd(position: u8) -> GripperCommand {
     })
 }
 
+/// Position holds at `q` carrying its gravity: what the runtime sends for
+/// a held pose.
+fn gravity_hold(bus: &mut SimBus, robot: &RobotConfig, q: &[f64]) -> Vec<JointCommand> {
+    let gravity = bus.gravity_at(q).expect("gravity");
+    robot
+        .joints
+        .iter()
+        .zip(q)
+        .zip(gravity)
+        .map(|((j, &angle), g)| {
+            let factor = par6_bus::spectral::torque_to_ma_factor(
+                j.gear_ratio,
+                j.gear_efficiency,
+                j.kt_nm_a,
+                j.dir,
+            );
+            JointCommand::position(
+                JointConversion::from_config(j)
+                    .motor_ticks(angle)
+                    .rem_euclid(1 << j.encoder_bits),
+                0,
+                (g * factor).round() as i16,
+            )
+        })
+        .collect()
+}
+
 /// Read the boot wire positions (one velocity-0 tick produces motion
 /// replies), then return position-hold commands for them.
 fn hold_commands(rig: &mut Rig, robot: &RobotConfig) -> Vec<JointCommand> {
@@ -1703,6 +2051,76 @@ fn hold_commands(rig: &mut Rig, robot: &RobotConfig) -> Vec<JointCommand> {
             JointCommand::position(pos, 0, 0)
         })
         .collect()
+}
+
+/// A steady push on a held joint moves its link off the encoder by the push
+/// over the drivetrain stiffness, as a load bends the arm's belts and
+/// gears, while the drive keeps the encoder on target. The link's dry
+/// friction can hold up to its own torque either way.
+#[test]
+fn a_held_joint_gives_under_load_through_its_drivetrain() {
+    let robot = par6();
+    let mut rig = Rig::boot(&robot, None, Some(&calibration_pose(&robot)));
+    let hold = hold_commands(&mut rig, &robot);
+    let settle = |rig: &mut Rig| {
+        for _ in 0..robot.ticks(1.5) {
+            rig.step(&hold, &GripperCommand::FirmwarePoll);
+        }
+    };
+    // Link angle and encoder angle, each in its own frame: only their
+    // changes are compared.
+    let read = |rig: &Rig| -> Vec<(f64, f64)> {
+        let truth = rig.bus.true_joint_rad();
+        robot
+            .joints
+            .iter()
+            .zip(truth)
+            .map(|(j, link)| {
+                let ticks = rig.state.nodes[usize::from(j.node_id)]
+                    .position_ticks
+                    .expect("position");
+                (link, JointConversion::from_config(j).joint_rad(ticks))
+            })
+            .collect()
+    };
+    settle(&mut rig);
+    let before = read(&rig);
+    let mut push_nm = Vec::new();
+    for j in &robot.joints {
+        let factor = par6_bus::spectral::torque_to_ma_factor(
+            j.gear_ratio,
+            j.gear_efficiency,
+            j.kt_nm_a,
+            j.dir,
+        );
+        let load_ma = 0.4 * j.ilim_ma;
+        rig.bus.set_joint_load_ma(j.node_id, load_ma);
+        push_nm.push(-load_ma / factor);
+    }
+    settle(&mut rig);
+    let after = read(&rig);
+    for (i, j) in robot.joints.iter().enumerate() {
+        let k = robot.sim.transmission_stiffness_nm_rad[i];
+        let friction = robot.sim.coulomb_nm[i];
+        // The encoder wraps once per motor turn.
+        let turn = std::f64::consts::TAU / j.gear_ratio;
+        let mut encoder = after[i].1 - before[i].1;
+        encoder -= (encoder / turn).round() * turn;
+        let give = (after[i].0 - before[i].0) - encoder;
+        assert!(
+            encoder.abs() < 0.2 * (push_nm[i] / k).abs(),
+            "J{}: the drive must hold the encoder on target, moved {encoder} rad",
+            i + 1
+        );
+        assert!(
+            (give * k - push_nm[i]).abs() <= 2.0 * friction + 0.05 * push_nm[i].abs(),
+            "J{}: a {:+.3} Nm push must give {:+.5} rad through a {k} Nm/rad drivetrain \
+             (within its {friction} Nm friction), gave {give:+.5}",
+            i + 1,
+            push_nm[i],
+            push_nm[i] / k
+        );
+    }
 }
 
 /// The grasp scenario end to end through the REAL status path: a block
@@ -1775,55 +2193,6 @@ fn grasp_detected_through_status_bits() {
     assert_eq!(r.object_detection, ObjectDetection::ReachedNoObject);
 }
 
-/// Which frames feed the driver watchdog, stated against the firmware.
-///
-/// `Gripper_pack_data`'s siblings in `communication_CAN.cpp` set
-/// `watchdog_reset = 1` in exactly two places: the data-pack cases that
-/// install a `Controller_mode`, and the `OUT_IN_*` cases when the request
-/// is a `REMOTE_FRAME`. Idle, Estop, Clear_Error, the gain/limit writes
-/// and the watchdog setup itself do not feed it.
-///
-/// Getting this backwards is invisible from inside the simulator and
-/// wrong in both directions on the arm: the RT's homing pattern of idle
-/// frames plus encoder polls would fault here while running fine on
-/// hardware, and a config-only traffic pattern would pass here while
-/// faulting a real driver.
-#[test]
-fn only_motion_frames_and_answered_polls_feed_the_watchdog() {
-    let mut robot = par6();
-    robot.joints[0].watchdog_timeout_ms = 200;
-    let wd_ticks = u64::from(robot.ticks(f64::from(robot.joints[0].watchdog_timeout_ms) / 1000.0));
-
-    // Firmware Idle frames (cmd 12) alone do not feed it: the watchdog
-    // fires even though every tick carries an accepted, well-formed
-    // command frame. Note `JointCommand::idle()` is NOT this — that is
-    // velocity(0,0), a real data pack, which does feed.
-    let mut rig = Rig::boot(&robot, None, None);
-    let mut cmds = rig.idle_cmds();
-    cmds[0] = JointCommand::velocity(-8000, 0);
-    for _ in 0..60 {
-        rig.step(&cmds, &GripperCommand::NoGripper);
-    }
-    cmds[0] = JointCommand::drop_to_idle();
-    for _ in 0..(wd_ticks + 60) {
-        rig.step_joints_only(&cmds);
-    }
-    rig.bus.queue_poll_override(
-        PollAction::Poll {
-            node: 0,
-            kind: PollKind::Errors,
-        },
-        1,
-    );
-    rig.step(&cmds, &GripperCommand::NoGripper);
-    rig.step(&cmds, &GripperCommand::NoGripper);
-    let flags = rig.state.nodes[0].error_flags.unwrap();
-    assert!(
-        flags.watchdog,
-        "idle frames must not feed the watchdog (flags {flags:?})"
-    );
-}
-
 /// A faulted driver has no drive authority until `Clear_Error`.
 ///
 /// Firmware runs its whole mode switch inside `if (controller.Error == 0)`;
@@ -1836,9 +2205,10 @@ fn a_faulted_driver_stops_driving_until_the_fault_is_cleared() {
     let robot = par6();
     let mut rig = Rig::boot(&robot, None, None);
     let mut cmds = rig.idle_cmds();
+    let spin_up = robot.ticks(0.5);
 
     cmds[0] = JointCommand::velocity(-8000, 0);
-    for _ in 0..120 {
+    for _ in 0..spin_up {
         rig.step(&cmds, &GripperCommand::NoGripper);
     }
     assert!(
@@ -1846,9 +2216,11 @@ fn a_faulted_driver_stops_driving_until_the_fault_is_cleared() {
         "drive never reached speed"
     );
 
-    // Fault it while the SAME command keeps arriving every tick.
+    // Fault it while the SAME command keeps arriving every tick: no
+    // current, and nothing holding the joint — a load turns it where a
+    // brake would not.
     rig.bus.inject_fault(0, FaultKind::Temperature);
-    for _ in 0..200 {
+    for _ in 0..robot.ticks(0.8) {
         rig.step(&cmds, &GripperCommand::NoGripper);
     }
     let faulted = rig.state.nodes[0].speed_ticks_s.unwrap();
@@ -1857,15 +2229,34 @@ fn a_faulted_driver_stops_driving_until_the_fault_is_cleared() {
         "a faulted driver kept driving at {faulted}: firmware disables the \
          power stage while Error is latched, however hard the host commands"
     );
+    assert_eq!(
+        rig.state.nodes[0].current_ma,
+        Some(0),
+        "a faulted stage drives no current"
+    );
+    let rest = rig.state.nodes[0].position_ticks.unwrap();
+    rig.bus.set_joint_load_ma(0, 0.5 * robot.joints[0].ilim_ma);
+    for _ in 0..robot.ticks(0.3) {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+    rig.bus.set_joint_load_ma(0, 0.0);
+    assert!(
+        (rig.state.nodes[0].position_ticks.unwrap() - rest).abs() > 200,
+        "a load must turn a faulted joint; this one was held"
+    );
 
     // Clearing restores authority — the fault gate is not a one-way trip.
     rig.bus.send_clear_error(0, 3).unwrap();
-    for _ in 0..200 {
+    let resumed_start = rig.state.nodes[0].position_ticks.unwrap();
+    let window = robot.ticks(0.8);
+    for _ in 0..window {
         rig.step(&cmds, &GripperCommand::NoGripper);
     }
+    let resumed = f64::from(rig.state.nodes[0].position_ticks.unwrap() - resumed_start)
+        / (f64::from(window) * robot.robot.tick_dt_s);
     assert!(
-        rig.state.nodes[0].speed_ticks_s.unwrap() <= -6000,
-        "drive did not resume after clear-error"
+        resumed <= -6000.0,
+        "drive did not resume after clear-error: mean {resumed} ticks/s"
     );
 }
 
@@ -1882,28 +2273,30 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     let q0 = [0.0, -1.85, 2.85, 0.0, 0.0, 0.0];
     let mut rig = Rig::boot(&robot, None, Some(&q0));
     let hold = hold_all(&mut rig, &robot);
+    let mut control = Rig::boot(&robot, None, Some(&q0));
+    let control_hold = hold_all(&mut control, &robot);
     for _ in 0..u64::from(robot.ticks(0.5)) {
         rig.step(&hold, &GripperCommand::NoGripper);
+        control.step(&control_hold, &GripperCommand::NoGripper);
     }
     let before = rig.bus.true_joint_rad();
     assert!(
         rig.bus.world_object_pose("block").is_none(),
         "no block before it is declared"
     );
-    // The installation layer the shipped config declares — the floor is a
-    // shape like any other, so the scene only has one once it is applied.
-    rig.bus
-        .set_world(Layer::Installation, &robot.installation_shapes);
-    // Where a dropped body comes to rest: the floor's own top face, read
-    // from the shape the config declares rather than assumed to be z = 0.
-    // It sits below the mounting plane by the height of the plate the arm
-    // is bolted to.
-    let floor_top = robot
-        .installation_shapes
-        .iter()
-        .find(|s| s.name == "floor")
-        .map(|s| s.pose[2] + s.params[2] / 2.0)
-        .expect("the shipped config declares a floor");
+    // An installation's floor — a shape like any other, so the scene only
+    // has one once it is applied — welded 10 mm below the mounting plane,
+    // clear of the base. Where a dropped body comes to rest is its top
+    // face, read from the shape rather than assumed to be z = 0.
+    let floor = shape(
+        "floor",
+        "box",
+        &[6.0, 6.0, 0.2],
+        [0.0, 0.0, -0.11, 0.0, 0.0, 0.0],
+        Some(None),
+    );
+    let floor_top = floor.pose[2] + floor.params[2] / 2.0;
+    rig.bus.set_world(Layer::Installation, &[floor]);
 
     // A free block in the air over the floor, plus a keep-out and a marker
     // that must not become bodies — all beyond the arm's reach, so nothing
@@ -1937,6 +2330,7 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     });
     rig.bus.set_world(Layer::Program, &world);
     rig.step(&hold, &GripperCommand::NoGripper);
+    control.step(&control_hold, &GripperCommand::NoGripper);
     // The rebuild resets MuJoCo's constraint warm start, so the held arm
     // sees one substep of transient — a fraction of a milliradian.
     let after = rig.bus.true_joint_rad();
@@ -1968,6 +2362,7 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     );
     for _ in 0..u64::from(robot.ticks(1.5)) {
         rig.step(&hold, &GripperCommand::NoGripper);
+        control.step(&control_hold, &GripperCommand::NoGripper);
     }
     let rest = rig.bus.world_object_pose("block").unwrap();
     assert!(
@@ -2010,6 +2405,7 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     let before_shelf = rig.bus.true_joint_rad();
     rig.bus.set_world(Layer::Program, &world);
     rig.step(&hold, &GripperCommand::NoGripper);
+    control.step(&control_hold, &GripperCommand::NoGripper);
     for (a, b) in rig.bus.true_joint_rad().iter().zip(&before_shelf) {
         assert!(
             (a - b).abs() < 1e-3,
@@ -2027,6 +2423,7 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     );
     for _ in 0..u64::from(robot.ticks(1.5)) {
         rig.step(&hold, &GripperCommand::NoGripper);
+        control.step(&control_hold, &GripperCommand::NoGripper);
     }
     let on_shelf = rig.bus.world_object_pose("block2").unwrap();
     assert!(
@@ -2040,6 +2437,7 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     let before_clear = rig.bus.true_joint_rad();
     rig.bus.set_world(Layer::Program, &[]);
     rig.step(&hold, &GripperCommand::NoGripper);
+    control.step(&control_hold, &GripperCommand::NoGripper);
     assert!(
         rig.bus.world_object_pose("block").is_none()
             && rig.bus.world_object_pose("block2").is_none()
@@ -2052,53 +2450,537 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
             a - b
         );
     }
-    // And across the whole sequence, not only across each rebuild: the arm
-    // held one position throughout, so drift that accumulates between the
-    // rebuilds is exactly what the per-step comparisons cannot see. The bound
-    // is the position loop's measured steady-state creep under hold on this
-    // plant over these ~3.5 s (worst joint 1.5 mrad, the loaded elbow), not a
-    // claim that holding is exact.
-    for (j, (a, b)) in cleared.iter().zip(&before).enumerate() {
+    // And across the whole sequence, not only across each rebuild: drift
+    // that accumulates between the rebuilds is exactly what the per-step
+    // comparisons cannot see. A finite-gain hold creeps a little on its own,
+    // so the reference is the control rig, held the same way for the same
+    // time with no rebuilds.
+    let unchanged = control.bus.true_joint_rad();
+    for (j, (a, b)) in cleared.iter().zip(&unchanged).enumerate() {
         assert!(
-            (a - b).abs() < 2e-3,
-            "joint {j} drifted {:+.5} rad while holding through the rebuilds",
+            (a - b).abs() < 1e-3,
+            "joint {j} drifted {:+.5} rad more than the unrebuilt control",
             a - b
         );
     }
 }
 
-/// The kinematic plant drives on the loop's own feedback share: a torque
-/// feedforward that alone saturates Ilim (shoulder gravity at homing
-/// current) must not cancel the position error out of the command.
+/// The position loop keeps its own share of the command under a torque
+/// feedforward: a feedforward pushing AGAINST the target — on its own it
+/// turns the joint the other way — does not stop the loop closing on it.
 #[test]
-fn a_saturating_feedforward_does_not_cancel_the_position_loop() {
+fn a_feedforward_does_not_cancel_the_position_loop() {
     let robot = par6();
-    let mut rig = Rig::boot(&robot, None, None);
     let node = usize::from(robot.joints[0].node_id);
-    let mut cmds = rig.idle_cmds();
-    // Polls rotate over the nodes; wait for this one's first answer.
-    let mut start = None;
-    for _ in 0..20 {
-        rig.step(&cmds, &GripperCommand::NoGripper);
-        start = rig.state.nodes[node].position_ticks;
-        if start.is_some() {
-            break;
+    let against = -(0.3 * robot.joints[0].ilim_ma) as i16;
+    let moved = |cmd: &dyn Fn(i32) -> JointCommand| -> i32 {
+        let mut rig = Rig::boot(&robot, None, None);
+        let mut cmds = rig.idle_cmds();
+        // Polls rotate over the nodes; wait for this one's first answer.
+        let mut start = None;
+        for _ in 0..20 {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+            start = rig.state.nodes[node].position_ticks;
+            if start.is_some() {
+                break;
+            }
+        }
+        let start = start.expect("the sim answers the polls");
+        cmds[0] = cmd(start);
+        for _ in 0..200 {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        rig.state.nodes[node].position_ticks.expect("polled") - start
+    };
+    // The control: the feedforward alone turns the joint negative.
+    let pushed = moved(&|_| JointCommand::current(against));
+    assert!(
+        pushed < -500,
+        "the feedforward alone moves the joint: {pushed}"
+    );
+    let closed = moved(&|start| JointCommand::position(start + 4000, 0, against));
+    assert!(
+        closed > 500,
+        "the joint must close on its target against the feedforward: moved {closed} of 4000"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Combined telemetry, the drive's tool id, and the empty gripper slot
+// ---------------------------------------------------------------------------
+
+/// One cmd-37 poll lands temperature, voltage, the error flags and the
+/// current together and marks the node as answering it; the gripper
+/// drive's device info names the tool it is built into, and a
+/// `set_tool_id` renames it on the spot. With no gripper fitted the
+/// gripper slot puts nothing on the bus: a tick is the joint frames and
+/// one poll.
+#[test]
+fn one_telemetry_poll_refreshes_the_node_and_the_gripper_names_its_tool() {
+    let robot = par6();
+    let gripper = msg_gripper();
+    let gnode = robot.bus.gripper_node;
+    let mut rig = Rig::boot(&robot, Some(&gripper), None);
+    let cmds = rig.idle_cmds();
+    // Only the poll goes out, so the current can only come from its reply.
+    rig.state.nodes[2].current_ma = None;
+    rig.bus.queue_poll_override(
+        PollAction::Poll {
+            node: 2,
+            kind: PollKind::Telemetry,
+        },
+        1,
+    );
+    rig.step_poll_only();
+    rig.step_poll_only();
+    let n = &rig.state.nodes[2];
+    assert!(n.combined_telemetry, "{n:?}");
+    assert_eq!(n.temperature_c, Some(34), "{n:?}");
+    assert_eq!(n.voltage_mv, Some(24_000), "{n:?}");
+    assert!(n.error_flags.is_some_and(|f| f.calibrated), "{n:?}");
+    assert!(n.current_ma.is_some(), "{n:?}");
+
+    let device_info = |rig: &mut Rig| {
+        rig.bus.queue_poll_override(
+            PollAction::Poll {
+                node: gnode,
+                kind: PollKind::DeviceInfo,
+            },
+            1,
+        );
+        rig.step(&cmds, &GripperCommand::FirmwarePoll);
+        rig.step(&cmds, &GripperCommand::FirmwarePoll);
+        rig.state.nodes[usize::from(gnode)]
+            .device_info
+            .expect("device info")
+    };
+    assert_eq!(
+        device_info(&mut rig).tool_id,
+        gripper.can_tool_id.expect("the MSG rail carries an id")
+    );
+    rig.bus.set_tool_id(gnode, 33).expect("set_tool_id");
+    assert_eq!(device_info(&mut rig).tool_id, 33);
+
+    let mut bare = Rig::boot(&robot, None, None);
+    let cmds = bare.idle_cmds();
+    bare.step(&cmds, &GripperCommand::NoGripper);
+    bare.bus.reset_tx_peak();
+    bare.step(&cmds, &GripperCommand::NoGripper);
+    assert_eq!(
+        bare.bus.peak_tx_frames_per_tick(),
+        robot.joints.len() + 2,
+        "a bare arm's tick is its joint frames, the timing-dummy ping and one poll"
+    );
+}
+
+/// The loop-rate capture (cmd 38/39) is what host-side tuning fits: the
+/// velocity the drive's loop acted on and the current it drove, sample by
+/// sample through a velocity step, read back one pair per poll slot.
+#[test]
+fn capture_records_a_velocity_step_at_the_loop_rate_and_reads_back() {
+    let robot = par6();
+    let j = 0usize;
+    let node = robot.joints[j].node_id;
+    let step = 6000;
+    // A velocity step captured at `divisor` loops a sample: the velocity
+    // and current records, read back chunk by chunk through the poll slot.
+    let capture = |divisor: u8, wanted: u16| -> (Rig, Vec<i32>, Vec<i16>) {
+        let mut rig = Rig::boot(&robot, None, Some(&calibration_pose(&robot)));
+        let mut cmds = rig.idle_cmds();
+        cmds[j] = JointCommand::velocity(0, 0);
+        for _ in 0..robot.ticks(0.2) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        let (velocity, current) =
+            capture_step(&mut rig, &robot, &mut cmds, j, step, divisor, wanted, 0.32);
+        (rig, velocity, current)
+    };
+
+    // 800 samples, every second loop: the rise and the plateau.
+    let wanted = 800u16;
+    let (mut rig, velocity, current) = capture(2, wanted);
+    let n = usize::from(wanted);
+    assert!(
+        velocity[0].abs() < step / 10,
+        "the capture starts before the step lands: {}",
+        velocity[0]
+    );
+    // Evaluate mean tracking separately from ripple: this exercises the
+    // recorder and its cadence, not agreement with a measured hardware plant.
+    let tail = &velocity[n / 2..];
+    let settled = tail.iter().sum::<i32>() / tail.len() as i32;
+    assert!(
+        (settled - step).abs() < step / 10,
+        "the response settles about the commanded speed: {settled} vs {step}"
+    );
+    let rise_at = |v: &[i32]| v.iter().position(|&x| x > step / 2).expect("a rise");
+    let rise = rise_at(&velocity);
+    assert!(
+        rise > 0 && rise < n / 2,
+        "the rise is inside the capture: {rise}"
+    );
+    // The current peaks as the drivetrain winds up to carry the link,
+    // after the rotor itself is up to speed (the arm's J1 too).
+    let accelerating = current[..n / 4].iter().map(|c| c.abs()).max().unwrap();
+    let tail = &current[n / 2..];
+    let cruising = tail.iter().map(|&c| i32::from(c)).sum::<i32>().abs() / tail.len() as i32;
+    assert!(
+        i32::from(accelerating) > cruising,
+        "accelerating costs more current ({accelerating} mA) than cruising ({cruising} mA)"
+    );
+
+    // The divisor is the cadence: sampling every loop, the same rise takes
+    // twice the samples to reach.
+    let (_, every_loop, _) = capture(1, wanted);
+    let ratio = rise_at(&every_loop) as f64 / rise as f64;
+    assert!(
+        (ratio - 2.0).abs() < 0.2,
+        "a divisor of 2 must halve the sample rate: the rise is {} samples \
+         in, against {rise} at divisor 2",
+        rise_at(&every_loop)
+    );
+
+    rig.bus.capture_start(node, 1, 10).expect("second capture");
+    assert_eq!(
+        rig.bus.capture(node).expect("a capture buffer").recorded,
+        0,
+        "a new capture forgets the last one"
+    );
+}
+
+/// The simulator keeps the backend contracts the hardware does: nothing
+/// goes out before it is configured, joint commands are sent once a tick
+/// and only for every joint, and the RX drain stops at its per-tick cap
+/// with the rest kept for the next tick.
+#[test]
+fn the_send_contracts_and_the_rx_cap_hold() {
+    let mut robot = par6();
+    robot.bus.rx_frames_per_tick_cap = 4;
+    let mut bus = SimBus::new(scene());
+    let joints = [JointCommand::idle(); 6];
+    assert!(
+        bus.send_joint_commands(&joints).is_err(),
+        "nothing is sent before the bus is configured"
+    );
+    bus.boot_configure(&robot, Some(&msg_gripper()), 1)
+        .expect("sim boot");
+
+    bus.begin_tick(1);
+    bus.send_joint_commands(&joints).expect("the tick's send");
+    assert!(
+        bus.send_joint_commands(&joints).is_err(),
+        "a second send in one tick is refused"
+    );
+    bus.begin_tick(2);
+    assert!(
+        bus.send_joint_commands(&joints[..5]).is_err(),
+        "a send that does not cover every joint is refused"
+    );
+
+    // Every joint answers its tick's frame: more replies than the cap.
+    let mut state = BusState::new();
+    bus.begin_tick(3);
+    bus.send_joint_commands(&joints).expect("send");
+    bus.begin_tick(4);
+    let first = bus.drain_rx(&mut state).expect("drain");
+    let second = bus.drain_rx(&mut state).expect("drain");
+    assert_eq!(first, 4, "the drain stops at its cap");
+    assert!(second >= 2, "the rest is kept for the next drain: {second}");
+}
+
+/// Step joint `j` to `step` ticks/s from whatever `cmds` left it doing, with
+/// the drive capturing every `divisor` loops from the same tick, hold the
+/// step for `step_s`, stop, and read the record back through the poll slot:
+/// its velocity \[ticks/s\] and current \[mA\]. `cmds` keeps the other joints.
+#[allow(clippy::too_many_arguments)]
+fn capture_step(
+    rig: &mut Rig,
+    robot: &RobotConfig,
+    cmds: &mut [JointCommand],
+    j: usize,
+    step: i32,
+    divisor: u8,
+    wanted: u16,
+    step_s: f64,
+) -> (Vec<i32>, Vec<i16>) {
+    let node = robot.joints[j].node_id;
+    rig.bus
+        .capture_start(node, divisor, wanted)
+        .expect("capture_start");
+    cmds[j] = JointCommand::velocity(step, 0);
+    for _ in 0..robot.ticks(step_s) {
+        rig.step(cmds, &GripperCommand::NoGripper);
+    }
+    cmds[j] = JointCommand::velocity(0, 0);
+    let read = |rig: &mut Rig, cmds: &[JointCommand], channel: u8, chunk: u16| {
+        rig.bus.queue_poll_override(
+            PollAction::CaptureRead {
+                node,
+                channel,
+                chunk,
+            },
+            1,
+        );
+        rig.step(cmds, &GripperCommand::NoGripper);
+    };
+    read(rig, cmds, CAPTURE_STATUS_CHANNEL, 0);
+    rig.step(cmds, &GripperCommand::NoGripper);
+    let status = rig.bus.capture(node).expect("a capture buffer");
+    assert_eq!(
+        (status.recorded, status.wanted, status.divisor),
+        (wanted, wanted, u16::from(divisor)),
+        "the drive stops by itself at the length asked for"
+    );
+    let chunks = status.chunks();
+    for channel in [0u8, 1] {
+        for chunk in 0..chunks {
+            read(rig, cmds, channel, chunk);
         }
     }
-    let start = start.expect("the sim answers the polls");
+    rig.step(cmds, &GripperCommand::NoGripper);
+    let cap = rig.bus.capture(node).expect("a capture buffer");
+    let n = usize::from(wanted);
+    let velocity = cap.velocity[..n]
+        .iter()
+        .map(|&v| i32::from(v) * CAPTURE_VEL_SCALE)
+        .collect();
+    (velocity, cap.current[..n].to_vec())
+}
 
-    // Position mode with the feedforward channel pinned far past Ilim.
-    let target = start + 4000;
-    cmds[0] = JointCommand::position(target, 0, i16::MAX);
-    for _ in 0..200 {
+// ---------------------------------------------------------------------------
+// Fidelity against the arm
+// ---------------------------------------------------------------------------
+//
+// The plant against what the reference arm measured, so a model change that
+// drifts away from the arm fails here. The simulator is meant to be useful,
+// not exact, and the arm's own repeat runs spread these quantities by up to
+// a factor of two (J1's static friction 0.19-0.29 Nm, J4's 0.025-0.058 Nm
+// over eight runs), so the plant is held within that factor of the arm:
+// closer than that, the measurements cannot confirm.
+
+/// How far from the arm the plant may land, either way.
+const BALLPARK: f64 = 2.0;
+
+fn assert_ballpark(what: &str, sim: f64, arm: f64) {
+    let ratio = sim / arm;
+    assert!(
+        (1.0 / BALLPARK..=BALLPARK).contains(&ratio),
+        "{what}: the plant gives {sim:.4}, the arm {arm:.4} ({ratio:.2}x)"
+    );
+}
+
+/// The bare-flange arm, as every reference run had it, booted at `q`.
+fn flange_rig(robot: &RobotConfig, q: &[f64]) -> Rig {
+    let mut bus = SimBus::new(Scene {
+        tool: Tool::Flange,
+        ..scene()
+    });
+    bus.set_initial_joint_rad(q);
+    bus.boot_configure(robot, None, robot.bus.boot_config_repeats)
+        .expect("boot");
+    Rig {
+        bus,
+        state: BusState::new(),
+        tick: 0,
+        joints: robot.joints.len(),
+    }
+}
+
+/// J1 sweeping at 10 deg/s with the arm out (the stiction stage's arm-out
+/// pose, configured gains) tracks as the arm did in run
+/// selfcal-1791409575463997117 on 2026-10-07: a speed error of 1.01 deg/s
+/// RMS without ever reversing (slowest 7.5 deg/s), the encoder at most
+/// 0.076 deg off the command, 0.261 A on average. The plant has no current
+/// ripple, so its speed error may fall short of the arm's but never exceed
+/// it.
+#[test]
+fn the_base_sweeps_like_the_arm() {
+    const ARM_SPEED_ERROR_RMS_DEG_S: f64 = 1.01;
+    const ARM_PEAK_POSITION_ERROR_DEG: f64 = 0.076;
+    const ARM_MEAN_CURRENT_A: f64 = 0.261;
+    let robot = par6();
+    let dt = robot.robot.tick_dt_s;
+    let mut q = robot.homing.ready_pose_rad(6).expect("ready pose");
+    q[0] -= 40_f64.to_radians();
+    q[1] = (-40_f64).to_radians();
+    q[2] = 185_f64.to_radians();
+    q[4] = (-60_f64).to_radians();
+    let mut rig = flange_rig(&robot, &q);
+    let mut commands = gravity_hold(&mut rig.bus, &robot, &q);
+    let conv = JointConversion::from_config(&robot.joints[0]);
+    let ticks_per_rad = conv.motor_speed_ticks_s(1.0);
+    let node = usize::from(robot.joints[0].node_id);
+    let start = conv
+        .motor_ticks(q[0])
+        .rem_euclid(1 << robot.joints[0].encoder_bits);
+    let speed = 10_f64.to_radians();
+    let ramp = |u: f64| {
+        let u = u.clamp(0.0, 1.0);
+        35.0 * u.powi(4) - 84.0 * u.powi(5) + 70.0 * u.powi(6) - 20.0 * u.powi(7)
+    };
+    let (mut delta, mut previous) = (0.0, 0.0);
+    let (mut squared_error, mut slowest, mut peak_error, mut current, mut n) =
+        (0.0, f64::INFINITY, 0.0_f64, 0.0, 0u32);
+    for k in 0..robot.ticks(12.0) {
+        let t = f64::from(k) * dt;
+        let fraction = if t < 3.0 {
+            ramp(t + dt - 2.0)
+        } else if t < 10.0 {
+            1.0
+        } else {
+            1.0 - ramp(t + dt - 10.0)
+        };
+        let velocity = speed * fraction;
+        delta += (previous + velocity) * dt * 0.5;
+        previous = velocity;
+        let target = start + (delta * ticks_per_rad).round() as i32;
+        commands[0] = JointCommand::position(target, (velocity * ticks_per_rad).round() as i32, 0);
+        rig.step(&commands, &GripperCommand::NoGripper);
+        if (4.0..10.0).contains(&t) {
+            let state = &rig.state.nodes[node];
+            assert!(!state.live_error_bit, "drive fault during ordinary motion");
+            let measured = f64::from(state.speed_ticks_s.expect("speed")) / ticks_per_rad;
+            squared_error += (measured - speed).to_degrees().powi(2);
+            slowest = slowest.min(measured.to_degrees());
+            let off = f64::from(state.position_ticks.expect("position") - target);
+            peak_error = peak_error.max((off / ticks_per_rad).to_degrees().abs());
+            current += f64::from(state.current_ma.expect("current"));
+            n += 1;
+        }
+    }
+    let rms = (squared_error / f64::from(n)).sqrt();
+    assert!(slowest > 0.0, "the base reversed: {slowest:.3} deg/s");
+    assert!(
+        rms <= ARM_SPEED_ERROR_RMS_DEG_S,
+        "the base shakes more than the arm: {rms:.3} deg/s RMS against \
+         {ARM_SPEED_ERROR_RMS_DEG_S}"
+    );
+    assert_ballpark(
+        "J1's peak tracking error [deg]",
+        peak_error,
+        ARM_PEAK_POSITION_ERROR_DEG,
+    );
+    assert_ballpark(
+        "J1's mean current [A]",
+        (current / f64::from(n) / 1000.0).abs(),
+        ARM_MEAN_CURRENT_A,
+    );
+    let rest = f64::from(rig.state.nodes[node].speed_ticks_s.expect("speed")) / ticks_per_rad;
+    assert!(rest.to_degrees().abs() < 1.0, "the base failed to settle");
+}
+
+/// J1 stepped to 20 deg/s from rest at the ready pose draws the current the
+/// arm drew for that step: 523-599 mA at its peak, median 567, over eighteen
+/// captures in six runs on 2026-10-01 and 2026-10-02, the drive recording
+/// every third loop. The peak is the base's inertia and its drivetrain
+/// winding up, which is what a payload adds to.
+#[test]
+fn a_speed_step_draws_the_current_the_arm_draws() {
+    const ARM_PEAK_CURRENT_MA: f64 = 567.0;
+    const STEP_TICKS_S: i32 = -5825;
+    let robot = par6();
+    let q = robot.homing.ready_pose_rad(6).expect("ready pose");
+    let mut rig = flange_rig(&robot, &q);
+    let mut cmds = gravity_hold(&mut rig.bus, &robot, &q);
+    for _ in 0..robot.ticks(1.0) {
         rig.step(&cmds, &GripperCommand::NoGripper);
     }
-    let now = rig.state.nodes[node].position_ticks.expect("polled");
-    assert!(
-        now - start > 500,
-        "the joint must close on its target under a saturating feedforward: \
-         moved {} ticks of {}",
-        now - start,
-        target - start
+    let (_, current) = capture_step(
+        &mut rig,
+        &robot,
+        &mut cmds,
+        0,
+        STEP_TICKS_S,
+        3,
+        par6_bus::spectral::codec::CAPTURE_LEN,
+        0.6,
     );
+    let peak = current
+        .iter()
+        .map(|c| f64::from(c.unsigned_abs()))
+        .fold(0.0, f64::max);
+    assert_ballpark(
+        "J1's peak current on a 20 deg/s step [mA]",
+        peak,
+        ARM_PEAK_CURRENT_MA,
+    );
+}
+
+/// Each joint breaks away from rest at the ready pose near where the arm's
+/// did, measured as the stiction stage measures it on the arm: from the
+/// current the held joint rests on, the current ramps at 5% of the limit per
+/// second until the encoder is sliding (100 ticks/s over 0.2 s and 40 ticks
+/// out), and the current at the start of that window counts. Half the
+/// spread between the two directions, through the motor constant, is the
+/// static friction. The arm's are the medians of eight runs on 2026-09-23
+/// and 2026-10-01. With the arm out the arm's base breaks away at 0.36 Nm,
+/// about twice the plant's: its bearings carry the overturning moment, which
+/// the plant's constant friction does not see.
+#[test]
+fn each_joint_breaks_away_where_the_arm_does() {
+    const ARM_STATIC_NM: [f64; 6] = [0.265, 0.607, 0.332, 0.050, 0.038, 0.087];
+    let robot = par6();
+    let q = robot.homing.ready_pose_rad(6).expect("ready pose");
+    let mut rig = flange_rig(&robot, &q);
+    let hold = gravity_hold(&mut rig.bus, &robot, &q);
+    for (j, arm) in ARM_STATIC_NM.into_iter().enumerate() {
+        let joint = &robot.joints[j];
+        let factor = par6_bus::spectral::torque_to_ma_factor(
+            joint.gear_ratio,
+            joint.gear_efficiency,
+            joint.kt_nm_a,
+            joint.dir,
+        )
+        .abs();
+        let up = breakaway_ma(&mut rig, &robot, &hold, j, 1.0);
+        let down = breakaway_ma(&mut rig, &robot, &hold, j, -1.0);
+        assert_ballpark(
+            &format!("J{}'s static friction [Nm]", j + 1),
+            (up - down).abs() / 2.0 / factor,
+            arm,
+        );
+    }
+}
+
+/// The current at which joint `j` starts sliding, ramped from its holding
+/// current in `sign`'s direction while the others hold \[mA\].
+fn breakaway_ma(
+    rig: &mut Rig,
+    robot: &RobotConfig,
+    hold: &[JointCommand],
+    j: usize,
+    sign: f64,
+) -> f64 {
+    let dt = robot.robot.tick_dt_s;
+    let node = usize::from(robot.joints[j].node_id);
+    for _ in 0..robot.ticks(1.0) {
+        rig.step(hold, &GripperCommand::NoGripper);
+    }
+    let balance = f64::from(rig.state.nodes[node].current_ma.expect("current"));
+    let start = rig.state.nodes[node].position_ticks.expect("position");
+    let ilim = robot.joints[j].ilim_ma;
+    let window = robot.ticks(0.2) as usize;
+    let mut recent = VecDeque::with_capacity(window + 1);
+    let mut commands = hold.to_vec();
+    for t in 0..robot.ticks(0.6 / 0.05) {
+        let ramp = sign * 0.05 * ilim * f64::from(t) * dt;
+        let current = (balance + ramp).clamp(-ilim, ilim);
+        commands[j] = JointCommand::current(current.round() as i16);
+        rig.step(&commands, &GripperCommand::NoGripper);
+        let moved = rig.state.nodes[node].position_ticks.expect("position") - start;
+        recent.push_back((moved, current));
+        if recent.len() > window {
+            recent.pop_front();
+        }
+        let (oldest_moved, oldest_current) = recent[0];
+        let sliding = f64::from(moved - oldest_moved).abs() / (recent.len() as f64 * dt);
+        if recent.len() == window
+            && sliding >= 100.0
+            && moved.abs() >= 40
+            && ramp.abs() >= 0.01 * ilim
+        {
+            return oldest_current;
+        }
+    }
+    panic!("J{} never broke away below 60% of its current limit", j + 1);
 }

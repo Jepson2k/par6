@@ -43,23 +43,28 @@ pub use scenario::SimulationScenario;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use par6_config::{GripperConfig, KtSource, RobotConfig};
+use par6_config::{KtSource, RobotConfig, ToolConfig};
 use par6_proto::{Layer, Shape};
 
 use crate::bus::DriverBus;
 use crate::hw::sched::{FreshnessClock, DEVICE_INFO_PERIOD_SLOTS};
 use crate::node_config::NodeConfig;
 use crate::spectral::codec::{
-    decode_frame, encode_clear_error, encode_current_gains, encode_gripper_command, encode_limits,
-    encode_pd_gains, encode_position_gains, encode_velocity_gains, encode_voltage_limit,
-    encode_watchdog, fold_bits_msb_first, pack_can_id, pack_f32, pack_i16, pack_i24, pack_i32,
-    unfold_bits_msb_first, unpack_can_id, unpack_i16, unpack_i24, unpack_i32, CanFrame, CommandId,
-    Payload,
+    decode_frame, encode_clear_error, encode_current_gains, encode_gripper_command,
+    encode_gripper_id, encode_limits, encode_pd_gains, encode_position_gains,
+    encode_velocity_gains, encode_voltage_limit, encode_watchdog, fold_bits_msb_first, pack_can_id,
+    pack_f32, pack_i16, pack_i24, pack_i32, unfold_bits_msb_first, unpack_can_id, unpack_i16,
+    unpack_i24, unpack_i32, CanFrame, CommandId, Payload,
+};
+use crate::spectral::codec::{
+    encode_capture, encode_capture_read, encode_capture_stream, encode_readback_request,
 };
 use crate::spectral::convert::JointConversion;
+use crate::types::CaptureBuffer;
 use crate::types::{
     BusError, BusState, DeviceInfo, DriveTune, ErrorFlags, FirmwareGripperCommand, Freshness,
-    GripperCommand, HallState, JointCommand, LinkHealth, NodeId, PollAction, PollKind, MAX_NODES,
+    GripperCommand, HallState, JointCommand, LinkHealth, LinkState, NodeId, PollAction, PollKind,
+    MAX_NODES,
 };
 
 use driver::Electrical;
@@ -70,6 +75,8 @@ use map::JointMap;
 /// RX queue capacity \[frames\]. Replies past it are dropped, mirroring
 /// the silent kernel-queue drop of a saturated real interface.
 const RX_QUEUE_CAP: usize = 512;
+/// A streaming drive's frame period \[s\]: its loop sends one every 320 µs.
+const STREAM_FRAME_PERIOD_S: f64 = 320e-6;
 
 /// Where the runtime posts world layers for the simulator: one slot per
 /// layer, latest wins, taken by the bus on its own tick. Posting allocates
@@ -115,10 +122,23 @@ pub struct SimBus {
     tick: u64,
     dt: f64,
     silent: bool,
+    /// Test hook: the bus swallows every reply, as a controller that
+    /// came up error-passive does, until `recover_link` cycles it.
+    deaf: bool,
+    /// Test hook: a cycle does not bring the link back (the drives are
+    /// unpowered or the cable is cut).
+    stays_deaf: bool,
+    tx_frames_this_tick: usize,
+    peak_tx_frames_per_tick: usize,
     configured: bool,
     joint_nodes: Vec<NodeId>,
     node_to_joint: [Option<usize>; MAX_NODES],
     gripper_node: NodeId,
+    captures: Vec<CaptureBuffer>,
+    /// Per node, a capture stream in progress: the channel being sent and
+    /// its next pair. Paced like the firmware's loop: one frame every
+    /// [`STREAM_FRAME_PERIOD_S`].
+    streams: Vec<Option<(u8, u16)>>,
     timing_dummy_node: NodeId,
     rx_cap: usize,
     fresh: FreshnessClock,
@@ -143,6 +163,9 @@ pub struct SimBus {
     scene: scene::Scene,
     /// The active tool's config inertials (`None` = the variant URDF's).
     tool: Option<scene::ToolInertial>,
+    /// `RobotConfig::gravity_correction`, which the plant adds as a
+    /// gravity-only load.
+    gravity_correction: Vec<f64>,
     /// The compiled-once base spec (arm, tool, floor — no world objects);
     /// every world change injects into a clone of it.
     base_spec: Option<scene::BaseSpec>,
@@ -155,9 +178,6 @@ pub struct SimBus {
     /// Mirror of the gripper front end's latched firmware command, used
     /// to drive the scene's jaw DOF (see [`mujoco::JawDrive`]).
     mj_jaw_cmd: Option<FirmwareGripperCommand>,
-    /// Test-declared jaw obstructions `(closing at, opening at)`; `None`
-    /// leaves them to the scene physics.
-    gripper_object_override: Option<(Option<u8>, Option<u8>)>,
     /// A teleport landed and no joint frames have re-commanded the arm
     /// since: the plant clamps the landed pose meanwhile.
     landed_unheld: bool,
@@ -175,10 +195,16 @@ impl SimBus {
             tick: 0,
             dt: 0.004,
             silent: false,
+            deaf: false,
+            stays_deaf: false,
+            tx_frames_this_tick: 0,
+            peak_tx_frames_per_tick: 0,
             configured: false,
             joint_nodes: Vec::new(),
             node_to_joint: [None; MAX_NODES],
             gripper_node: 0,
+            captures: (0..MAX_NODES).map(|_| CaptureBuffer::new()).collect(),
+            streams: vec![None; MAX_NODES],
             timing_dummy_node: 0,
             rx_cap: 32,
             fresh: FreshnessClock::default(),
@@ -201,12 +227,12 @@ impl SimBus {
             initial_q: None,
             scene,
             tool: None,
+            gravity_correction: Vec::new(),
             base_spec: None,
             world: [Vec::new(), Vec::new()],
             world_dirty: false,
             mailbox: WorldMailbox::default(),
             mj_jaw_cmd: None,
-            gripper_object_override: None,
             landed_unheld: false,
         }
     }
@@ -214,7 +240,7 @@ impl SimBus {
     /// Override the true boot pose \[rad\], one entry per joint (default:
     /// the config boot-calibration pose, where each joint reads its
     /// `sector_home_offset`). Call before `boot_configure`; values are
-    /// clamped inside the hard limits.
+    /// clamped inside the endstops.
     pub fn set_initial_joint_rad(&mut self, q0: &[f64]) {
         self.initial_q = Some(q0.to_vec());
     }
@@ -239,7 +265,7 @@ impl SimBus {
     }
 
     /// Teleport the simulated arm to `q` \[rad\] (one entry per joint,
-    /// clamped inside the hard limits) after boot: the plant state moves
+    /// clamped inside the endstops) after boot: the plant state moves
     /// and the reported-position wrap re-bases onto the new pose, while
     /// the drivers, the gripper and the link state carry on. The arm
     /// appears at rest and stays held: the drivetrain clamps the landed
@@ -260,14 +286,17 @@ impl SimBus {
         }
         let mut clamped = [0.0; MAX_NODES];
         for (j, map) in self.maps.iter_mut().enumerate() {
-            clamped[j] = q[j].clamp(map.hard_lo_rad, map.hard_hi_rad);
+            clamped[j] = map.endstops.map_or(q[j], |(lo, hi)| q[j].clamp(lo, hi));
             map.reseed(clamped[j]);
-            // Held at the landed reading until re-commanded.
-            let wire = f64::from(map.conv.motor_ticks(clamped[j])) + map.report_offset;
-            self.drivers[j].reseed_hold(wire);
         }
-        let q = &clamped[..self.maps.len()];
-        self.plant_mut().reseed(q);
+        let n = self.maps.len();
+        self.plant_mut().reseed(&clamped[..n]);
+        // Held at the landed reading, carrying its load, until re-commanded.
+        for (j, (map, &q)) in self.maps.iter().zip(&clamped).enumerate().take(n) {
+            let wire = f64::from(map.conv.motor_ticks(q)) + map.report_offset;
+            let hold_ma = self.plant().landed_load_nm(j) * map.factor_ma_per_nm;
+            self.drivers[j].reseed_hold(wire, hold_ma);
+        }
         // Replies queued this tick describe the pose the arm just left;
         // drained under the re-based reference they would read as a jump
         // — and one tick of gravity feedforward for that phantom pose
@@ -327,30 +356,6 @@ impl SimBus {
         };
         g.teleport(closed);
         Ok(())
-    }
-
-    /// Declare an object between the jaws: closing jams at this position
-    /// byte. This overrides what the scene physics reports; with neither
-    /// direction declared jammed (`None` here and for opening) the
-    /// physics decides again.
-    pub fn set_gripper_object_closing(&mut self, at: Option<u8>) {
-        let (_, open) = self.gripper_object_override.unwrap_or((None, None));
-        self.set_gripper_object_override(at, open);
-    }
-
-    /// Declare an object jamming the opening direction at this position
-    /// byte (same override semantics as
-    /// [`set_gripper_object_closing`](Self::set_gripper_object_closing)).
-    pub fn set_gripper_object_opening(&mut self, at: Option<u8>) {
-        let (close, _) = self.gripper_object_override.unwrap_or((None, None));
-        self.set_gripper_object_override(close, at);
-    }
-
-    fn set_gripper_object_override(&mut self, close: Option<u8>, open: Option<u8>) {
-        self.gripper_object_override = (close.is_some() || open.is_some()).then_some((close, open));
-        if let Some(g) = &mut self.gripper {
-            (g.object_close_at, g.object_open_at) = (close, open);
-        }
     }
 
     /// Replace one world layer. The scene is rebuilt on the next tick
@@ -428,14 +433,24 @@ impl SimBus {
         self.dropped_rx
     }
 
-    /// Ground truth: the plant's true joint angles \[rad\], one per arm
-    /// joint, straight from the physics state through the boot-frame
-    /// conversion — no `report_offset`, no runtime re-referencing. This
-    /// is the oracle the runtime's homed frame is tested against; nothing
-    /// on the wire can reach it.
+    /// Ground truth: the plant's true link angles \[rad\], one per arm
+    /// joint, straight from the physics state — no `report_offset`, no
+    /// runtime re-referencing, and nothing on the wire can reach it.
+    /// Where the arm physically is; the runtime's homed frame is tested
+    /// against [`true_motor_rad`](Self::true_motor_rad).
     pub fn true_joint_rad(&self) -> Vec<f64> {
         (0..self.drivers.len())
-            .map(|j| self.maps[j].joint_rad(self.motor_state(j).0))
+            .map(|j| self.plant().joint_rad(j))
+            .collect()
+    }
+
+    /// Ground truth on the motor side, where the encoders read \[rad,
+    /// joint side\]: the frame the runtime's reference lives in. It equals
+    /// [`true_joint_rad`](Self::true_joint_rad) on a rigid drivetrain; on
+    /// a compliant one the link lags it by its load over the stiffness.
+    pub fn true_motor_rad(&self) -> Vec<f64> {
+        (0..self.drivers.len())
+            .map(|j| self.plant().motor_rad(j))
             .collect()
     }
 
@@ -462,6 +477,22 @@ impl SimBus {
         None
     }
 
+    /// Maximum host frames in one tick since the last reset, including
+    /// configuration writes and polls as well as motion commands.
+    pub fn peak_tx_frames_per_tick(&self) -> usize {
+        self.peak_tx_frames_per_tick
+    }
+
+    /// Exclude boot traffic when measuring the running controller's bus load.
+    pub fn reset_tx_peak(&mut self) {
+        self.peak_tx_frames_per_tick = self.tx_frames_this_tick;
+    }
+
+    fn count_tx(&mut self) {
+        self.tx_frames_this_tick += 1;
+        self.peak_tx_frames_per_tick = self.peak_tx_frames_per_tick.max(self.tx_frames_this_tick);
+    }
+
     fn ensure_ready(&self) -> Result<(), BusError> {
         if !self.configured {
             return Err(BusError::NotConfigured);
@@ -472,6 +503,44 @@ impl SimBus {
             });
         }
         Ok(())
+    }
+
+    /// The frames each streaming node's loop would have sent since the last
+    /// tick: channels 0, 1, 2 in pair order up to the last pair recorded.
+    fn pump_streams(&mut self) {
+        for node in 0..MAX_NODES {
+            let Some((mut channel, mut chunk)) = self.streams[node] else {
+                continue;
+            };
+            let Some(j) = self.node_to_joint[node] else {
+                self.streams[node] = None;
+                continue;
+            };
+            if self.scenario.supply_scale(self.tick) == 0.0 {
+                continue;
+            }
+            let pairs = self.drivers[j].capture_pairs();
+            for _ in 0..(self.dt / STREAM_FRAME_PERIOD_S) as usize {
+                while chunk >= pairs {
+                    channel += 1;
+                    chunk = 0;
+                    if channel > 2 {
+                        break;
+                    }
+                }
+                if channel > 2 {
+                    break;
+                }
+                let err = self.drivers[j].err_bit();
+                let p = self.drivers[j].capture_reply(channel, chunk);
+                self.enqueue(CanFrame::data_frame(
+                    pack_can_id(node as NodeId, CommandId::CaptureStreamData, err),
+                    &p,
+                ));
+                chunk += 1;
+            }
+            self.streams[node] = (channel <= 2).then_some((channel, chunk));
+        }
     }
 
     fn enqueue(&mut self, mut frame: CanFrame) {
@@ -575,13 +644,10 @@ impl SimBus {
                 supply_scale: self.scenario.supply_scale(self.tick),
             },
         );
-        // The scene owns the object positions unless a test declared them:
-        // whatever physically jammed the jaws becomes the front end's
+        // Whatever physically jammed the jaws becomes the front end's
         // obstruction.
         if let Some(g) = &mut self.gripper {
-            (g.object_close_at, g.object_open_at) = self
-                .gripper_object_override
-                .unwrap_or_else(|| plant.jaw_obstruction());
+            (g.object_close_at, g.object_open_at) = plant.jaw_obstruction();
         }
         if let Some(g) = &mut self.gripper {
             g.step(dt);
@@ -596,17 +662,13 @@ impl SimBus {
             // band check is circular.
             let d = (self.maps[j].joint_rad(pos) - center).rem_euclid(std::f64::consts::TAU);
             let in_band = d.min(std::f64::consts::TAU - d) <= half;
-            let d = &mut self.drivers[j];
-            if in_band && !d.hall_in_band {
-                d.hall_latched_ticks = Some(self.maps[j].report_pos(pos));
-                d.hall_edge_pending = true;
-            }
-            d.hall_in_band = in_band;
+            self.drivers[j].sample_hall(in_band, self.maps[j].report_pos(pos));
         }
     }
 
     fn joint_reply_values(&self, j: usize) -> (i32, i32, i16) {
-        let (pos, vel) = self.motor_state(j);
+        let (pos, _) = self.motor_state(j);
+        let vel = self.drivers[j].measured_velocity;
         let cur = self.drivers[j].cur_out_ma;
         (
             self.maps[j].report_pos(pos),
@@ -667,6 +729,7 @@ impl SimBus {
     /// Deliver an RTR telemetry poll to `node` and enqueue its reply.
     /// Nodes without a driver (the timing dummy) stay silent.
     fn deliver_rtr(&mut self, node: NodeId, kind: PollKind) {
+        self.count_tx();
         if self.scenario.supply_scale(self.tick) == 0.0 {
             return;
         }
@@ -694,6 +757,15 @@ impl SimBus {
         d.feed_watchdog_poll();
         let err = d.err_bit();
         let frame = match kind {
+            PollKind::Telemetry => {
+                let (_, _, cur) = motion.unwrap_or((0, 0, 0));
+                let mut p = [0u8; 8];
+                p[0..2].copy_from_slice(&pack_i16(d.temperature_c));
+                p[2..4].copy_from_slice(&pack_i16(d.voltage_mv));
+                p[4..6].copy_from_slice(&Self::errors_payload(d.flags()));
+                p[6..8].copy_from_slice(&pack_i16(cur));
+                CanFrame::data_frame(pack_can_id(node, CommandId::Telemetry, err), &p)
+            }
             PollKind::Temperature => CanFrame::data_frame(
                 pack_can_id(node, CommandId::Temperature, err),
                 &pack_i16(d.temperature_c),
@@ -712,12 +784,14 @@ impl SimBus {
                     batch,
                     sw_ver,
                     serial,
+                    tool_id,
                 } = d.device;
-                let mut p = [0u8; 7];
+                let mut p = [0u8; 8];
                 p[0] = hw_ver;
                 p[1] = batch;
                 p[2] = sw_ver;
                 p[3..7].copy_from_slice(&pack_i32(serial));
+                p[7] = tool_id;
                 CanFrame::data_frame(pack_can_id(node, CommandId::DeviceInfo, err), &p)
             }
             PollKind::Kt => CanFrame::data_frame(
@@ -745,8 +819,27 @@ impl SimBus {
             return;
         }
         let (node, raw_cmd, _) = unpack_can_id(frame.id);
+        if let Some(kind) = CommandId::from_raw(raw_cmd).and_then(driver::config_kind) {
+            self.count_tx();
+            if self.scenario.supply_scale(self.tick) == 0.0 {
+                return;
+            }
+            let Some(j) = self.node_to_joint[usize::from(node)] else {
+                return;
+            };
+            if let Some((bytes, len)) = self.drivers[j].config_readback(kind) {
+                let err = self.drivers[j].err_bit();
+                let cmd = CommandId::from_raw(raw_cmd).expect("checked above");
+                self.enqueue(CanFrame::data_frame(
+                    pack_can_id(node, cmd, err),
+                    &bytes[..len],
+                ));
+            }
+            return;
+        }
         let kind = match CommandId::from_raw(raw_cmd) {
             Some(CommandId::EncoderData) => PollKind::Encoder,
+            Some(CommandId::Telemetry) => PollKind::Telemetry,
             Some(CommandId::Temperature) => PollKind::Temperature,
             Some(CommandId::Voltage) => PollKind::Voltage,
             Some(CommandId::StateOfErrors) => PollKind::Errors,
@@ -761,6 +854,7 @@ impl SimBus {
     /// Deliver one host→driver DATA frame to its node and enqueue
     /// whatever the driver replies.
     fn deliver_data(&mut self, frame: &CanFrame) {
+        self.count_tx();
         if self.scenario.supply_scale(self.tick) == 0.0 {
             return;
         }
@@ -775,6 +869,27 @@ impl SimBus {
         let Some(j) = self.node_to_joint[usize::from(node)] else {
             return;
         };
+        let d = frame.payload();
+        match (cmd, d.len()) {
+            (CommandId::Capture, 3) => {
+                self.drivers[j].capture_start(d[0], u16::from_be_bytes([d[1], d[2]]));
+                return;
+            }
+            (CommandId::CaptureStream, 0) => {
+                self.streams[usize::from(node)] = Some((0, 0));
+                return;
+            }
+            (CommandId::CaptureRead, 3) => {
+                let err = self.drivers[j].err_bit();
+                let p = self.drivers[j].capture_reply(d[0], u16::from_be_bytes([d[1], d[2]]));
+                self.enqueue(CanFrame::data_frame(
+                    pack_can_id(node, CommandId::CaptureRead, err),
+                    &p,
+                ));
+                return;
+            }
+            _ => {}
+        }
         let reply = self.drivers[j].on_data_frame(cmd, frame.payload());
         match reply {
             ReplyKind::None => {}
@@ -787,19 +902,13 @@ impl SimBus {
             ReplyKind::Hall => {
                 let err = self.drivers[j].err_bit();
                 let (live_pos, _, _) = self.joint_reply_values(j);
-                let d = &mut self.drivers[j];
+                let d = &self.drivers[j];
                 let state = HallState {
-                    trigger: !d.hall_in_band,
-                    pin2: false,
-                    edge: d.hall_edge_pending,
+                    trigger: d.hall_trigger,
+                    pin2: d.hall_in_band,
+                    edge: d.hall_edge,
                 };
-                d.hall_edge_pending = false;
-                let pos = if d.hall_in_band {
-                    d.hall_latched_ticks.unwrap_or(live_pos)
-                } else {
-                    live_pos
-                };
-                let f = Self::hall_reply(node, err, pos, state);
+                let f = Self::hall_reply(node, err, live_pos, state);
                 self.enqueue(f);
             }
         }
@@ -824,6 +933,10 @@ impl SimBus {
                     self.mj_jaw_cmd = Some(fcmd);
                     g.on_firmware_command(fcmd);
                     None
+                }
+                (CommandId::SetGripperId, 1) => {
+                    g.driver.device.tool_id = d[0];
+                    Some(ReplyKind::None)
                 }
                 (CommandId::GripperDataPack, 0) => {
                     g.on_empty_poll();
@@ -911,6 +1024,10 @@ impl SimBus {
             for f in frames {
                 self.deliver_data(&f);
             }
+            let c = self.node_configs[i];
+            for f in c.extra_frames() {
+                self.deliver_data(&f);
+            }
         }
     }
 
@@ -934,7 +1051,7 @@ impl SimBus {
                 speed_ticks_s,
                 current_ma,
             } => {
-                state.nodes[n].position_ticks = Some(position_ticks);
+                state.nodes[n].record_position(position_ticks);
                 state.nodes[n].speed_ticks_s = Some(speed_ticks_s);
                 state.nodes[n].current_ma = Some(current_ma);
             }
@@ -942,20 +1059,36 @@ impl SimBus {
                 position_ticks,
                 speed_ticks_s,
             } => {
-                state.nodes[n].position_ticks = Some(position_ticks);
+                state.nodes[n].record_position(position_ticks);
                 state.nodes[n].speed_ticks_s = Some(speed_ticks_s);
             }
             Payload::Hall {
                 position_ticks,
                 state: hall,
             } => {
-                state.nodes[n].position_ticks = Some(position_ticks);
+                state.nodes[n].record_position(position_ticks);
                 state.nodes[n].hall = Some(hall);
             }
             Payload::Temperature { deg_c } => state.nodes[n].temperature_c = Some(deg_c),
             Payload::Voltage { mv } => state.nodes[n].voltage_mv = Some(mv),
             Payload::IqCurrent { ma } => state.nodes[n].current_ma = Some(ma),
             Payload::Errors(flags) => state.nodes[n].error_flags = Some(flags),
+            Payload::Telemetry {
+                deg_c,
+                mv,
+                flags,
+                ma,
+            } => {
+                let s = &mut state.nodes[n];
+                s.temperature_c = Some(deg_c);
+                s.voltage_mv = Some(mv);
+                s.error_flags = Some(flags);
+                s.current_ma = Some(ma);
+                s.combined_telemetry = true;
+            }
+            Payload::Readback(r) => state.nodes[n].readback[r.kind().index()] = Some(r),
+            // Kept by the backend, not the shared state: see `SimBus::captures`.
+            Payload::Capture { .. } | Payload::CaptureStatus { .. } => {}
             Payload::DeviceInfo(info) => state.nodes[n].device_info = Some(info),
             Payload::Kt { nm_per_a } => state.nodes[n].kt_nm_a = Some(nm_per_a),
             Payload::Gripper(reply) => {
@@ -968,7 +1101,80 @@ impl SimBus {
     }
 }
 
+/// The tool's mass as the plant carries it, from the same kinematics the
+/// controller's gravity model reads.
+fn tool_inertial(g: &ToolConfig) -> scene::ToolInertial {
+    scene::ToolInertial {
+        d_m: g.kinematics.d_m,
+        a_m: g.kinematics.a_m,
+        alpha_rad: g.kinematics.alpha_rad,
+        mass_kg: g.kinematics.mass_kg,
+        com_m: g.kinematics.com_m,
+        inertia_kg_m2: g.kinematics.inertia_kg_m2,
+    }
+}
+
+/// The scene geometry a tool brings, by the rule the kinematics picks its
+/// tree with — its declared URDF variant, else the vendor's name prefix — so
+/// the plant swings the tool the controller models.
+fn scene_tool(tool: Option<&ToolConfig>) -> scene::Tool {
+    let Some(g) = tool else {
+        return scene::Tool::Flange;
+    };
+    match par6_kin::GripperVariant::resolve(&g.name.to_ascii_uppercase(), g.urdf_variant.as_deref())
+    {
+        par6_kin::GripperVariant::Flange => scene::Tool::Flange,
+        par6_kin::GripperVariant::Msg => scene::Tool::Msg,
+        par6_kin::GripperVariant::Ssg48 => scene::Tool::Ssg48,
+    }
+}
+
 impl DriverBus for SimBus {
+    /// The plant takes the new tool's geometry and mass, and the gripper
+    /// node is the new tool's: its drive answers with its own stroke and
+    /// id, or nothing answers when the tool has no driver. Objects in the
+    /// world start again from their spawn poses.
+    fn simulated(&self) -> bool {
+        true
+    }
+
+    fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>) {
+        // Rebuilt where the encoders read, the links carried over as they
+        // hang: the new tool's weight loads the drivetrains from there.
+        let motors = self.true_motor_rad();
+        let links = self.true_joint_rad();
+        let was = (self.scene.tool, self.tool);
+        self.scene.tool = scene_tool(tool);
+        self.tool = tool.map(tool_inertial);
+        match self.try_make_plant(robot, &motors) {
+            Ok(mut plant) => {
+                plant.carry_links(&links);
+                self.plant = Some(plant);
+            }
+            Err(e) => {
+                log::error!("sim: no plant for the new tool ({e}); the previous one stays");
+                (self.scene.tool, self.tool) = was;
+            }
+        }
+        self.mj_jaw_cmd = None;
+        let node = self.gripper_node;
+        self.fresh.refit_gripper(node, self.tick);
+        let driven = tool.filter(|g| g.driver.is_some());
+        self.gripper = driven.map(|g| GripperSim::new(self.dt, node, g));
+        self.node_configs.retain(|c| c.node != node);
+        let bit = 1u16 << u16::from(node);
+        match driven.and_then(|g| g.driver.as_ref()) {
+            Some(d) => {
+                self.node_configs
+                    .push(NodeConfig::gripper(node, d, robot.bus.watchdog_action));
+                if !self.deaf {
+                    self.connected |= bit;
+                }
+            }
+            None => self.connected &= !bit,
+        }
+    }
+
     fn begin_tick(&mut self, tick: u64) {
         debug_assert!(tick >= self.tick, "tick must be non-decreasing");
         if self.configured {
@@ -978,7 +1184,9 @@ impl DriverBus for SimBus {
             }
         }
         self.tick = tick;
+        self.pump_streams();
         self.joints_sent_this_tick = false;
+        self.tx_frames_this_tick = 0;
         if !self.silent {
             self.fresh.latch_lost(tick);
         }
@@ -1009,8 +1217,8 @@ impl DriverBus for SimBus {
             };
             count += 1;
             self.health.rx_frames += 1;
-            if self.silent {
-                // FLASHING: drain-and-discard, never decode.
+            if self.silent || self.deaf {
+                // FLASHING (or a deaf link): drain-and-discard, never decode.
                 continue;
             }
             let age = self.tick.saturating_sub(enqueued);
@@ -1020,7 +1228,19 @@ impl DriverBus for SimBus {
             // frames still count for freshness and the live fault bit.
             let (node, err_bit) = match decode_frame(&frame) {
                 Ok(d) => {
-                    Self::apply(&d, state);
+                    match d.payload {
+                        Payload::Capture {
+                            channel,
+                            chunk,
+                            samples,
+                        } => self.captures[usize::from(d.node)].store(channel, chunk, samples),
+                        Payload::CaptureStatus {
+                            recorded,
+                            wanted,
+                            divisor,
+                        } => self.captures[usize::from(d.node)].status(recorded, wanted, divisor),
+                        _ => Self::apply(&d, state),
+                    }
                     (d.node, d.err_bit)
                 }
                 Err(e) => (e.node(), e.err_bit()),
@@ -1087,8 +1307,6 @@ impl DriverBus for SimBus {
         let Some(f) = frame else {
             return Ok(());
         };
-        // NoGripper's RTR ping targets the driverless timing dummy, so it
-        // goes unanswered like on the real bus.
         self.deliver_frame(&f);
         Ok(())
     }
@@ -1108,6 +1326,27 @@ impl DriverBus for SimBus {
                     self.deliver_data(&f);
                 }
                 PollAction::ResendConfig { node } => self.apply_node_config(node, 1),
+                PollAction::ConfigRead { node, kind } => {
+                    let f = encode_readback_request(node, kind);
+                    self.deliver_frame(&f);
+                }
+                PollAction::CaptureRead {
+                    node,
+                    channel,
+                    chunk,
+                } => {
+                    let f = encode_capture_read(node, channel, chunk);
+                    self.deliver_data(&f);
+                }
+                PollAction::ConfigFrame { node, kind } => {
+                    let c = self.node_configs.iter().find(|c| c.node == node).ok_or(
+                        BusError::InvalidCommand {
+                            reason: "configuration poll for a node with no stored configuration",
+                        },
+                    )?;
+                    let frame = crate::hw::sched::config_frame(kind, c);
+                    self.deliver_data(&frame);
+                }
             }
             if repeats > 1 {
                 self.override_slot = Some((action, repeats - 1));
@@ -1125,15 +1364,12 @@ impl DriverBus for SimBus {
         if self.slot_counter.is_multiple_of(DEVICE_INFO_PERIOD_SLOTS) {
             self.di_remaining = self.poll_targets();
         }
-        let idx = (self.poll_cursor / 3) as usize % self.poll_targets();
+        // Every simulated drive runs the par6 firmware, so one combined
+        // poll per target is the whole cycle.
+        let idx = self.poll_cursor as usize % self.poll_targets();
         let node = self.poll_target_node(idx);
-        let kind = match self.poll_cursor % 3 {
-            0 => PollKind::Temperature,
-            1 => PollKind::Voltage,
-            _ => PollKind::Errors,
-        };
         self.poll_cursor += 1;
-        self.deliver_rtr(node, kind);
+        self.deliver_rtr(node, PollKind::Telemetry);
         Ok(())
     }
 
@@ -1147,7 +1383,7 @@ impl DriverBus for SimBus {
     fn boot_configure(
         &mut self,
         robot: &RobotConfig,
-        gripper: Option<&GripperConfig>,
+        gripper: Option<&ToolConfig>,
         repeats: u8,
     ) -> Result<(), BusError> {
         let n = robot.joints.len();
@@ -1172,7 +1408,7 @@ impl DriverBus for SimBus {
                 assert_eq!(q.len(), n, "initial pose length != joint count");
                 q.iter()
                     .zip(&robot.joints)
-                    .map(|(q, j)| q.clamp(j.limits.hard_min_rad, j.limits.hard_max_rad))
+                    .map(|(q, j)| j.limits.endstops().map_or(*q, |(lo, hi)| q.clamp(lo, hi)))
                     .collect()
             }
             None => robot
@@ -1214,17 +1450,12 @@ impl DriverBus for SimBus {
             })
             .collect();
 
-        self.tool = gripper.map(|g| scene::ToolInertial {
-            d_m: g.kinematics.d_m,
-            a_m: g.kinematics.a_m,
-            alpha_rad: g.kinematics.alpha_rad,
-            mass_kg: g.kinematics.mass_kg,
-            com_m: g.kinematics.com_m,
-            inertia_kg_m2: g.kinematics.inertia_kg_m2,
-        });
+        self.scene.tool = scene_tool(gripper);
+        self.tool = gripper.map(tool_inertial);
+        self.gravity_correction
+            .clone_from(&robot.gravity_correction);
         self.plant = Some(self.make_plant(robot, &q0));
         self.mj_jaw_cmd = None;
-        self.gripper_object_override = None;
 
         let has_can_gripper = gripper.is_some_and(|g| g.driver.is_some());
         self.gripper = if has_can_gripper {
@@ -1265,8 +1496,13 @@ impl DriverBus for SimBus {
                 self.deliver_rtr(*node, PollKind::Kt);
             }
         }
-        // Bus scan: every simulated driver answers its ping.
-        self.connected = nodes.iter().fold(0u16, |m, n| m | (1 << u16::from(*n)));
+        // Bus scan: every simulated driver answers its ping — unless the
+        // link is deaf, in which case nobody is heard, as on hardware.
+        self.connected = if self.deaf {
+            0
+        } else {
+            nodes.iter().fold(0u16, |m, n| m | (1 << u16::from(*n)))
+        };
         Ok(())
     }
 
@@ -1320,6 +1556,64 @@ impl DriverBus for SimBus {
             self.connected |= 1 << u16::from(new_id);
         }
         Ok(())
+    }
+
+    fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        self.deliver_frame(&encode_gripper_id(node, tool_id));
+        Ok(())
+    }
+
+    fn set_ripple(
+        &mut self,
+        node: NodeId,
+        ripple: &[par6_config::RippleHarmonic],
+    ) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        if ripple.len() > usize::from(crate::spectral::codec::RIPPLE_SLOTS) {
+            return Err(BusError::InvalidCommand {
+                reason: "more ripple harmonics than a drive has slots",
+            });
+        }
+        let slots = crate::node_config::ripple_slots(ripple);
+        if let Some(c) = self.node_configs.iter_mut().find(|c| c.node == node) {
+            c.ripple = slots;
+        }
+        for (slot, (h, a, b)) in slots.iter().enumerate() {
+            self.deliver_frame(&crate::spectral::codec::encode_ripple(
+                node, slot as u8, *h, *a, *b,
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        if let Some(c) = self.node_configs.iter_mut().find(|c| c.node == node) {
+            c.velocity_window = Some(window);
+        }
+        self.deliver_frame(&crate::spectral::codec::encode_velocity_window(
+            node, window,
+        ));
+        Ok(())
+    }
+
+    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        self.deliver_frame(&encode_capture_stream(node));
+        Ok(())
+    }
+
+    fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        self.streams[usize::from(node)] = None;
+        self.captures[usize::from(node)].clear();
+        self.deliver_frame(&encode_capture(node, divisor, wanted));
+        Ok(())
+    }
+
+    fn capture(&self, node: NodeId) -> Option<&CaptureBuffer> {
+        self.captures.get(usize::from(node))
     }
 
     /// The virtual driver accepts cmd 13 and has no NVM to write.
@@ -1380,34 +1674,98 @@ impl DriverBus for SimBus {
     fn link_health(&self) -> LinkHealth {
         self.health
     }
+
+    fn recover_link(&mut self) -> bool {
+        self.health.restarts += 1;
+        if self.stays_deaf {
+            return true;
+        }
+        self.deaf = false;
+        self.health.state = LinkState::Up;
+        // The drives answer again the moment the link is back.
+        self.connected = self
+            .node_configs
+            .iter()
+            .fold(0u16, |m, c| m | (1 << u16::from(c.node)));
+        true
+    }
 }
 
 impl SimBus {
+    /// Test hook: a deaf link that cycling does not revive.
+    pub fn set_dead(&mut self) {
+        self.set_deaf(true);
+        self.stays_deaf = true;
+    }
+
+    /// Test hook: make the link deaf (every reply is dropped undecoded,
+    /// the way an error-passive controller hears nobody) until the
+    /// runtime cycles it through `recover_link`. The link reports
+    /// error-passive while deaf.
+    pub fn set_deaf(&mut self, deaf: bool) {
+        self.deaf = deaf;
+        self.stays_deaf = false;
+        self.health.state = if deaf {
+            LinkState::ErrorPassive
+        } else {
+            LinkState::Up
+        };
+    }
+
     /// Compile the scene for this robot config with the current world and
     /// place the arm at `q0`; keeps the base spec for later world changes.
     fn make_plant(&mut self, robot: &RobotConfig, q0: &[f64]) -> mujoco::MujocoPlant {
+        self.try_make_plant(robot, q0)
+            .unwrap_or_else(|e| panic!("sim scene: {e}"))
+    }
+
+    /// [`Self::make_plant`], with a scene the configuration cannot build
+    /// answered rather than fatal.
+    fn try_make_plant(
+        &mut self,
+        robot: &RobotConfig,
+        q0: &[f64],
+    ) -> Result<mujoco::MujocoPlant, String> {
+        let sim = &robot.sim;
         let tuning: Vec<scene::JointTuning> = self
             .maps
             .iter()
-            .zip(&robot.sim.motor_jm_kg_m2)
-            .map(|(map, jm)| scene::JointTuning::from_config(map, *jm, &robot.sim))
+            .zip(&sim.motor_jm_kg_m2)
+            .zip(sim.viscous_nm_s.iter().zip(&sim.coulomb_nm))
+            .zip(&sim.transmission_stiffness_nm_rad)
+            .map(|(((map, jm), (b, tc)), k)| {
+                scene::JointTuning::from_config(
+                    map,
+                    *jm,
+                    *b,
+                    *tc,
+                    (*k, sim.transmission_damping_ratio),
+                )
+            })
             .collect();
         let build = scene::Build {
             timestep: scene::timestep_for(self.dt),
             joints: &tuning,
             tool: self.tool.as_ref(),
+            lateral: (
+                sim.arm_lateral_stiffness_nm_rad,
+                sim.arm_lateral_damping_nm_s,
+            ),
         };
-        let mut spec = self
-            .scene
-            .spec(&build)
-            .unwrap_or_else(|e| panic!("sim scene: {e}"));
-        let base = scene::BaseSpec::new(&spec).unwrap_or_else(|e| panic!("sim scene: {e}"));
+        let mut spec = self.scene.spec(&build).map_err(|e| e.to_string())?;
+        let base = scene::BaseSpec::new(&spec).map_err(|e| e.to_string())?;
         scene::inject_world(&mut spec, &[&self.world[0], &self.world[1]])
-            .unwrap_or_else(|e| panic!("sim scene: {e}"));
-        let model = scene::compile(&mut spec).unwrap_or_else(|e| panic!("sim scene: {e}"));
+            .map_err(|e| e.to_string())?;
+        let model = scene::compile(&mut spec)?;
         self.base_spec = Some(base);
         self.world_dirty = false;
-        mujoco::MujocoPlant::new(model, &self.maps, q0, &robot.sim.powered_support_nm)
+        Ok(mujoco::MujocoPlant::new(
+            model,
+            &self.maps,
+            q0,
+            &robot.sim.powered_support_nm,
+            &self.gravity_correction,
+        ))
     }
 
     /// Rebuild the scene around the current world layers, in place.

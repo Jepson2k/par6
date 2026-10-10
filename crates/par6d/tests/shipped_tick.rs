@@ -1,14 +1,15 @@
-//! The SHIPPED 250 Hz configuration, end to end — the one test that runs
-//! `config/PAR6.toml` with its `tick_dt_s = 0.004` UNPATCHED.
+//! The SHIPPED 250 Hz configuration, end to end — a loop timing soak with
+//! `config/PAR6.toml` and its `tick_dt_s = 0.004` UNPATCHED.
 //!
-//! Every other harness re-ticks the config for CI headroom
-//! (`sim_session.rs` 0.02, `ffi_kinematics.rs` 0.02, the python e2e rig
-//! 0.05), so before this test nothing ever exercised the ~20 derived
-//! `round(seconds/dt)` counts, the 32-frame RX cap, the 7-node poll
-//! cadence or the 5:1 status decimation at the values that meet the arm —
-//! and the repo has already been bitten by exactly that class of bug
+//! Most fixtures re-tick the config for CI headroom; the release streaming
+//! collision workflow also uses the shipped rate. This soak covers the
+//! derived `round(seconds/dt)` counts, the 32-frame RX cap, the 7-node poll
+//! cadence and the 5:1 status decimation at the values that meet the arm.
+//! The repo has already been bitten by exactly that class of bug
 //! (`core_errors.rs` documents the stream watchdog rounding to a single
 //! unsatisfiable tick at a non-default dt).
+//! Normal `--sim` policy still applies: the configured 40 ms stream
+//! watchdog is floored at twice the shipped 250 ms servo grace, to 500 ms.
 //!
 //! Run it in RELEASE — it skips itself in debug builds, where the RT loop
 //! cannot hold a 4 ms period anywhere. CI runs it as the

@@ -253,6 +253,12 @@ fn per_tick_kinematics_cost_is_reported() {
     let n = 500;
     for variant in [GripperVariant::Flange, GripperVariant::Ssg48] {
         let mut kin = load(variant);
+        // A calibrated arm runs gravity through its installed correction,
+        // so that is the cost the budget has to cover.
+        let correction: Vec<f64> = (0..4 * kin.body_count())
+            .map(|i| 0.001 * (i % 7) as f64)
+            .collect();
+        kin.set_gravity_correction(&correction).unwrap();
         let mut pose = [0.0; 16];
         let mut tau = [0.0; NQ];
         let mut jac = [0.0; 6 * NQ];

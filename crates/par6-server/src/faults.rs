@@ -185,16 +185,37 @@ mod tests {
             "a self-clearing warning is not a standing error"
         );
 
+        // Each case names the text its cause must carry: the joint it
+        // blames, or the latched key nothing more specific describes.
         let cases = [
-            (RtCode::RtiLinkLost, None, ErrorCode::SysRtiLinkLost),
-            (RtCode::StreamFault, None, ErrorCode::SysStreamFault),
-            (RtCode::LoopCritical, None, ErrorCode::SysLoopCritical),
-            (RtCode::ExecLinkLost, None, ErrorCode::SysExecLinkLost),
-            (RtCode::SwEstop, None, ErrorCode::SysEstopActive),
-            (RtCode::Encoder, Some(3), ErrorCode::SysJointFault),
-            (RtCode::GripperFault, Some(6), ErrorCode::MotnToolFault),
+            (RtCode::RtiLinkLost, None, ErrorCode::SysRtiLinkLost, ""),
+            (RtCode::StreamFault, None, ErrorCode::SysStreamFault, ""),
+            (RtCode::LoopCritical, None, ErrorCode::SysLoopCritical, ""),
+            (RtCode::ExecLinkLost, None, ErrorCode::SysExecLinkLost, ""),
+            (RtCode::SwEstop, None, ErrorCode::SysEstopActive, ""),
+            (RtCode::BusOff, None, ErrorCode::SysBusOff, ""),
+            (
+                RtCode::TorqueEnvelope,
+                Some(2),
+                ErrorCode::SysTorqueEnvelope,
+                "Joint 2",
+            ),
+            (
+                RtCode::ExecSettleTimeout,
+                Some(4),
+                ErrorCode::MotnSettleTimeout,
+                "J4",
+            ),
+            (RtCode::Encoder, Some(3), ErrorCode::SysJointFault, ""),
+            (RtCode::GripperFault, Some(6), ErrorCode::MotnToolFault, ""),
+            (
+                RtCode::CanLost,
+                Some(MAX_JOINTS as u8),
+                ErrorCode::MotnTickFailed,
+                "CanLost",
+            ),
         ];
-        for (rt, joint, wire) in cases {
+        for (rt, joint, wire, names) in cases {
             let e = rt_standing_error(&snap_with(&[(rt, joint)]))
                 .unwrap_or_else(|| panic!("{rt:?} must surface"));
             assert_eq!(e.code, wire as u16, "{rt:?}");
@@ -204,6 +225,7 @@ mod tests {
                 "{rt:?} left an unfilled placeholder: {}",
                 e.cause
             );
+            assert!(e.cause.contains(names), "{rt:?}: {}", e.cause);
         }
 
         // The e-stop outranks a drive fault it caused: an operator

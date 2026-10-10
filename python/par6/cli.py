@@ -163,14 +163,14 @@ def _cmd_scan(client: RobotClient, args: argparse.Namespace) -> int:
         _emit(rows, True)
         return 0
     fresh = {0: "unknown", 1: "fresh", 2: "stale", 3: "lost"}
-    print("node  configured  present  freshness  hw  sw  serial")
+    print("node  configured  present  freshness  hw  sw  serial  tool")
     for r in rows:
         if not (r["present"] or r["configured"] or args.all):
             continue
         print(
             f"{r['node']:>4}  {'yes' if r['configured'] else 'no':>10}  "
             f"{'yes' if r['present'] else 'no':>7}  {fresh.get(r['freshness'], '?'):>9}  "
-            f"{r['hw_ver']:>2}  {r['sw_ver']:>2}  {r['serial']}"
+            f"{r['hw_ver']:>2}  {r['sw_ver']:>2}  {r['serial']:>6}  {r.get('tool_id') or '-'}"
         )
     return 0
 
@@ -181,6 +181,17 @@ def _cmd_set_can_id(client: RobotClient, args: argparse.Namespace) -> int:
     _emit(
         f"node {args.node} told to answer as {args.new_id}; run `par6 save-config "
         f"{args.new_id} --force` to keep it, then update the config and restart",
+        args.json,
+    )
+    return 0
+
+
+def _cmd_set_tool_id(client: RobotClient, args: argparse.Namespace) -> int:
+    if client.set_tool_id(args.node, args.tool_id, force=args.force) != 1:
+        return _unconfirmed("tool-id", client)
+    _emit(
+        f"node {args.node} told it is tool {args.tool_id} and asked to save it; "
+        f"restart the daemon to fit that tool",
         args.json,
     )
     return 0
@@ -401,6 +412,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true", help="address an id the config does not list"
     )
     save.set_defaults(fn=_cmd_save_config)
+
+    toolid = sub.add_parser(
+        "tool-id",
+        help="commissioning: tell a gripper drive which tool it is built into",
+    )
+    toolid.add_argument("node", type=int, help="the gripper drive's id (0-15)")
+    toolid.add_argument(
+        "tool_id", type=int, help="the tool's can_tool_id (1-255; 0 clears it)"
+    )
+    toolid.add_argument(
+        "--force", action="store_true", help="address an id the config does not list"
+    )
+    toolid.set_defaults(fn=_cmd_set_tool_id)
 
     gains = sub.add_parser(
         "set-pid-gains", help="push one drive's tuning live (every gain required)"

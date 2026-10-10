@@ -11,25 +11,28 @@
 //!   (idle / nudge / position / gripper_move, run in parallel within the
 //!   step), the `home` group (per-joint FSMs in parallel, gripper
 //!   firmware calibrate / motor homing), `move_to` cubic-Hermite position
-//!   moves, `post_moves`, then the global trailing moves. Pre/post/
-//!   move_to timeouts warn and continue; home-phase failures FAIL the
-//!   sequence.
+//!   moves, `post_moves`, then the global trailing moves. A failed
+//!   position or home phase fails the sequence. The entire sequence,
+//!   including trailing moves, fails and stops once it outlasts the sum of
+//!   its parts' own bounds.
 //! - the per-joint FSM: approach (stall = windowed displacement plateau
 //!   AND current-ratio window, both required; hall = trigger/edge with
 //!   the pre-clear guard, on cmd-32 bits dropped at every approach entry
 //!   so only a reply this approach asked for can be a hit) → dwell →
-//!   backoff → pause → second pass at the rehome speed → optional release
-//!   (current-only, latch at the sample percentage) → settle
+//!   backoff (speed ramped at both ends) → pause → second pass at the
+//!   rehome speed → optional release (current-only, ramped in from the
+//!   stall push and back out to zero, latched at the sample percentage of
+//!   its hold); a hall hit latches at the trigger and brakes to a stop →
+//!   settle
 //!   (position-never-valid = FAILURE, two-pass mismatch = FAILURE, then
 //!   the home reference is applied and normal limits restored) →
 //!   optional post-move.
 //!
-//! Current limits: entry swaps every involved node to its homing current
-//! (Limits frames ×4 — the runtime keeps the full config reload for exit,
-//! via the bus's stored-config resend); each FSM start re-applies it (the
-//! only path that also covers the gripper motor); completion restores the
-//! normal Ilim ×4; exit resends the full stored node config. The
-//! EFFECTIVE per-node limit is published every tick.
+//! Current limits: waiting joints retain normal holding authority. Active
+//! unreferenced nudges and homing phases use the configured seeking limit;
+//! referenced joints use their normal limit. Limit transitions send four
+//! frames, and exit resends each node's stored configuration. The effective
+//! per-node limit is published every tick.
 //!
 //! All plan storage is allocated at construction; `tick` is
 //! allocation-free.
@@ -39,15 +42,22 @@ use par6_bus::{
     BusState, DriverBus, FirmwareGripperCommand, GripperCommand, JointCommand, NodeId, NodeState,
 };
 use par6_config::{
-    ConfigBundle, GripperHomeMode, HomingStrategy, JointHoming, PreMove, RobotConfig,
+    ConfigBundle, GripperHomeMode, HomingConfig, HomingStrategy, JointHoming, PreMove, RobotConfig,
 };
 
 use crate::state::{HomingJointStatus, HomingPhase, HomingStatus};
 use crate::{MAX_JOINTS, NUM_NODES};
 
-/// Pre/post-move timeout \[s\] (warn and continue).
+/// Final hold at the ready pose over which the reference-check residual
+/// is averaged \[s\].
+const REFERENCE_CHECK_S: f64 = 0.5;
+/// What the whole-sequence deadline allows beyond the sum of its parts'
+/// own bounds \[s\]: the ticks spent passing between parts, so a part that
+/// times out reports its own failure rather than the deadline's.
+const SEQUENCE_SLACK_S: f64 = 1.0;
+/// Settling allowance after a pre/post positioning profile \[s\].
 const PRE_POST_TIMEOUT_S: f64 = 4.0;
-/// move_to timeout = duration + this \[s\] (warn and continue).
+/// move_to failure timeout = duration + this \[s\].
 const MOVE_TO_EXTRA_S: f64 = 2.0;
 /// Stopped dwell between the passes \[s\].
 const DWELL_S: f64 = 0.08;
@@ -55,15 +65,25 @@ const DWELL_S: f64 = 0.08;
 const PAUSE_S: f64 = 0.15;
 /// Settle hold before the reference is applied \[s\].
 const SETTLE_S: f64 = 0.08;
+/// How long every current and speed change after a hit is ramped over
+/// \[s\]. A stall push leaves the gearbox wound up against the stop, and
+/// stepping straight to the release current let it spring free in about
+/// 40 ms (J3 4.1 deg at 137 deg/s on the 2026-09-22 hardware run); stepping
+/// back out let a joint pressed into its stop snap loose the same way (J5
+/// 3.0 deg at 378 deg/s). Several times that spring-back time makes both
+/// changes gradual, as it does the backoff and the stop after a hall
+/// trigger, which would jump the velocity target by the whole seek speed in
+/// one tick. The push itself drops to idle at the hit.
+const RAMP_S: f64 = 0.25;
 /// Stall/current detection window \[s\].
-const DETECT_WINDOW_S: f64 = 0.08;
+pub const DETECT_WINDOW_S: f64 = 0.08;
 /// Current-detector startup guard \[s\].
 const STARTUP_GUARD_S: f64 = 0.15;
 /// Hall pre-clear guard: a trigger this early means "started on the
 /// sensor" \[s\].
 const PRECLEAR_GUARD_S: f64 = 0.5;
 /// Pass-2 speed factor (vendor `rehome_speed_factor` default).
-const REHOME_SPEED_FACTOR: f64 = 0.3;
+pub const REHOME_SPEED_FACTOR: f64 = 0.3;
 /// Current-ratio threshold on the homing current.
 const CURRENT_RATIO: f64 = 0.70;
 /// Fraction of the detection window that must be above threshold.
@@ -98,6 +118,9 @@ pub enum SeqStatus {
     Inactive,
     /// Sequence in progress.
     Running,
+    /// Every step has run; the arm holds the ready pose while the
+    /// runtime accumulates the reference-check residual.
+    Checking,
     /// Sequence finished successfully — the runtime sets `homed`.
     Complete,
     /// Sequence failed — the runtime clears `homed` and returns to IDLE.
@@ -110,50 +133,57 @@ const GRIPPER_SLOT: usize = MAX_JOINTS;
 // ---------------------------------------------------------------- params
 
 #[derive(Debug, Clone)]
-struct HomerParams {
-    node: NodeId,
-    strategy: HomingStrategy,
+pub struct HomerParams {
+    pub node: NodeId,
+    pub strategy: HomingStrategy,
     /// Signed approach speed \[motor ticks/s\].
-    speed: f64,
-    current_ma: f64,
-    timeout_ticks: u32,
-    backoff_ticks: u32,
-    two_pass: bool,
-    max_diff_ticks: i64,
-    release: Option<ReleasePlan>,
-    post: Option<PostPlan>,
-    stall_needed: u32,
-    startup_guard: u32,
-    cur_window: u32,
-    cur_needed: u32,
-    dwell_ticks: u32,
-    pause_ticks: u32,
-    settle_ticks: u32,
-    preclear_ticks: u32,
-    in_pos_streak: u32,
-    pre_post_timeout: u32,
-    normal_vel_limit: f32,
-    normal_ilim: f32,
-    dt: f64,
+    pub speed: f64,
+    pub current_ma: f64,
+    pub timeout_ticks: u32,
+    pub backoff_ticks: u32,
+    pub two_pass: bool,
+    pub max_diff_ticks: i64,
+    pub release: Option<ReleasePlan>,
+    pub post: Option<PostPlan>,
+    pub stall_needed: u32,
+    pub startup_guard: u32,
+    pub cur_window: u32,
+    pub cur_needed: u32,
+    pub dwell_ticks: u32,
+    pub pause_ticks: u32,
+    /// [`RAMP_S`] in ticks.
+    pub ramp_ticks: u32,
+    pub settle_ticks: u32,
+    pub preclear_ticks: u32,
+    pub in_pos_streak: u32,
+    pub pre_post_timeout: u32,
+    /// The longest the post-home move can take: the profile sized for the
+    /// joint's whole hard range at its post-home speed \[ticks\]; 0 when it
+    /// has none.
+    pub post_ticks: u32,
+    pub normal_vel_limit: f32,
+    pub normal_ilim: f32,
+    pub dt: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct ReleasePlan {
-    current_ma: i16,
-    dur_ticks: u32,
-    sample_tick: u32,
+pub struct ReleasePlan {
+    pub current_ma: i16,
+    pub dur_ticks: u32,
+    pub sample_tick: u32,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct PostPlan {
-    position_rad: f64,
-    speed: f64,
+pub struct PostPlan {
+    pub position_rad: f64,
+    pub speed: f64,
 }
 
 impl HomerParams {
-    fn from_config(
+    pub fn from_config(
         node: NodeId,
         jh: &JointHoming,
+        seek_timeout_s: f64,
         normal_vel_limit: f64,
         normal_ilim: f64,
         dt: f64,
@@ -166,7 +196,7 @@ impl HomerParams {
             strategy: jh.strategy,
             speed: dir_sign * jh.speed_ticks_s,
             current_ma: jh.current_ma,
-            timeout_ticks: ticks(jh.timeout_s).max(1),
+            timeout_ticks: ticks(seek_timeout_s).max(1),
             backoff_ticks: ticks(jh.backoff_s),
             two_pass: jh.two_pass && jh.strategy == HomingStrategy::Stall,
             max_diff_ticks: i64::from(jh.two_pass_max_diff_ticks),
@@ -193,10 +223,12 @@ impl HomerParams {
             cur_needed: ((f64::from(cur_window) * CURRENT_WINDOW_FRACTION).ceil() as u32).max(1),
             dwell_ticks: ticks(DWELL_S).max(1),
             pause_ticks: ticks(PAUSE_S).max(1),
+            ramp_ticks: ticks(RAMP_S).max(1),
             settle_ticks: ticks(SETTLE_S).max(1),
             preclear_ticks: ticks(PRECLEAR_GUARD_S),
             in_pos_streak: ticks(DETECT_WINDOW_S).max(1),
             pre_post_timeout: ticks(PRE_POST_TIMEOUT_S).max(1),
+            post_ticks: 0,
             normal_vel_limit: normal_vel_limit as f32,
             normal_ilim: normal_ilim as f32,
             dt,
@@ -213,11 +245,19 @@ enum HPhase {
     /// start, until the sensor actually reads clear (bounded by the
     /// joint's timeout budget).
     Preclear,
+    /// Stopped on the stop, still pressed by whatever the drive's velocity
+    /// loop wound up during the push. Ramping that current off in current
+    /// mode was tried and rejected (2026-09-23): the drive keeps the
+    /// wind-up across the mode change and the first velocity frame after
+    /// it threw the wrist 0.65 deg back into the stop at 218 deg/s. The
+    /// backoff ramp discharges it smoothly instead.
     Dwell,
     /// Post-dwell backoff before the pass-2 pause.
     Backoff,
     Pause,
     Release,
+    /// Ramping the hall approach's speed to zero after the trigger.
+    Brake,
     Settle,
     PostMove,
     Finished,
@@ -225,7 +265,7 @@ enum HPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HomerEvent {
+pub enum HomerEvent {
     /// The reference position was latched at settle; the orchestrator
     /// applies it and restores limits.
     Reference { latched_ticks: i32 },
@@ -235,7 +275,7 @@ enum HomerEvent {
 }
 
 #[derive(Debug)]
-struct Homer {
+pub struct Homer {
     phase: HPhase,
     /// The phase the FSM was in when it failed — what the published
     /// `HomingPhase` reports for a `Failed` status, so the operator can
@@ -258,17 +298,21 @@ struct Homer {
     /// pre-clears — the per-joint timeout bounds the WHOLE attempt, so
     /// a sensor that never clears exhausts it instead of looping.
     spent: u32,
-    post_target_ticks: i32,
+    /// Set by the caller after a `Reference` event: the post-home target in
+    /// motor ticks, which needs the joint conversion the FSM does not hold.
+    pub post_target_ticks: i32,
     post_streak: u32,
     /// Position at PostMove entry (captured from the first tick with a
     /// valid reading) and the Hermite profile sized from it.
     post_start_ticks: Option<i32>,
     post_dur_ticks: u32,
     post_elapsed: u32,
+    /// Measured current at the stall hit: where the release ramp starts.
+    hit_current: f64,
 }
 
 impl Homer {
-    fn new(p: &HomerParams) -> Self {
+    pub fn new(p: &HomerParams) -> Self {
         Self {
             phase: HPhase::Finished,
             failed_in: HPhase::Finished,
@@ -289,10 +333,11 @@ impl Homer {
             post_start_ticks: None,
             post_dur_ticks: 0,
             post_elapsed: 0,
+            hit_current: 0.0,
         }
     }
 
-    fn start(&mut self) {
+    pub fn start(&mut self) {
         self.phase = HPhase::Approach;
         self.elapsed = 0;
         self.pass = 1;
@@ -316,7 +361,7 @@ impl Homer {
         self.cur_hits = 0;
     }
 
-    fn running(&self) -> bool {
+    pub fn running(&self) -> bool {
         !matches!(self.phase, HPhase::Finished | HPhase::Failed)
     }
 
@@ -333,10 +378,10 @@ impl Homer {
             HPhase::Approach => HomingPhase::Approach,
             HPhase::Preclear => HomingPhase::Backoff,
             HPhase::Dwell => HomingPhase::Dwell,
+            HPhase::Release => HomingPhase::Release,
             HPhase::Backoff => HomingPhase::Backoff,
             HPhase::Pause => HomingPhase::Pause,
-            HPhase::Release => HomingPhase::Release,
-            HPhase::Settle => HomingPhase::Settle,
+            HPhase::Brake | HPhase::Settle => HomingPhase::Settle,
             HPhase::PostMove => HomingPhase::PostMove,
             HPhase::Finished => HomingPhase::Finished,
             HPhase::Failed => HomingPhase::Finished,
@@ -344,6 +389,15 @@ impl Homer {
         match self.phase {
             HPhase::Failed => map(&self.failed_in),
             ref p => map(p),
+        }
+    }
+
+    /// The signed approach speed for the current pass \[motor ticks/s\].
+    fn approach_speed(&self, p: &HomerParams) -> f64 {
+        if self.pass == 2 {
+            p.speed * REHOME_SPEED_FACTOR
+        } else {
+            p.speed
         }
     }
 
@@ -394,7 +448,7 @@ impl Homer {
     /// One FSM tick. Returns the wire command for this joint and at most
     /// one event. Takes the node state mutably: entering an approach
     /// drops the node's cached cmd-32 bits (see below).
-    fn tick(
+    pub fn tick(
         &mut self,
         p: &HomerParams,
         node: &mut NodeState,
@@ -415,11 +469,7 @@ impl Homer {
                     // approach is evidence; `None` stays "no reply yet".
                     node.hall = None;
                 }
-                let speed = if self.pass == 2 {
-                    p.speed * REHOME_SPEED_FACTOR
-                } else {
-                    p.speed
-                };
+                let speed = self.approach_speed(p);
                 let (cmd, hit) = match p.strategy {
                     HomingStrategy::Stall => (
                         JointCommand::velocity(trunc_to_wire(speed), 0),
@@ -451,29 +501,46 @@ impl Homer {
                     return (JointCommand::idle(), None);
                 }
                 let hit_pos = i64::from(node.position_ticks.unwrap_or(0));
+                self.elapsed = 0;
                 match p.strategy {
                     HomingStrategy::Hall => {
                         // Position latched AT trigger; hall skips two-pass
                         // and release.
                         self.latched = node.position_ticks;
-                        self.phase = HPhase::Settle;
-                        self.elapsed = 0;
+                        self.phase = HPhase::Brake;
                     }
                     HomingStrategy::Stall => {
                         self.pass_hits[usize::from(self.pass - 1)] = hit_pos;
-                        if self.pass == 1 && p.two_pass {
-                            self.phase = HPhase::Dwell;
-                            self.elapsed = 0;
+                        self.hit_current = f64::from(node.current_ma.unwrap_or(0));
+                        let final_hit = !(self.pass == 1 && p.two_pass);
+                        self.phase = if !final_hit {
+                            HPhase::Dwell
                         } else if p.release.is_some() {
-                            self.phase = HPhase::Release;
-                            self.elapsed = 0;
+                            HPhase::Release
                         } else {
-                            self.phase = HPhase::Settle;
-                            self.elapsed = 0;
-                        }
+                            HPhase::Settle
+                        };
                     }
                 }
-                (JointCommand::idle(), None)
+                // The hit tick is the first tick of the phase that follows:
+                // a ramp starts from the push, never from an idle frame.
+                self.tick(p, node)
+            }
+            HPhase::Brake => {
+                self.elapsed += 1;
+                let speed = hermite(
+                    self.approach_speed(p),
+                    0.0,
+                    self.elapsed,
+                    p.ramp_ticks,
+                    p.dt,
+                )
+                .0;
+                if self.elapsed >= p.ramp_ticks {
+                    self.elapsed = 0;
+                    self.phase = HPhase::Settle;
+                }
+                (JointCommand::velocity(trunc_to_wire(speed), 0), None)
             }
             HPhase::Dwell => {
                 self.elapsed += 1;
@@ -508,12 +575,23 @@ impl Homer {
             }
             HPhase::Backoff => {
                 self.elapsed += 1;
-                let cmd = JointCommand::velocity(trunc_to_wire(-p.speed), 0);
-                if self.elapsed >= p.backoff_ticks {
+                // Ramped at both ends; each ramp covers half its length at
+                // full speed, so running one ramp past the configured time
+                // keeps the configured distance.
+                let ramp = p.ramp_ticks.min(p.backoff_ticks).max(1);
+                let (full, e) = (-p.speed, self.elapsed);
+                let speed = if e <= ramp {
+                    hermite(0.0, full, e, ramp, p.dt).0
+                } else if e <= p.backoff_ticks {
+                    full
+                } else {
+                    hermite(full, 0.0, e - p.backoff_ticks, ramp, p.dt).0
+                };
+                if e >= p.backoff_ticks + ramp {
                     self.elapsed = 0;
                     self.phase = HPhase::Pause;
                 }
-                (cmd, None)
+                (JointCommand::velocity(trunc_to_wire(speed), 0), None)
             }
             HPhase::Pause => {
                 self.elapsed += 1;
@@ -528,16 +606,28 @@ impl Homer {
             HPhase::Release => {
                 self.elapsed += 1;
                 let r = p.release.expect("release phase without a plan");
-                if self.elapsed == r.sample_tick {
+                let (ramp, e) = (p.ramp_ticks, self.elapsed);
+                let target = f64::from(r.current_ma);
+                // Ramp in from the stall push, hold for the configured
+                // duration (the reference is sampled inside the hold, where
+                // the vendor samples it), then ramp out to zero.
+                let current = if e <= ramp {
+                    hermite(self.hit_current, target, e, ramp, p.dt).0
+                } else if e <= ramp + r.dur_ticks {
+                    target
+                } else {
+                    hermite(target, 0.0, e - ramp - r.dur_ticks, ramp, p.dt).0
+                };
+                if e == ramp + r.sample_tick {
                     if let Some(pos) = node.position_ticks {
                         self.latched = Some(pos);
                     }
                 }
-                if self.elapsed >= r.dur_ticks {
+                if e >= 2 * ramp + r.dur_ticks {
                     self.phase = HPhase::Settle;
                     self.elapsed = 0;
                 }
-                (JointCommand::current(r.current_ma), None)
+                (JointCommand::current(current.round() as i16), None)
             }
             HPhase::Settle => {
                 self.elapsed += 1;
@@ -625,11 +715,11 @@ impl Homer {
                     })
                     .unwrap_or(false);
                 self.post_streak = if in_pos { self.post_streak + 1 } else { 0 };
-                if self.post_streak >= p.in_pos_streak {
+                if self.post_elapsed >= self.post_dur_ticks && self.post_streak >= p.in_pos_streak {
                     self.phase = HPhase::Finished;
-                } else if self.elapsed > p.pre_post_timeout {
-                    log::warn!("homing node {}: post-move timeout (continuing)", p.node);
-                    self.phase = HPhase::Finished;
+                } else if self.elapsed > self.post_dur_ticks.saturating_add(p.pre_post_timeout) {
+                    log::warn!("homing node {}: post-home target not reached", p.node);
+                    return self.fail();
                 }
                 (cmd, None)
             }
@@ -646,7 +736,6 @@ struct MoveState {
     dur_ticks: u32,
     elapsed: u32,
     done: bool,
-    warned: bool,
     start_ticks: Option<i32>,
 }
 
@@ -658,7 +747,6 @@ struct MoveToState {
     timeout_ticks: u32,
     elapsed: u32,
     done: bool,
-    warned: bool,
     start_ticks: Option<i32>,
     target_ticks: i32,
     streak: u32,
@@ -708,6 +796,59 @@ struct CalRun {
     elapsed: u32,
 }
 
+/// The step plans of `homing`, and its trailing moves.
+fn plan_sequence(homing: &HomingConfig, dt: f64) -> (Vec<StepPlan>, Vec<MoveState>) {
+    let ticks = |s: f64| (s / dt).round() as u32;
+    let plan_move = |m: &PreMove| MoveState {
+        spec: *m,
+        dur_ticks: ticks(match m {
+            PreMove::Idle { duration_s, .. }
+            | PreMove::Nudge { duration_s, .. }
+            | PreMove::Position { duration_s, .. }
+            | PreMove::GripperMove { duration_s, .. } => *duration_s,
+        })
+        .max(1),
+        elapsed: 0,
+        done: false,
+        start_ticks: None,
+    };
+    let steps = homing
+        .sequence
+        .iter()
+        .map(|s| StepPlan {
+            pre: s.pre_moves.iter().map(plan_move).collect(),
+            home_joints: {
+                let mut mask = [false; MAX_JOINTS];
+                if let Some(h) = s.home.as_ref() {
+                    for j in &h.joints {
+                        mask[usize::from(*j)] = true;
+                    }
+                }
+                mask
+            },
+            home_gripper: s.home.as_ref().and_then(|h| h.gripper),
+            move_to: s
+                .move_to
+                .iter()
+                .map(|m| MoveToState {
+                    joint: usize::from(m.joint),
+                    position_rad: m.position_rad,
+                    dur_ticks: ticks(m.duration_s).max(1),
+                    timeout_ticks: ticks(m.duration_s + MOVE_TO_EXTRA_S),
+                    elapsed: 0,
+                    done: false,
+                    start_ticks: None,
+                    target_ticks: 0,
+                    streak: 0,
+                })
+                .collect(),
+            post: s.post_moves.iter().map(plan_move).collect(),
+        })
+        .collect();
+    let global_post = homing.post_moves.iter().map(plan_move).collect();
+    (steps, global_post)
+}
+
 /// The homing subsystem: owns the parsed sequence and all FSM state.
 pub struct HomingSystem {
     dt: f64,
@@ -728,14 +869,21 @@ pub struct HomingSystem {
     cal_min_wait: u32,
 
     active: bool,
+    elapsed_ticks: u32,
+    sequence_timeout_ticks: u32,
     step_idx: usize,
     part: Part,
     statuses: [HomingJointStatus; NUM_NODES],
+    seeking_limits: [bool; NUM_NODES],
     last_fw_cmd: Option<FirmwareGripperCommand>,
     cal: Option<CalRun>,
     cal_failed: bool,
     endstop_ticks: Option<i32>,
     ticks_per_meter: Option<f64>,
+    /// Length of the final hold reported as [`SeqStatus::Checking`];
+    /// zero when the config carries no reference bounds.
+    check_ticks: u32,
+    check_left: u32,
 }
 
 impl HomingSystem {
@@ -745,21 +893,34 @@ impl HomingSystem {
         let dt = robot.robot.tick_dt_s;
         let ticks = |s: f64| (s / dt).round() as u32;
         let params: [HomerParams; MAX_JOINTS] = std::array::from_fn(|i| {
-            HomerParams::from_config(
-                robot.joints[i].node_id,
-                &robot.homing.joints[i],
-                robot.joints[i].velocity_limit_ticks_s,
-                robot.joints[i].ilim_ma,
+            let (joint, jh) = (&robot.joints[i], &robot.homing.joints[i]);
+            let mut p = HomerParams::from_config(
+                joint.node_id,
+                jh,
+                jh.seek_timeout_s(joint),
+                joint.velocity_limit_ticks_s,
+                joint.ilim_ma,
                 dt,
-            )
+            );
+            // The post move's span is sized at its start (peak tangent
+            // 1.5·d/span at the post-home speed), from at most the whole range.
+            if let Some(post) = &jh.post_home {
+                let ticks_per_rad = f64::from(1u32 << joint.encoder_bits) / std::f64::consts::TAU
+                    * joint.gear_ratio;
+                let range = (joint.limits.hard_max_rad - joint.limits.hard_min_rad) * ticks_per_rad;
+                p.post_ticks =
+                    ((1.5 * range / post.speed_ticks_s.abs().max(1.0)) / dt).ceil() as u32;
+            }
+            p
         });
-        let active_gripper = bundle.active_gripper();
-        let gripper_driver = active_gripper.and_then(|g| g.driver.as_ref());
-        let gripper_params = active_gripper.and_then(|g| {
+        let active_tool = bundle.active_tool();
+        let gripper_driver = active_tool.and_then(|g| g.driver.as_ref());
+        let gripper_params = active_tool.and_then(|g| {
             let (d, h) = (g.driver.as_ref()?, g.homing.as_ref()?);
             Some(HomerParams::from_config(
                 robot.bus.gripper_node,
                 h,
+                h.timeout_s,
                 d.velocity_limit_ticks_s,
                 d.ilim_ma,
                 dt,
@@ -772,62 +933,13 @@ impl HomingSystem {
                 .map(Homer::new)
                 .unwrap_or_else(|| Homer::new(&params[0])),
         );
-        let plan_move = |m: &PreMove| MoveState {
-            spec: *m,
-            dur_ticks: ticks(match m {
-                PreMove::Idle { duration_s, .. }
-                | PreMove::Nudge { duration_s, .. }
-                | PreMove::Position { duration_s, .. }
-                | PreMove::GripperMove { duration_s, .. } => *duration_s,
-            })
-            .max(1),
-            elapsed: 0,
-            done: false,
-            warned: false,
-            start_ticks: None,
-        };
-        let steps = robot
-            .homing
-            .sequence
-            .iter()
-            .map(|s| StepPlan {
-                pre: s.pre_moves.iter().map(plan_move).collect(),
-                home_joints: {
-                    let mut mask = [false; MAX_JOINTS];
-                    if let Some(h) = s.home.as_ref() {
-                        for j in &h.joints {
-                            mask[usize::from(*j)] = true;
-                        }
-                    }
-                    mask
-                },
-                home_gripper: s.home.as_ref().and_then(|h| h.gripper),
-                move_to: s
-                    .move_to
-                    .iter()
-                    .map(|m| MoveToState {
-                        joint: usize::from(m.joint),
-                        position_rad: m.position_rad,
-                        dur_ticks: ticks(m.duration_s).max(1),
-                        timeout_ticks: ticks(m.duration_s + MOVE_TO_EXTRA_S),
-                        elapsed: 0,
-                        done: false,
-                        warned: false,
-                        start_ticks: None,
-                        target_ticks: 0,
-                        streak: 0,
-                    })
-                    .collect(),
-                post: s.post_moves.iter().map(plan_move).collect(),
-            })
-            .collect();
-        let global_post = robot.homing.post_moves.iter().map(plan_move).collect();
+        let (steps, global_post) = plan_sequence(&robot.homing.for_tool(active_tool), dt);
         let eff_offset = std::array::from_fn(|i| {
             bundle
                 .effective_home_offset(i)
                 .unwrap_or(robot.homing.joints[i].home_offset_rad)
         });
-        Self {
+        let mut system = Self {
             dt,
             params,
             gripper_homer_started: false,
@@ -843,20 +955,103 @@ impl HomingSystem {
             cal_timeout: ticks(CAL_TIMEOUT_S).max(1),
             cal_min_wait: ticks(CAL_MIN_WAIT_S),
             active: false,
+            elapsed_ticks: 0,
+            sequence_timeout_ticks: 1,
             step_idx: 0,
             part: Part::Pre,
             statuses: [HomingJointStatus::Idle; NUM_NODES],
+            seeking_limits: [false; NUM_NODES],
             last_fw_cmd: None,
             cal: None,
             cal_failed: false,
             endstop_ticks: None,
             ticks_per_meter: None,
+            check_ticks: if robot.homing.reference_check_nm.is_empty() {
+                0
+            } else {
+                ticks(REFERENCE_CHECK_S).max(1)
+            },
+            check_left: 0,
+        };
+        system.sequence_timeout_ticks = system.sequence_budget_ticks();
+        system
+    }
+
+    /// The longest a healthy run of the planned sequence can take: each
+    /// step's moves to their own timeouts and its slowest homer to its
+    /// whole seek budget. The whole-sequence deadline is then a backstop
+    /// for a part that outlives its own bound, never a cut on a slow but
+    /// healthy home — a far-from-its-stops arm seeks for longer than any
+    /// fixed figure sized on a typical run.
+    fn sequence_budget_ticks(&self) -> u32 {
+        let pre_post = (PRE_POST_TIMEOUT_S / self.dt).round() as u32;
+        let moves = |ms: &[MoveState]| {
+            ms.iter()
+                .map(|m| m.dur_ticks.saturating_add(pre_post))
+                .fold(0u32, u32::saturating_add)
+        };
+        let homer = |p: &HomerParams| {
+            [
+                p.timeout_ticks,
+                p.backoff_ticks,
+                p.ramp_ticks.saturating_mul(4),
+                p.dwell_ticks,
+                p.pause_ticks,
+                p.settle_ticks,
+                p.release.map_or(0, |r| r.dur_ticks),
+                p.post_ticks,
+                p.pre_post_timeout,
+            ]
+            .into_iter()
+            .fold(0u32, u32::saturating_add)
+        };
+        let mut total = moves(&self.global_post).saturating_add(self.check_ticks);
+        for step in &self.steps {
+            let joints = (0..MAX_JOINTS)
+                .filter(|&j| step.home_joints[j])
+                .map(|j| homer(&self.params[j]))
+                .max()
+                .unwrap_or(0);
+            let gripper = match step.home_gripper {
+                Some(GripperHomeMode::Motor) => self.gripper_params.as_ref().map_or(0, homer),
+                Some(GripperHomeMode::Firmware) => self.cal_timeout,
+                None => 0,
+            };
+            let move_to = step
+                .move_to
+                .iter()
+                .map(|m| m.timeout_ticks)
+                .fold(0u32, u32::saturating_add);
+            total = [
+                moves(&step.pre),
+                joints.max(gripper),
+                move_to,
+                moves(&step.post),
+            ]
+            .into_iter()
+            .fold(total, u32::saturating_add);
+        }
+        total.saturating_add((SEQUENCE_SLACK_S / self.dt).round() as u32)
+    }
+
+    /// Re-base `joint`'s home reference on a newly fitted tool's offset,
+    /// for the next sequence to latch.
+    pub fn set_home_offset(&mut self, joint: usize, offset_rad: f64) {
+        if let Some(o) = self.eff_offset.get_mut(joint) {
+            *o = offset_rad;
         }
     }
 
     /// Whether a sequence is currently running.
     pub fn active(&self) -> bool {
         self.active
+    }
+
+    /// The reference check rejected `joint`'s latched reference: the
+    /// joint is marked failed in its `Finished` phase so the ordinary
+    /// `HOMING_FAILED` warning attributes it.
+    pub fn fail_reference(&mut self, joint: usize) {
+        self.statuses[joint] = HomingJointStatus::Failed;
     }
 
     /// A live retune of `node` replaces the "normal" limits the sequence
@@ -889,10 +1084,11 @@ impl HomingSystem {
         (self.endstop_ticks, self.ticks_per_meter)
     }
 
-    /// Start the sequence: reset all state, swap every involved node to
-    /// its homing current (Limits ×4).
+    /// Start with normal holding authority. Only active unreferenced
+    /// moves use the reduced seeking limits.
     pub fn start<B: DriverBus>(&mut self, bus: &mut B) {
         self.active = true;
+        self.elapsed_ticks = 0;
         self.step_idx = 0;
         self.part = Part::Pre;
         self.statuses = [HomingJointStatus::Idle; NUM_NODES];
@@ -900,25 +1096,102 @@ impl HomingSystem {
         self.cal_failed = false;
         self.last_fw_cmd = None;
         self.gripper_homer_started = false;
+        self.check_left = self.check_ticks;
         for h in &mut self.homers {
             h.phase = HPhase::Finished;
         }
         self.reset_step_states(0);
-        for p in &self.params {
-            let _ = bus.send_limits(
-                p.node,
-                p.normal_vel_limit,
-                p.current_ma as f32,
-                LIMIT_REPEATS,
-            );
+        self.seeking_limits.fill(false);
+        for p in self.params.iter().chain(self.gripper_params.iter()) {
+            let _ = bus.send_limits(p.node, p.normal_vel_limit, p.normal_ilim, LIMIT_REPEATS);
         }
-        if let Some(gp) = &self.gripper_params {
-            let _ = bus.send_limits(
-                gp.node,
-                gp.normal_vel_limit,
-                gp.current_ma as f32,
-                LIMIT_REPEATS,
-            );
+    }
+    /// Adopt a newly fitted tool's gripper.
+    ///
+    /// The pinion radius, the homing plan and whether there is a CAN
+    /// gripper at all are properties of the tool, not of the arm, so
+    /// `select_tool` has to move them. The reference latched against the
+    /// jaw that came off is dropped with it: a different jaw has its own
+    /// endstop, and `ticks_per_meter` derived from the old pinion would
+    /// report the new one's opening wrong. The sequence is re-planned for
+    /// it: a tool with no CAN driver runs it without the gripper work.
+    pub fn set_gripper(
+        &mut self,
+        robot: &RobotConfig,
+        gripper: Option<&par6_config::ToolConfig>,
+        dt: f64,
+    ) {
+        let driver = gripper.and_then(|g| g.driver.as_ref());
+        self.has_can_gripper = driver.is_some();
+        self.gripper_gear_r_m = driver.map_or(0.0, |d| d.gear_r_m);
+        self.gripper_params = gripper.and_then(|g| {
+            let (d, h) = (g.driver.as_ref()?, g.homing.as_ref()?);
+            Some(HomerParams::from_config(
+                self.gripper_node,
+                h,
+                h.timeout_s,
+                d.velocity_limit_ticks_s,
+                d.ilim_ma,
+                dt,
+            ))
+        });
+        // The placeholder for "no CAN gripper" is an arm joint's FSM, which
+        // never starts -- the same stand-in the boot path uses.
+        let seed = self.gripper_params.as_ref().unwrap_or(&self.params[0]);
+        self.homers[GRIPPER_SLOT] = Homer::new(seed);
+        self.endstop_ticks = None;
+        self.ticks_per_meter = None;
+        self.statuses[GRIPPER_SLOT] = HomingJointStatus::Idle;
+        (self.steps, self.global_post) = plan_sequence(&robot.homing.for_tool(gripper), dt);
+        self.sequence_timeout_ticks = self.sequence_budget_ticks();
+    }
+
+    fn apply_phase_limits<B: DriverBus>(&mut self, bus: &mut B) {
+        let mut seeking = [false; NUM_NODES];
+        let mut mark_moves = |moves: &[MoveState]| {
+            for m in moves.iter().filter(|m| !m.done) {
+                match m.spec {
+                    PreMove::Nudge { joint, .. } | PreMove::Position { joint, .. } => {
+                        seeking[usize::from(joint)] = true;
+                    }
+                    PreMove::Idle { .. } | PreMove::GripperMove { .. } => {}
+                }
+            }
+        };
+        if let Some(step) = self.steps.get(self.step_idx) {
+            match self.part {
+                Part::Pre => mark_moves(&step.pre),
+                Part::Post => mark_moves(&step.post),
+                Part::GlobalPost => mark_moves(&self.global_post),
+                Part::HomeStart | Part::Home => {
+                    seeking[..MAX_JOINTS].copy_from_slice(&step.home_joints);
+                    seeking[GRIPPER_SLOT] = step.home_gripper.is_some();
+                }
+                Part::MoveTo => {
+                    for m in step.move_to.iter().filter(|m| !m.done) {
+                        seeking[m.joint] = true;
+                    }
+                }
+            }
+        } else {
+            mark_moves(&self.global_post);
+        }
+        for (i, p) in self
+            .params
+            .iter()
+            .chain(self.gripper_params.iter())
+            .enumerate()
+        {
+            seeking[i] &= self.statuses[i] != HomingJointStatus::Done;
+            if seeking[i] != self.seeking_limits[i] {
+                let limit = if seeking[i] {
+                    p.current_ma as f32
+                } else {
+                    p.normal_ilim
+                };
+                let _ = bus.send_limits(p.node, p.normal_vel_limit, limit, LIMIT_REPEATS);
+                self.seeking_limits[i] = seeking[i];
+            }
         }
     }
 
@@ -948,13 +1221,11 @@ impl HomingSystem {
             for m in step.pre.iter_mut().chain(step.post.iter_mut()) {
                 m.elapsed = 0;
                 m.done = false;
-                m.warned = false;
                 m.start_ticks = None;
             }
             for m in &mut step.move_to {
                 m.elapsed = 0;
                 m.done = false;
-                m.warned = false;
                 m.start_ticks = None;
                 m.streak = 0;
             }
@@ -965,7 +1236,7 @@ impl HomingSystem {
     pub fn status(&self) -> HomingStatus {
         let mut eff = [0.0f32; NUM_NODES];
         for (i, e) in eff.iter_mut().enumerate().take(MAX_JOINTS) {
-            let homing_now = self.active && self.statuses[i] != HomingJointStatus::Done;
+            let homing_now = self.active && self.seeking_limits[i];
             *e = if homing_now {
                 self.params[i].current_ma as f32
             } else {
@@ -973,7 +1244,7 @@ impl HomingSystem {
             };
         }
         if let Some(gp) = &self.gripper_params {
-            let homing_now = self.active && self.statuses[GRIPPER_SLOT] != HomingJointStatus::Done;
+            let homing_now = self.active && self.seeking_limits[GRIPPER_SLOT];
             eff[GRIPPER_SLOT] = if homing_now {
                 gp.current_ma as f32
             } else {
@@ -1018,14 +1289,26 @@ impl HomingSystem {
         &self.statuses
     }
 
-    fn fail<B: DriverBus>(&mut self, bus: &mut B) -> SeqStatus {
+    fn fail<B: DriverBus>(
+        &mut self,
+        bus: &mut B,
+        cmds: &mut [JointCommand; MAX_JOINTS],
+        gcmd: &mut GripperCommand,
+    ) -> SeqStatus {
+        // No parallel phase may send another drive command on the failure tick.
+        cmds.fill(JointCommand::idle());
+        *gcmd = if self.has_can_gripper {
+            GripperCommand::Motor(JointCommand::idle())
+        } else {
+            GripperCommand::NoGripper
+        };
         self.active = false;
         self.restore_all(bus);
         SeqStatus::Failed
     }
 
     /// Advance one move (pre/post kind); fills the actuator command.
-    /// Returns whether the move is complete.
+    /// Returns completion, or the joint whose positioning failed.
     #[allow(clippy::too_many_arguments)]
     fn tick_move(
         m: &mut MoveState,
@@ -1037,9 +1320,9 @@ impl HomingSystem {
         cmds: &mut [JointCommand; MAX_JOINTS],
         gcmd: &mut GripperCommand,
         last_fw: &mut Option<FirmwareGripperCommand>,
-    ) -> bool {
+    ) -> Result<bool, usize> {
         if m.done {
-            return true;
+            return Ok(true);
         }
         m.elapsed += 1;
         match m.spec {
@@ -1098,12 +1381,9 @@ impl HomingSystem {
                         m.done = true;
                     }
                 }
-                if !m.done && m.elapsed > pre_post_timeout {
-                    if !m.warned {
-                        log::warn!("homing position pre/post-move timed out (continuing)");
-                        m.warned = true;
-                    }
-                    m.done = true;
+                if !m.done && m.elapsed > m.dur_ticks.saturating_add(pre_post_timeout) {
+                    log::warn!("homing position move for joint {j}: target not reached");
+                    return Err(j);
                 }
             }
             PreMove::GripperMove {
@@ -1132,7 +1412,7 @@ impl HomingSystem {
                 }
             }
         }
-        m.done
+        Ok(m.done)
     }
 
     /// One HOMING tick: fill the full per-joint command array (idle
@@ -1162,13 +1442,34 @@ impl HomingSystem {
         if !self.active {
             return SeqStatus::Inactive;
         }
+        self.elapsed_ticks += 1;
+        if self.elapsed_ticks >= self.sequence_timeout_ticks {
+            log::warn!(
+                "homing exceeded its {:.1} s whole-sequence deadline",
+                f64::from(self.sequence_timeout_ticks) * self.dt
+            );
+            for (homer, status) in self.homers.iter_mut().zip(self.statuses.iter_mut()) {
+                if *status == HomingJointStatus::Running {
+                    homer.fail();
+                    *status = HomingJointStatus::Failed;
+                }
+            }
+            *gcmd = if self.has_can_gripper {
+                GripperCommand::Motor(JointCommand::idle())
+            } else {
+                GripperCommand::NoGripper
+            };
+            return self.fail(bus, cmds, gcmd);
+        }
+        self.apply_phase_limits(bus);
         if self.step_idx >= self.steps.len() {
-            return self.tick_global_post(state, conv, cmds, gcmd);
+            return self.tick_global_post(bus, state, conv, cmds, gcmd);
         }
 
         match self.part {
             Part::Pre => {
                 let mut all_done = true;
+                let mut failed = false;
                 let mut step = std::mem::take(&mut self.steps[self.step_idx].pre);
                 for m in &mut step {
                     let done = Self::tick_move(
@@ -1182,38 +1483,33 @@ impl HomingSystem {
                         gcmd,
                         &mut self.last_fw_cmd,
                     );
-                    all_done &= done;
+                    match done {
+                        Ok(done) => all_done &= done,
+                        Err(j) => {
+                            self.statuses[j] = HomingJointStatus::Failed;
+                            failed = true;
+                        }
+                    }
                 }
                 self.steps[self.step_idx].pre = step;
+                if failed {
+                    return self.fail(bus, cmds, gcmd);
+                }
                 if all_done {
                     self.part = Part::HomeStart;
                 }
                 SeqStatus::Running
             }
             Part::HomeStart => {
-                // FSM start: homing current limits ×4 (the only path that
-                // also applies to the gripper motor), reset FSMs.
+                // Phase limits are applied before the first approach command.
                 let joints = self.steps[self.step_idx].home_joints;
                 for j in (0..MAX_JOINTS).filter(|&j| joints[j]) {
-                    let p = &self.params[j];
-                    let _ = bus.send_limits(
-                        p.node,
-                        p.normal_vel_limit,
-                        p.current_ma as f32,
-                        LIMIT_REPEATS,
-                    );
                     self.homers[j].start();
                     self.statuses[j] = HomingJointStatus::Running;
                 }
                 match self.steps[self.step_idx].home_gripper {
                     Some(GripperHomeMode::Motor) => {
-                        if let Some(gp) = &self.gripper_params {
-                            let _ = bus.send_limits(
-                                gp.node,
-                                gp.normal_vel_limit,
-                                gp.current_ma as f32,
-                                LIMIT_REPEATS,
-                            );
+                        if self.gripper_params.is_some() {
                             self.homers[GRIPPER_SLOT].start();
                             self.gripper_homer_started = true;
                             self.statuses[GRIPPER_SLOT] = HomingJointStatus::Running;
@@ -1235,10 +1531,21 @@ impl HomingSystem {
             Part::MoveTo => {
                 let mut all_done = true;
                 let mut moves = std::mem::take(&mut self.steps[self.step_idx].move_to);
+                let mut failed = false;
                 for m in &mut moves {
-                    all_done &= self.tick_move_to(m, state, conv, cmds);
+                    match self.tick_move_to(m, state, conv, cmds) {
+                        Ok(done) => all_done &= done,
+                        Err(()) => {
+                            self.statuses[m.joint] = HomingJointStatus::Failed;
+                            failed = true;
+                        }
+                    }
                 }
                 self.steps[self.step_idx].move_to = moves;
+                if failed {
+                    cmds.fill(JointCommand::idle());
+                    return self.fail(bus, cmds, gcmd);
+                }
                 if all_done {
                     self.part = Part::Post;
                 }
@@ -1246,6 +1553,7 @@ impl HomingSystem {
             }
             Part::Post => {
                 let mut all_done = true;
+                let mut failed = false;
                 let mut post = std::mem::take(&mut self.steps[self.step_idx].post);
                 for m in &mut post {
                     let done = Self::tick_move(
@@ -1259,9 +1567,18 @@ impl HomingSystem {
                         gcmd,
                         &mut self.last_fw_cmd,
                     );
-                    all_done &= done;
+                    match done {
+                        Ok(done) => all_done &= done,
+                        Err(j) => {
+                            self.statuses[j] = HomingJointStatus::Failed;
+                            failed = true;
+                        }
+                    }
                 }
                 self.steps[self.step_idx].post = post;
+                if failed {
+                    return self.fail(bus, cmds, gcmd);
+                }
                 if all_done {
                     self.step_idx += 1;
                     if self.step_idx < self.steps.len() {
@@ -1272,25 +1589,26 @@ impl HomingSystem {
                         for m in &mut self.global_post {
                             m.elapsed = 0;
                             m.done = false;
-                            m.warned = false;
                             m.start_ticks = None;
                         }
                     }
                 }
                 SeqStatus::Running
             }
-            Part::GlobalPost => self.tick_global_post(state, conv, cmds, gcmd),
+            Part::GlobalPost => self.tick_global_post(bus, state, conv, cmds, gcmd),
         }
     }
 
-    fn tick_global_post(
+    fn tick_global_post<B: DriverBus>(
         &mut self,
+        bus: &mut B,
         state: &BusState,
         conv: &[JointConversion; MAX_JOINTS],
         cmds: &mut [JointCommand; MAX_JOINTS],
         gcmd: &mut GripperCommand,
     ) -> SeqStatus {
         let mut all_done = true;
+        let mut failed = false;
         let mut post = std::mem::take(&mut self.global_post);
         for m in &mut post {
             let done = Self::tick_move(
@@ -1304,10 +1622,26 @@ impl HomingSystem {
                 gcmd,
                 &mut self.last_fw_cmd,
             );
-            all_done &= done;
+            match done {
+                Ok(done) => all_done &= done,
+                Err(j) => {
+                    self.statuses[j] = HomingJointStatus::Failed;
+                    failed = true;
+                }
+            }
         }
         self.global_post = post;
+        if failed {
+            return self.fail(bus, cmds, gcmd);
+        }
         if all_done {
+            // The idle keep-alive frames already filled in by `tick`
+            // hold every joint on the drive's own loops, so the current
+            // they draw is the load the reference puts them under.
+            if self.check_left > 0 {
+                self.check_left -= 1;
+                return SeqStatus::Checking;
+            }
             self.active = false;
             return SeqStatus::Complete;
         }
@@ -1320,9 +1654,9 @@ impl HomingSystem {
         state: &BusState,
         conv: &[JointConversion; MAX_JOINTS],
         cmds: &mut [JointCommand; MAX_JOINTS],
-    ) -> bool {
+    ) -> Result<bool, ()> {
         if m.done {
-            return true;
+            return Ok(true);
         }
         m.elapsed += 1;
         let j = m.joint;
@@ -1350,13 +1684,10 @@ impl HomingSystem {
             }
         }
         if !m.done && m.elapsed > m.timeout_ticks {
-            if !m.warned {
-                log::warn!("homing move_to joint {j} timed out (continuing)");
-                m.warned = true;
-            }
-            m.done = true;
+            log::warn!("homing move_to joint {j} timed out; clearance not established");
+            return Err(());
         }
-        m.done
+        Ok(m.done)
     }
 
     fn tick_home<B: DriverBus>(
@@ -1382,6 +1713,7 @@ impl HomingSystem {
                     conv[j].set_home(latched_ticks, self.eff_offset[j]);
                     let _ =
                         bus.send_limits(p.node, p.normal_vel_limit, p.normal_ilim, LIMIT_REPEATS);
+                    self.seeking_limits[j] = false;
                     self.statuses[j] = HomingJointStatus::Done;
                     if let Some(post) = &p.post {
                         self.homers[j].post_target_ticks = conv[j].motor_ticks(post.position_rad);
@@ -1415,6 +1747,7 @@ impl HomingSystem {
                                     gp.normal_ilim,
                                     LIMIT_REPEATS,
                                 );
+                                self.seeking_limits[GRIPPER_SLOT] = false;
                                 self.statuses[GRIPPER_SLOT] = HomingJointStatus::Done;
                             }
                             Some(HomerEvent::Failed) => {
@@ -1450,7 +1783,7 @@ impl HomingSystem {
             None => {}
         }
         if failed {
-            return self.fail(bus);
+            return self.fail(bus, cmds, gcmd);
         }
         // Part complete when every FSM in the group is finished.
         let arm_done = (0..MAX_JOINTS)

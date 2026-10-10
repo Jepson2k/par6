@@ -12,6 +12,29 @@ fn shipped() -> String {
     std::fs::read_to_string(&path).expect("shipped PAR6.toml")
 }
 
+#[test]
+fn a_continuous_joint_cannot_home_by_pressing_against_an_endstop() {
+    let field = refused_field(
+        load_with(
+            "hard_min_rad = -2.952",
+            "continuous = true\nhard_min_rad = -2.952",
+        ),
+        "stall homing without a mechanical endstop",
+    );
+    assert_eq!(field, "joints[0].limits.continuous");
+}
+
+#[test]
+fn a_continuous_joint_cannot_park_on_an_endstop() {
+    let field = refused_field(
+        load_with("endstop_joints = [1, 2]", "endstop_joints = [1, 2, 5]"),
+        "parking the continuous wrist on a nonexistent mechanical endstop",
+    );
+    assert_eq!(field, "shutdown.endstop_joints");
+    load_with("endstop_joints = [1, 2]", "endstop_joints = [1, 2]")
+        .expect("the shoulder and elbow have mechanical endstops");
+}
+
 /// Load the shipped config with one line rewritten.
 fn load_with(from: &str, to: &str) -> Result<RobotConfig, ConfigError> {
     let text = shipped();
@@ -50,7 +73,7 @@ fn powered_support_requires_one_finite_nonnegative_value_per_joint() {
     ] {
         let field = refused_field(
             load_with(
-                "powered_support_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]",
+                "powered_support_nm = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]",
                 &format!("powered_support_nm = {values}"),
             ),
             values,
@@ -58,10 +81,10 @@ fn powered_support_requires_one_finite_nonnegative_value_per_joint() {
         assert_eq!(field, "sim.powered_support_nm");
     }
     load_with(
-        "powered_support_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]",
         "powered_support_nm = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]",
+        "powered_support_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]",
     )
-    .expect("zero support is a valid model assumption");
+    .expect("a positive support is a valid model assumption");
 }
 
 #[test]
@@ -94,4 +117,167 @@ fn nan_and_unbounded_values_are_refused_by_name() {
         load_with("torque_rate_nm_s = 364.0", "torque_rate_nm_s = 364.0").is_ok(),
         "the shipped config loads"
     );
+}
+
+/// Homing must not depend on where the arm was last parked. Every joint
+/// gets a seek budget long enough to cross its whole mechanical range at
+/// the seek speed, so a joint left at the far end still reaches the
+/// endstop. The shipped `timeout_s` values do not: on 2026-09-20 J1 swept
+/// 196 deg of its 338 deg range inside the configured 13 s and stopped
+/// short of the switch, and J2, J3 and J6 carry the same shortfall.
+#[test]
+fn every_joint_can_seek_across_its_whole_range() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+    let robot = RobotConfig::load(&path).expect("shipped PAR6.toml");
+    for (i, (joint, homing)) in robot.joints.iter().zip(&robot.homing.joints).enumerate() {
+        let ticks_per_rad =
+            f64::from(1u32 << joint.encoder_bits) / std::f64::consts::TAU * joint.gear_ratio;
+        let span_ticks = (joint.limits.hard_max_rad - joint.limits.hard_min_rad) * ticks_per_rad;
+        let crossing_s = span_ticks / homing.speed_ticks_s;
+        let budget_s = homing.seek_timeout_s(joint);
+        // A bare crossing leaves nothing for the ramp up to seek speed or
+        // the stall confirmation at the stop: a fifth more, at least.
+        assert!(
+            budget_s >= 1.2 * crossing_s,
+            "J{}: seek budget {budget_s:.1} s covers only {:.0}% of the {crossing_s:.1} s \
+             needed to cross its range at {} ticks/s",
+            i + 1,
+            budget_s / crossing_s * 100.0,
+            homing.speed_ticks_s,
+        );
+    }
+}
+
+/// The two-pass check compares where the second pass stalled with the
+/// first, and the second pass starts a backoff away. A tolerance that
+/// reaches the backoff passes a second pass that stalled where it began
+/// — J0 shipped the vendor's 3500 ticks against a 1350-tick backoff.
+#[test]
+fn a_two_pass_tolerance_must_be_below_the_backoff_travel() {
+    let shipped = "two_pass_max_diff_ticks = 500";
+    // J0: 4500 ticks/s for 0.3 s.
+    let field = refused_field(
+        load_with(shipped, "two_pass_max_diff_ticks = 1350"),
+        "a tolerance equal to the backoff",
+    );
+    assert_eq!(field, "homing.joints[0].two_pass_max_diff_ticks");
+    load_with(shipped, "two_pass_max_diff_ticks = 1349").expect("a tolerance inside the backoff");
+}
+
+/// A joint's name is how an overlay addresses it, so two joints may not
+/// share one.
+#[test]
+fn joint_names_are_unique() {
+    let field = refused_field(
+        load_with("name = \"joint2\"", "name = \"joint1\""),
+        "two joints named joint1",
+    );
+    assert_eq!(field, "joints[1].name");
+}
+
+/// One installation's values layer over the shipped file: a local overlay
+/// sets one joint's gain and stands the arm on its bench, everything it
+/// does not name stays shipped, and a key the schema does not know is
+/// refused with the overlay named, since the mistake is there.
+#[test]
+fn a_local_overlay_layers_one_installations_values_over_the_shipped_file() {
+    use par6_config::ConfigBundle;
+    let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+    let dir = std::env::temp_dir().join(format!("par6-config-overlay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let local = dir.join("local.toml");
+    std::fs::write(
+        &local,
+        "[[joints]]\nname = \"joint1\"\n\
+         [[joints]]\nname = \"joint2\"\n[joints.gains]\nkiv = 0.00123\n\
+         [[installation_shapes]]\nname = \"bench\"\nkind = \"box\"\n\
+         params = [1.0, 1.0, 0.1]\npose = [0.0, 0.0, -0.06, 0.0, 0.0, 0.0]\n",
+    )
+    .expect("overlay");
+    let plain = ConfigBundle::load(&shipped).expect("shipped");
+    let layered = ConfigBundle::load_with(&shipped, Some(&local), None).expect("layered");
+    assert_eq!(layered.robot.joints[1].gains.kiv, 0.00123);
+    assert_eq!(
+        layered.robot.joints[1].gains.kpv,
+        plain.robot.joints[1].gains.kpv
+    );
+    assert_eq!(layered.robot.joints[0], plain.robot.joints[0]);
+    assert_eq!(layered.robot.sim, plain.robot.sim);
+    assert!(
+        layered
+            .installation_shapes
+            .iter()
+            .any(|s| s.name == "bench"),
+        "the overlay's bench shape: {:?}",
+        layered.installation_shapes
+    );
+
+    std::fs::write(&local, "[sim]\nviscous = [0.0]\n").expect("typo");
+    let err = ConfigBundle::load_with(&shipped, Some(&local), None)
+        .expect_err("an unknown key must be refused");
+    assert!(
+        err.to_string().contains("local.toml"),
+        "the refusal must name the overlay: {err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A tool file layers the same way: a `[[tools]]` entry, named after the
+/// tool, changes that tool and no other, and the runtime reports the tool
+/// as it runs it. An entry for a tool no file defines, or naming none, is
+/// refused rather than left to do nothing.
+#[test]
+fn a_local_overlay_layers_one_tools_values_over_its_file() {
+    use par6_config::ConfigBundle;
+    const TOOL: &str = "MSG_small_motor_150mm_rail";
+    let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+    let dir = std::env::temp_dir().join(format!("par6-config-tool-overlay-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let local = dir.join("local.toml");
+    let write = |text: &str| std::fs::write(&local, text).expect("overlay");
+    write(&format!(
+        "[[tools]]\nname = \"{TOOL}\"\n[tools.driver]\nilim_ma = 900.0\n"
+    ));
+    let plain = ConfigBundle::load(&shipped).expect("shipped");
+    let layered = ConfigBundle::load_with(&shipped, Some(&local), None).expect("layered");
+    let tool = |b: &ConfigBundle, name: &str| {
+        b.tools
+            .iter()
+            .find(|t| t.name == name)
+            .expect("tool")
+            .clone()
+    };
+    let (was, now) = (tool(&plain, TOOL), tool(&layered, TOOL));
+    assert_eq!(now.driver.as_ref().unwrap().ilim_ma, 900.0);
+    assert_eq!(
+        now.driver.as_ref().unwrap().gains,
+        was.driver.as_ref().unwrap().gains
+    );
+    assert_eq!(now.kinematics, was.kinematics);
+    for t in plain.tools.iter().filter(|t| t.name != TOOL) {
+        assert_eq!(tool(&layered, &t.name), *t, "{} changed", t.name);
+    }
+    assert_eq!(layered.robot, plain.robot);
+
+    let reported = par6_config::effective_tool_tomls(&shipped, Some(&local)).expect("reported");
+    let changed: Vec<_> = reported
+        .iter()
+        .filter(|(name, content)| {
+            *content
+                != std::fs::read_to_string(shipped.with_file_name("grippers").join(name)).unwrap()
+        })
+        .map(|(name, _)| name.as_str())
+        .collect();
+    assert_eq!(changed, [format!("{TOOL}.toml")]);
+
+    for (overlay, what) in [
+        ("[[tools]]\nname = \"NoSuchTool\"\n", "NoSuchTool"),
+        ("[[tools]]\n[tools.driver]\nilim_ma = 900.0\n", "name"),
+    ] {
+        write(overlay);
+        let err = ConfigBundle::load_with(&shipped, Some(&local), None)
+            .expect_err("an entry that changes no tool must be refused");
+        assert!(err.to_string().contains(what), "{err}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 }

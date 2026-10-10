@@ -1,8 +1,9 @@
 //! The real `par6-motion` engines behind the `par6-rt` per-tick hook
 //! traits — thin lifecycle mappings, no behavior of their own.
 
-use par6_motion::{JogDirection, MotionLimits, StreamStep, StreamingExecutor};
-use par6_rt::{JogEngine as RtJogEngine, StreamTracker, MAX_JOINTS};
+use crate::{JogEngine as RtJogEngine, StreamTracker, MAX_JOINTS};
+use par6_config::{LimitMode, RobotConfig};
+use par6_motion::{JogDirection, MotionError, MotionLimits, StreamStep, StreamingExecutor};
 
 /// `par6_motion::JogEngine` (jerk-aware lookahead, direction-block
 /// latching) behind the RT jog hook.
@@ -20,6 +21,14 @@ impl MotionJog {
             engine,
             base_accel_time_s,
         }
+    }
+
+    /// The jog the robot's `[jog]` config describes.
+    pub fn from_config(robot: &RobotConfig) -> Result<Self, MotionError> {
+        Ok(Self::new(
+            par6_motion::JogEngine::new(robot)?,
+            robot.jog.accel_time_s,
+        ))
     }
 }
 
@@ -51,6 +60,7 @@ impl RtJogEngine for MotionJog {
     /// acceleration is `v_full / accel_time_s`, so dividing the time by
     /// the fraction scales the acceleration by it.
     fn set_accel_scale(&mut self, accel: f64) {
+        let accel = accel.clamp(par6_motion::MIN_ACCEL_FRACTION, 1.0);
         if let Err(e) = self.engine.set_accel_time_s(self.base_accel_time_s / accel) {
             log::warn!("jog accel scale {accel} refused: {e}");
         }
@@ -132,6 +142,18 @@ impl MotionStream {
         }
     }
 
+    /// The stream limiter at the robot's tick under its STREAM limits.
+    pub fn from_config(robot: &RobotConfig) -> Result<Self, MotionError> {
+        let dt = robot.robot.tick_dt_s;
+        let limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
+        Ok(Self::new(
+            StreamingExecutor::new(dt, &limits)?,
+            dt,
+            limits,
+            robot.stream.fault_latch_s,
+        ))
+    }
+
     fn clamp(&self, q: &mut [f64; MAX_JOINTS]) {
         for (j, v) in q.iter_mut().enumerate() {
             *v = v.clamp(self.soft_min[j], self.soft_max[j]);
@@ -154,6 +176,11 @@ impl StreamTracker for MotionStream {
         self.fail_streak = 0;
         self.target_refused = false;
         self.scale_refused = false;
+    }
+
+    fn set_bounds(&mut self, min: &[f64; MAX_JOINTS], max: &[f64; MAX_JOINTS]) {
+        self.soft_min = *min;
+        self.soft_max = *max;
     }
 
     fn set_target(&mut self, q_target: &[f64; MAX_JOINTS]) {
@@ -183,9 +210,13 @@ impl StreamTracker for MotionStream {
     }
 
     fn set_scale(&mut self, speed: f64, accel: f64) {
+        self.set_scale_per_joint(&[speed; MAX_JOINTS], accel);
+    }
+
+    fn set_scale_per_joint(&mut self, speed: &[f64; MAX_JOINTS], accel: f64) {
         let mut scaled = self.base;
-        for j in 0..MAX_JOINTS {
-            scaled.velocity[j] = self.base.velocity[j] * speed;
+        for (j, fraction) in speed.iter().enumerate() {
+            scaled.velocity[j] = self.base.velocity[j] * fraction;
             scaled.acceleration[j] = self.base.acceleration[j] * accel;
             // Jerk rides the acceleration fraction: a stream asked to
             // accelerate gently that kept the full jerk ceiling would
@@ -198,7 +229,7 @@ impl StreamTracker for MotionStream {
             Err(e) => {
                 if !self.scale_refused {
                     log::warn!(
-                        "stream limit scale ({speed}, {accel}) refused: {e} (repeats suppressed)"
+                        "stream limit scale ({speed:?}, {accel}) refused: {e} (repeats suppressed)"
                     );
                 }
                 self.scale_refused = true;
@@ -208,27 +239,16 @@ impl StreamTracker for MotionStream {
 
     fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]) {
         match self.executor.step() {
-            Ok(StreamStep { q, qd, finished }) => {
+            Ok(StreamStep { q, finished, .. }) => {
                 self.finished = finished;
                 *q_out = q;
                 self.clamp(q_out);
-                // The velocity channel of a cmd-2 position frame is an
-                // additive feedforward on the driver's position loop
-                // (vendor firmware). The OTG reports the velocity it ends the
-                // tick AT, which is zero on every tick that lands on the
-                // current target — a stepped stream advancing a reachable
-                // target every cycle would get no feedforward at all and
-                // track only on position error. Send the larger of the
-                // OTG's profile velocity and the rate the position
-                // channel actually advanced this tick, so the driver is
-                // fed the true rate of the commanded motion.
+                // Cmd-2 velocity is additive position-loop feedforward.
+                // Use the interval-average rate consistently: choosing between
+                // it and endpoint velocity creates a jerk jump at reversals.
+                // An interval that lands at rest still needs its advance fed.
                 for j in 0..MAX_JOINTS {
-                    let advance = (q_out[j] - self.hold_q[j]) / self.dt;
-                    qd_out[j] = if advance.abs() > qd[j].abs() {
-                        advance
-                    } else {
-                        qd[j]
-                    };
+                    qd_out[j] = (q_out[j] - self.hold_q[j]) / self.dt;
                 }
                 self.hold_q = *q_out;
                 if self.fail_streak > 0 {
@@ -295,55 +315,111 @@ mod tests {
     /// exactly `round(fault_latch_s / dt)` consecutive failures, and
     /// recover cleanly the moment a step succeeds again. The failure is
     /// the real one: a zeroed velocity ceiling that Ruckig refuses on
-    /// every update.
+    /// every update. The tick rates give a whole window, one whose
+    /// remainder rounds down and one whose remainder rounds up.
     #[test]
     fn a_failing_limiter_throttles_its_log_and_faults_after_the_window() {
         let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
         let limits = stream_limits();
-        let dt = 0.05;
-        let fault_latch_s = 0.5; // 10 ticks at this dt
-        let mut stream = MotionStream::new(
-            par6_motion::StreamingExecutor::new(dt, &limits).expect("executor"),
-            dt,
-            limits,
-            fault_latch_s,
-        );
-        let start = [0.0; MAX_JOINTS];
-        stream.activate(&start);
-        let mut target = start;
-        target[0] = 0.3;
-        stream.set_target(&target);
-        stream.set_scale(0.0, 0.0);
+        let fault_latch_s = 0.5;
+        for (dt, window) in [(0.05, 10), (0.06, 8), (0.03, 17)] {
+            let mut stream = MotionStream::new(
+                par6_motion::StreamingExecutor::new(dt, &limits).expect("executor"),
+                dt,
+                limits,
+                fault_latch_s,
+            );
+            let start = [0.0; MAX_JOINTS];
+            stream.activate(&start);
+            let mut target = start;
+            target[0] = 0.3;
+            stream.set_target(&target);
+            stream.set_scale(0.0, 0.0);
 
-        let mut q = [f64::NAN; MAX_JOINTS];
-        let mut qd = [f64::NAN; MAX_JOINTS];
-        STEP_FAIL_RECORDS.store(0, Ordering::Relaxed);
-        for tick in 1..10 {
+            let mut q = [f64::NAN; MAX_JOINTS];
+            let mut qd = [f64::NAN; MAX_JOINTS];
+            STEP_FAIL_RECORDS.store(0, Ordering::Relaxed);
+            for tick in 1..window {
+                stream.step(&mut q, &mut qd);
+                assert!(
+                    !stream.faulted(),
+                    "dt {dt}, tick {tick}: the latch window is {window} ticks"
+                );
+                assert_eq!(q[0], start[0], "a failing step holds, never emits garbage");
+                assert_eq!(qd[0], 0.0);
+            }
             stream.step(&mut q, &mut qd);
             assert!(
-                !stream.faulted(),
-                "tick {tick}: the latch window is {fault_latch_s} s = 10 ticks"
+                stream.faulted(),
+                "dt {dt}: {window} consecutive failures must fault"
             );
-            assert_eq!(q[0], start[0], "a failing step holds, never emits garbage");
-            assert_eq!(qd[0], 0.0);
-        }
-        stream.step(&mut q, &mut qd);
-        assert!(
-            stream.faulted(),
-            "10 consecutive failures = round(fault_latch_s / dt) must fault"
-        );
-        assert_eq!(
-            STEP_FAIL_RECORDS.load(Ordering::Relaxed),
-            1,
-            "one warn per streak, not one per 250 Hz tick"
-        );
+            assert_eq!(
+                STEP_FAIL_RECORDS.load(Ordering::Relaxed),
+                1,
+                "dt {dt}: one warn per streak, not one per tick"
+            );
 
-        // Recovery: a healthy scale makes the next step succeed and the
-        // fault reads clear again.
-        stream.set_scale(1.0, 1.0);
-        stream.step(&mut q, &mut qd);
-        assert!(!stream.faulted(), "a recovered limiter is healthy");
-        assert!(q[0] > start[0], "and it is tracking the target again");
+            // Recovery: a healthy scale makes the next step succeed and the
+            // fault reads clear again.
+            stream.set_scale(1.0, 1.0);
+            stream.step(&mut q, &mut qd);
+            assert!(!stream.faulted(), "dt {dt}: a recovered limiter is healthy");
+            assert!(
+                q[0] > start[0],
+                "dt {dt}: and it is tracking the target again"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_reversals_preserve_feedforward_jerk() {
+        let mut limits = stream_limits();
+        limits.velocity.fill(0.2);
+        limits.acceleration.fill(0.4);
+        limits.jerk.fill(1.2);
+        let dt = 0.004;
+        let mut stream = MotionStream::new(
+            StreamingExecutor::new(dt, &limits).expect("executor"),
+            dt,
+            limits,
+            0.5,
+        );
+        let start = std::array::from_fn(|j| (limits.soft_min[j] + limits.soft_max[j]) / 2.0);
+        stream.activate(&start);
+        stream.set_scale(0.5, 0.5);
+        let mut q = start;
+        let mut qd = [0.0; MAX_JOINTS];
+        let mut previous_velocity = 0.0;
+        let mut previous_accel = 0.0;
+        let mut peak_jerk = 0.0_f64;
+        let mut reversals = 0;
+        for tick in 0..1000 {
+            // Encoder-sized corrections cross zero velocity at nonzero
+            // acceleration, as settling and renewed servo targets can do.
+            let mut target = start;
+            target[4] += if (tick / 7) % 2 == 0 {
+                0.00002
+            } else {
+                -0.00002
+            };
+            stream.set_target(&target);
+            stream.step(&mut q, &mut qd);
+            let acceleration = (qd[4] - previous_velocity) / dt;
+            let jerk = (acceleration - previous_accel) / dt;
+            assert!(qd[4].abs() <= 0.1 + 1e-9);
+            assert!(acceleration.abs() <= 0.2 + 1e-9);
+            peak_jerk = peak_jerk.max(jerk.abs());
+            if qd[4] * previous_velocity < 0.0 {
+                reversals += 1;
+            }
+            previous_velocity = qd[4];
+            previous_accel = acceleration;
+        }
+        assert!(reversals > 10, "the trial must exercise velocity reversals");
+        assert!(
+            peak_jerk <= 0.6 + 1e-7,
+            "wire jerk {peak_jerk} exceeds the scaled bound"
+        );
     }
 
     /// A servo source nudging its target a little further every cycle —
@@ -374,36 +450,39 @@ mod tests {
         let mut target = start;
         let mut q = [0.0; MAX_JOINTS];
         let mut qd = [0.0; MAX_JOINTS];
-        let mut ticks_advancing = 0usize;
 
-        for _ in 0..160 {
-            let previous = q[0];
-            target[0] += step_rad;
-            stream.set_target(&target);
-            stream.step(&mut q, &mut qd);
-            let advance = (q[0] - previous) / dt;
-            if advance.abs() > 0.0 {
-                ticks_advancing += 1;
-                assert!(
-                    qd[0].abs() + 1e-12 >= advance.abs(),
-                    "commanded velocity {:.6} rad/s under-feeds a position \
-                     channel advancing at {:.6} rad/s",
-                    qd[0],
-                    advance,
-                );
+        // Out and back: the feedforward is signed with the advance.
+        for direction in [1.0, -1.0] {
+            let from = target[0];
+            let mut ticks_advancing = 0usize;
+            for _ in 0..80 {
+                let previous = q[0];
+                target[0] += direction * step_rad;
+                stream.set_target(&target);
+                stream.step(&mut q, &mut qd);
+                let advance = (q[0] - previous) / dt;
+                if advance != 0.0 {
+                    ticks_advancing += 1;
+                    assert!(
+                        (qd[0] - advance).abs() < 1e-9,
+                        "commanded velocity {:.6} rad/s is not the position \
+                         channel's advance of {:.6} rad/s",
+                        qd[0],
+                        advance,
+                    );
+                }
             }
+            assert!(
+                ticks_advancing > 70,
+                "the position channel should track the stepped target on \
+                 essentially every tick, advanced on {ticks_advancing}/80"
+            );
+            assert!(
+                (target[0] - q[0]).abs() < 0.1 * (target[0] - from).abs(),
+                "the tracker fell behind the stepped target: {:.4} toward {:.4} rad",
+                q[0],
+                target[0]
+            );
         }
-
-        assert!(
-            ticks_advancing > 150,
-            "the position channel should track the stepped target on \
-             essentially every tick, advanced on {ticks_advancing}/160"
-        );
-        assert!(
-            q[0] > 0.9 * target[0],
-            "the tracker fell behind the stepped target: {:.4} of {:.4} rad",
-            q[0],
-            target[0]
-        );
     }
 }

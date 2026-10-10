@@ -36,8 +36,7 @@ wire_enum! {
         /// Bus scan and selfcheck; requests IDLE when it passes.
         Booting = 0,
         /// At rest. With gravity comp on and the arm homed and enabled this
-        /// is a torque-only hold with no position term — i.e. freedrive (a
-        /// configured drift lock re-holds the pose once the arm is still).
+        /// is a torque-only hold with no position term — i.e. freedrive.
         Idle = 1,
         /// Hard-error latch: active zero-velocity hold, drives DISABLED.
         ActiveError = 2,
@@ -139,6 +138,11 @@ wire_enum! {
         SetStatusRate = 31,
         /// Select 10–100% of planned execution speed, preserving pause.
         SetExecutionSpeed = 32,
+        /// Commissioning: tell a gripper drive which tool it is built into
+        /// (cmd 36 to `node`, carrying `tool_id`) and have it saved. Same gate
+        /// and `force` rule as SET_CAN_ID. The drive reports the id in its
+        /// device info from then on, and the runtime fits that tool at boot.
+        SetToolId = 33,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -464,6 +468,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SetPidGains
         | C::SetCanId
         | C::SaveConfig
+        | C::SetToolId
         | C::SetExecutionSpeed
         | C::SetStatusRate
         | C::Teleport => CommandClass::System,

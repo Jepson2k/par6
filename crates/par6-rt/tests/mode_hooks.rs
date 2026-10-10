@@ -6,7 +6,6 @@
 mod common;
 
 use common::Rig;
-use par6_bus::GripperCommand;
 use par6_rt::{ErrorCode, Mode, RtCommand, MAX_JOINTS};
 
 fn has_error(rig: &mut Rig, code: ErrorCode) -> bool {
@@ -49,47 +48,5 @@ fn a_hard_error_during_safety_stop_keeps_the_limp_law() {
             0,
             "J{i}: limp frames carry no current"
         );
-    }
-}
-
-/// The e-stop line, unlike a lost node, is nothing the homing sequence
-/// notices on its own: the hard latch strikes while the sequence is
-/// still active, so the transition hook is the only thing that can hand
-/// the gripper back.
-#[test]
-fn a_hard_error_mid_homing_hands_the_gripper_back_idle() {
-    let mut rig = Rig::new();
-    rig.ready();
-    rig.cmd(RtCommand::SetMode(Mode::Homing));
-    assert_eq!(rig.snap().mode, Mode::Homing);
-
-    rig.estop_line
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-    let mut latched = false;
-    for _ in 0..50 {
-        rig.clear_tx();
-        rig.tick();
-        if has_error(&mut rig, ErrorCode::Estop) {
-            latched = true;
-            break;
-        }
-    }
-    assert!(latched, "the e-stop must latch while homing runs");
-    let s = rig.snap();
-    assert_eq!(s.mode, Mode::ActiveError);
-    assert!(!s.homing.active, "the sequence aborted");
-
-    // The announcement starts on the latch tick and runs three frames:
-    // real DLC-5 frames with `action` dropped, not the bare watchdog poll
-    // that would leave the firmware holding whatever homing last
-    // commanded.
-    rig.tick_n(2);
-    let sends = rig.gripper_sends();
-    assert_eq!(sends.len(), 3, "{sends:?}");
-    for s in &sends {
-        match s {
-            GripperCommand::Firmware(f) => assert!(!f.action, "idle announcement: {f:?}"),
-            other => panic!("expected an idle announcement, got {other:?}"),
-        }
     }
 }

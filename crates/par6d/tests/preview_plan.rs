@@ -73,7 +73,7 @@ fn the_plan_records_every_command_and_a_run_of_it_lands_on_the_same_lines() {
     let tool = par6_config::RobotConfig::load(&config)
         .expect("config")
         .robot
-        .active_gripper;
+        .active_tool;
     let mut a = park_deg();
     a[0] += 15.0;
     let mut b = a;

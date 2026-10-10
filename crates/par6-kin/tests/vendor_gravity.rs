@@ -36,17 +36,19 @@ struct Fixture {
     cases: Vec<Case>,
 }
 
+/// Keyed by the vendor gripper file each entry was read from, which is
+/// also the name of the config file that must carry the same values.
 #[derive(Deserialize)]
 struct Tools {
-    #[serde(rename = "MSG")]
-    msg: ToolEntry,
+    #[serde(rename = "MSG_small_motor_150mm_rail")]
+    msg_small_150: ToolEntry,
     #[serde(rename = "SSG48")]
     ssg48: ToolEntry,
 }
 
 /// The vendor DH tool description, spelled as a gripper config's
 /// `[kinematics]` table.
-#[derive(Deserialize)]
+#[derive(Deserialize, Debug, PartialEq)]
 struct ToolEntry {
     d_m: f64,
     a_m: f64,
@@ -64,7 +66,7 @@ struct Case {
     /// The Flange VARIANT tree: arm plus the vendor flange plate.
     tau_flange_variant: [f64; NQ],
     /// The arm carrying each vendor gripper as a DH tool.
-    tau_arm_msg_tool: [f64; NQ],
+    tau_arm_msg_small_motor_150mm_rail_tool: [f64; NQ],
     tau_arm_ssg48_tool: [f64; NQ],
 }
 
@@ -123,10 +125,28 @@ fn the_shipped_arm_model_is_the_vendors_arm() {
     );
 }
 
-/// The tool paths: a variant tree with its plate, and a DH tool attached
-/// at load. Each is a different composition of the same arm, and the
-/// vendor computed the load for all of them — a tool mass slip lands
-/// here and nowhere else.
+/// The shipped gripper config `name`'s `[kinematics]`, as the vendor's
+/// DH tool description.
+fn shipped_tool(name: &str) -> ToolEntry {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(format!("../../config/grippers/{name}.toml"));
+    let k = par6_config::ToolConfig::load(&path)
+        .unwrap_or_else(|e| panic!("{name}: {e}"))
+        .kinematics;
+    ToolEntry {
+        d_m: k.d_m,
+        a_m: k.a_m,
+        alpha_rad: k.alpha_rad,
+        mass_kg: k.mass_kg,
+        com_m: k.com_m,
+        inertia_kg_m2: k.inertia_kg_m2,
+    }
+}
+
+/// The tool paths: a variant tree with its plate, and the shipped
+/// gripper configs attached as DH tools at load. Each is a different
+/// composition of the same arm, and the vendor computed the load for all
+/// of them — a tool mass slip in a config lands here and nowhere else.
 #[test]
 fn the_shipped_tool_compositions_are_the_vendors_too() {
     let fx = fixture();
@@ -140,19 +160,23 @@ fn the_shipped_tool_compositions_are_the_vendors_too() {
             t.inertia_kg_m2,
         )
     };
+    let msg_small_150 = shipped_tool("MSG_small_motor_150mm_rail");
+    let ssg48 = shipped_tool("SSG48");
+    assert_eq!(msg_small_150, fx.tools.msg_small_150);
+    assert_eq!(ssg48, fx.tools.ssg48);
     let mut flange = Kin::load(&assets_dir(), GripperVariant::Flange).expect("flange variant");
-    let mut msg = Kin::load_arm(&assets_dir(), Some(&dh(&fx.tools.msg))).expect("arm + MSG");
-    let mut ssg = Kin::load_arm(&assets_dir(), Some(&dh(&fx.tools.ssg48))).expect("arm + SSG48");
+    let mut msg = Kin::load_arm(&assets_dir(), Some(&dh(&msg_small_150))).expect("arm + MSG");
+    let mut ssg = Kin::load_arm(&assets_dir(), Some(&dh(&ssg48))).expect("arm + SSG48");
 
     let mut worst = [
         ("flange variant", 0.0f64),
-        ("arm + MSG tool", 0.0),
+        ("arm + MSG_small_motor_150mm_rail tool", 0.0),
         ("arm + SSG48 tool", 0.0),
     ];
     for c in &fx.cases {
         for (slot, (kin, want)) in [
             (&mut flange, &c.tau_flange_variant),
-            (&mut msg, &c.tau_arm_msg_tool),
+            (&mut msg, &c.tau_arm_msg_small_motor_150mm_rail_tool),
             (&mut ssg, &c.tau_arm_ssg48_tool),
         ]
         .into_iter()
