@@ -1,6 +1,7 @@
-//! RT contract: after `Kin` construction, fk/tcp/jacobian/gravity/ik
+//! RT contract: after `Kin` construction, fk/tcp/jacobian/gravity
 //! allocate nothing on the calling thread (CLAUDE.md: the RT tick path
-//! allocates NOTHING after init).
+//! allocates NOTHING after init) — gravity with an installed arm
+//! correction included, since that is how a calibrated arm runs it.
 //!
 //! The counting allocator sees every Rust-side allocation; C++-side
 //! allocations bypass it, but the shim preallocates its whole workspace in
@@ -64,8 +65,15 @@ fn kinematics_calls_are_allocation_free_after_init() {
     let mut jac = [0.0; 6 * NQ];
     let mut tau = [0.0; NQ];
 
+    // A calibrated arm runs gravity through its installed correction.
+    let correction: Vec<f64> = (0..4 * kin.body_count())
+        .map(|i| 0.001 * (i % 7) as f64)
+        .collect();
+    kin.set_gravity_correction(&correction).unwrap();
+
     // Warm-up outside the measured window (lazy TLS/locale/etc. one-shots).
     kin.fk(&q, &mut pose).unwrap();
+    kin.gravity(&q, &mut tau).unwrap();
 
     let allocs = allocations_during(|| {
         for _ in 0..10 {

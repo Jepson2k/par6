@@ -658,8 +658,21 @@ async def test_a_stopped_arm_is_held_and_still_floats_on_request(daemon: LiveDae
         assert await client.freedrive(False) == 1
 
 
+@pytest.fixture
+def robot_matching_daemon(daemon: LiveDaemon, monkeypatch):
+    # Robot's defaults must describe this fixture, not an installed arm.
+    monkeypatch.setenv("PAR6_CONFIG", str(daemon.config))
+    _cfg.config.cache_clear()
+    try:
+        yield Robot()
+    finally:
+        _cfg.config.cache_clear()
+
+
 @pytest.mark.timeout(120)
-async def test_tool_identity_agrees_with_the_runtime(daemon: LiveDaemon):
+async def test_tool_identity_agrees_with_the_runtime(
+    daemon: LiveDaemon, robot_matching_daemon: Robot
+):
     """The tool the client advertises must be the tool the runtime has.
 
     ``Robot.tools`` is what a UI renders before any STATUS arrives, and every
@@ -668,7 +681,7 @@ async def test_tool_identity_agrees_with_the_runtime(daemon: LiveDaemon):
     have to name the same entry of that collection, and the collection's
     default has to be the tool the runtime is actually fitted with.
     """
-    robot = Robot()
+    robot = robot_matching_daemon
     async with daemon.client() as client:
         assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
         reported = await client.tools()
@@ -1524,13 +1537,18 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         # held there, instead of carrying on to the streamed goal at the
         # shape's centre — and instead of being handed to the gravity
         # float once it has stopped.
+        last_rest_state = None
+
         def at_rest(s) -> bool:
+            nonlocal last_rest_state
             z_seen.append(float(s.pose[11]))
             resting = max(abs(v) for v in s.speeds) < 3.0
+            last_rest_state = (s.mode.name, s.freedrive, list(s.speeds))
             return s.mode == ControllerMode.EXEC and not s.freedrive and resting
 
         assert await client.wait_status(at_rest, timeout=STEP_BUDGET_S), (
-            "the gate refused the datagram but never cancelled the session"
+            "the gate refused the datagram but never cancelled the session: "
+            f"{last_rest_state}"
         )
         # How deep the arm gets is the gate's reaction plus the braking
         # distance, and housekeeping only reacts as often as it runs. A

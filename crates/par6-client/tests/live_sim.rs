@@ -5,13 +5,14 @@
 //! COMPLETE contract and the STATUS fallback.
 
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use std::sync::Arc;
 use std::time::Duration;
 
 use par6_client::{
     Ack, Client, ClientConfig, ClientError, Frame, StatusTransport, MIN_MTU, NUM_JOINTS,
 };
 use par6_proto::command as cmd;
-use par6_proto::{Command, ErrorCode, Shape};
+use par6_proto::{Command, ErrorCode, QueryResult, Shape};
 use par6d::Daemon;
 
 #[path = "../../par6d/tests/common/mod.rs"]
@@ -63,7 +64,9 @@ where
         client.close();
     });
     drop(rt);
-    daemon.shutdown();
+    daemon
+        .shutdown()
+        .expect("the daemon's threads exit cleanly");
 }
 
 /// A fresh daemon for `tag`, and one session against it.
@@ -123,6 +126,10 @@ fn a_missing_complete_push_is_recovered_from_the_runtime() {
         let park = common::park_deg();
         settle_at(&client, park).await;
         client.drop_complete_pushes_for_test(true);
+        assert!(
+            !client.command_completion(999).await.expect("query").0,
+            "an index nothing ran under must read unfinished"
+        );
 
         let mut target = park;
         target[0] += 8.0;
@@ -131,6 +138,10 @@ fn a_missing_complete_push_is_recovered_from_the_runtime() {
             .await
             .expect("move_j accepted")
             .expect("move_j acked with an index");
+        assert!(
+            !client.command_completion(landed).await.expect("query").0,
+            "a running command must read unfinished"
+        );
         assert!(
             client
                 .wait_command(landed, BUDGET)
@@ -142,6 +153,14 @@ fn a_missing_complete_push_is_recovered_from_the_runtime() {
             client.command_completion(landed).await.expect("query"),
             (true, true, None, None)
         );
+        match client
+            .query(Command::CommandCompletion { index: landed })
+            .await
+            .expect("query")
+        {
+            QueryResult::CommandCompletion { index, .. } => assert_eq!(index, landed),
+            other => panic!("unexpected {other:?}"),
+        }
 
         let mut far = park;
         far[0] -= 30.0;
@@ -163,7 +182,47 @@ fn a_missing_complete_push_is_recovered_from_the_runtime() {
             }
             other => panic!("the cancellation must be recovered without its push: {other:?}"),
         }
+        // Read through the query itself, not settled from STATUS.
+        match client.command_completion(cancelled).await.expect("query") {
+            (true, false, Some(e), None) => {
+                assert_eq!(e.code, ErrorCode::MotnCancelled as u16, "{e:?}")
+            }
+            other => panic!("a cancelled command reads finished with its detail: {other:?}"),
+        }
         client.drop_complete_pushes_for_test(false);
+    });
+}
+
+#[test]
+fn status_receipt_stays_paired_with_its_original_packet() {
+    run_session("status-receipt", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        assert!(client.wait_status(|_| true, BUDGET).await);
+        let before = client.latest_received_status().expect("received STATUS");
+        assert!(
+            client
+                .wait_status(|s| s.seq != before.status.seq, BUDGET)
+                .await,
+            "another actual UDP frame must arrive"
+        );
+        client.close_joined().await;
+        let after = client.latest_received_status().expect("cached STATUS");
+        assert_ne!(after.status.seq, before.status.seq);
+        assert!(after.received_at > before.received_at);
+
+        // After joined shutdown all three APIs must expose the same final
+        // frame. Keeping a snapshot or re-reading it cannot refresh receipt.
+        let wire = client.latest_status().expect("legacy latest STATUS");
+        let subscription = client.subscribe_status();
+        let watched = subscription
+            .borrow()
+            .clone()
+            .expect("legacy watched STATUS");
+        assert!(Arc::ptr_eq(&wire, &after.status));
+        assert!(Arc::ptr_eq(&watched, &after.status));
+        let reread = client.latest_received_status().expect("reread STATUS");
+        assert!(Arc::ptr_eq(&reread.status, &after.status));
+        assert_eq!(reread.received_at, after.received_at);
     });
 }
 
@@ -367,7 +426,9 @@ fn a_retransmitted_queued_command_is_re_acked_with_its_original_index() {
 
 /// A move cancelled mid-flight completes in error: `wait_command`
 /// surfaces the runtime's MOTN_CANCELLED as a structured refusal (never
-/// `Ok(true)`), and there is no settle verdict to read off it.
+/// `Ok(true)`), and there is no settle verdict to read off it. The arm
+/// itself comes to rest short of the target and stays there: what the
+/// RT still held of the planned motion went with the cancel.
 #[test]
 fn a_cancelled_move_completes_in_error_with_no_verdict() {
     run_session("cancel", |client| async move {
@@ -400,6 +461,29 @@ fn a_cancelled_move_completes_in_error_with_no_verdict() {
             other => panic!("a cancelled move must complete in error, got {other:?}"),
         }
         assert_eq!(client.command_verdict(index), None);
+
+        assert!(
+            client
+                .wait_status(|s| s.speeds.iter().all(|v| v.abs() < 1e-3), BUDGET)
+                .await,
+            "the stopped arm comes to rest"
+        );
+        let rest = client.latest_status().expect("status").angles;
+        assert!(
+            far[0] - rest[0] > 5.0,
+            "the stop let the move run on to its target: J0 at {:.2}, target {:.2}",
+            rest[0],
+            far[0]
+        );
+        // Six seconds of planned motion were cut short; a ring that kept
+        // them would set the arm moving again within a few frames.
+        let resumed = client
+            .wait_status(
+                move |s| (s.angles[0] - rest[0]).abs() > 0.5,
+                Duration::from_secs(2),
+            )
+            .await;
+        assert!(!resumed, "the arm resumed the cancelled move after resting");
     })
 }
 
@@ -731,6 +815,7 @@ fn servo_l_holds_the_line_where_servo_j_pose_does_not() {
 
             let mut samples = 0u32;
             let mut arrived = false;
+            let mut nearest = f64::INFINITY;
             for _ in 0..250 {
                 if mode == 0 {
                     client.servo_l(target, Some(0.3), Some(0.3)).await
@@ -754,12 +839,18 @@ fn servo_l_holds_the_line_where_servo_j_pose_does_not() {
                     *out = out.max(off_line(&start, &target, &here));
                     samples += 1;
                 }
+                nearest = nearest.min(remaining);
                 if remaining < 1.0 {
                     arrived = true;
                     break;
                 }
             }
-            assert!(arrived, "mode {mode} never reached its target");
+            let speeds = client.joint_speeds().await.expect("joint speeds");
+            assert!(
+                arrived,
+                "mode {mode} never reached its target: nearest {nearest:.2} mm, \
+                 joint speeds now {speeds:.3?}"
+            );
             assert!(
                 samples > 20,
                 "mode {mode}: only {samples} samples along the path"
@@ -944,7 +1035,9 @@ fn a_restart_mid_wait_is_reported_as_the_session_changing() {
             let client = client.clone();
             rt.spawn(async move { client.wait_command(index, BUDGET).await })
         };
-        daemon.shutdown();
+        daemon
+            .shutdown()
+            .expect("the daemon's threads exit cleanly");
         let mut opts =
             common::sim_options(common::retimed_config("client-restart", 0.02), status_port);
         opts.command_port = Some(command_port);
@@ -956,7 +1049,9 @@ fn a_restart_mid_wait_is_reported_as_the_session_changing() {
     }
     client.close();
     drop(rt);
-    daemon.shutdown();
+    daemon
+        .shutdown()
+        .expect("the daemon's threads exit cleanly");
 }
 
 /// A `servo_l` stream that goes silent brakes the tool ALONG its line and

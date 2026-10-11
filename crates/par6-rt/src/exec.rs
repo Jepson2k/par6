@@ -5,10 +5,8 @@
 //! decelerates to a hold with the remaining ring intact; starvation
 //! holds at the last target. Command
 //! boundaries (a `command_index` change or `is_last`) hand off to the
-//! [`SettlePolicy`]: `blend_continues` bypasses settling in the same tick
-//! so blended corners stay velocity-continuous, a non-blended boundary
-//! holds at the boundary target until the policy reports completion (or
-//! faults, under `strict`).
+//! [`SettlePolicy`]: the boundary holds at its target until the policy
+//! reports completion (or faults, under `strict`).
 //!
 //! `completed_index`/`active_command_index` publish 0 for "none" — the
 //! planner assigns command indices from 1.
@@ -287,9 +285,9 @@ impl ExecPlayback {
         }
         if let Some(boundary) = self.owe_boundary.take() {
             self.last_meta = None;
-            if self.policy.arm(boundary.blend_continues) {
-                // Immediate completion (commanded policy or blend-through):
-                // no hold tick, motion continues below.
+            if self.policy.arm() {
+                // Immediate completion (commanded policy): no hold tick,
+                // motion continues below.
                 self.completed = boundary.command_index;
             } else {
                 self.settling = true;
@@ -301,9 +299,7 @@ impl ExecPlayback {
             self.at_rest();
             return ExecTick::Ok;
         };
-        if next.meta.command_index != self.left.meta.command_index
-            && !self.left.meta.blend_continues
-        {
+        if next.meta.command_index != self.left.meta.command_index {
             // The planner's initial measured pose can differ from the old
             // hold target. A synthetic bridge would bypass its path checks.
             self.left = match next.start {
@@ -433,9 +429,7 @@ impl ExecPlayback {
                 if let Some(next) = self.consumer.peek() {
                     if next.meta.command_index != self.left.meta.command_index {
                         self.owe_boundary = self.last_meta.take();
-                        if !self.left.meta.blend_continues {
-                            self.phase = 0.0;
-                        }
+                        self.phase = 0.0;
                     }
                 }
             }
@@ -476,8 +470,7 @@ impl ExecPlayback {
             match following {
                 Some(right)
                     if !next.meta.is_last
-                        && (right.meta.command_index == next.meta.command_index
-                            || next.meta.blend_continues) =>
+                        && right.meta.command_index == next.meta.command_index =>
                 {
                     (next, right)
                 }

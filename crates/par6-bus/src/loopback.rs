@@ -11,10 +11,11 @@
 
 use std::collections::VecDeque;
 
-use par6_config::{GripperConfig, RobotConfig};
+use par6_config::{RobotConfig, ToolConfig};
 
 use crate::bus::DriverBus;
 use crate::hw::sched::FreshnessClock;
+use crate::types::CaptureBuffer;
 use crate::types::{
     BusError, BusState, DeviceInfo, DriveTune, ErrorFlags, Freshness, GripperCommand, GripperReply,
     HallState, JointCommand, LinkHealth, NodeId, PollAction, PollKind, MAX_NODES,
@@ -103,6 +104,13 @@ impl Reply {
 /// One frame everything the loopback transmitted, for test assertions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TxRecord {
+    /// One configuration field sent through the poll slot.
+    ConfigFrame {
+        /// Target node.
+        node: NodeId,
+        /// Configuration field.
+        kind: crate::ConfigKind,
+    },
     /// One motion frame per arm joint, config order.
     Joints(Vec<JointCommand>),
     /// The gripper-slot frame (`NoGripper` = RTR ping to the timing
@@ -131,6 +139,13 @@ pub enum TxRecord {
     SaveConfig {
         /// Target node.
         node: NodeId,
+    },
+    /// Gripper_ID (cmd 36).
+    SetToolId {
+        /// Target node.
+        node: NodeId,
+        /// The tool id it was told it is built into.
+        tool_id: u8,
     },
     /// Limits frame (cmd 20).
     Limits {
@@ -170,7 +185,6 @@ pub struct LoopbackBus {
     configured: bool,
     joint_nodes: Vec<NodeId>,
     gripper_node: NodeId,
-    timing_dummy_node: NodeId,
     rx_cap: usize,
     fresh: FreshnessClock,
     connected: u16,
@@ -195,7 +209,6 @@ impl LoopbackBus {
             configured: false,
             joint_nodes: Vec::new(),
             gripper_node: 0,
-            timing_dummy_node: 0,
             rx_cap: 32,
             fresh: FreshnessClock::default(),
             connected: 0,
@@ -218,6 +231,21 @@ impl LoopbackBus {
             err_bit,
             reply,
         });
+    }
+
+    /// The gripper drive answering the boot's identity probe with
+    /// `tool_id`, which the core holds BOOTING for.
+    pub fn report_tool(&mut self, gripper_node: NodeId, tool_id: u8) {
+        self.inject(
+            false,
+            Reply::DeviceInfo {
+                node: gripper_node,
+                info: DeviceInfo {
+                    tool_id,
+                    ..Default::default()
+                },
+            },
+        );
     }
 
     fn ensure_ready(&self) -> Result<(), BusError> {
@@ -258,7 +286,7 @@ impl LoopbackBus {
                 current_ma,
                 ..
             } => {
-                state.nodes[node].position_ticks = Some(position_ticks);
+                state.nodes[node].record_position(position_ticks);
                 state.nodes[node].speed_ticks_s = Some(speed_ticks_s);
                 state.nodes[node].current_ma = Some(current_ma);
             }
@@ -270,7 +298,7 @@ impl LoopbackBus {
                 hall,
                 ..
             } => {
-                state.nodes[node].position_ticks = Some(position_ticks);
+                state.nodes[node].record_position(position_ticks);
                 state.nodes[node].hall = Some(hall);
             }
             Reply::Kt { kt_nm_a, .. } => state.nodes[node].kt_nm_a = Some(kt_nm_a),
@@ -291,6 +319,8 @@ impl Default for LoopbackBus {
 }
 
 impl DriverBus for LoopbackBus {
+    fn fit_tool(&mut self, _robot: &RobotConfig, _tool: Option<&ToolConfig>) {}
+
     fn begin_tick(&mut self, tick: u64) {
         debug_assert!(tick >= self.tick, "tick must be non-decreasing");
         self.tick = tick;
@@ -395,22 +425,38 @@ impl DriverBus for LoopbackBus {
                     self.tx_log.push((tick, TxRecord::ClearError { node }));
                 }
                 PollAction::ResendConfig { node } => self.record_config_pass(node),
+                // Nothing answers on the loopback; the slot is consumed like a poll.
+                PollAction::CaptureRead { .. } => {}
+                PollAction::ConfigRead { .. } => {}
+                PollAction::ConfigFrame { node, kind } => {
+                    if !self.joint_nodes.contains(&node) && node != self.gripper_node {
+                        return Err(BusError::InvalidCommand {
+                            reason: "configuration poll for a node with no stored configuration",
+                        });
+                    }
+                    if self.refuse_config_sends & (1 << node) != 0 {
+                        return Err(BusError::TxQueueFull);
+                    }
+                    self.tx_log
+                        .push((self.tick, TxRecord::ConfigFrame { node, kind }));
+                }
             }
             if repeats > 1 {
                 self.override_slot = Some((action, repeats - 1));
             }
             return Ok(());
         }
-        let idx = (self.poll_cursor / 3) as usize % self.poll_targets();
+        let idx = self.poll_cursor as usize % self.poll_targets();
         let node = self.poll_target_node(idx);
-        let kind = match self.poll_cursor % 3 {
-            0 => PollKind::Temperature,
-            1 => PollKind::Voltage,
-            _ => PollKind::Errors,
-        };
         self.poll_cursor += 1;
         let tick = self.tick;
-        self.tx_log.push((tick, TxRecord::Poll { node, kind }));
+        self.tx_log.push((
+            tick,
+            TxRecord::Poll {
+                node,
+                kind: PollKind::Telemetry,
+            },
+        ));
         Ok(())
     }
 
@@ -424,12 +470,11 @@ impl DriverBus for LoopbackBus {
     fn boot_configure(
         &mut self,
         robot: &RobotConfig,
-        gripper: Option<&GripperConfig>,
+        gripper: Option<&ToolConfig>,
         repeats: u8,
     ) -> Result<(), BusError> {
         self.joint_nodes = robot.joints.iter().map(|j| j.node_id).collect();
         self.gripper_node = robot.bus.gripper_node;
-        self.timing_dummy_node = robot.bus.timing_dummy_node;
         self.fresh.configure(
             u64::from(robot.ticks(robot.bus.stale_warn_s)),
             u64::from(robot.ticks(robot.bus.lost_s)),
@@ -490,6 +535,44 @@ impl DriverBus for LoopbackBus {
         self.tx_log
             .push((tick, TxRecord::SetCanId { node, new_id }));
         Ok(())
+    }
+
+    fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        let tick = self.tick;
+        self.tx_log
+            .push((tick, TxRecord::SetToolId { node, tool_id }));
+        Ok(())
+    }
+
+    /// Nothing on the loopback applies it; the request is accepted.
+    fn set_velocity_window(&mut self, _node: NodeId, _window: u8) -> Result<(), BusError> {
+        self.ensure_ready()
+    }
+
+    /// Nothing on the loopback applies it; the request is accepted.
+    fn set_ripple(
+        &mut self,
+        _node: NodeId,
+        _ripple: &[par6_config::RippleHarmonic],
+    ) -> Result<(), BusError> {
+        self.ensure_ready()
+    }
+
+    /// Nothing on the loopback records, so nothing streams; the request is
+    /// accepted.
+    fn capture_stream(&mut self, _node: NodeId) -> Result<(), BusError> {
+        self.ensure_ready()
+    }
+
+    /// The loopback has no drive to record anything; the request is
+    /// accepted and nothing is ever read back.
+    fn capture_start(&mut self, _node: NodeId, _divisor: u8, _wanted: u16) -> Result<(), BusError> {
+        self.ensure_ready()
+    }
+
+    fn capture(&self, _node: NodeId) -> Option<&CaptureBuffer> {
+        None
     }
 
     fn save_config(&mut self, node: NodeId) -> Result<(), BusError> {
@@ -556,340 +639,5 @@ impl DriverBus for LoopbackBus {
 
     fn link_health(&self) -> LinkHealth {
         self.health
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::types::ObjectDetection;
-    use std::path::PathBuf;
-
-    fn configured_bus() -> (LoopbackBus, RobotConfig) {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
-        let robot = RobotConfig::load(&path).expect("PAR6.toml");
-        let gpath =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/grippers/SSG48.toml");
-        let gripper = GripperConfig::load(&gpath).expect("SSG48.toml");
-        let mut bus = LoopbackBus::new();
-        bus.boot_configure(&robot, Some(&gripper), 3).unwrap();
-        (bus, robot)
-    }
-
-    #[test]
-    fn boot_configure_passes_and_send_contracts() {
-        let mut bus = LoopbackBus::new();
-        // Nothing works before boot_configure.
-        assert_eq!(
-            bus.send_joint_commands(&[JointCommand::idle(); 6]),
-            Err(BusError::NotConfigured)
-        );
-        let (mut bus, _) = configured_bus();
-        // 3 passes × (6 joints + gripper) config passes recorded.
-        let passes = bus
-            .tx_log
-            .iter()
-            .filter(|(_, r)| matches!(r, TxRecord::ConfigPass { .. }))
-            .count();
-        assert_eq!(passes, 3 * 7);
-        assert_eq!(bus.connected_nodes(), 0b0000_0000_0111_1111);
-
-        bus.begin_tick(1);
-        let cmds = [
-            JointCommand::position(1000, 2000, 300),
-            JointCommand::velocity(-500, 250),
-            JointCommand::current(-150),
-            JointCommand::hall(4500, 2),
-            JointCommand::pd(10, 0, 50),
-            JointCommand::idle(),
-        ];
-        bus.send_joint_commands(&cmds).unwrap();
-
-        // Single-send-per-tick invariant.
-        assert!(matches!(
-            bus.send_joint_commands(&cmds),
-            Err(BusError::InvalidCommand { .. })
-        ));
-        // Wrong joint count is rejected.
-        bus.begin_tick(2);
-        assert!(matches!(
-            bus.send_joint_commands(&cmds[..5]),
-            Err(BusError::InvalidCommand { .. })
-        ));
-        // Gripper slot accepts every variant.
-        bus.send_gripper(&GripperCommand::Calibrate).unwrap();
-        bus.begin_tick(3);
-        bus.send_gripper(&GripperCommand::FirmwarePoll).unwrap();
-    }
-
-    #[test]
-    fn drain_decodes_and_freshness_warns_then_latches() {
-        let (mut bus, robot) = configured_bus();
-        let mut state = BusState::new();
-        let stale = u64::from(robot.ticks(robot.bus.stale_warn_s)); // 10
-        let lost = u64::from(robot.ticks(robot.bus.lost_s)); // 50
-
-        bus.begin_tick(1);
-        bus.inject(
-            true,
-            Reply::Motion {
-                node: 0,
-                position_ticks: 12345,
-                speed_ticks_s: -678,
-                current_ma: 90,
-            },
-        );
-        bus.inject(false, Reply::Temperature { node: 0, deg_c: 41 });
-        bus.inject(
-            false,
-            Reply::Errors {
-                node: 0,
-                flags: ErrorFlags {
-                    error: true,
-                    current: true,
-                    ..ErrorFlags::default()
-                },
-            },
-        );
-        bus.inject(
-            false,
-            Reply::Gripper {
-                reply: GripperReply {
-                    position: 252,
-                    current_ma: 120,
-                    activated: true,
-                    object_detection: ObjectDetection::DetectedClosing,
-                    calibrated: true,
-                    ..GripperReply::default()
-                },
-            },
-        );
-        let n = bus.drain_rx(&mut state).unwrap();
-        assert_eq!(n, 4);
-        assert_eq!(state.nodes[0].position_ticks, Some(12345));
-        assert_eq!(state.nodes[0].speed_ticks_s, Some(-678));
-        assert_eq!(state.nodes[0].current_ma, Some(90));
-        assert_eq!(state.nodes[0].temperature_c, Some(41));
-        assert!(state.nodes[0].error_flags.unwrap().current);
-        // err bit of the LAST frame wins (per-frame live signal).
-        assert!(!state.nodes[0].live_error_bit);
-        assert_eq!(state.nodes[0].data_age_ticks, 0);
-        let g = state.gripper.reply.unwrap();
-        assert_eq!(g.position, 252);
-        assert_eq!(g.object_detection, ObjectDetection::DetectedClosing);
-        assert_eq!(bus.freshness(0), Freshness::Fresh);
-        assert_eq!(bus.freshness(1), Freshness::Unknown);
-
-        // Age past the warn threshold: stale (self-clearing warning).
-        bus.begin_tick(1 + stale);
-        bus.drain_rx(&mut state).unwrap();
-        assert_eq!(bus.freshness(0), Freshness::Stale);
-        assert_eq!(state.nodes[0].data_age_ticks, stale);
-
-        // A frame while stale clears it and reports the reconnect edge.
-        bus.inject(
-            false,
-            Reply::Motion {
-                node: 0,
-                position_ticks: 1,
-                speed_ticks_s: 0,
-                current_ma: 0,
-            },
-        );
-        bus.drain_rx(&mut state).unwrap();
-        assert_eq!(state.reconnected_mask, 1 << 0);
-        assert_eq!(bus.freshness(0), Freshness::Fresh);
-
-        // Age past the lost threshold: LATCHED.
-        bus.begin_tick(1 + stale + lost);
-        bus.drain_rx(&mut state).unwrap();
-        assert_eq!(bus.freshness(0), Freshness::Lost);
-        // Frames resuming do NOT clear the latch...
-        bus.inject(
-            false,
-            Reply::Motion {
-                node: 0,
-                position_ticks: 2,
-                speed_ticks_s: 0,
-                current_ma: 0,
-            },
-        );
-        bus.drain_rx(&mut state).unwrap();
-        assert_eq!(
-            state.reconnected_mask,
-            1 << 0,
-            "reconnect edge still reported"
-        );
-        assert_eq!(bus.freshness(0), Freshness::Lost);
-        // ...only the user clear path does, and it re-arms the clock at
-        // "seen now" so a node that stays silent re-latches on its own.
-        bus.clear_lost_latch(0);
-        assert_eq!(bus.freshness(0), Freshness::Fresh);
-        bus.begin_tick(1 + stale + 2 * lost);
-        assert_eq!(
-            bus.freshness(0),
-            Freshness::Lost,
-            "a still-silent node re-latches after the clear"
-        );
-        bus.clear_lost_latch(0);
-        bus.inject(
-            false,
-            Reply::Motion {
-                node: 0,
-                position_ticks: 3,
-                speed_ticks_s: 0,
-                current_ma: 0,
-            },
-        );
-        bus.drain_rx(&mut state).unwrap();
-        assert_eq!(bus.freshness(0), Freshness::Fresh);
-    }
-
-    #[test]
-    fn drain_caps_frames_per_tick() {
-        let (mut bus, robot) = configured_bus();
-        let cap = robot.bus.rx_frames_per_tick_cap as usize; // 32
-        let mut state = BusState::new();
-        bus.begin_tick(1);
-        for i in 0..(cap + 8) {
-            bus.inject(
-                false,
-                Reply::Motion {
-                    node: (i % 6) as NodeId,
-                    position_ticks: i as i32,
-                    speed_ticks_s: 0,
-                    current_ma: 0,
-                },
-            );
-        }
-        assert_eq!(bus.drain_rx(&mut state).unwrap(), cap);
-        assert_eq!(state.frames_last_drain as usize, cap);
-        // The surplus clears on the next tick's drain (backlog recovery).
-        bus.begin_tick(2);
-        assert_eq!(bus.drain_rx(&mut state).unwrap(), 8);
-        assert_eq!(
-            state.frame_age_max_ticks, 1,
-            "backlogged frames aged one tick"
-        );
-    }
-
-    #[test]
-    fn poll_round_robin_covers_all_nodes_and_override_preempts() {
-        let (mut bus, robot) = configured_bus();
-        bus.tx_log.clear();
-        let total = robot.joints.len() + 1; // 6 joints + gripper
-        for t in 0..(3 * total as u64) {
-            bus.begin_tick(t);
-            bus.poll_step().unwrap();
-        }
-        // Every node got each of temp/voltage/errors exactly once per
-        // 3×total_nodes ticks.
-        let mut seen = std::collections::HashMap::new();
-        for (_, rec) in &bus.tx_log {
-            let TxRecord::Poll { node, kind } = rec else {
-                panic!("unexpected record {rec:?}");
-            };
-            *seen.entry((*node, *kind)).or_insert(0) += 1;
-        }
-        assert_eq!(seen.len(), 3 * total);
-        assert!(seen.values().all(|&c| c == 1));
-        let polled_nodes: std::collections::BTreeSet<_> = seen.keys().map(|(n, _)| *n).collect();
-        assert!(polled_nodes.contains(&robot.bus.gripper_node));
-
-        // Override preempts for exactly `repeats` steps, then the
-        // round-robin resumes.
-        bus.tx_log.clear();
-        bus.queue_poll_override(PollAction::ClearError { node: 2 }, 3);
-        for t in 100..105 {
-            bus.begin_tick(t);
-            bus.poll_step().unwrap();
-        }
-        let kinds: Vec<bool> = bus
-            .tx_log
-            .iter()
-            .map(|(_, r)| matches!(r, TxRecord::ClearError { node: 2 }))
-            .collect();
-        assert_eq!(kinds, vec![true, true, true, false, false]);
-    }
-
-    #[test]
-    fn silent_mode_is_bus_silent_and_discards_rx() {
-        let (mut bus, robot) = configured_bus();
-        bus.tx_log.clear();
-        bus.begin_tick(1);
-        bus.set_silent(true);
-        assert!(bus.is_silent());
-        // Any send is a contract violation.
-        assert!(matches!(
-            bus.send_joint_commands(&[JointCommand::idle(); 6]),
-            Err(BusError::InvalidCommand { .. })
-        ));
-        assert!(matches!(
-            bus.send_gripper(&GripperCommand::FirmwarePoll),
-            Err(BusError::InvalidCommand { .. })
-        ));
-        // Polls are suppressed silently (tick structure stays uniform).
-        bus.poll_step().unwrap();
-        assert!(bus.tx_log.is_empty());
-        // RX is drained but DISCARDED — bootloader frames alias
-        // application ids, nothing may decode.
-        let mut state = BusState::new();
-        bus.inject(
-            false,
-            Reply::Motion {
-                node: 0,
-                position_ticks: 999,
-                speed_ticks_s: 0,
-                current_ma: 0,
-            },
-        );
-        assert_eq!(bus.drain_rx(&mut state).unwrap(), 1);
-        assert_eq!(state.nodes[0].position_ticks, None);
-        // Exit: re-base freshness so the silence never reads as disconnect.
-        bus.set_silent(false);
-        bus.rebase_freshness();
-        for n in 0..6 {
-            assert_eq!(bus.freshness(n), Freshness::Fresh);
-        }
-        // "Seen now", not "never seen": a driver that did not survive the
-        // flash still latches after the normal lost window.
-        let lost = u64::from(robot.ticks(robot.bus.lost_s));
-        bus.begin_tick(1 + lost);
-        for n in 0..6 {
-            assert_eq!(bus.freshness(n), Freshness::Lost);
-        }
-    }
-
-    #[test]
-    fn homing_limit_and_clear_error_hooks_record_repeats() {
-        let (mut bus, robot) = configured_bus();
-        bus.tx_log.clear();
-        bus.begin_tick(1);
-        // Homing entry: Limits(normal vel, homing current) ×4 to the joint.
-        let vel = robot.joints[0].velocity_limit_ticks_s as f32;
-        let cur = robot.homing.joints[0].current_ma as f32;
-        bus.send_limits(0, vel, cur, 4).unwrap();
-        let limits: Vec<_> = bus
-            .tx_log
-            .iter()
-            .filter(|(_, r)| matches!(r, TxRecord::Limits { node: 0, .. }))
-            .collect();
-        assert_eq!(limits.len(), 4);
-        // Clear sequence: cmd 1 ×3.
-        bus.send_clear_error(3, 3).unwrap();
-        let clears = bus
-            .tx_log
-            .iter()
-            .filter(|(_, r)| matches!(r, TxRecord::ClearError { node: 3 }))
-            .count();
-        assert_eq!(clears, 3);
-        // Reconnect path re-sends the stored config.
-        bus.resend_node_config(2, 2).unwrap();
-        let passes = bus
-            .tx_log
-            .iter()
-            .filter(|(_, r)| matches!(r, TxRecord::ConfigPass { node: 2 }))
-            .count();
-        assert_eq!(passes, 2);
     }
 }

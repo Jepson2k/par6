@@ -8,7 +8,7 @@ use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use par6_client::ClientError;
+use par6_client::{ClientError, ReceivedStatus};
 use par6_proto::command::ToolParam;
 use par6_proto::{
     Command, FlashingAssertion, Frame, QueryResult, Shape, Status, ToolStatusWire, WireError,
@@ -105,6 +105,24 @@ pub fn tool_status_dict(py: Python<'_>, t: &ToolStatusWire) -> PyResult<PyObject
 /// lists of ints (the numpy buffers slice-assign from them).
 fn int_list(v: &[u8]) -> Vec<u16> {
     v.iter().map(|b| u16::from(*b)).collect()
+}
+
+/// Client-local receipt time expressed in Python's monotonic clock domain.
+pub fn received_status_dict(py: Python<'_>, received: &ReceivedStatus) -> PyResult<PyObject> {
+    // Sample Python first: time between the two clock reads can only make
+    // the receipt look older, never fresher. Sample after acquiring the GIL
+    // so waiting for Python is included in the native elapsed time.
+    let now: f64 = py
+        .import("time")?
+        .getattr("monotonic")?
+        .call0()?
+        .extract()?;
+    let receipt = now - received.received_at.elapsed().as_secs_f64();
+    let result = status_dict(py, &received.status)?;
+    result
+        .bind(py)
+        .set_item("client_received_monotonic_s", receipt)?;
+    Ok(result)
 }
 
 /// One STATUS frame as a dict of plain values (field names match the
@@ -334,6 +352,7 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
                 row.set_item("hw_ver", n.hw_ver)?;
                 row.set_item("sw_ver", n.sw_ver)?;
                 row.set_item("serial", n.serial)?;
+                row.set_item("tool_id", n.tool_id)?;
                 rows.append(row)?;
             }
             d.set_item("nodes", rows)?;
@@ -365,19 +384,22 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             fingerprint,
             robot_filename,
             robot_toml,
-            grippers,
+            tools,
         } => {
             d.set_item("path", path)?;
             d.set_item("fingerprint", fingerprint)?;
             d.set_item("robot_filename", robot_filename)?;
             d.set_item("robot_toml", robot_toml)?;
             let gs = PyList::empty(py);
-            for (name, content) in grippers {
+            for (name, content) in tools {
                 let gd = PyDict::new(py);
                 gd.set_item("filename", name)?;
                 gd.set_item("content", content)?;
                 gs.append(gd)?;
             }
+            // "tools" is the name; "grippers" stays because waldoctl and
+            // Waldo-Commander read it, and those move on their own branches.
+            d.set_item("tools", &gs)?;
             d.set_item("grippers", gs)?;
         }
         other => {

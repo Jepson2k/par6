@@ -5,10 +5,8 @@
 //! feedforward at tick resolution) and the RT EXEC mode consumes at most
 //! one per tick according to the selected execution speed. Segment metadata travels ON the samples: `command_index`
 //! attributes samples to queued commands, `checkpoint_id` changes mark
-//! checkpoint label boundaries, `blend_continues` tells the completion
-//! policy to skip settling at a segment end (blended corners stay
-//! velocity-continuous), `is_last` marks the final sample of the queued
-//! program.
+//! checkpoint label boundaries, `is_last` marks the final sample of the
+//! queued program.
 //!
 //! Backpressure is by SAMPLE COUNT: [`SampleProducer::samples_remaining`]
 //! / [`SampleConsumer::samples_remaining`] is the planner's deadline
@@ -45,9 +43,6 @@ pub struct SampleMeta {
     /// Checkpoint label id; a CHANGE between consecutive samples is a
     /// checkpoint boundary (push completion for the previous label).
     pub checkpoint_id: u32,
-    /// True while this sample's segment blends into the next command:
-    /// at the boundary the completion policy must NOT settle.
-    pub blend_continues: bool,
     /// Final sample of the queued program; EXEC completion runs after it.
     pub is_last: bool,
 }
@@ -338,7 +333,6 @@ mod tests {
             meta: SampleMeta {
                 command_index: (i / 10) as u32,
                 checkpoint_id: (i / 25) as u32,
-                blend_continues: i % 10 != 9,
                 is_last: false,
             },
             ..Sample::default()
@@ -432,51 +426,6 @@ mod tests {
         assert!(tx.try_push(&sample(20)));
         assert_eq!(rx.clear_marked(), 0);
         assert_eq!(rx.pop().expect("survivor").q[0], 20.0);
-    }
-
-    #[test]
-    fn boundary_metadata_semantics() {
-        let (mut tx, mut rx) = sample_ring(16);
-        // Two commands; command 0 blends into command 1, command 1 settles.
-        for i in 0..4 {
-            let mut s = sample(0);
-            s.meta = SampleMeta {
-                command_index: 0,
-                checkpoint_id: 7,
-                blend_continues: true,
-                is_last: false,
-            };
-            s.q[0] = i as f64;
-            assert!(tx.try_push(&s));
-        }
-        for i in 4..8 {
-            let mut s = sample(0);
-            s.meta = SampleMeta {
-                command_index: 1,
-                checkpoint_id: 8,
-                blend_continues: false,
-                is_last: i == 7,
-            };
-            s.q[0] = i as f64;
-            assert!(tx.try_push(&s));
-        }
-        // Consumer walks the stream detecting boundaries the way EXEC does.
-        let mut boundaries = Vec::new();
-        let mut prev: Option<Sample> = None;
-        while let Some(s) = rx.pop() {
-            if let Some(p) = prev {
-                if s.meta.checkpoint_id != p.meta.checkpoint_id {
-                    boundaries.push((p.meta.checkpoint_id, p.meta.blend_continues));
-                }
-            }
-            if s.meta.is_last {
-                boundaries.push((s.meta.checkpoint_id, s.meta.blend_continues));
-            }
-            prev = Some(s);
-        }
-        // One blend-through boundary at the 0→1 transition, one settling
-        // final boundary.
-        assert_eq!(boundaries, vec![(7, true), (8, false)]);
     }
 
     #[test]

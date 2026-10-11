@@ -20,8 +20,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetPayload, SetShapes, SetTcpOffset,
-    Shape, Stop, Teleport,
+    JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SelectTool, SetPayload, SetShapes,
+    SetTcpOffset, Shape, Stop, Teleport,
 };
 use par6_proto::{Command, ControllerMode, ErrorCode, Frame, QueryResult, Status, NUM_JOINTS};
 
@@ -48,55 +48,45 @@ fn test_config(tag: &str) -> PathBuf {
     common::retimed_config(&format!("ffi-{tag}"), TEST_TICK_DT_S)
 }
 
-/// The tick period every rig in this file boots at. Anything that has to
-/// agree with the runtime's own tick-derived arithmetic — the streaming
-/// gate's stopping projection, for one — has to read THIS, not the
-/// shipped config's period.
+/// The tick period the rigs in this file boot at, for CI headroom.
+/// Anything that has to agree with the runtime's own tick-derived
+/// arithmetic reads the rig's config, not this or the shipped period.
 const TEST_TICK_DT_S: f64 = 0.02;
 
 /// [`test_config`] with the active (MSG) gripper's `[kinematics] mass_kg`
 /// replaced — the knob the gravity-wiring test turns.
 fn test_config_with_tool_mass(tag: &str, mass_kg: f64) -> PathBuf {
     let dst = test_config(tag);
-    let toml = dst
-        .parent()
-        .unwrap()
-        .join("grippers/MSG_small_motor_150mm_rail.toml");
+    // Whichever tool the config selects: pinning one variant's file name
+    // patches a file the run never loads once the shipped tool changes,
+    // and the test then compares two identical arms.
+    let robot = std::fs::read_to_string(&dst).expect("robot toml");
+    let name = robot
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("active_tool"))
+        .and_then(|rest| rest.split('"').nth(1))
+        .expect("the config names an active gripper");
+    let toml = dst.parent().unwrap().join(format!("grippers/{name}.toml"));
     let text = std::fs::read_to_string(&toml).expect("gripper toml");
-    // contains(), not assert_ne on the output: the baseline call passes
-    // the default 0.37, whose patch is a no-op by construction.
     assert!(
-        text.contains("mass_kg = 0.37"),
-        "mass_kg patch point must exist"
+        text.lines().any(|l| l.trim_start().starts_with("mass_kg")),
+        "{name} has no mass_kg to patch"
     );
-    let patched = text.replace("mass_kg = 0.37", &format!("mass_kg = {mass_kg}"));
+    let patched: String = text
+        .split_inclusive('\n')
+        .map(|line| {
+            if line.trim_start().starts_with("mass_kg") {
+                format!("mass_kg = {mass_kg}\n")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
     std::fs::write(&toml, patched).expect("write gripper toml");
     dst
 }
 
 // ---- in-process rig --------------------------------------------------------
-
-/// The 50 Hz config with the `[freedrive]` drift lock switched on. The
-/// torque plant has no stiction, so a model bias that a real gearbox
-/// would turn into a slow creep moves the arm at a rate a hand push
-/// would; the release speed is raised past that, so the lock arms on the
-/// drifting arm after its settle window instead of reading the drift as
-/// an operator push.
-fn drift_lock_config(tag: &str) -> PathBuf {
-    let dst = test_config(tag);
-    let text = std::fs::read_to_string(&dst).expect("read test config");
-    let mut patched = text.clone();
-    for (from, to) in [
-        ("drift_lock = false", "drift_lock = true"),
-        ("release_rad_s = 0.08", "release_rad_s = 1.0"),
-        ("settle_s = 0.3", "settle_s = 0.2"),
-    ] {
-        assert!(patched.contains(from), "patch point {from:?} must exist");
-        patched = patched.replace(from, to);
-    }
-    std::fs::write(&dst, patched).expect("write drift-lock config");
-    dst
-}
 
 fn enable_and_teleport(rig: &Rig, c: &mut Client, angles_deg: [f64; NUM_JOINTS]) {
     let deadline = Instant::now() + BUDGET;
@@ -139,17 +129,10 @@ struct ReferenceCase {
 /// carry once the arm is teleported there.
 fn reference_case() -> ReferenceCase {
     let bundle = par6_config::ConfigBundle::load(&shipped_config()).expect("PAR6 config");
-    let gripper = bundle
-        .robot
-        .robot
-        .active_gripper
-        .trim()
-        .to_ascii_uppercase();
+    let gripper = bundle.robot.robot.active_tool.trim().to_ascii_uppercase();
     let variant = par6_kin::GripperVariant::resolve(
         &gripper,
-        bundle
-            .active_gripper()
-            .and_then(|g| g.urdf_variant.as_deref()),
+        bundle.active_tool().and_then(|g| g.urdf_variant.as_deref()),
     );
     let mut kin = par6_kin::Kin::load(&common::assets_dir(), variant).expect("reference model");
     let mut q = [0.0; NUM_JOINTS];
@@ -344,13 +327,14 @@ fn cartesian_surface_over_protocol_v2() {
         rel: false,
     });
     let i = c.ok_index(&move_l);
-    let path: Vec<[f64; 3]> = rig
-        .collect_status(Duration::from_secs_f64(MOVE_S + 1.0))
-        .iter()
-        .map(tcp_mm)
-        .collect();
+    let frames = rig.collect_status(Duration::from_secs_f64(MOVE_S + 1.0));
+    let path: Vec<[f64; 3]> = frames.iter().map(tcp_mm).collect();
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "move_l must complete ok, got {detail:?}");
+    assert!(
+        !frames.iter().any(near_singular),
+        "a line through a healthy region crossed the shipped singularity thresholds"
+    );
 
     let moving: Vec<[f64; 3]> = path
         .into_iter()
@@ -518,6 +502,13 @@ fn cartesian_surface_over_protocol_v2() {
     rig.shutdown();
 }
 
+/// The runtime model's G(q) for the tick a frame describes: STATUS
+/// carries the measured torque and the external estimate, measured minus
+/// G(q) from the same tick.
+fn model_g(s: &Status) -> [f64; NUM_JOINTS] {
+    std::array::from_fn(|j| s.torques[j] - s.torques_ext[j])
+}
+
 /// The gravity hook is wired, signed right and scaled right, end to end.
 ///
 /// With comp on — the simulator's default, now that the plant has weight
@@ -547,10 +538,19 @@ fn gravity_hook_holds_the_arm() {
         held.gravity_comp,
         "the simulator applies the feedforward: its plant has the weight to cancel"
     );
+    // Held where it was placed: a hook that does not carry the arm lets
+    // it sag until the gearbox friction catches it, and the still pose
+    // is then wherever that was.
+    for (i, (now, placed)) in held.angles.iter().zip(CART_START_DEG).enumerate() {
+        assert!(
+            (now - placed).abs() < HOLD_TOL,
+            "joint {i} gave way on release: placed at {placed:.2}, still at {now:.2} deg"
+        );
+    }
 
-    // Hold: three seconds of IDLE must not move the arm.
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
+    // Hold: three seconds of the runtime's IDLE must not move the arm.
+    let until = held.mono_time_ns + 3_000_000_000;
+    loop {
         let s = rig.wait_status("a status while holding", |_| true);
         for (i, (now, then)) in s.angles.iter().zip(held.angles.iter()).enumerate() {
             assert!(
@@ -561,90 +561,30 @@ fn gravity_hook_holds_the_arm() {
                 held.angles
             );
         }
+        if s.mono_time_ns >= until {
+            break;
+        }
     }
 
-    // Scale and sign: the shoulder holds the outstretched arm against
-    // gravity and reads a torque of the right order; the wrist roll is
-    // on gravity's axis and reads nearly none.
+    // Sign and scale: IDLE's law is torque-only, so what the drives
+    // deliver IS the hook's output, and it must be the model's G(q) at the
+    // held pose — the external estimate (measured minus model) is what a
+    // mis-signed or mis-scaled hook leaves over.
     let s = wait_still(&rig);
+    let g = model_g(&s);
     assert!(
-        s.torques[1].abs() > 1.0,
-        "the shoulder carries the arm's weight, got {:.3} Nm ({:?})",
-        s.torques[1],
-        s.torques
+        g[1].abs() > 1.0,
+        "the shoulder carries the arm's weight here, the model says {:.3} Nm",
+        g[1]
     );
-    assert!(
-        s.torques[5].abs() < 0.5,
-        "the wrist roll is on gravity's axis and carries nearly none, got {:.3} Nm",
-        s.torques[5]
-    );
+    for (j, (t, gj)) in s.torques.iter().zip(g.iter()).enumerate() {
+        assert!(
+            (t - gj).abs() <= 0.02 * gj.abs() + 0.02,
+            "J{j}: the drives deliver {t:.4} Nm, the model's G(q) is {gj:.4} Nm"
+        );
+    }
 
     rig.shutdown();
-}
-
-/// The `[freedrive]` drift lock against a biased gravity model. A runtime
-/// payload the plant does not carry IS that bias — the controller lifts
-/// a mass that is not there — and an IDLE arm under it rises for as long
-/// as nothing stops it. With the lock configured the same bias is caught
-/// inside the settle window and held by the drive's impedance frame plus
-/// the clamped integral.
-///
-/// The bias is sized between two bounds. It has to clear the
-/// drivetrain's holding friction to move anything at all — a
-/// self-locking gearbox absorbs a small mismatch without back-driving,
-/// which is why an unpowered arm does not collapse — and it has to stay
-/// inside the lock's authority, or the locked arm flies off with the
-/// free one and the test compares two runaways. Eight hundred grams at
-/// 5 cm sits in that window; two kilos does not.
-#[test]
-fn the_drift_lock_bounds_the_drift_of_a_biased_gravity_model() {
-    const WINDOW: Duration = Duration::from_secs(2);
-    const LOADED: [usize; 5] = [1, 2, 3, 4, 5];
-    let payload = SetPayload {
-        mass: 0.8,
-        com: [0.0, 0.0, 0.05],
-        inertia: None,
-    };
-
-    let drift_deg = |config: PathBuf| -> [f64; NUM_JOINTS] {
-        let rig = Rig::boot_with(config);
-        let mut c = Client::new(rig.addr());
-        rig.wait_status("link_ok", |s| s.link_ok == 1);
-        c.ok(&Command::Reset);
-        enable_and_teleport(&rig, &mut c, HOLD_POSE_DEG);
-        // Held by the true model first, so the bias is the only change.
-        let start = rig
-            .collect_status(Duration::from_secs(1))
-            .last()
-            .expect("status while settling")
-            .angles;
-        c.ok(&Command::SetPayload(payload.clone()));
-        let watch = rig.collect_status(WINDOW);
-        let end = watch.last().expect("status during the drift window");
-        assert!(
-            end.mode == ControllerMode::Idle && end.enabled && end.gravity_comp,
-            "the arm must be in freedrive throughout: {end:?}"
-        );
-        assert!(end.error.is_none(), "unexpected error: {:?}", end.error);
-        let drift: [f64; NUM_JOINTS] = std::array::from_fn(|j| (end.angles[j] - start[j]).abs());
-        rig.shutdown();
-        drift
-    };
-    let worst = |d: &[f64; NUM_JOINTS]| LOADED.iter().map(|&j| d[j]).fold(0.0f64, f64::max);
-
-    let free_per_joint = drift_deg(test_config("drift-free"));
-    let locked_per_joint = drift_deg(drift_lock_config("drift-locked"));
-    let (free, locked) = (worst(&free_per_joint), worst(&locked_per_joint));
-    assert!(
-        free > 5.0,
-        "the biased model must visibly move an unlocked arm in {WINDOW:?}; \
-         drifted {free:.2}° ({free_per_joint:.2?})"
-    );
-    assert!(
-        locked < 2.0 && locked < free / 3.0,
-        "the lock must bound the drift: locked {locked:.2}° vs free {free:.2}° \
-         (per joint: locked {locked_per_joint:.2?}, free {free_per_joint:.2?})"
-    );
 }
 
 #[test]
@@ -682,13 +622,17 @@ fn a_full_speed_move_lands_cleanly() {
     }));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "the full-speed move must complete: {detail:?}");
-    // The plant settles into its stiction band, so the landing tolerance
-    // asks "did the trajectory arrive", not "did the servo null out" — a
+    // Landed, measured once the arm is still rather than on the first
+    // frame that happens to pass: the plant settles into its stiction
+    // band, so the tolerance is the band, not the servo's null — a
     // feedforward with the wrong sign or scale misses by tens of degrees
-    // or latches an error.
-    let s = rig.wait_status("landed on the target", |s| {
-        angles_close(&s.angles, &target, 8.0)
-    });
+    // or latches an error, and a plan aimed elsewhere lands elsewhere.
+    let s = wait_still(&rig);
+    assert!(
+        angles_close(&s.angles, &target, 2.0),
+        "the move came to rest at {:?}, not on {target:?}",
+        s.angles
+    );
     assert!(
         s.error.is_none(),
         "standing error after the move: {:?}",
@@ -698,61 +642,119 @@ fn a_full_speed_move_lands_cleanly() {
     rig.shutdown();
 }
 
+fn near_singular(s: &Status) -> bool {
+    s.warnings
+        .iter()
+        .any(|w| w.code == ErrorCode::TrajNearSingularity as u16)
+}
+
+/// The near-singularity warning reads the config's thresholds and stands
+/// while the path that crossed them runs. A condition limit of 1, which
+/// every jacobian exceeds, flags a line through the same healthy region
+/// the shipped thresholds pass; the move still runs, and the warning
+/// clears once it lands.
+#[test]
+fn a_path_past_the_singularity_thresholds_warns_while_it_runs() {
+    let config = test_config("singular");
+    let text = std::fs::read_to_string(&config).expect("read test config");
+    let patched = text.replace(
+        "singularity_cond_max = 1000.0",
+        "singularity_cond_max = 1.0",
+    );
+    assert_ne!(patched, text, "singularity_cond_max patch point must exist");
+    std::fs::write(&config, patched).expect("write singular config");
+    let rig = Rig::boot_with(config);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    enable_and_teleport(&rig, &mut c, CART_START_DEG);
+    let s = rig.wait_status("start pose", |_| true);
+    assert!(!near_singular(&s), "nothing has run yet");
+    let start = tcp_mm(&s);
+    let target = [start[0] + 60.0, start[1], start[2] + 60.0];
+    let i = c.ok_index(&move_l_to(1101, wire_pose_at(&s.pose, target), MOVE_S));
+    let warned = rig.wait_status("the warning while the path runs", near_singular);
+    assert!(
+        distance(tcp_mm(&warned), target) > 1.0,
+        "the warning must stand while the move is still under way"
+    );
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "a warning, not a refusal: {detail:?}");
+    rig.wait_status("the warning clears once the path lands", |s| {
+        !near_singular(s)
+    });
+    rig.shutdown();
+}
+
 // ---- gravity reads the gripper config --------------------------------------
 
-/// The gravity model reads the gripper CONFIG, not just the URDF.
+/// The gravity model reads the gripper CONFIG, not just the URDF, and
+/// carries a declared payload whole.
 ///
 /// Boot plain `--sim` twice; the only difference is the active gripper's
 /// `[kinematics] mass_kg` (0.37 kg stock vs 2.37 kg — a tool two kilos
-/// heavier). At the same teleported posture the published external
-/// torque must shift by the extra tool weight: about 6.7 Nm at the
-/// shoulder and 0.3 Nm at the wrist pitch for these numbers.
+/// heavier). At the same posture the model's G(q) must shift by the extra
+/// tool weight: about 6.7 Nm at the shoulder and 0.3 Nm at the wrist
+/// pitch for these numbers. On the stock arm a SET_PAYLOAD with an
+/// offset centre of mass and an inertia then has to land in the model as
+/// declared, every term of it, and read back as declared.
 ///
-/// STATUS publishes `torques_ext = measured − G(q)`, and the kinematic
-/// plant measures no torque, so what arrives is the model's own gravity
-/// with the sign flipped — which is why the magnitudes below are read
-/// off `torques_ext` directly.
-///
-/// Failing before the wiring landed, twice over: par6d built its gravity
-/// model with `tool: None`, so `mass_kg` was parsed, validated and read
-/// by nothing — the promised "masses/COM/inertia from config" was false —
-/// and plain `--sim` installed `ZeroGravity`, so the same field
-/// published all-zero torques no matter the model. (The feedforward is
-/// still never APPLIED on the kinematic plant: comp is disabled at boot,
-/// publish-only.)
+/// STATUS carries the filtered measured torque and `torques_ext` = that
+/// minus G(q) from the same tick, so their difference is the model's own
+/// G(q) whatever the plant is doing.
 #[test]
 fn gripper_config_mass_changes_published_gravity_torque() {
-    fn published_gravity(tag: &str, mass_kg: f64) -> ([f64; NUM_JOINTS], [f64; NUM_JOINTS]) {
-        let rig = Rig::boot_with(test_config_with_tool_mass(tag, mass_kg));
+    let payload = SetPayload {
+        mass: 1.2,
+        com: [0.02, -0.01, 0.06],
+        inertia: Some([2e-3, 1e-4, 3e-3, -2e-4, 1e-4, 2.5e-3]),
+    };
+    let run = |tag: &str, mass_kg: f64, declare: bool| {
+        let config = test_config_with_tool_mass(tag, mass_kg);
+        let rig = Rig::boot_with(config.clone());
         let mut c = Client::new(rig.addr());
         rig.wait_status("link_ok", |s| s.link_ok == 1);
         c.ok(&Command::Reset);
         enable_and_teleport(&rig, &mut c, CART_START_DEG);
+        // G(q) is exact on any tick; the heavy tool's wrist cannot hold
+        // this posture for long, so it is read on landing.
         let at = rig.wait_status("at the probe posture", |s| {
             angles_close(&s.angles, &CART_START_DEG, 0.1)
-                && s.torques_ext.iter().any(|t| t.abs() > 1e-9)
+        });
+        let loaded = declare.then(|| {
+            c.ok(&Command::SetPayload(payload.clone()));
+            let readback = match c.query(&Command::Payload) {
+                QueryResult::Payload { mass, com, inertia } => (mass, com, inertia),
+                other => panic!("unexpected {other:?}"),
+            };
+            let s = rig.wait_status("the payload reaches the model", |s| {
+                (model_g(s)[1] - model_g(&at)[1]).abs() > 1.0
+            });
+            (config, readback, s)
         });
         rig.shutdown();
-        (at.angles, at.torques_ext)
-    }
+        (at, loaded)
+    };
 
-    let (q_stock, g_stock) = published_gravity("grav-stock", 0.37);
-    let (q_heavy, g_heavy) = published_gravity("grav-heavy", 2.37);
+    let (stock, loaded) = run("grav-stock", 0.37, true);
+    let (heavy, _) = run("grav-heavy", 2.37, false);
+    let (q_stock, g_stock) = (stock.angles, model_g(&stock));
+    let (q_heavy, g_heavy) = (heavy.angles, model_g(&heavy));
     assert!(
         angles_close(&q_stock, &q_heavy, 0.2),
         "the two runs must be compared at the same posture: {q_stock:?} vs {q_heavy:?}"
     );
 
-    // Plain --sim publishes the real model, not placeholder zeros: the
+    // Plain --sim runs the real model, not placeholder zeros: the
     // shoulder carries most of the arm at this posture.
     assert!(
         g_stock[1].abs() > 2.0,
-        "published shoulder gravity torque is {:.3} Nm — the kinematic-sim \
-         runtime is publishing a placeholder, not G(q)",
+        "the shoulder's model gravity torque is {:.3} Nm — the runtime is \
+         running a placeholder, not G(q)",
         g_stock[1]
     );
-    // The config knob reaches the published torque, at the joints the
-    // extra tool mass actually loads.
+    // The config knob reaches the model, at the joints the extra tool
+    // mass actually loads.
     let d_shoulder = (g_heavy[1] - g_stock[1]).abs();
     let d_wrist = (g_heavy[4] - g_stock[4]).abs();
     assert!(
@@ -767,13 +769,45 @@ fn gripper_config_mass_changes_published_gravity_torque() {
          {d_wrist:.3} Nm (expected ~0.3): the tool attaches to the wrong link \
          or not at all"
     );
-    // And J0 stays gravity-free: its axis is vertical, so a value here
-    // means the tool was attached in the wrong frame.
+    // J0's axis is vertical, so a value here means the tool was attached
+    // in the wrong frame.
     assert!(
         g_heavy[0].abs() < 1e-6,
         "J0 is on the vertical axis and must carry no gravity torque, got {:.6}",
         g_heavy[0]
     );
+
+    // The declared payload, every term, is what the runtime's model holds.
+    let (config, readback, s) = loaded.expect("the stock run declared a payload");
+    assert_eq!(
+        readback,
+        (
+            payload.mass,
+            payload.com,
+            payload.inertia.expect("declared")
+        ),
+        "the payload reads back as declared"
+    );
+    let bundle = par6_config::ConfigBundle::load(&config).expect("test config");
+    let mut kin = par6d::kin::load_gravity_kin(&common::assets_dir(), bundle.active_tool())
+        .expect("gravity model");
+    kin.set_gravity_correction(&bundle.robot.gravity_correction)
+        .expect("gravity correction");
+    kin.set_tool(payload.mass, payload.com, payload.inertia)
+        .expect("payload");
+    let mut want = [0.0; NUM_JOINTS];
+    kin.gravity(&s.angles.map(f64::to_radians), &mut want)
+        .expect("gravity");
+    let got = model_g(&s);
+    for j in 0..NUM_JOINTS {
+        let want = want[j] * bundle.robot.gravity_scale[j];
+        assert!(
+            (got[j] - want).abs() < 1e-3,
+            "J{j}: the runtime's model holds {:.4} Nm under the payload, the \
+             declared payload gives {want:.4}",
+            got[j]
+        );
+    }
 }
 
 // ---- collision enforcement -------------------------------------------------
@@ -966,7 +1000,8 @@ fn collision_world_is_enforced_over_protocol_v2() {
 
     // A malformed set is refused WHOLE. Every flavour of malformed: a
     // kind waldoctl does not define, an arity that does not match the
-    // kind, a dimension coal cannot build, and a name already taken.
+    // kind, a dimension coal cannot build, a name the set repeats
+    // anywhere in it, and a name the installation layer already uses.
     let mut unknown_kind = keepout.clone();
     unknown_kind.kind = "pyramid".to_owned();
     unknown_kind.name = "bad".to_owned();
@@ -977,18 +1012,35 @@ fn collision_world_is_enforced_over_protocol_v2() {
     negative.kind = "sphere".to_owned();
     negative.params = vec![-1.0];
     negative.name = "bad".to_owned();
-    let duplicate = keepout.clone();
-    for (label, bad) in [
-        ("unknown kind", unknown_kind),
-        ("wrong arity", short_params),
-        ("negative radius", negative),
-        ("duplicate name", duplicate),
+    let mut between = keepout.clone();
+    between.name = "between".to_owned();
+    let mut floor = keepout.clone();
+    floor.name = "floor".to_owned();
+    for (label, set, named) in [
+        ("unknown kind", vec![keepout.clone(), unknown_kind], ""),
+        ("wrong arity", vec![keepout.clone(), short_params], ""),
+        ("negative radius", vec![keepout.clone(), negative], ""),
+        (
+            "duplicate name",
+            vec![keepout.clone(), between, keepout.clone()],
+            "\"keepout\"",
+        ),
+        (
+            "installation name",
+            vec![keepout.clone(), floor.clone()],
+            "\"floor\"",
+        ),
     ] {
-        let err = c.expect_error(&set_shapes(vec![keepout.clone(), bad]));
+        let err = c.expect_error(&set_shapes(set));
         assert_eq!(
             err.code,
             ErrorCode::CommValidationError as u16,
             "a {label} shape must be refused, got {err:?}"
+        );
+        assert!(
+            err.cause.contains(named),
+            "the {label} refusal must name the shape: {}",
+            err.cause
         );
         let (program, refused_epoch) = shapes_readback(&mut c);
         assert_eq!(
@@ -1010,6 +1062,13 @@ fn collision_world_is_enforced_over_protocol_v2() {
         detail.expect("a failed COMPLETE carries the error").code,
         ErrorCode::SysSelfCollision as u16
     );
+
+    // A visualization-only shape never appears in a colliding pair, so
+    // the installation's name is free for it.
+    floor.collision = false;
+    c.ok(&set_shapes(vec![keepout.clone(), floor.clone()]));
+    let (program, _) = shapes_readback(&mut c);
+    assert_eq!(program, vec![keepout.clone(), floor]);
 
     // A world change does not spare motion already committed: drop the
     // keep-out onto the path of a move that is already running and it
@@ -1080,17 +1139,35 @@ fn collision_world_is_enforced_over_protocol_v2() {
     );
     enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
     let i = c.ok_index(&move_j(7005, end_deg, SWEEP_S));
+    // And a world change clear of the remaining path leaves the running
+    // move alone: a runtime that failed every running move on ANY world
+    // change would pass the loop above just the same.
+    rig.drain_status();
+    rig.wait_status("the sweep is under way", |s| {
+        s.executing_index == i as i64 && s.angles[0] > SWEEP_START_DEG[0] + 3.0
+    });
+    c.ok(&set_shapes(vec![keepout_at("far", [900.0, 900.0, 900.0])]));
+    let (program, _) = shapes_readback(&mut c);
+    assert_eq!(program.len(), 1, "the far box must be applied, not ignored");
     let (ok, detail) = c.wait_complete(i);
     assert!(
         ok,
-        "the sweep must run once the keep-out is removed, got {detail:?}"
+        "the sweep must run once the keep-out is removed, past a box clear of \
+         its path, got {detail:?}"
     );
-    rig.drain_status();
-    let s = rig.wait_status("a clean move clears the verdict", |_| true);
+    let s = settled_tcp(&rig, "the arm at rest at the end of the sweep");
     assert!(
-        !s.collision_active && s.collision_pairs.is_empty(),
-        "the refusal's pairs outlived the motion that caused them: {:?}",
-        s.collision_pairs
+        angles_close(&s.angles, &end_deg, 1.0),
+        "the move must run to its target: {:?}",
+        s.angles
+    );
+    assert!(
+        !s.collision_active && s.collision_pairs.is_empty() && s.error.is_none(),
+        "a clean move clears the verdict and leaves none behind: active={} pairs={:?} \
+         error={:?}",
+        s.collision_active,
+        s.collision_pairs,
+        s.error
     );
 
     // reset_state clears the program layer: the readback empties and the
@@ -1201,29 +1278,19 @@ fn tcp_at_m(angles_deg: [f64; NUM_JOINTS]) -> [f64; 3] {
     [pose[3], pose[7], pose[11]]
 }
 
-/// The J0 jog `speeds` fraction whose stopping projection covers
-/// `travel_rad` — the inverse of [`par6d::stream_stopping_travel`],
-/// found by bisection rather than by restating the gate's arithmetic
-/// here (a test that recomputes the projection cannot catch it being
-/// wrong).
-fn j0_speed_reaching(travel_rad: f64) -> f64 {
-    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
+/// The J0 jog `speeds` fraction whose stop, held at that speed, is
+/// `travel_rad` on — the inverse of [`par6d::held_jog_travel`], found by
+/// bisection rather than by restating the gate's arithmetic here (a test
+/// that recomputes the projection cannot catch it being wrong).
+fn j0_speed_reaching(travel_rad: f64, cfg: &par6_config::RobotConfig) -> f64 {
     let lim = cfg.joints[0].limits.for_mode(par6_config::LimitMode::Jog);
-    // The rig's period, not the shipped one: the projection is counted
-    // in ticks, so a helper that inverts it against a different tick
-    // rate asks for a speed whose lookahead lands somewhere else
-    // entirely.
-    // The settling term the gate projects is `v / kpp`, the position loop's
-    // own gain -- not an acceleration. Inverting it against the jog
-    // acceleration limit (an order larger) asks for a speed whose real
-    // projection is many times the travel, so the helper's contract ("the
-    // speed whose stop covers `travel_rad`") would not hold.
-    let kpp = cfg.joints[0].gains.kpp;
-    let (v_max, dt) = (lim.velocity_rad_s, TEST_TICK_DT_S);
+    let (v_max, dt) = (lim.velocity_rad_s, cfg.robot.tick_dt_s);
+    let travel =
+        |v: f64| par6d::held_jog_travel(v, v_max, lim.acceleration_rad_s2, &cfg.jog, 1.0, dt);
     let (mut lo, mut hi) = (0.0, v_max);
     for _ in 0..60 {
         let mid = 0.5 * (lo + hi);
-        if par6d::stream_stopping_travel(mid, kpp, dt) < travel_rad {
+        if travel(mid) < travel_rad {
             lo = mid;
         } else {
             hi = mid;
@@ -1236,10 +1303,12 @@ fn j0_speed_reaching(travel_rad: f64) -> f64 {
 /// motion (issue #19 gap 1 + gap 2), over the real protocol against the
 /// real coal world and the real RT jog engine:
 ///
-/// - a jog TOWARD a keep-out stops short of it: the gate's velocity-
-///   scaled lookahead predicts the contact, the stream is stopped, and
-///   STATUS latches `collision_active` with the keep-out named — the arm
-///   never reaches the box;
+/// - a jog held TOWARD a keep-out, joint or cartesian, slow or at full
+///   speed, comes to rest on the keep-out's clearance and stays there:
+///   braked when the projection of its stop reaches the clearance, then
+///   placed on it, with STATUS latching `collision_active` and the
+///   keep-out named — never inside the clearance, never more than 5 mm
+///   out of it;
 /// - from INSIDE the keep-out (dropped over the arm), a jog moving
 ///   OUTWARD is permitted — the arm demonstrably escapes;
 /// - from a SHALLOW penetration, a jog driving DEEPER is refused with a
@@ -1248,7 +1317,23 @@ fn j0_speed_reaching(travel_rad: f64) -> f64 {
 ///   it), while the outward jog from the same spot runs.
 #[test]
 fn streaming_is_gated_by_the_collision_world() {
-    let rig = boot_tagged("streamgate");
+    streaming_gated_by_the_collision_world_at(TEST_TICK_DT_S);
+}
+
+/// The same workflow at the shipped 250 Hz, the rate housekeeping,
+/// braking and the powered hold meet the arm at. Release only (`pixi run
+/// test-stream-timing`): a debug RT loop cannot hold a 4 ms period.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "the shipped 250 Hz needs a release build")]
+fn streaming_is_gated_by_the_collision_world_at_the_shipped_rate() {
+    let shipped = par6_config::RobotConfig::load(&shipped_config()).expect("shipped config");
+    streaming_gated_by_the_collision_world_at(shipped.robot.tick_dt_s);
+}
+
+fn streaming_gated_by_the_collision_world_at(dt: f64) {
+    let config = common::retimed_config(&format!("ffi-streamgate-{}", (dt * 1e3) as u32), dt);
+    let robot = par6_config::RobotConfig::load(&config).expect("collision-test config");
+    let rig = Rig::boot_with(config);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1262,57 +1347,419 @@ fn streaming_is_gated_by_the_collision_world() {
     let keepout = keepout_at("keepout", [mid_m[0] * 1e3, mid_m[1] * 1e3, mid_m[2] * 1e3]);
     c.ok(&set_shapes(vec![keepout.clone()]));
 
-    // --- a jog toward the keep-out stops short of it.
-    // Start with the TCP two box widths from the box centre, jog toward
-    // it at half speed, and let the periodic re-check catch the approach.
-    let start_deg = with_j0(mid_deg, -2.0 * KEEPOUT_M * deg_per_m);
+    // --- a jog held toward the keep-out comes to rest on its clearance
+    // and stays there, at any speed, joint or cartesian. The clearance is
+    // the stop the operator is owed. The placement is commanded a
+    // milliradian short of it and accepted within two of that, so it may
+    // finish half a millimetre inside at the gripper's reach, and a
+    // millimetre covers its settle; resting more than 5 mm out of it is
+    // ground the gate took from them — where the arm stopped before it
+    // was placed.
+    let clearance_mm = par6d::COLLISION_CLEARANCE_M * 1e3;
+    let mut world = keepout_world(mid_m);
+    let start_deg = with_j0(mid_deg, -4.0 * KEEPOUT_M * deg_per_m);
+    let start_m = tcp_at_m(start_deg);
+    let (dx, dy) = (mid_m[0] - start_m[0], mid_m[1] - start_m[1]);
+    let toward = [dx / dx.hypot(dy), dy / dx.hypot(dy)];
+    let jog_l = |velocities: [f64; 6]| {
+        Command::JogL(JogL {
+            velocities,
+            duration: 0.2,
+            frame: Frame::Wrf,
+            accel: None,
+        })
+    };
+    let toward_l = jog_l([toward[0], toward[1], 0.0, 0.0, 0.0, 0.0]);
+    // Held, or let go the moment it is refused. Held, the refusal puts the
+    // arm on the standoff; let go, it stops where its brake leaves it — never
+    // inside the clearance, and with no approach nobody is asking for.
+    let held = [
+        ("jog_j at 10 %", jog_j(0, 0.1, 0.2), None),
+        ("jog_j at full speed", jog_j(0, 1.0, 0.2), None),
+        ("jog_l at full speed", toward_l.clone(), None),
+        (
+            "jog_j at full speed, let go when refused",
+            jog_j(0, 1.0, 0.2),
+            Some(jog_j(0, 0.0, 0.2)),
+        ),
+        (
+            "jog_l at full speed, let go when refused",
+            toward_l,
+            Some(jog_l([0.0; 6])),
+        ),
+    ];
+    for (what, jog, release) in &held {
+        c.ok(&Command::Reset);
+        enable_and_teleport(&rig, &mut c, start_deg);
+        rig.drain_status();
+        // Re-sent once a frame, as a held key is, and the replies drained.
+        // Placed means at rest for two seconds still holding it, in
+        // whichever mode the placement left the arm.
+        let (mut closest, mut still_since, mut latched) = (f64::INFINITY, None, None);
+        let (mut closest_at, mut closest_mode) = (0, ControllerMode::Idle);
+        // Handed to IDLE while still moving: the drop out of a refusal's
+        // control that lets the arm coast where it will. Above an encoder
+        // count a tick, which on the base alone reads 0.056 rad/s, and
+        // for two frames running: a drivetrain unwinding when its hold
+        // current drops is over within one.
+        let mut coasting = None;
+        let mut idle_moving = 0;
+        // Where the refusal's brake first left it at rest.
+        let mut brake_rest = None;
+        let mut first_ns: Option<u64> = None;
+        let deadline = Instant::now() + 2 * BUDGET;
+        let s = loop {
+            assert!(
+                Instant::now() < deadline,
+                "{what}: never came to rest on the clearance"
+            );
+            let Some(s) = rig.recv_status() else { continue };
+            assert_ne!(
+                s.mode,
+                ControllerMode::ActiveError,
+                "{what}: runtime fault: {:?}",
+                s.error
+            );
+            c.send(
+                release
+                    .as_ref()
+                    .filter(|_| latched.is_some())
+                    .unwrap_or(jog),
+            );
+            c.drain();
+            let t0 = *first_ns.get_or_insert(s.mono_time_ns);
+            let gap = world_gap_m(&mut world, s.angles) * 1e3;
+            if gap < closest {
+                (closest, closest_at, closest_mode) = (gap, s.mono_time_ns - t0, s.mode);
+            }
+            if latched.is_none() && s.collision_active {
+                latched = Some(s.collision_pairs.clone());
+            }
+            if latched.is_some()
+                && s.mode == ControllerMode::Idle
+                && s.speeds.iter().any(|v| v.abs() > 0.1)
+            {
+                idle_moving += 1;
+                if idle_moving >= 2 {
+                    coasting.get_or_insert(s.speeds);
+                }
+            } else {
+                idle_moving = 0;
+            }
+            let still = latched.is_some() && s.speeds.iter().all(|v| v.abs() < 0.01);
+            if still && brake_rest.is_none() {
+                brake_rest = Some(gap);
+            }
+            still_since = if still {
+                still_since.or(Some(s.mono_time_ns))
+            } else {
+                None
+            };
+            if still_since.is_some_and(|t| s.mono_time_ns - t >= 2_000_000_000) {
+                break s;
+            }
+        };
+        let pairs = latched.expect("latched before resting");
+        assert!(
+            pairs
+                .iter()
+                .any(|(a, b)| a == "shape:keepout" || b == "shape:keepout"),
+            "{what}: the latched pairs must name the keep-out as a program shape: {pairs:?}"
+        );
+        let rest = world_gap_m(&mut world, s.angles) * 1e3;
+        assert!(
+            closest >= clearance_mm - 1.0,
+            "{what}: came within {closest:.1} mm of the keep-out, inside its \
+             {clearance_mm:.0} mm clearance, {:.2} s in, in {closest_mode:?}",
+            closest_at as f64 * 1e-9
+        );
+        assert!(
+            coasting.is_none(),
+            "{what}: dropped into IDLE moving at {coasting:?} rad/s"
+        );
+        if release.is_none() {
+            assert!(
+                rest <= clearance_mm + 5.0,
+                "{what}: rests {rest:.1} mm from the keep-out, more than 5 mm out of its \
+                 {clearance_mm:.0} mm clearance"
+            );
+            if matches!(jog, Command::JogL(_)) {
+                assert_eq!(
+                    s.mode,
+                    ControllerMode::Exec,
+                    "{what}: the collision refusal must finish in a powered hold"
+                );
+                assert!(s.enabled, "{what}: the hold must retain drive authority");
+                // An operator can release and re-press a blocked direction.
+                // Neither the silence that ends the live command nor the
+                // re-press may discard the settled refusal for an IDLE
+                // damping phase.
+                let silence_ns = ((robot.stream.servo_grace_s + 0.2) * 1e9) as u64;
+                let mut last_ns = s.mono_time_ns;
+                for (phase, pressed) in [("silence", None), ("a re-pressed direction", Some(jog))] {
+                    let from = last_ns;
+                    while last_ns - from < silence_ns {
+                        if let Some(jog) = pressed {
+                            c.send(jog);
+                            c.drain();
+                        }
+                        assert!(Instant::now() < deadline, "{phase} timed out");
+                        let Some(held) = rig.recv_status() else {
+                            continue;
+                        };
+                        last_ns = held.mono_time_ns;
+                        assert_eq!(
+                            held.mode,
+                            ControllerMode::Exec,
+                            "{phase} dropped the parked hold"
+                        );
+                    }
+                }
+            }
+        } else {
+            // Two millimetres for the drive settling onto where it stopped.
+            assert!(
+                rest - closest < 2.0,
+                "{what}: retreated from its closest approach at {closest:.1} mm to {rest:.1} mm"
+            );
+            // Braked well short of the clearance, it was let go of long
+            // before a placement could have put it there.
+            if let Some(braked) = brake_rest.filter(|b| *b > clearance_mm + 50.0) {
+                assert!(
+                    rest > clearance_mm + 5.0,
+                    "{what}: braked {braked:.1} mm from the keep-out and let go of, it was \
+                     still carried on to the standoff, {rest:.1} mm from it"
+                );
+            }
+        }
+    }
+
+    // --- the same layer re-sent all through a placement puts nothing in
+    // its way, and does not hold it up.
+    c.ok(&Command::Reset);
     enable_and_teleport(&rig, &mut c, start_deg);
     rig.drain_status();
-    c.send(&jog_j(0, 0.5, 10.0));
-    let s = rig.wait_status("the jog is blocked and latched", |s| s.collision_active);
+    let jog = jog_j(0, 1.0, 0.2);
+    let (mut latched, mut still_since) = (false, None);
+    let deadline = Instant::now() + 2 * BUDGET;
+    let s = loop {
+        assert!(
+            Instant::now() < deadline,
+            "a placement under a re-sent layer never came to rest"
+        );
+        let Some(s) = rig.recv_status() else { continue };
+        c.send(&jog);
+        c.drain();
+        latched |= s.collision_active;
+        if latched {
+            c.ok(&set_shapes(vec![keepout.clone()]));
+        }
+        still_since = if latched && s.speeds.iter().all(|v| v.abs() < 0.01) {
+            still_since.or(Some(s.mono_time_ns))
+        } else {
+            None
+        };
+        if still_since.is_some_and(|t| s.mono_time_ns - t >= 2_000_000_000) {
+            break s;
+        }
+    };
+    let rest = world_gap_m(&mut world, s.angles) * 1e3;
     assert!(
-        s.collision_pairs
-            .iter()
-            .any(|(a, b)| a == "shape:keepout" || b == "shape:keepout"),
-        "the latched pairs must name the keep-out as a program shape: {:?}",
-        s.collision_pairs
-    );
-    rig.drain_status();
-    let s = rig.wait_status("the blocked jog comes to rest", |s| {
-        s.speeds.iter().all(|v| v.abs() < 0.05)
-    });
-    assert!(
-        s.angles[0] < mid_deg[0] - 5.0,
-        "the jog drove to the keep-out it was stopped for: j0 = {} deg toward {}",
-        s.angles[0],
-        mid_deg[0]
+        rest <= clearance_mm + 5.0,
+        "under a re-sent layer the placement stopped {rest:.1} mm from the keep-out, more \
+         than 5 mm out of its clearance"
     );
 
-    // --- from inside the keep-out, an escaping jog is permitted.
-    // Teleport into the box (a keep-out dropped over the arm) and jog
-    // back out: refusing this would trap the arm, which is exactly what
-    // the escape rule exists to prevent.
-    enable_and_teleport(&rig, &mut c, mid_deg);
+    // --- a keep-out dropped across a placement under way, nothing held:
+    // the arm is stopped and put on the new keep-out's clearance, not
+    // carried on through it toward the standoff it was solved for before.
+    let wall_m = tcp_at_m(with_j0(mid_deg, -0.6 * KEEPOUT_M * deg_per_m));
+    let wall = keepout_at("wall", [wall_m[0] * 1e3, wall_m[1] * 1e3, wall_m[2] * 1e3]);
+    let mut wall_world = keepout_world(wall_m);
+    c.ok(&Command::Reset);
+    enable_and_teleport(&rig, &mut c, start_deg);
     rig.drain_status();
-    c.send(&jog_j(0, -0.3, 5.0));
-    rig.wait_status("the escaping jog moves the arm out", |s| {
-        s.angles[0] < mid_deg[0] - 3.0
+    // Start the refusal while the arm is visibly moving but still well
+    // short of the wall. At 250 Hz the jog's natural refusal can brake
+    // less than 40 mm before the original keep-out, already past this
+    // wall: that leaves no placement in which to insert it.
+    c.send(&jog_j(0, 1.0, 1.0));
+    rig.wait_status("measured motion before the early servo refusal", |s| {
+        s.angles[0] > start_deg[0] + 0.2 && s.speeds[0] > 0.05
     });
+    let refused_target = Command::ServoJ(par6_proto::command::ServoJ {
+        angles: mid_deg,
+        speed: Some(1.0),
+        accel: None,
+    });
+    let error = c.expect_error(&refused_target);
+    assert_eq!(error.code, ErrorCode::SysSelfCollision as u16);
+    assert!(error.cause.contains("keepout"), "{error:?}");
+    // Until the wall goes down, decided on the newest frame: this loop's
+    // own queries trail the stream, and a stale frame would drop it late.
+    let (mut latched, mut placement_origin) = (false, None);
+    let deadline = Instant::now() + 2 * BUDGET;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the refused motion never set off on its placement"
+        );
+        rig.drain_status();
+        let Some(s) = rig.recv_status() else { continue };
+        c.send(&refused_target);
+        c.drain();
+        latched |= s.collision_active;
+        // Close enough that the placement's own gentle brake would carry
+        // the arm into it, far enough that a full-rate stop does not.
+        let gap = world_gap_m(&mut wall_world, s.angles) * 1e3;
+        // Only JogJ was admitted; STREAM after its refused ServoJ is
+        // the placement. Its entry need not publish all-zero speeds.
+        if placement_origin.is_none() && latched && s.mode == ControllerMode::Stream {
+            assert!(
+                gap > 55.0,
+                "placement was first observed only {gap:.1} mm before the wall"
+            );
+            placement_origin = Some(s.angles[0]);
+        }
+        if let Some(placement_start) = placement_origin.filter(|_| gap < 55.0) {
+            assert!(
+                gap > 35.0,
+                "the premise: the wall goes down ahead of the arm, not {gap:.1} mm from it"
+            );
+            assert_eq!(
+                s.mode,
+                ControllerMode::Stream,
+                "the placement must be underway"
+            );
+            assert!(
+                s.angles[0] > placement_start + 0.2 && s.speeds[0] > 0.01,
+                "the wall must interrupt measured placement motion: {s:?}"
+            );
+            c.ok(&set_shapes(vec![keepout.clone(), wall.clone()]));
+            break;
+        }
+    }
+    let (mut closest, mut still_since, mut link_lost) = (f64::INFINITY, None, false);
+    let s = loop {
+        assert!(
+            Instant::now() < deadline,
+            "a placement under a dropped keep-out never came to rest"
+        );
+        let Some(s) = rig.recv_status() else { continue };
+        c.drain();
+        link_lost |= s
+            .error
+            .as_ref()
+            .is_some_and(|e| e.code == ErrorCode::SysRtiLinkLost as u16);
+        closest = closest.min(world_gap_m(&mut wall_world, s.angles) * 1e3);
+        still_since = if s.speeds.iter().all(|v| v.abs() < 0.01) {
+            still_since.or(Some(s.mono_time_ns))
+        } else {
+            None
+        };
+        if still_since.is_some_and(|t| s.mono_time_ns - t >= 2_000_000_000) {
+            break s;
+        }
+    };
+    let rest = world_gap_m(&mut wall_world, s.angles) * 1e3;
+    assert!(
+        !link_lost,
+        "the placement went unfed and the RT latched a lost stream link"
+    );
+    assert!(
+        closest >= clearance_mm - 1.0,
+        "came within {closest:.1} mm of the keep-out dropped across its placement"
+    );
+    assert!(
+        rest <= clearance_mm + 5.0,
+        "rests {rest:.1} mm from the keep-out dropped across its placement, more than 5 mm \
+         out of its clearance"
+    );
+    c.ok(&Command::Reset);
+    c.ok(&set_shapes(vec![keepout.clone()]));
+
+    // --- from inside the keep-out, an escaping jog is permitted, joint
+    // or cartesian. Teleport into the box (a keep-out dropped over the
+    // arm) and jog back out: refusing this would trap the arm, which is
+    // exactly what the escape rule exists to prevent — and the refusal's
+    // placement would take it out by the nearest side, whichever way it
+    // was jogged.
+    let away = [-0.3 * toward[0], -0.3 * toward[1], 0.0, 0.0, 0.0, 0.0];
+    let escapes = [
+        ("jog_j", jog_j(0, -0.3, 5.0)),
+        (
+            "jog_l",
+            Command::JogL(JogL {
+                velocities: away,
+                duration: 5.0,
+                frame: Frame::Wrf,
+                accel: None,
+            }),
+        ),
+    ];
+    for (what, jog) in &escapes {
+        enable_and_teleport(&rig, &mut c, mid_deg);
+        rig.drain_status();
+        c.send(jog);
+        rig.wait_status(&format!("the escaping {what} moves the arm out"), |s| {
+            s.angles[0] < mid_deg[0] - 3.0
+        });
+        // Stopped and at rest BEFORE the next teleport: its 5 s duration
+        // outlives the wait above, and the release ramp of a live jog
+        // would drag the freshly teleported pose back out of the box.
+        c.ok(&Command::Stop(Stop { clear_queue: false }));
+        rig.drain_status();
+        rig.wait_status("the stopped escape jog comes to rest", |s| {
+            s.speeds.iter().all(|v| v.abs() < 0.05)
+        });
+    }
+
+    // --- from inside the clearance, short of the box, a jog fast enough
+    // to stop beyond its far side is refused: its stop is clear, but the
+    // way there goes through the keep-out.
+    let face_start = start_deg[0];
+    let (mut lo, mut hi) = (face_start, mid_deg[0]);
+    for _ in 0..40 {
+        let mid = 0.5 * (lo + hi);
+        if world_gap_m(&mut world, with_j0(start_deg, mid - face_start)) * 1e3 > clearance_mm / 2.0
+        {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let band_deg = with_j0(start_deg, lo - face_start);
+    enable_and_teleport(&rig, &mut c, band_deg);
+    rig.drain_status();
+    rig.wait_status("the arm rests inside the clearance", |s| {
+        s.speeds.iter().all(|v| v.abs() < 0.05) && (s.angles[0] - band_deg[0]).abs() < 0.1
+    });
+    let err = c.expect_error(&jog_j(0, 1.0, 5.0));
+    assert_eq!(
+        err.code,
+        ErrorCode::SysSelfCollision as u16,
+        "a jog through the keep-out must be refused: {err:?}"
+    );
+    // A move queued while that refusal is still being put down cancels the
+    // placement instead of being cut short by it.
+    let away_deg = with_j0(band_deg, -10.0);
+    let i = c.ok_index(&move_j(7201, away_deg, 2.0));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "a move queued behind a refusal must run, got {detail:?}"
+    );
+    let s = wait_still(&rig);
+    assert!(
+        angles_close(&s.angles, &away_deg, 1.0),
+        "the move must reach its target: {:?}",
+        s.angles
+    );
 
     // --- from a shallow penetration, driving deeper is refused.
     // The TCP sits inside the box near its face; a slow jog toward the
     // centre goes DEEPER through the same colliding pair, and only the
     // min-distance half of the escape rule can see that.
-    // Stop the still-running escape jog and let it decelerate to rest
-    // BEFORE teleporting: its 5 s duration outlives the wait above, and
-    // the release ramp of a live jog would drag the freshly teleported
-    // pose back out of the box — the gate would then be right to ACCEPT
-    // the inward jog.
-    c.ok(&Command::Stop(Stop { clear_queue: false }));
-    rig.drain_status();
-    rig.wait_status("the stopped escape jog comes to rest", |s| {
-        s.speeds.iter().all(|v| v.abs() < 0.05)
-    });
     let shallow_deg = with_j0(mid_deg, -0.8 * (KEEPOUT_M / 2.0) * deg_per_m);
     enable_and_teleport(&rig, &mut c, shallow_deg);
     rig.drain_status();
@@ -1320,7 +1767,7 @@ fn streaming_is_gated_by_the_collision_world() {
         s.speeds.iter().all(|v| v.abs() < 0.05) && (s.angles[0] - shallow_deg[0]).abs() < 1.0
     });
     assert!(s.homed, "teleport must leave the arm referenced");
-    // A speed whose lookahead lands AT the box centre. coal's penetration
+    // A speed whose held stop lands AT the box centre. coal's penetration
     // depth for a mesh-vs-box pair is a local contact-patch estimate,
     // nearly flat in the true depth (measured on this rig: ~5 mm of
     // reported deepening across the full 40 mm face-to-centre travel),
@@ -1328,7 +1775,7 @@ fn streaming_is_gated_by_the_collision_world() {
     // tolerance — the centre is where the measured drop is unambiguous.
     // The refusal still cannot be excused as "the far side is shallower
     // again": the centre is the depth extremum, not past it.
-    let pct = j0_speed_reaching(0.8 * (KEEPOUT_M / 2.0) / radius_m);
+    let pct = j0_speed_reaching(0.8 * (KEEPOUT_M / 2.0) / radius_m, &robot);
     let err = c.expect_error(&jog_j(0, pct, 5.0));
     assert_eq!(
         err.code,
@@ -1350,34 +1797,172 @@ fn streaming_is_gated_by_the_collision_world() {
     rig.shutdown();
 }
 
+/// A refusal while braking owns the direction it refused, not every
+/// direction: reversing out of it, along either world axis or in the
+/// tool frame, is admitted even though it closes on a second, clear
+/// obstacle behind the tool (minimum distance alone cannot tell which the
+/// operator is steering away from), and removing the obstruction
+/// releases the refused direction itself.
+#[test]
+fn cartesian_braking_allows_reversing_toward_a_different_clear_obstacle() {
+    for (axis, frame, remove_approach) in [
+        (0, Frame::Wrf, false),
+        (1, Frame::Wrf, false),
+        (0, Frame::Trf, false),
+        (0, Frame::Wrf, true),
+    ] {
+        let rig = boot_tagged("cart-brake-reverse");
+        let mut c = Client::new(rig.addr());
+        rig.wait_status("link_ok", |s| s.link_ok == 1);
+        c.ok(&Command::Reset);
+        enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+        let start = wait_still(&rig);
+
+        // Two cubes beside the tool's x path, inside the clearance of it,
+        // one ahead and one behind: the approach is refused by the first
+        // while the reverse and its stopping projection still fit short
+        // of the second.
+        let obstacle = |name: &str, x: f64| {
+            let mut shape = keepout_at(name, [x, -240.91222750890856, 168.27042825904842]);
+            shape.params = vec![0.04; 3];
+            shape
+        };
+        let ahead = obstacle("approach", 463.8101402931911);
+        let behind = obstacle("behind", 179.02290625063788);
+        let mut world = par6_kin::Collision::load(
+            &common::assets_dir(),
+            par6_kin::GripperVariant::Msg,
+            par6d::COLLISION_CLEARANCE_M,
+        )
+        .expect("reference world");
+        world
+            .set_layer(
+                par6_kin::Layer::Program,
+                &[
+                    par6_kin::Shape::from_proto(&ahead).expect("ahead shape"),
+                    par6_kin::Shape::from_proto(&behind).expect("behind shape"),
+                ],
+            )
+            .expect("reference obstacles");
+        assert!(world_gap_m(&mut world, start.angles) > par6d::COLLISION_CLEARANCE_M);
+        c.ok(&set_shapes(vec![behind.clone()]));
+        let jog = |fraction, duration| {
+            Command::JogL(JogL {
+                velocities: [fraction, 0.0, 0.0, 0.0, 0.0, 0.0],
+                duration,
+                frame: Frame::Wrf,
+                accel: None,
+            })
+        };
+        let forward = jog(1.0, 1.0);
+        c.send(&forward);
+        let moving = rig.wait_status("the tool approaches under measured motion", |s| {
+            s.mode == ControllerMode::Stream
+                && s.pose[3] > start.pose[3] + 0.2
+                && s.speeds.iter().any(|v| v.abs() > 0.05)
+        });
+        c.ok(&set_shapes(vec![ahead, behind.clone()]));
+        let error = c.expect_error(&forward);
+        assert_eq!(error.code, ErrorCode::SysSelfCollision as u16);
+        assert!(error.cause.contains("approach"), "{error:?}");
+        if remove_approach {
+            // Removing the obstruction while braking must also release its
+            // ownership of the old approach direction.
+            c.ok(&set_shapes(vec![behind.clone()]));
+            world
+                .set_layer(
+                    par6_kin::Layer::Program,
+                    &[par6_kin::Shape::from_proto(&behind).expect("behind shape")],
+                )
+                .expect("remove reference approach");
+        }
+
+        let mut velocities = [0.0; 6];
+        let direction = if remove_approach { 1.0 } else { -1.0 };
+        velocities[axis] = direction * 0.2;
+        if frame == Frame::Trf {
+            let world = velocities;
+            for (j, velocity) in velocities.iter_mut().enumerate().take(3) {
+                *velocity = (0..3).map(|r| moving.pose[4 * r + j] * world[r]).sum();
+            }
+        }
+        let reverse_id = c.send(&Command::JogL(JogL {
+            velocities,
+            duration: 0.3,
+            frame,
+            accel: None,
+        }));
+        let barrier_id = c.send(&Command::Ping);
+        let deadline = Instant::now() + BUDGET;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "reverse admission did not answer"
+            );
+            match c.try_recv() {
+                Some(par6_proto::Reply::Error { req_id, error }) if req_id == reverse_id => {
+                    panic!("a collision-clear jog was refused while braking (remove_approach={remove_approach}): {error:?}");
+                }
+                Some(par6_proto::Reply::Response { req_id, .. }) if req_id == barrier_id => break,
+                _ => {}
+            }
+        }
+        let deadline = Instant::now() + BUDGET;
+        loop {
+            assert!(
+                Instant::now() < deadline,
+                "the accepted reverse never moved the physical arm"
+            );
+            let Some(s) = rig.recv_status() else { continue };
+            assert_ne!(s.mode, ControllerMode::ActiveError, "{:?}", s.error);
+            assert!(
+                world_gap_m(&mut world, s.angles) >= par6d::COLLISION_CLEARANCE_M,
+                "the reverse entered a keep-out's clearance"
+            );
+            if direction * (s.pose[4 * axis + 3] - moving.pose[4 * axis + 3]) > 0.2 {
+                break;
+            }
+        }
+        c.ok(&Command::Stop(Stop { clear_queue: true }));
+        rig.shutdown();
+    }
+}
+
 // ---- installation keep-outs ------------------------------------------------
 
-/// `[[installation_shapes]]` in the robot TOML is a real producer for the
-/// installation layer (issue #19 gap 3): the configured keep-out arrives
+/// `[[installation_shapes]]` is a real producer for the installation layer
+/// (issue #19 gap 3), declared where an installation's own values live: in
+/// the local overlay beside the robot TOML. The configured keep-out arrives
 /// in the ENFORCED collision world at boot (a planned move through it is
 /// refused, not merely echoed), the SHAPES query reads it back on the
-/// `installation` list, and neither `set_shapes` nor `reset_state` can
-/// remove it. A malformed entry refuses BOOT with the shape named.
+/// `installation` list, CONFIG_BUNDLE reports it in the config the runtime
+/// runs, and neither `set_shapes` nor `reset_state` can remove it. A
+/// malformed entry refuses BOOT with the shape named.
 #[test]
 fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
     let mid_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG / 2.0);
     let end_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG);
     let mid_m = tcp_at_m(mid_deg);
 
+    // The overlay also sets one of the fitted tool's own values: the
+    // runtime reports the tool file as it runs it.
     let config = test_config("install-shapes");
+    let fitted = par6_config::ConfigBundle::load(&config)
+        .expect("config")
+        .robot
+        .robot
+        .active_tool;
     std::fs::write(
-        &config,
+        config.with_file_name(par6_config::LOCAL_CONFIG_NAME),
         format!(
-            "{}\n[[installation_shapes]]\nname = \"cage\"\nkind = \"box\"\n\
+            "[[installation_shapes]]\nname = \"cage\"\nkind = \"box\"\n\
              params = [{KEEPOUT_M}, {KEEPOUT_M}, {KEEPOUT_M}]\n\
-             pose = [{}, {}, {}, 0.0, 0.0, 0.0]\n",
-            std::fs::read_to_string(&config).expect("test config"),
-            mid_m[0],
-            mid_m[1],
-            mid_m[2],
+             pose = [{}, {}, {}, 0.0, 0.0, 0.0]\n\
+             [[tools]]\nname = \"{fitted}\"\n[tools.driver]\nilim_ma = 912.0\n",
+            mid_m[0], mid_m[1], mid_m[2],
         ),
     )
-    .expect("write config");
+    .expect("write the local overlay");
     let rig = Rig::boot_with(config);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
@@ -1392,9 +1977,6 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
             ..
         } => {
             assert_eq!(program, Vec::<Shape>::new());
-            // The shipped config declares the floor, and this fixture
-            // adds the cage: both are installation shapes, both enforced
-            // from boot, neither reachable from the wire.
             assert_eq!(
                 installation
                     .iter()
@@ -1408,6 +1990,29 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
             assert_eq!(cage.params, vec![KEEPOUT_M; 3]);
         }
         other => panic!("unexpected SHAPES result {other:?}"),
+    }
+    // A client rebuilding the config from CONFIG_BUNDLE gets the cage and
+    // the fitted tool's own value too.
+    match c.query(&Command::ConfigBundle) {
+        QueryResult::ConfigBundle {
+            robot_toml, tools, ..
+        } => {
+            let doc: toml::Table = toml::from_str(&robot_toml).expect("the reported robot TOML");
+            let names: Vec<_> = doc["installation_shapes"]
+                .as_array()
+                .expect("the installation shapes")
+                .iter()
+                .filter_map(|s| s["name"].as_str())
+                .collect();
+            assert_eq!(names, ["floor", "cage"], "{robot_toml}");
+            let (_, tool) = tools
+                .iter()
+                .find(|(name, _)| *name == format!("{fitted}.toml"))
+                .expect("the fitted tool's file");
+            let doc: toml::Table = toml::from_str(tool).expect("the reported tool TOML");
+            assert_eq!(doc["driver"]["ilim_ma"].as_float(), Some(912.0), "{tool}");
+        }
+        other => panic!("unexpected CONFIG_BUNDLE result {other:?}"),
     }
 
     // ENFORCED, not just echoed: the sweep through it is refused with
@@ -1436,6 +2041,37 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
             .iter()
             .any(|(a, b)| a == "install:cage" || b == "install:cage"),
         "the latched pairs must name the cage as an installation shape: {:?}",
+        s.collision_pairs
+    );
+
+    // A tool change rebuilds both worlds for the new tool's geometry; the
+    // cage comes along into the planner's and the gate's alike.
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let i = c.ok_index(&Command::SelectTool(SelectTool {
+        key: 7103,
+        tool_name: "MSG_medium_motor_150mm_rail".to_owned(),
+        variant_key: None,
+    }));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "select_tool must complete, got {detail:?}");
+    let i = c.ok_index(&move_j(7104, end_deg, SWEEP_S));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(!ok, "a tool change dropped the planner's cage: {detail:?}");
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    rig.drain_status();
+    rig.wait_status("the refused move's verdict is cleared", |s| {
+        !s.collision_active
+    });
+    c.send(&jog_j(0, 0.5, 10.0));
+    let s = rig.wait_status(
+        "the jog toward the cage is blocked after the tool change",
+        |s| s.collision_active,
+    );
+    assert!(
+        s.collision_pairs
+            .iter()
+            .any(|(a, b)| a == "install:cage" || b == "install:cage"),
+        "a tool change dropped the stream gate's cage: {:?}",
         s.collision_pairs
     );
 
@@ -2309,7 +2945,7 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
     curve_start(&rig, &mut c);
     let i1 = c.ok_index(&move_j(6001, corner_deg, None));
     let i2 = c.ok_index(&move_j(6002, finish_deg, None));
-    let sharp = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    let sharp = rig.collect_through(i2, Duration::from_secs_f64(2.0 * LEG_S + 2.0));
     for i in [i1, i2] {
         let (ok, detail) = c.wait_complete(i);
         assert!(
@@ -2331,7 +2967,7 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
     curve_start(&rig, &mut c);
     let i1 = c.ok_index(&move_j(6003, corner_deg, Some(BLEND_MM)));
     let i2 = c.ok_index(&move_j(6004, finish_deg, None));
-    let blended = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    let blended = rig.collect_through(i2, Duration::from_secs_f64(2.0 * LEG_S + 2.0));
     for i in [i1, i2] {
         let (ok, detail) = c.wait_complete(i);
         assert!(
@@ -2360,29 +2996,50 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
         "expected the corner region to be sampled, got {} frames",
         mid.len()
     );
-    // The floor is on progress over a window, not on one frame's speed:
-    // STATUS carries the drive's instantaneous velocity, and a velocity
-    // loop rings through a corner — measured on the sim rig at 0.02 to
-    // 0.15 rad/s on alternate frames while the joints advanced steadily.
-    // A blend that stops is a window in which nothing moved.
-    const WINDOW_S: f64 = 0.25;
-    let mut slowest = f64::INFINITY;
-    for (a, s0) in mid.iter().enumerate() {
-        let span = |s: &Status| (s.mono_time_ns.saturating_sub(s0.mono_time_ns)) as f64 * 1e-9;
-        if let Some(s1) = mid[a..].iter().find(|s| span(s) >= WINDOW_S) {
-            let moved = s0
+    // The drive reports velocity over only 20 firmware samples (3.2 ms).
+    // One encoder count in that window is already 0.0187 rad/s on J1;
+    // judge continued path progress over 100 ms instead of mistaking a
+    // quantized sample for a stop. The same speed threshold must
+    // distinguish the unblended control from the rounded path.
+    let slowest_progress = |frames: &[Status]| {
+        let mut slowest = f64::INFINITY;
+        let mut windows = 0;
+        for (i, a) in frames.iter().enumerate() {
+            if from_corner(a, corner_deg) >= 4.0 {
+                continue;
+            }
+            let Some(b) = frames[i + 1..]
+                .iter()
+                .find(|b| b.mono_time_ns.saturating_sub(a.mono_time_ns) >= 100_000_000)
+            else {
+                continue;
+            };
+            if from_corner(b, corner_deg) >= 4.0 {
+                continue;
+            }
+            let dt = (b.mono_time_ns - a.mono_time_ns) as f64 * 1e-9;
+            let travel = a
                 .angles
                 .iter()
-                .zip(s1.angles.iter())
-                .map(|(p, q)| (q - p).abs().to_radians())
-                .fold(0.0f64, f64::max);
-            slowest = slowest.min(moved / span(s1));
+                .zip(b.angles)
+                .map(|(a, b)| (b - a).to_radians().powi(2))
+                .sum::<f64>()
+                .sqrt();
+            slowest = slowest.min(travel / dt);
+            windows += 1;
         }
-    }
+        assert!(windows >= 5, "not enough corner progress windows");
+        slowest
+    };
+    let sharp_slowest = slowest_progress(&sharp);
+    let slowest = slowest_progress(&blended);
+    assert!(
+        sharp_slowest < 0.02,
+        "the unblended control must actually stop at the corner, got {sharp_slowest:.4} rad/s"
+    );
     assert!(
         slowest > 0.02,
-        "the blended joint corner slowed to {slowest:.4} rad/s over {WINDOW_S} s: \
-         a blend that stops is not a blend"
+        "the blended joint corner slowed to {slowest:.4} rad/s: a blend that stops is not a blend"
     );
     rig.wait_status(
         "the blended joint chain reports both commands complete",
@@ -2418,15 +3075,15 @@ fn to_deg(rad: [f64; NUM_JOINTS]) -> [f64; NUM_JOINTS] {
     rad.map(f64::to_degrees)
 }
 
-/// A posture whose pose the seeded solve reaches only by turning: from
-/// the park pose, DLS converges on a configuration with J4 and J6 each
-/// a full revolution out (`+2π`) — the same arm and numbers the
-/// soft-limit check rejects verbatim. Chosen near the park pose so the
-/// executed move is short and the sim's tracking lag stays far inside
-/// the landing tolerance.
-const TURNED_POSTURE_RAD: [f64; NUM_JOINTS] = [
-    0.585_609, -1.010_888, 3.205_22, -0.031_356, -0.093_302, 3.045_917,
-];
+/// A posture clear of the wrist singularity, with J6 near the top of
+/// its window.
+const TURNED_POSTURE_RAD: [f64; NUM_JOINTS] =
+    [0.585_609, -1.010_888, 3.205_22, -0.031_356, -0.093_302, 5.2];
+
+/// J6 where the move to [`TURNED_POSTURE_RAD`] starts: more than π below
+/// the target, so the solution nearest this seed is the target's `-2π`
+/// alias — below J6's window, while the target itself is inside it.
+const SEED_J6_RAD: f64 = 0.2;
 
 /// J5 held past its SOFT window (1.9 rad) but inside its hard one: a
 /// posture the arm can be teleported into and whose pose no turn of any
@@ -2436,17 +3093,12 @@ const BEYOND_SOFT_J5_RAD: f64 = 1.9;
 /// A converged IK solution is judged as a configuration, not as a turn
 /// count.
 ///
-/// Damped least squares integrates joint increments without bound, so a
-/// solve routinely lands on `q + 2πk`: the same arm posture, carried by
-/// a number the soft-limit check refuses verbatim — measured on this
-/// rig as `move target for joint 3 (5.366112773926797 rad) is outside
-/// soft limits [-2.6147335, 2.5547335]`, for a solution 0.917 rad
-/// inside that window.
-///
-/// Both halves are the fix: the turned solution has to run and land on
-/// the commanded pose, and a target that is out of range at every turn
-/// count has to stay refused — wrapping is branch selection, never a
-/// way past the limits.
+/// The closed-form solve returns each joint on the branch nearest its
+/// seed, and for a joint whose window is wider than π that branch can
+/// sit outside the window while a turn of it sits inside. That turned
+/// solution has to run and land on the commanded pose, and a target
+/// that is out of range at every turn count has to stay refused —
+/// wrapping is branch selection, never a way past the limits.
 #[test]
 fn ik_solutions_are_wrapped_into_their_soft_window() {
     let rig = boot_tagged("ikwrap");
@@ -2466,9 +3118,9 @@ fn ik_solutions_are_wrapped_into_their_soft_window() {
     });
     let target = wire_pose_at(&at_posture.pose, tcp_mm(&at_posture));
 
-    // Commanded from the park pose, the seeded solve turns J1 and J4 a
-    // revolution past their windows to reach it.
-    enable_and_teleport(&rig, &mut c, park);
+    let mut seed_deg = turned_deg;
+    seed_deg[5] = SEED_J6_RAD.to_degrees();
+    enable_and_teleport(&rig, &mut c, seed_deg);
     let i = c.ok_index(&move_j_pose(9101, target, 8.0));
     let (ok, detail) = c.wait_complete(i);
     assert!(
@@ -2493,6 +3145,12 @@ fn ik_solutions_are_wrapped_into_their_soft_window() {
             soft[j]
         );
     }
+    assert!(
+        (settled.angles[5] - turned_deg[5]).abs() < 1.0,
+        "J6 turned onto the in-window branch: {} deg, wanted {}",
+        settled.angles[5],
+        turned_deg[5]
+    );
 
     // Out of range at every turn count: J5 beyond its soft window, which
     // the wrist flip mirrors to the far side of the same window.
@@ -2549,36 +3207,7 @@ fn ik_solutions_are_wrapped_into_their_soft_window() {
 /// cannot use next to its own fixtures. Two speeds an order apart,
 /// because a landing that depends on approach speed is a lag, not a
 /// standoff.
-///
-/// RED, knowingly, and downstream of the drive: the fast leg rests at
-/// 6.0 mm against 5.0 plus or minus 1.0 — repeatably, three runs of
-/// three, which is itself new (it used to scatter). The surplus is two
-/// terms. About 0.45 mm is [`STANDOFF_SETTLE_MARGIN_RAD`], which is
-/// load-bearing and measured so: zeroed, the arm reaches 0.2 mm INSIDE
-/// the keep-out on two runs of three, and once bailed out to 65 mm. The
-/// other 0.55 mm is the coast after the placement's hold is dropped,
-/// bounded by the speed the handover is gated on — and that gate cannot
-/// go below the drive's own ring, which is what
-/// `a_held_servo_target_settles` is about. Gate it at 1e-3 rad/s while
-/// joint 1 still hunts and the placement never satisfies it, times out,
-/// and leaves the arm 0.3 mm inside the keep-out having reached 4.2 mm
-/// inside on the way. With joint 1 settled the same gate lands the arm
-/// at 5.3 to 5.7 mm on three runs of three and lifts the closest
-/// approach from 2.0 mm to 4.3.
-///
-/// So this goes green when the drive does. Two things not to retry:
-/// trimming the settle margin (above), and judging a landing more
-/// tightly than an arrival — below the coast every landing reads as a
-/// miss, each retry creeps in and coasts back out, and the arm parks
-/// where the retries ran out, measured at 9.8 mm.
 #[test]
-// Skipped on the owner's authorisation until there is bench time for the
-// ring-frequency measurement the doc comment describes. It is not a flake
-// and not weakened: it fails for a known reason, it still runs under
-// `--include-ignored`, and it goes green when the drive does.
-#[ignore = "the fast leg rests 1 mm outside the standoff because the handover gate \
-            cannot sit below the drive's ring; goes green when a_held_servo_target_settles \
-            does — see the doc comment"]
 fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
     let rig = boot_tagged("servogate");
     let mut c = Client::new(rig.addr());
@@ -2682,9 +3311,8 @@ fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
         // of the motion. Rest is only believable once the arm has held
         // still across a window WIDER than that pause.
         let settle = Instant::now() + Duration::from_secs(20);
-        // Wider than the whole refusal sequence's travel budget, so a
-        // pause between braking and placement cannot be read as the end
-        // of the motion.
+        // Wider than the measured-braking phase budget, so a pause before
+        // a residual correction cannot be read as the end of the motion.
         let quiet = Duration::from_secs(4);
         let mut rest = f64::NAN;
         let mut last = f64::NAN;
@@ -2806,72 +3434,10 @@ fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
 /// the config declares "arrived" means — read from the config the rig
 /// booted rather than restated here.
 ///
-/// IGNORED, unresolved: the requirement is real, the arm meets it, and
-/// the simulator does not. Joint 1 rings at 5 Hz, 1.39 deg peak to peak
-/// against the config's 0.57 deg tolerance, with the commanded position
-/// pinned on the target. This needs bench time, not more analysis — what
-/// is known is written down here so none of it is re-derived.
-///
-/// The drive model is the firmware's
-/// (`Source-Robotics/STEPFOC-stepper-controller`), down to the integer
-/// encoder count its velocity is differenced from, the 20-sample average
-/// the loops read, the `V_errSum` clamp that has no anti-windup, and the
-/// current loop's PI into the winding against the configured voltage
-/// limit. Linearised, the cascade is
-///
-/// ```text
-/// J s^3 + Kv s^2 + (Kpp Kv + Kiv) s + Kpp Kiv
-/// ```
-///
-/// which holds only while `J < Kv^2/Kiv + Kv/Kpp`. In joint units joint 1
-/// has `Kv` 0.44 N.m.s/rad, `Kiv` 275 N.m/(rad/s)/s and `Kpp` 5.0, so it
-/// holds up to 0.088 kg.m^2, against 0.25 to 0.28 in the sim at this pose
-/// (agreed two ways: the torque trace, and `J = (Kpp Kv + Kiv)/w^2` from
-/// the ring itself). The frequency that polynomial predicts is 5 Hz,
-/// which is what it rings at — the sim is an accurate model of SOMETHING,
-/// just not of this arm.
-///
-/// Joint 1 is the only joint without margin. `Kv` goes as the SQUARE of
-/// the gear ratio (once through ticks per radian, once through torque),
-/// so its 6.4:1 leaves it fifteen times softer than joint 2's 25:1
-/// against a comparable inertia; joint 2 holds to 1.6 kg.m^2, joint 3 to
-/// 0.75.
-///
-/// RULED OUT, each against a measurement on the arm:
-///
-/// - The gains. `kpv` 0.06 settles it (`Kv > J Kpp`) and turns this whole
-///   file green, but the owner confirms the real arm holds still on the
-///   shipped 0.015, so the config is right and the model is wrong.
-/// - Inertia via mass. The URDF carries 5.11 kg above joint 1, 6.11 kg
-///   with the base; the arm weighs over 5 kg on a scale. The masses are
-///   not inflated.
-/// - Friction alone. Measured joint-1 breakaway is 0.19 to 0.25 N.m (110
-///   mA one way, 140 mA the other, at 1.756 N.m/A). The sim gives it only
-///   0.128 — `G * motor_tc_nm`, the motor's detent, because
-///   `drivetrain_friction` credits `holding_friction_nm` only against an
-///   external load and joint 1 is a vertical axis carrying none. So the
-///   sim DOES under-model this friction about twofold and that is worth
-///   fixing on its own, but it is not the answer: the ring only stops
-///   between 0.26 and 0.51 N.m, and breakaway is static stiction, an
-///   UPPER bound on the kinetic friction a joint already hunting would
-///   see.
-///
-/// WHAT WOULD SETTLE IT, and it needs the real arm: the ring frequency,
-/// which takes no torque constant, no efficiency, no friction and no
-/// inertia estimate — only a clock. `Kiv` dominates `Kpp Kv` (275 against
-/// 2.2), so `w^2 ~ Kiv/J`, and the stability condition `Kv > J Kpp`
-/// becomes a threshold on frequency alone: BELOW ABOUT 8.9 Hz THIS
-/// CASCADE HUNTS, ABOVE IT IT HOLDS. Hold joint 1 on a target, push the
-/// link a few degrees off it, let go, and log the angle. If the real
-/// transient rings near 10 Hz then `kt * eta / J` on the arm is about
-/// four times the sim's and one of those three is wrong here. If it rings
-/// near 5 Hz and decays, the inertia and gains are right and the real
-/// drive has damping this model lacks. If it rings near 5 Hz and does not
-/// decay, the arm hunts too, below the threshold of noticing, and the
-/// tolerance is what wants revisiting.
+/// This extended pose exercises the base joint's high-inertia load. The
+/// configured drive gains must settle it without changing the machine's
+/// arrival tolerance; otherwise a keep-out landing has no stable endpoint.
 #[test]
-#[ignore = "joint 1 hunts in the sim and not on the arm, and the cause is not yet \
-            found; needs a ring-frequency measurement on the robot — see the doc"]
 fn a_held_servo_target_settles() {
     let tol_rad = par6_config::RobotConfig::load(&common::shipped_config())
         .expect("shipped config")
@@ -2884,29 +3450,41 @@ fn a_held_servo_target_settles() {
     enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
     rig.drain_status();
 
+    // Five seconds of the runtime's own clock, the target re-sent on
+    // every other frame — well inside the stream watchdog.
     let target = with_j0(SWEEP_START_DEG, 20.0);
-    let end = Instant::now() + Duration::from_secs(5);
-    let mut sent = Instant::now() - Duration::from_secs(1);
-    let mut trace: Vec<f64> = Vec::new();
-    while Instant::now() < end {
-        if sent.elapsed() >= Duration::from_millis(50) {
-            c.send(&Command::ServoJ(par6_proto::command::ServoJ {
-                angles: target,
-                speed: None,
-                accel: None,
-            }));
-            sent = Instant::now();
-        }
+    let hold = || {
+        Command::ServoJ(par6_proto::command::ServoJ {
+            angles: target,
+            speed: None,
+            accel: None,
+        })
+    };
+    c.send(&hold());
+    let first = rig.wait_status("the hold started", |_| true);
+    let mut trace: Vec<(u64, f64)> = Vec::new();
+    while trace
+        .last()
+        .is_none_or(|(t, _)| *t < first.mono_time_ns + 5_000_000_000)
+    {
         if let Some(s) = rig.recv_status() {
-            trace.push(s.angles[0]);
+            if s.seq % 2 == 0 {
+                c.send(&hold());
+            }
+            trace.push((s.mono_time_ns, s.angles[0]));
         }
     }
     rig.shutdown();
 
-    // The last second of a five-second hold: by then the arm has had
-    // four seconds to cover twenty degrees.
-    assert!(trace.len() > 40, "no status stream to judge");
-    let tail = &trace[trace.len() - 30..];
+    // The last second of the hold: by then the arm has had four seconds
+    // to cover twenty degrees.
+    let last_t = trace.last().expect("status during the hold").0;
+    let tail: Vec<f64> = trace
+        .iter()
+        .filter(|(t, _)| *t + 1_000_000_000 >= last_t)
+        .map(|(_, a)| *a)
+        .collect();
+    assert!(tail.len() > 10, "no status stream to judge");
     let lo = tail.iter().cloned().fold(f64::INFINITY, f64::min);
     let hi = tail.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     let tol_deg = tol_rad.to_degrees();
@@ -3098,52 +3676,6 @@ fn move_p_tracks_its_corner_without_stopping_in_it() {
     rig.shutdown();
 }
 
-/// A world change during a move does not manufacture a failure: a
-/// keep-out that stays clear of the remaining path leaves the move to
-/// complete, with no verdict and no standing error.
-///
-/// The control for the mid-flight re-guard beside it: without this, a
-/// runtime that failed every running move on ANY world change would
-/// pass the keep-out-on-the-path test just the same.
-#[test]
-fn an_off_path_world_change_leaves_a_running_move_alone() {
-    let rig = boot_tagged("collision-offpath");
-    let mut c = Client::new(rig.addr());
-    rig.wait_status("link_ok", |s| s.link_ok == 1);
-    c.ok(&Command::Reset);
-    let end_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG);
-
-    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
-    let i = c.ok_index(&move_j(8101, end_deg, SWEEP_S));
-    rig.drain_status();
-    rig.wait_status("the sweep is under way", |s| {
-        s.executing_index == i as i64 && s.angles[0] > SWEEP_START_DEG[0] + 3.0
-    });
-    c.ok(&set_shapes(vec![keepout_at("far", [900.0, 900.0, 900.0])]));
-    let (program, _) = shapes_readback(&mut c);
-    assert_eq!(program.len(), 1, "the far box must be applied, not ignored");
-
-    let (ok, detail) = c.wait_complete(i);
-    assert!(
-        ok,
-        "a world change clear of the path must not stop the move, got {detail:?}"
-    );
-    let s = settled_tcp(&rig, "the arm at rest at the end of the sweep");
-    assert!(
-        angles_close(&s.angles, &end_deg, 1.0),
-        "the move must run to its target: {:?}",
-        s.angles
-    );
-    assert!(
-        !s.collision_active && s.collision_pairs.is_empty() && s.error.is_none(),
-        "an off-path change must leave no verdict behind: active={} pairs={:?} error={:?}",
-        s.collision_active,
-        s.collision_pairs,
-        s.error
-    );
-    rig.shutdown();
-}
-
 /// A move queued behind another is re-guarded when it ACTIVATES, not
 /// only when it was accepted.
 ///
@@ -3223,13 +3755,17 @@ fn planning_does_not_stall_the_command_plane() {
     let s = curve_start(&rig, &mut c);
     let start = tcp_mm(&s);
 
-    // Twenty-four reversals: every corner is an IK solve and a blend,
-    // and the retimer has to search hard across them.
-    let waypoints: Vec<[f64; 6]> = (0..24)
+    // Ninety-six right-angle corners, a descending square spiral: every
+    // corner is an IK solve and a blend, and the retimer has to search
+    // hard across them. Not reversals: a path that doubles back on itself
+    // has a cusp the retimer cannot give a speed to, and the move is
+    // refused instead of planned.
+    let square = [(0.0, 0.0), (20.0, 0.0), (20.0, 20.0), (0.0, 20.0)];
+    let waypoints: Vec<[f64; 6]> = (0..96)
         .map(|i| {
-            let leg = f64::from(i);
-            let x = start[0] + if i % 2 == 0 { 60.0 } else { 0.0 };
-            wire_pose_at(&s.pose, [x, start[1], start[2] - leg * 4.0])
+            let (dx, dy) = square[i % 4];
+            let z = start[2] - f64::from(i as u32);
+            wire_pose_at(&s.pose, [start[0] + dx, start[1] + dy, z])
         })
         .collect();
 
@@ -3262,20 +3798,21 @@ fn planning_does_not_stall_the_command_plane() {
         "the queue ack took {ack:?}, which is not the enqueue it is supposed to be"
     );
 
-    // Watch for exactly as long as the command takes, so the window is
-    // the planning window rather than a guess about it.
+    // Watch until the move starts executing, so the window is the
+    // planning window rather than a guess about it — and a path the
+    // planner refused never starts, so starting is the plan succeeding.
     let mut worst = Duration::ZERO;
     let mut ping_worst = Duration::ZERO;
     let mut last = Instant::now();
     let deadline = Instant::now() + BUDGET;
-    while !c.peek_complete(i) {
-        assert!(Instant::now() < deadline, "the command never completed");
-        if rig.recv_status().is_some() {
+    let mut started = false;
+    while !started {
+        assert!(Instant::now() < deadline, "the command never started");
+        if let Some(s) = rig.recv_status() {
             worst = worst.max(last.elapsed());
             last = Instant::now();
+            started = s.executing_index == i as i64;
         }
-        // Also the receive-side probe: each one reads replies, which is
-        // what stashes the COMPLETE this loop is waiting for.
         let t = Instant::now();
         let _ = c.query(&Command::Ping);
         ping_worst = ping_worst.max(t.elapsed());

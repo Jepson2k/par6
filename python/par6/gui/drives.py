@@ -288,6 +288,7 @@ class DrivesPanel(Panel):
                         {"name": "hw_ver", "label": "HW", "field": "hw_ver"},
                         {"name": "sw_ver", "label": "FW", "field": "sw_ver"},
                         {"name": "serial", "label": "Serial", "field": "serial"},
+                        {"name": "tool_id", "label": "Tool", "field": "tool_id"},
                     ],
                     rows=[],
                     row_key="node",
@@ -316,6 +317,7 @@ class DrivesPanel(Panel):
                 "hw_ver": row.get("hw_ver") or "—",
                 "sw_ver": row.get("sw_ver") or "—",
                 "serial": row.get("serial") or "—",
+                "tool_id": row.get("tool_id") or "—",
             }
             for row in rows
             if row.get("present") or row.get("configured")

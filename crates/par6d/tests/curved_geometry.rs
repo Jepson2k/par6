@@ -18,9 +18,9 @@ use par6d::preview::{Preview, PreviewResult};
 
 mod common;
 use common::{
-    assets_dir, distance, distance_to_segment, path_misses, process_corner, progress_along,
-    retimed_config, rotation_angle_deg, span_tcp, spline_waypoints, to_rad, wire_pose_at,
-    ARC_RADIUS_MM, CURVE_START_DEG,
+    assets_dir, distance, distance_to_segment, path_misses, process_corner, retimed_config,
+    rotation_angle_deg, span_tcp, spline_waypoints, to_rad, wire_pose_at, ARC_RADIUS_MM,
+    CURVE_START_DEG,
 };
 
 /// The planner's own path error. Two orders tighter than the live suite's
@@ -81,7 +81,8 @@ fn path_of(preview: &mut Preview, r: &PreviewResult) -> Vec<[f64; 3]> {
 ///
 /// Four independent ways to fail the name: leave the circle, leave its
 /// plane, miss the via point, or hug the chord — which is a `move_l`
-/// wearing an arc's command tag.
+/// wearing an arc's command tag. A `rel: true` twin lands on the same
+/// circle.
 #[test]
 fn move_c_traces_the_circle_through_its_via_point() {
     let mut p = planned("curve-arc");
@@ -138,18 +139,12 @@ fn move_c_traces_the_circle_through_its_via_point() {
         end_miss < PLAN_TOL_MM,
         "move_c planned to end {end_miss:.3} mm off its end pose"
     );
-}
 
-/// `rel: true` resolves via and end against the pose the move starts at.
-///
-/// Read as absolute, these deltas are millimetres from the world origin —
-/// far outside the arm — so a move that lands where its absolute twin
-/// lands can only have resolved them relatively.
-#[test]
-fn a_relative_move_c_lands_where_its_absolute_twin_lands() {
-    let mut p = planned("curve-arc-rel");
-    let end = [p.start[0] + 2.0 * ARC_RADIUS_MM, p.start[1], p.start[2]];
-
+    // `rel: true` resolves via and end against the pose the move starts
+    // at. Read as absolute, these deltas are millimetres from the world
+    // origin — far outside the arm — so a move that lands where its
+    // absolute twin lands can only have resolved them relatively.
+    p.preview.teleport_rad(to_rad(&CURVE_START_DEG));
     let r = p.preview.submit(Command::MoveC(MoveC {
         key: 4005,
         via: [ARC_RADIUS_MM, 0.0, -ARC_RADIUS_MM, 0.0, 0.0, 0.0],
@@ -162,13 +157,11 @@ fn a_relative_move_c_lands_where_its_absolute_twin_lands() {
         rel: true,
     }));
     let path = path_of(&mut p.preview, &r);
-
     let miss = distance(*path.last().expect("path"), end);
     assert!(
         miss < PLAN_TOL_MM,
         "the rel arc planned to end {miss:.3} mm from where its absolute twin lands"
     );
-    let center = [p.start[0] + ARC_RADIUS_MM, p.start[1], p.start[2]];
     let radial = path
         .iter()
         .map(|q| (distance(*q, center) - ARC_RADIUS_MM).abs())
@@ -223,16 +216,30 @@ fn move_s_passes_through_every_waypoint_and_curves_between_them() {
         end_miss < PLAN_TOL_MM,
         "move_s planned to end {end_miss:.3} mm off its last waypoint"
     );
-    // Between the first two waypoints it leaves the chord joining them.
-    let bow = path
-        .iter()
-        .filter(|q| (0.1..0.9).contains(&progress_along(**q, waypoints[0], waypoints[1])))
-        .map(|q| distance_to_segment(*q, waypoints[0], waypoints[1]))
-        .fold(0.0f64, f64::max);
-    assert!(
-        bow > 3.0,
-        "move_s ran straight between its waypoints ({bow:.2} mm of bow)"
-    );
+    // Between every pair of consecutive waypoints it leaves the chord
+    // joining them: each stretch of the path, cut at the rows nearest the
+    // waypoints, is measured against its own chord, by more than twice
+    // the planner's own error. A polyline through the same points sits on
+    // every chord.
+    let nearest = |w: [f64; 3]| {
+        (0..path.len())
+            .min_by(|&a, &b| distance(path[a], w).total_cmp(&distance(path[b], w)))
+            .expect("path")
+    };
+    let cuts: Vec<usize> = waypoints.iter().map(|w| nearest(*w)).collect();
+    for (k, pair) in waypoints.windows(2).enumerate() {
+        let (from, to) = (cuts[k], cuts[k + 1]);
+        assert!(from < to, "move_s reached waypoint {} before {k}", k + 1);
+        let bow = path[from..=to]
+            .iter()
+            .map(|q| distance_to_segment(*q, pair[0], pair[1]))
+            .fold(0.0f64, f64::max);
+        assert!(
+            bow > 2.0 * PLAN_TOL_MM,
+            "move_s ran straight from waypoint {k} to {} ({bow:.2} mm of bow)",
+            k + 1
+        );
+    }
 }
 
 /// `move_p` rounds its interior corner instead of stopping in it, and
@@ -425,58 +432,80 @@ fn a_rounded_square_holds_the_tool_orientation_through_every_corner() {
     );
 }
 
-/// A full-speed `move_l` never sweeps the tool faster than the planned
-/// linear ceiling, however much room the joints have: the `speed`
-/// fraction scales a TCP speed, as it does on parol6.
+/// A `move_l` never sweeps the tool faster than the planned linear
+/// ceiling times its `speed` fraction, however much room the joints have:
+/// the fraction scales a TCP speed, as it does on parol6. The ceiling is
+/// set off the shipped value, so it is the config's that binds.
 #[test]
 fn a_full_speed_move_l_runs_at_the_tcp_ceiling_not_the_joints() {
-    let mut p = planned("curve-ceiling");
-    let far = [p.start[0] + 150.0, p.start[1], p.start[2]];
-    let result = p.preview.submit(Command::MoveL(MoveL {
-        key: 4101,
-        pose: wire_pose_at(&p.pose, far),
-        frame: Frame::Wrf,
-        duration: None,
-        speed: Some(1.0),
-        accel: None,
-        blend_radius: None,
-        rel: false,
-    }));
-    assert!(
-        result.error.is_none(),
-        "the move must be accepted, got {:?}",
-        result.error
+    const CEILING_M_S: f64 = 0.15;
+    let config = retimed_config("curve-ceiling", 0.02);
+    let text = std::fs::read_to_string(&config).expect("read test config");
+    let patched = text.replace(
+        "planned_linear_max_m_s = 0.2",
+        &format!("planned_linear_max_m_s = {CEILING_M_S}"),
     );
-    let record = p.preview.plan_record(None);
-    let dt = record.row_dt_s;
-    let path: Vec<[f64; 3]> = span_tcp(&record, result.start_row, result.rows)
-        .iter()
-        .map(tcp_mm)
-        .collect();
-    // 150 mm at up to 0.2 m/s is under a second of rows at the row rate.
-    assert!(
-        path.len() > 25,
-        "expected a sampled path, got {} points",
-        path.len()
+    assert_ne!(
+        patched, text,
+        "planned_linear_max_m_s patch point must exist"
     );
-    let speeds: Vec<f64> = path.windows(2).map(|w| distance(w[0], w[1]) / dt).collect();
-    let fastest = speeds.iter().copied().fold(0.0f64, f64::max);
-    // 0.2 m/s is the shipped `planned_linear_max_m_s`; a row-rate sample
-    // of a path sampled every 2 mm rounds by well under 2%.
-    assert!(
-        fastest <= 200.0 * 1.02,
-        "the tool peaked at {fastest:.1} mm/s over a 200 mm/s ceiling"
-    );
-    assert!(
-        fastest >= 150.0,
-        "the tool never got near the ceiling ({fastest:.1} mm/s): the ceiling is not what bounds this move"
-    );
+    std::fs::write(&config, patched).expect("write ceiling config");
+    let mut preview =
+        Preview::new(Some(&config), Some(&assets_dir()), None).expect("the preview boots");
+    preview.set_homed(true);
+    for fraction in [1.0, 0.5] {
+        preview.teleport_rad(to_rad(&CURVE_START_DEG));
+        let pose = preview.pose().expect("FK at the start posture");
+        let start = tcp_mm(&pose);
+        let far = [start[0] + 150.0, start[1], start[2]];
+        let result = preview.submit(Command::MoveL(MoveL {
+            key: 4101,
+            pose: wire_pose_at(&pose, far),
+            frame: Frame::Wrf,
+            duration: None,
+            speed: Some(fraction),
+            accel: None,
+            blend_radius: None,
+            rel: false,
+        }));
+        assert!(
+            result.error.is_none(),
+            "the move must be accepted, got {:?}",
+            result.error
+        );
+        let record = preview.plan_record(None);
+        let dt = record.row_dt_s;
+        let path: Vec<[f64; 3]> = span_tcp(&record, result.start_row, result.rows)
+            .iter()
+            .map(tcp_mm)
+            .collect();
+        assert!(
+            path.len() > 25,
+            "expected a sampled path, got {} points",
+            path.len()
+        );
+        let speeds: Vec<f64> = path.windows(2).map(|w| distance(w[0], w[1]) / dt).collect();
+        let fastest = speeds.iter().copied().fold(0.0f64, f64::max);
+        // A row-rate sample of a path sampled every 2 mm rounds by well
+        // under 2 %; the move is long enough to spend most of itself at
+        // the ceiling.
+        let ceiling = CEILING_M_S * 1e3 * fraction;
+        assert!(
+            fastest <= ceiling * 1.02,
+            "at {fraction} the tool peaked at {fastest:.1} mm/s over a {ceiling:.1} mm/s ceiling"
+        );
+        assert!(
+            fastest >= ceiling * 0.75,
+            "at {fraction} the tool never got near the {ceiling:.1} mm/s ceiling \
+             ({fastest:.1} mm/s): the ceiling is not what bounds this move"
+        );
+    }
 }
 
 /// The planned ceiling is on the tool's LINEAR speed, as parol6's is: a
 /// `move_l` that only turns the tool about its own axis has no linear
 /// speed to cap, and runs as fast as the wrist allows rather than at the
-/// ceiling over the rotation weight (0.2 m/s / 0.15 m/rad ≈ 1.33 rad/s).
+/// ceiling over the rotation weight.
 #[test]
 fn a_move_l_that_only_turns_the_tool_is_not_held_to_the_linear_ceiling() {
     let mut p = planned("curve-turn-in-place");
@@ -512,10 +541,16 @@ fn a_move_l_that_only_turns_the_tool_is_not_held_to_the_linear_ceiling() {
         .windows(2)
         .map(|w| rotation_angle_deg(&w[0], &w[1]).to_radians() / dt)
         .fold(0.0f64, f64::max);
-    let old_ceiling = 0.2 / 0.15;
+    // The linear ceiling over the rotation weight is what a rotation
+    // would be held to if the ceiling priced it.
+    let motion = par6_config::RobotConfig::load(&retimed_config("curve-turn-in-place", 0.02))
+        .expect("test config")
+        .motion;
+    let linear_ceiling = motion.planned_linear_max_m_s / motion.path_rot_weight_m_per_rad;
     assert!(
-        fastest > 1.3 * old_ceiling,
-        "the tool turned at no more than {fastest:.2} rad/s: the linear ceiling is holding a rotation"
+        fastest > 1.3 * linear_ceiling,
+        "the tool turned at no more than {fastest:.2} rad/s against the {linear_ceiling:.2} rad/s \
+         the linear ceiling would allow: the ceiling is holding a rotation"
     );
 }
 

@@ -22,8 +22,9 @@ use par6_bus::{
     BusError, BusState, DriverBus, Freshness, GripperCommand, JointCommand, LinkHealth,
     LoopbackBus, NodeId, PollAction,
 };
-use par6_config::{ConfigBundle, GripperConfig, RobotConfig};
-use par6_rt::hooks::{ClampStream, RampJog};
+use par6_config::{ConfigBundle, RobotConfig, ToolConfig};
+use par6_rt::adapters::{MotionJog, MotionStream};
+use par6_rt::hooks::ClampStream;
 use par6_rt::{
     sample_ring, CompletionPolicy, NoFk, RtCore, SharedDigitalIo, SharedFlashMarker,
     SharedLineGpio, SpecSettle, ZeroGravity,
@@ -64,6 +65,10 @@ impl DriverBus for FailingBus {
         self.inner.begin_tick(tick);
     }
 
+    fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>) {
+        self.inner.fit_tool(robot, tool);
+    }
+
     fn drain_rx(&mut self, state: &mut BusState) -> Result<usize, BusError> {
         if self.down {
             return Err(BusError::LinkDown);
@@ -99,7 +104,7 @@ impl DriverBus for FailingBus {
     fn boot_configure(
         &mut self,
         robot: &RobotConfig,
-        gripper: Option<&GripperConfig>,
+        gripper: Option<&ToolConfig>,
         repeats: u8,
     ) -> Result<(), BusError> {
         self.inner.boot_configure(robot, gripper, repeats)
@@ -124,6 +129,34 @@ impl DriverBus for FailingBus {
 
     fn save_config(&mut self, node: NodeId) -> Result<(), BusError> {
         self.inner.save_config(node)
+    }
+
+    fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError> {
+        self.inner.set_tool_id(node, tool_id)
+    }
+
+    fn set_ripple(
+        &mut self,
+        node: NodeId,
+        ripple: &[par6_config::RippleHarmonic],
+    ) -> Result<(), BusError> {
+        self.inner.set_ripple(node, ripple)
+    }
+
+    fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError> {
+        self.inner.set_velocity_window(node, window)
+    }
+
+    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
+        self.inner.capture_stream(node)
+    }
+
+    fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {
+        self.inner.capture_start(node, divisor, wanted)
+    }
+
+    fn capture(&self, node: NodeId) -> Option<&par6_bus::CaptureBuffer> {
+        self.inner.capture(node)
     }
 
     fn send_limits(
@@ -189,8 +222,8 @@ fn a_permanent_bus_fault_does_not_log_once_per_tick() {
     let (_producer, consumer) = sample_ring(64);
     let hooks = par6_rt::RtHooks {
         gravity: Box::new(ZeroGravity),
-        jog: Box::new(RampJog::new(&bundle.robot)),
-        stream: Box::new(ClampStream::new(&bundle.robot)),
+        jog: Box::new(MotionJog::from_config(&bundle.robot).expect("jog engine")),
+        stream: Box::new(MotionStream::from_config(&bundle.robot).expect("stream limiter")),
         stream_shaped: Box::new(ClampStream::new(&bundle.robot)),
         settle: Box::new(SpecSettle::new(
             CompletionPolicy::Settled,

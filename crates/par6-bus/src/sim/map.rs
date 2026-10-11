@@ -6,7 +6,7 @@ use crate::spectral::convert::JointConversion;
 
 /// Tick↔radian conversion (the REAL spectral conversion state, sector
 /// shift 0 — the sim's ground truth is unwrapped), the boot 14-bit wrap
-/// offset for reported positions, the hard limits and the torque↔current
+/// offset for reported positions, the endstops and the torque↔current
 /// factor of one arm joint.
 #[derive(Debug, Clone)]
 pub(crate) struct JointMap {
@@ -18,9 +18,9 @@ pub(crate) struct JointMap {
     pub report_offset: f64,
     /// `torque_to_ma_factor` \[mA per Nm\], sign included.
     pub factor_ma_per_nm: f64,
-    /// Hard limits \[rad\] (the scene's joint limits, the teleport clamp).
-    pub hard_lo_rad: f64,
-    pub hard_hi_rad: f64,
+    /// Mechanical endstops \[rad\] (the scene's joint limits, the
+    /// teleport clamp); `None` on a continuous joint.
+    pub endstops: Option<(f64, f64)>,
     pub gear_ratio: f64,
     /// Gear ratio the drivetrain reflections use (`dynamics_gear_ratio`,
     /// falling back to `gear_ratio` — the vendor's J1 tables disagree).
@@ -45,8 +45,7 @@ impl JointMap {
                 j.kt_nm_a,
                 j.dir,
             ),
-            hard_lo_rad: j.limits.hard_min_rad,
-            hard_hi_rad: j.limits.hard_max_rad,
+            endstops: j.limits.endstops(),
             gear_ratio: j.gear_ratio,
             dyn_gear: j.dynamics_gear_ratio.unwrap_or(j.gear_ratio),
             encoder_max_counts,

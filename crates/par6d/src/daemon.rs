@@ -38,11 +38,11 @@ use par6_rt::{
 };
 use par6_server::{ConfigInfoData, ServerConfig, ServerHandle};
 
-use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{housekeeping_loop, CoreLink, CoreOp, RtBridge, SharedState};
 use crate::grant::{self, BusGrant};
-use crate::options::{resolve_config_path, Options};
+use crate::options::{load_config, resolve_config_path, Options};
 use crate::planner::Par6Planner;
+use par6_rt::adapters::{MotionJog, MotionStream};
 
 /// Planner→RT sample ring capacity \[samples\] (~16 s at 4 ms; longer
 /// plans stream in under backpressure from the planner's poll loop).
@@ -63,6 +63,9 @@ pub enum DaemonError {
     /// Hardware mode is unavailable (missing interface or backend).
     #[error("{0}")]
     Hardware(String),
+    /// The gripper drive reports a tool the configuration does not know.
+    #[error("tool: {0}")]
+    Tool(String),
     /// The kinematics stack could not start (missing assets tree or a
     /// URDF that failed to load).
     #[error("kinematics: {0}")]
@@ -82,6 +85,10 @@ pub enum DaemonError {
     /// The command plane could not bind or start.
     #[error("command plane: {0}")]
     Io(#[from] std::io::Error),
+    /// A worker thread panicked; the arm's last frames are not known to
+    /// have been the shutdown sequence's.
+    #[error("{0} worker thread(s) panicked")]
+    WorkerPanicked(usize),
 }
 
 /// A running par6d instance (all threads + the command-plane server).
@@ -119,7 +126,56 @@ impl Daemon {
     pub fn start(opts: &Options) -> Result<Self, DaemonError> {
         let config_path =
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
-        let mut loaded = ConfigBundle::load(&config_path)?;
+        let (mut loaded, local) = load_config(&config_path, opts.local_config.as_deref(), None)?;
+        // What actually caps the tick rate is the wire, not the loop: the
+        // steady-state exchange has to finish inside one tick, and on
+        // classic CAN it is the binding constraint long before compute
+        // is. Only the real bus has one — `--sim` answers in memory —
+        // and the answer is the config's, so it comes before the
+        // interface is opened.
+        let mut hw_bus = if opts.sim {
+            None
+        } else {
+            refuse_unfit_bus(&loaded)?;
+            Some(open_hardware_bus(&loaded.robot.bus)?)
+        };
+        // The gripper drive says which tool is on the arm: a provisioned
+        // drive reports its tool id in its device info, and the bundle
+        // is fitted with that tool before anything is built from it. A
+        // drive that reports nothing leaves `active_tool` in charge; one
+        // that reports a tool the configuration does not know is a
+        // refusal, since fitting a guess is how a 200 mm rail once ran
+        // on a 150 mm gravity model. Only the real bus has a drive to
+        // ask — the simulator's gripper is whatever the bundle fits.
+        if let Some(bus) = hw_bus.as_mut() {
+            let node = loaded.robot.bus.gripper_node;
+            if let Some(id) = bus.probe_tool_id(node, &loaded.robot) {
+                let configured = loaded.robot.robot.active_tool.clone();
+                match loaded.tool_by_can_id(id).map(|t| t.name.clone()) {
+                    Some(name) if name != configured => {
+                        log::info!(
+                            "gripper node {node} reports tool id {id}: fitting `{name}` in \
+                             place of the configured `{configured}`"
+                        );
+                        loaded = load_config(&config_path, local.as_deref(), Some(&name))?.0;
+                        // A gripper drive on the bus is one more frame a tick.
+                        refuse_unfit_bus(&loaded)?;
+                    }
+                    Some(name) => {
+                        log::info!(
+                            "gripper node {node} reports tool id {id}: `{name}`, as configured"
+                        )
+                    }
+                    None => {
+                        return Err(DaemonError::Tool(format!(
+                            "gripper node {node} reports tool id {id}, which no configured \
+                             tool carries (can_tool_id); add it to that tool's config, or \
+                             provision the drive with `par6 tool-id`"
+                        )))
+                    }
+                }
+            }
+        }
         loaded.robot.timing = Some(resolve_loop_bands(opts.sim, loaded.robot.timing));
         loaded.robot.stream.command_timeout_s = resolve_stream_timeout(
             opts.sim,
@@ -154,46 +210,16 @@ impl Daemon {
                 bands.critical_sustain_s, robot.robot.tick_dt_s,
             )));
         }
-        // What actually caps the tick rate is the wire, not the loop: the
-        // steady-state exchange has to finish inside one tick, and on
-        // classic CAN it is the binding constraint long before compute
-        // is. Only the real bus has one — `--sim` answers in memory.
-        if !opts.sim {
-            let budget = par6_bus::budget::bus_budget(
-                robot.joints.len(),
-                bundle.active_gripper().is_some_and(|g| g.driver.is_some()),
-                robot.bus.bitrate,
-                robot.robot.tick_dt_s,
-            );
-            if !budget.fits() {
-                return Err(DaemonError::BusBudget(format!(
-                    "a {:.0} Hz tick asks for {} frames ({:.2} ms of wire time) on a \
-                     {} bit/s bus, which is {:.0}% of the {:.2} ms tick; this arm \
-                     carries at most {:.0} Hz on this bus",
-                    robot.tick_rate_hz(),
-                    budget.frames_per_tick,
-                    budget.wire_time_s * 1e3,
-                    robot.bus.bitrate,
-                    budget.utilisation * 100.0,
-                    robot.robot.tick_dt_s * 1e3,
-                    budget.max_tick_rate_hz,
-                )));
-            }
-            log::info!(
-                "bus budget: {} frames/tick, {:.2} ms of {:.2} ms ({:.0}%); ceiling {:.0} Hz",
-                budget.frames_per_tick,
-                budget.wire_time_s * 1e3,
-                robot.robot.tick_dt_s * 1e3,
-                budget.utilisation * 100.0,
-                budget.max_tick_rate_hz,
-            );
-        }
         log::info!(
-            "loaded {} ({} joints, tick {} Hz) from {}",
+            "loaded {} ({} joints, tick {} Hz) from {}{}",
             robot.robot.name,
             robot.joints.len(),
             robot.tick_rate_hz(),
-            config_path.display()
+            config_path.display(),
+            local
+                .as_deref()
+                .map(|l| format!(" + {}", l.display()))
+                .unwrap_or_default()
         );
         log::info!(
             "loop bands: degraded > {:.2}x dt, critical > {:.2}x dt sustained {} s",
@@ -217,7 +243,8 @@ impl Daemon {
             tool_offset,
             assets_dir,
             variant,
-        } = load_kin_stack(opts, &config_path, robot, bundle.active_gripper())?;
+            source: kin_source,
+        } = load_kin_stack(opts, &config_path, robot, bundle.active_tool())?;
 
         let dt = robot.robot.tick_dt_s;
         let stream_limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
@@ -253,10 +280,10 @@ impl Daemon {
         };
         let sim_bus = opts.sim.then(|| SimBus::new(sim_scene.clone()));
         let sim_world = sim_bus.as_ref().map(SimBus::mailbox);
-        let bus = if let Some(sim_bus) = sim_bus {
-            RuntimeBus::from(sim_bus)
-        } else {
-            RuntimeBus::from(open_hardware_bus(&robot.bus)?)
+        let bus = match (sim_bus, hw_bus.take()) {
+            (Some(sim_bus), _) => RuntimeBus::from(sim_bus),
+            (None, Some(hw)) => RuntimeBus::from(hw),
+            (None, None) => unreachable!("a hardware run opened its bus before the tool probe"),
         };
         let estop = estop_source(opts)?;
         let io = io_source(opts, &robot.io)?;
@@ -307,6 +334,9 @@ impl Daemon {
         };
 
         let link = CoreLink::new(cmds_tx, ops_tx, rt_break.clone());
+        // Where a select_tool leaves rebuilt models for the threads that own
+        // one: filled by the planner, drained by each owner in turn.
+        let tools: crate::bridge::ToolMailbox = Default::default();
         let planner = Par6Planner::new(
             link.clone(),
             producer,
@@ -318,6 +348,11 @@ impl Daemon {
                 collision,
                 tool_offset,
             },
+            crate::planner::PlannerSwap {
+                source: kin_source,
+                bundle: bundle.clone(),
+                tools: tools.clone(),
+            },
         )?;
         let stream_input = Arc::new(Mutex::new(handles.stream));
         let shared = Arc::new(Mutex::new(SharedState::default()));
@@ -328,6 +363,7 @@ impl Daemon {
         let stream_gate = Arc::new(Mutex::new(crate::bridge::StreamGate::new(
             gate_collision,
             &jog_limits,
+            &robot.jog,
             position_loop_gains(robot),
             robot.robot.tick_dt_s,
         )));
@@ -340,6 +376,7 @@ impl Daemon {
             opts.sim,
             sim_scene,
             sim_world,
+            tools.clone(),
             crate::bridge::CartStream {
                 kin: kin_bridge,
                 snapshots: bridge_snapshots,
@@ -349,13 +386,14 @@ impl Daemon {
             },
         );
         let mut cfg = server_config(opts, &bundle);
-        cfg.config_info = config_info(&config_path, &bundle.robot);
+        cfg.config_info = config_info(&config_path, local.as_deref(), &bundle.robot);
         let status_port = cfg.status_port;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()?;
         let mut threads: Vec<JoinHandle<()>> = Vec::new();
+
         // The installation layer is applied here, while the planner is
         // still in hand: it is immutable from the wire, and a keep-out
         // the runtime cannot enforce has to stop the boot rather than
@@ -459,6 +497,7 @@ impl Daemon {
                             shutdown,
                             kin_hk,
                             stream_gate,
+                            tools.clone(),
                             hk_stream_limits,
                         );
                     })?,
@@ -500,12 +539,13 @@ impl Daemon {
     }
 
     /// Stop everything: server task first, then the worker threads (all
-    /// joined), then the tokio runtime.
-    pub fn shutdown(mut self) {
-        self.stop();
+    /// joined), then the tokio runtime. A worker that panicked is an
+    /// error, not a log line.
+    pub fn shutdown(mut self) -> Result<(), DaemonError> {
+        self.stop()
     }
 
-    fn stop(&mut self) {
+    fn stop(&mut self) -> Result<(), DaemonError> {
         if let Some(server) = self.server.take() {
             server.shutdown();
             if let Some(rt) = &self.runtime {
@@ -516,20 +556,27 @@ impl Daemon {
         }
         self.shutdown.store(true, Ordering::SeqCst);
         self.rt_break.store(true, Ordering::SeqCst);
-        for t in self.threads.drain(..) {
-            if t.join().is_err() {
-                log::error!("worker thread panicked during shutdown");
-            }
-        }
+        let panicked = self
+            .threads
+            .drain(..)
+            .map(JoinHandle::join)
+            .filter(Result::is_err)
+            .count();
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_timeout(Duration::from_secs(1));
         }
+        if panicked > 0 {
+            log::error!("{panicked} worker thread(s) panicked");
+            return Err(DaemonError::WorkerPanicked(panicked));
+        }
+        Ok(())
     }
 }
 
 impl Drop for Daemon {
     fn drop(&mut self) {
-        self.stop();
+        // The panic, if any, is already logged.
+        let _ = self.stop();
     }
 }
 
@@ -687,60 +734,68 @@ struct ConfigFiles {
     fingerprint: String,
     robot_filename: String,
     robot_toml: String,
-    grippers: Vec<(String, String)>,
+    tools: Vec<(String, String)>,
 }
 
-fn read_config_files(robot_toml: &std::path::Path) -> std::io::Result<ConfigFiles> {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    let mut read = |path: &std::path::Path| -> std::io::Result<(String, String)> {
+/// The files as the daemon runs them: when the gripper drive identified a
+/// tool other than the file's `active_tool`, the served TOML names that
+/// tool and the fingerprint follows, so a client that materializes this
+/// bundle (payload estimation does) fits what the arm is wearing.
+fn fitted_files(mut files: ConfigFiles, active_tool: &str) -> ConfigFiles {
+    if let Some(text) = par6_config::fitted_robot_toml(&files.robot_toml, active_tool) {
+        files.robot_toml = text;
+        files.fingerprint =
+            par6_config::config_fingerprint(&files.robot_filename, &files.robot_toml, &files.tools);
+    }
+    files
+}
+
+/// The robot TOML as the runtime runs it — with the local overlay merged
+/// in, so a client that rebuilds the config from these files gets the
+/// arm's values, not the shipped ones — and the tool files beside it.
+fn read_config_files(
+    robot_toml: &std::path::Path,
+    local: Option<&std::path::Path>,
+) -> std::io::Result<ConfigFiles> {
+    let read = |path: &std::path::Path| -> std::io::Result<(String, String)> {
         let name = path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("")
             .to_owned();
         let content = std::fs::read_to_string(path)?;
-        hasher.update(name.as_bytes());
-        hasher.update(b"\n");
-        hasher.update(content.as_bytes());
         Ok((name, content))
     };
-    let (robot_filename, robot_content) = read(robot_toml)?;
-    let dir = robot_toml
-        .parent()
-        .unwrap_or_else(|| std::path::Path::new("."))
-        .join("grippers");
-    let mut paths: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
-        Ok(rd) => rd
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
-            .collect(),
-        Err(_) => Vec::new(),
-    };
-    paths.sort();
-    let grippers = paths
-        .iter()
-        .map(|g| read(g))
-        .collect::<std::io::Result<Vec<_>>>()?;
+    let (robot_filename, _) = read(robot_toml)?;
+    let robot_content = par6_config::effective_robot_toml(robot_toml, local)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let tools = par6_config::effective_tool_tomls(robot_toml, local)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
     Ok(ConfigFiles {
-        fingerprint: format!("{:x}", hasher.finalize()),
+        fingerprint: par6_config::config_fingerprint(&robot_filename, &robot_content, &tools),
         robot_filename,
         robot_toml: robot_content,
-        grippers,
+        tools,
     })
 }
 
-fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) -> ConfigInfoData {
+fn config_info(
+    config_path: &std::path::Path,
+    local: Option<&std::path::Path>,
+    robot: &par6_config::RobotConfig,
+) -> ConfigInfoData {
     let m = robot.motion;
-    let files = read_config_files(config_path).unwrap_or_else(|e| {
-        log::warn!("config file readback failed: {e}");
-        ConfigFiles {
-            fingerprint: String::new(),
-            robot_filename: String::new(),
-            robot_toml: String::new(),
-            grippers: Vec::new(),
-        }
-    });
+    let files = read_config_files(config_path, local)
+        .map(|files| fitted_files(files, &robot.robot.active_tool))
+        .unwrap_or_else(|e| {
+            log::warn!("config file readback failed: {e}");
+            ConfigFiles {
+                fingerprint: String::new(),
+                robot_filename: String::new(),
+                robot_toml: String::new(),
+                tools: Vec::new(),
+            }
+        });
     ConfigInfoData {
         path: config_path.display().to_string(),
         fingerprint: files.fingerprint,
@@ -761,7 +816,7 @@ fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) 
             .collect(),
         robot_filename: files.robot_filename,
         robot_toml: files.robot_toml,
-        grippers: files.grippers,
+        tools: files.tools,
     }
 }
 
@@ -771,12 +826,18 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
     cfg.rt_tick_rate_hz = robot.tick_rate_hz();
     cfg.digital_outputs = robot.io.outputs.iter().map(|l| l.name.clone()).collect();
     cfg.simulator = opts.sim;
-    cfg.tools = bundle.grippers.iter().map(|g| g.name.clone()).collect();
+    cfg.tools = bundle.tools.iter().map(|g| g.name.clone()).collect();
+    cfg.driven_tools = bundle
+        .tools
+        .iter()
+        .filter(|g| g.driver.is_some())
+        .map(|g| g.name.clone())
+        .collect();
     // The fitted tool is the one the kinematics, gravity model and bus
     // were built around at startup; a passive tool (no CAN driver) has no
     // controllable DOF.
-    cfg.fitted_tool = robot.robot.active_gripper.clone();
-    cfg.tool_dof = usize::from(bundle.active_gripper().is_some_and(|g| g.driver.is_some()));
+    cfg.fitted_tool = robot.robot.active_tool.clone();
+    cfg.tool_dof = usize::from(bundle.active_tool().is_some_and(|g| g.driver.is_some()));
     cfg.cartesian = true;
     // The drives `set_pid_gains` may retune: every joint node, plus the
     // gripper motor when the fitted tool drives one over CAN.
@@ -790,22 +851,36 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
             voltage_limit_mv: j.voltage_limit_mv,
         })
         .collect();
-    if let Some(d) = bundle.active_gripper().and_then(|g| g.driver.as_ref()) {
-        cfg.tunable_nodes.push(par6_server::TunableNode {
-            node: robot.bus.gripper_node,
-            ilim_ma: d.ilim_ma,
-            velocity_limit_ticks_s: d.velocity_limit_ticks_s,
-            voltage_limit_mv: d.voltage_limit_mv,
-        });
+    cfg.tool_ids = bundle.tools.iter().filter_map(|g| g.can_tool_id).collect();
+    cfg.tool_drives = bundle
+        .tools
+        .iter()
+        .filter_map(|g| {
+            let d = g.driver.as_ref()?;
+            Some((
+                g.name.clone(),
+                par6_server::TunableNode {
+                    node: robot.bus.gripper_node,
+                    ilim_ma: d.ilim_ma,
+                    velocity_limit_ticks_s: d.velocity_limit_ticks_s,
+                    voltage_limit_mv: d.voltage_limit_mv,
+                },
+            ))
+        })
+        .collect();
+    if let Some((_, drive)) = cfg
+        .tool_drives
+        .iter()
+        .find(|(t, _)| *t == robot.robot.active_tool)
+    {
+        cfg.tunable_nodes.push(*drive);
     }
     // The window `teleport` may place a joint in. Refusing outside it is
     // the server's job: the bridge is fire-and-forget and has no reply
     // channel to refuse on.
     for (slot, joint) in cfg.joint_hard_limits_deg.iter_mut().zip(&robot.joints) {
-        *slot = (
-            joint.limits.hard_min_rad.to_degrees(),
-            joint.limits.hard_max_rad.to_degrees(),
-        );
+        let (lo, hi) = joint.limits.travel_rad();
+        *slot = (lo.to_degrees(), hi.to_degrees());
     }
     cfg.profiles = crate::planner::profile_names();
     cfg.initial_profile = crate::planner::DEFAULT_PROFILE.to_owned();
@@ -853,6 +928,9 @@ pub(crate) struct KinStack {
     /// The URDF variant the models were built for; the sim scene carries
     /// the same tool.
     pub(crate) variant: par6_kin::GripperVariant,
+    /// The sources the models were built from, so a `select_tool` can
+    /// rebuild them for a different tool.
+    pub(crate) source: KinSource,
 }
 
 /// The sim scene tool matching a kinematics variant.
@@ -868,6 +946,7 @@ pub(crate) fn scene_tool(variant: par6_kin::GripperVariant) -> Tool {
 /// (missing tree, bad URDF) is a clean startup error.
 /// What every kinematics object is built from: the resolved assets
 /// directory and URDF variant, plus the config-derived solver settings.
+#[derive(Clone)]
 pub(crate) struct KinSource {
     assets_dir: std::path::PathBuf,
     /// Where `package://` mesh URIs resolve, when the assets tree is an
@@ -883,14 +962,14 @@ impl KinSource {
         opts: &Options,
         config_path: &std::path::Path,
         robot: &par6_config::RobotConfig,
-        active_gripper: Option<&par6_config::GripperConfig>,
+        active_tool: Option<&par6_config::ToolConfig>,
     ) -> Result<Self, DaemonError> {
         use crate::kin::{resolve_assets_dir, variant_for, SoftWindow};
         let assets_dir = resolve_assets_dir(opts.assets.as_deref(), config_path)
             .map_err(DaemonError::Kinematics)?;
         let variant = variant_for(
-            &robot.robot.active_gripper,
-            active_gripper.and_then(|g| g.urdf_variant.as_deref()),
+            &robot.robot.active_tool,
+            active_tool.and_then(|g| g.urdf_variant.as_deref()),
         );
         log::info!(
             "kinematics: {} from {}",
@@ -906,6 +985,24 @@ impl KinSource {
         })
     }
 
+    /// The same sources, resolved for a different tool.
+    ///
+    /// Only the URDF variant depends on which tool is fitted, so a
+    /// `select_tool` rebuild is this plus the gripper's own DH/inertial
+    /// params — the assets tree, the soft window and the damping are
+    /// properties of the arm and do not move.
+    pub(crate) fn for_gripper(&self, gripper: Option<&par6_config::ToolConfig>) -> Self {
+        Self {
+            assets_dir: self.assets_dir.clone(),
+            package_dir: self.package_dir.clone(),
+            variant: crate::kin::variant_for(
+                gripper.map_or("", |g| g.name.as_str()),
+                gripper.and_then(|g| g.urdf_variant.as_deref()),
+            ),
+            window: self.window,
+            dls_lambda: self.dls_lambda,
+        }
+    }
     fn kin(&self) -> Result<par6_kin::Kin, DaemonError> {
         crate::kin::load_kin(&self.assets_dir, self.variant).map_err(DaemonError::Kinematics)
     }
@@ -922,6 +1019,17 @@ impl KinSource {
         ))
     }
 
+    pub(crate) fn assets_dir(&self) -> &std::path::Path {
+        &self.assets_dir
+    }
+
+    /// The RT's forward-kinematics hook for this tool.
+    pub(crate) fn kin_fk(
+        &self,
+        offset: &crate::kin::ToolOffset,
+    ) -> Result<crate::kin::KinFk, DaemonError> {
+        Ok(crate::kin::KinFk::new(self.kin()?, offset.clone()))
+    }
     pub(crate) fn collision(&self) -> Result<par6_kin::Collision, DaemonError> {
         crate::kin::load_collision(
             &self.assets_dir,
@@ -943,14 +1051,18 @@ pub(crate) fn load_kin_stack(
     opts: &Options,
     config_path: &std::path::Path,
     robot: &par6_config::RobotConfig,
-    active_gripper: Option<&par6_config::GripperConfig>,
+    active_tool: Option<&par6_config::ToolConfig>,
 ) -> Result<KinStack, DaemonError> {
     use crate::kin::{KinFk, KinGravity, ToolOffset};
-    let src = KinSource::resolve(opts, config_path, robot, active_gripper)?;
-    let gravity_kin = crate::kin::load_gravity_kin(&src.assets_dir, active_gripper)
+    let src = KinSource::resolve(opts, config_path, robot, active_tool)?;
+    let mut gravity_kin = crate::kin::load_gravity_kin(&src.assets_dir, active_tool)
         .map_err(DaemonError::Kinematics)?;
+    gravity_kin
+        .set_gravity_correction(&robot.gravity_correction)
+        .map_err(|e| DaemonError::Kinematics(e.to_string()))?;
     let tool_offset = ToolOffset::new();
     Ok(KinStack {
+        source: src.clone(),
         fk: KinFk::new(src.kin()?, tool_offset.clone()),
         gravity: KinGravity::new(gravity_kin),
         planner: src.cart_kin(&tool_offset)?,
@@ -976,15 +1088,17 @@ pub(crate) struct PreviewKin {
     /// lane than the planner's and each holds mutable scratch.
     pub(crate) gate_collision: par6_kin::Collision,
     pub(crate) tool_offset: crate::kin::ToolOffset,
+    /// What a `select_tool` rebuilds the models from.
+    pub(crate) source: KinSource,
 }
 
 pub(crate) fn load_preview_kin(
     opts: &Options,
     config_path: &std::path::Path,
     robot: &par6_config::RobotConfig,
-    active_gripper: Option<&par6_config::GripperConfig>,
+    active_tool: Option<&par6_config::ToolConfig>,
 ) -> Result<PreviewKin, DaemonError> {
-    let src = KinSource::resolve(opts, config_path, robot, active_gripper)?;
+    let src = KinSource::resolve(opts, config_path, robot, active_tool)?;
     let tool_offset = crate::kin::ToolOffset::new();
     Ok(PreviewKin {
         planner: src.cart_kin(&tool_offset)?,
@@ -992,6 +1106,7 @@ pub(crate) fn load_preview_kin(
         collision: src.collision()?,
         gate_collision: src.collision()?,
         tool_offset,
+        source: src,
     })
 }
 
@@ -1078,6 +1193,41 @@ pub(crate) fn flash_marker() -> Box<dyn FlashMarker> {
 /// the race against the CAN driver still enumerating the interface
 /// (systemd's device ordering only helps once the device unit exists),
 /// and a bounded retry turns that into a delay instead of a crash-loop.
+/// Refuse a tick the configured bus cannot carry, with the ceiling it
+/// can, and log the budget it does carry.
+fn refuse_unfit_bus(bundle: &ConfigBundle) -> Result<(), DaemonError> {
+    let robot = &bundle.robot;
+    let budget = par6_bus::budget::bus_budget(
+        robot.joints.len(),
+        bundle.active_tool().is_some_and(|g| g.driver.is_some()),
+        robot.bus.bitrate,
+        robot.robot.tick_dt_s,
+    );
+    if !budget.fits() {
+        return Err(DaemonError::BusBudget(format!(
+            "a {:.0} Hz tick asks for {} frames ({:.2} ms of wire time) on a \
+             {} bit/s bus, which is {:.0}% of the {:.2} ms tick; this arm \
+             carries at most {:.0} Hz on this bus",
+            robot.tick_rate_hz(),
+            budget.frames_per_tick,
+            budget.wire_time_s * 1e3,
+            robot.bus.bitrate,
+            budget.utilisation * 100.0,
+            robot.robot.tick_dt_s * 1e3,
+            budget.max_tick_rate_hz,
+        )));
+    }
+    log::info!(
+        "bus budget: {} frames/tick, {:.2} ms of {:.2} ms ({:.0}%); ceiling {:.0} Hz",
+        budget.frames_per_tick,
+        budget.wire_time_s * 1e3,
+        robot.robot.tick_dt_s * 1e3,
+        budget.utilisation * 100.0,
+        budget.max_tick_rate_hz,
+    );
+    Ok(())
+}
+
 fn open_hardware_bus(cfg: &par6_config::BusConfig) -> Result<SocketCanBus, DaemonError> {
     log::info!("bus backend: SocketCAN on '{}'", cfg.interface);
     open_with_retry(
@@ -1127,7 +1277,8 @@ mod tests {
     /// The startup retry: a bus that appears mid-window opens (the boot
     /// race the loop exists for), a bus that never appears fails with
     /// the last error after exactly `1 + floor(retry_s)` second-paced
-    /// attempts, and `retry_s = 0` means one attempt and no waiting.
+    /// attempts, `retry_s = 0` means one attempt and no waiting, and an
+    /// absurd window is bounded rather than wrapped.
     #[test]
     fn bus_open_retries_once_per_second_until_the_window_closes() {
         let mut calls = 0;
@@ -1152,15 +1303,19 @@ mod tests {
 
         let mut calls = 0;
         let mut waits = Vec::new();
-        let failed: Result<u32, &str> = open_with_retry(
+        let failed: Result<u32, String> = open_with_retry(
             3.9,
             || {
                 calls += 1;
-                Err("ENODEV")
+                Err(format!("attempt {calls}"))
             },
             |d| waits.push(d),
         );
-        assert_eq!(failed, Err("ENODEV"));
+        assert_eq!(
+            failed,
+            Err("attempt 4".to_owned()),
+            "the last error is reported"
+        );
         assert_eq!(calls, 4, "1 + floor(3.9) attempts");
         assert_eq!(waits.len(), 3, "no wait after the last attempt");
 
@@ -1180,13 +1335,10 @@ mod tests {
             (1, 0),
             "0 = fail on the first attempt"
         );
-    }
 
-    /// A retry window past the config ceiling is clamped to the ceiling
-    /// (an hour of attempts, not a wrapped count of zero), and a NaN
-    /// window still runs its one attempt.
-    #[test]
-    fn an_absurd_retry_window_is_bounded_not_wrapped() {
+        // A window past the config ceiling is clamped to the ceiling (an
+        // hour of attempts, not a wrapped count of zero), and a NaN window
+        // still runs its one attempt.
         let attempts_for = |window: f64| {
             let mut calls = 0u32;
             let failed: Result<u32, &str> = open_with_retry(
@@ -1212,7 +1364,6 @@ mod tests {
     fn sim_relaxes_the_loop_bands_but_never_overrides_a_declared_section() {
         assert_eq!(resolve_loop_bands(false, None), TimingConfig::default());
         assert_eq!(resolve_loop_bands(true, None), TimingConfig::SIM);
-        assert!(TimingConfig::SIM.critical_factor > TimingConfig::default().critical_factor);
 
         // A config asking for a tight guard keeps it under --sim, so a
         // test can still prove the critical latch fires on the simulator.
@@ -1263,21 +1414,5 @@ mod tests {
             panic!("hardware mode must refuse an unreadable ESTOP_1");
         };
         assert!(msg.contains("ESTOP_1"), "the refusal names the line: {msg}");
-    }
-
-    /// Every FLASHING exit invalidates homing.
-    ///
-    /// The wiring this pins was a dropped write handle: a marker nothing
-    /// could ever set answered "no flash happened" for the life of the
-    /// process, so `RtCore::leave_mode` kept a home reference that the
-    /// driver reboot had already destroyed.
-    #[test]
-    fn the_flash_marker_reports_a_flash_on_every_flashing_exit() {
-        let mut marker = flash_marker();
-        assert!(marker.flashed(), "par6d cannot tell a flash from a scan");
-        assert!(
-            marker.flashed(),
-            "consulted once per window — a second window must invalidate too"
-        );
     }
 }

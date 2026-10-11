@@ -10,7 +10,7 @@
 //! - inertials: overwritten from the URDF, the mass-property source of
 //!   truth (the vendor MJCF carries stale shell-only inertias — see the
 //!   assets CHANGELOG);
-//! - timestep: the largest step ≤ 1 ms that divides the bus tick;
+//! - timestep: the largest step ≤ the drive-loop period that divides the bus tick;
 //! - actuators: deleted — the plant drives every DOF through `qfrc_applied`;
 //! - arm joints: armature / damping / frictionloss / limits from the robot
 //!   config, replacing the vendor's single eyeballed class-`Y` tuning;
@@ -23,11 +23,17 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use mujoco_rs::prelude::{MjModel, MjSpec, MjtGeom, MjtJoint, SpecItem, SpecObject};
-use mujoco_rs::wrappers::mj_editing::MjsGeom;
-use par6_config::SimConfig;
+use mujoco_rs::wrappers::mj_editing::{MjsGeom, MjtLimited};
 use par6_proto::{Physical, Shape};
 
 use super::map::JointMap;
+
+/// Name prefix of each arm joint's motor rotor (body and joint), present
+/// when its drivetrain has a stiffness.
+pub const ROTOR_PREFIX: &str = "par6/rotor/";
+
+/// Name prefix of the tendon that is each compliant drivetrain's spring.
+pub const TRANSMISSION_PREFIX: &str = "par6/transmission/";
 
 /// MJCF joint names of the six arm joints, in config order.
 pub const ARM_JOINTS: [&str; 6] = [
@@ -41,7 +47,7 @@ pub const ARM_JOINTS: [&str; 6] = [
 
 /// Upper bound on the integration step \[s\]; the actual step is the
 /// largest value at or under this that divides the bus tick exactly.
-pub const MAX_TIMESTEP_S: f64 = 0.001;
+pub const MAX_TIMESTEP_S: f64 = super::driver::FW_LOOP_DT;
 
 /// The tool the scene is fitted with — the config's `urdf_variant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,23 +104,38 @@ pub struct Scene {
 pub struct JointTuning {
     /// Reflected rotor inertia `G² · Jm` \[kg·m²\].
     pub armature: f64,
-    /// Reflected viscous friction `G² · b` \[N·m·s\].
+    /// Viscous friction at the joint \[N·m·s\], as measured there.
     pub damping: f64,
-    /// Reflected Coulomb friction `G · tc` \[N·m\].
+    /// Coulomb friction at the joint \[N·m\], as measured there.
     pub frictionloss: f64,
-    /// Config hard limits \[rad\].
-    pub range: [f64; 2],
+    /// The joint's endstops \[rad\]; `None` on a continuous joint.
+    pub endstops: Option<(f64, f64)>,
+    /// Drivetrain stiffness between motor and link \[Nm/rad\]; 0 = rigid.
+    pub transmission_nm_rad: f64,
+    /// Damping of that drivetrain spring \[Nm·s/rad\].
+    pub transmission_damping_nm_s: f64,
 }
 
 impl JointTuning {
-    /// From the config's `[sim]` motor constants and one joint's map.
-    pub(crate) fn from_config(map: &JointMap, motor_jm_kg_m2: f64, sim: &SimConfig) -> Self {
+    /// From the config's `[sim]` constants for one joint and its map.
+    pub(crate) fn from_config(
+        map: &JointMap,
+        motor_jm_kg_m2: f64,
+        viscous_nm_s: f64,
+        coulomb_nm: f64,
+        transmission: (f64, f64),
+    ) -> Self {
         let g = map.dyn_gear;
+        let armature = g * g * motor_jm_kg_m2;
+        let (stiffness, ratio) = transmission;
         Self {
-            armature: g * g * motor_jm_kg_m2,
-            damping: g * g * sim.motor_b_nm_s,
-            frictionloss: g * sim.motor_tc_nm,
-            range: [map.hard_lo_rad, map.hard_hi_rad],
+            armature,
+            damping: viscous_nm_s,
+            frictionloss: coulomb_nm,
+            endstops: map.endstops,
+            transmission_nm_rad: stiffness,
+            // The rotor swings on the spring against a far heavier link.
+            transmission_damping_nm_s: 2.0 * ratio * (stiffness * armature).sqrt(),
         }
     }
 }
@@ -156,6 +177,17 @@ impl ToolInertial {
     }
 }
 
+/// The arm's passive lateral hinges (see
+/// `SimConfig::arm_lateral_stiffness_nm_rad`): `(body, name, axis)`, two
+/// per fork on the body the fork's joint drives, about the two local axes
+/// that joint (local Z in the vendor MJCF) does not turn.
+const FLEX_HINGES: [(&str, &str, [f64; 3]); 4] = [
+    ("upper_arm", "par6/flex/shoulder_x", [1.0, 0.0, 0.0]),
+    ("upper_arm", "par6/flex/shoulder_y", [0.0, 1.0, 0.0]),
+    ("elbow", "par6/flex/elbow_x", [1.0, 0.0, 0.0]),
+    ("elbow", "par6/flex/elbow_y", [0.0, 1.0, 0.0]),
+];
+
 /// What a scene is built with, besides the vendor file.
 #[derive(Debug, Clone, Copy)]
 pub struct Build<'a> {
@@ -165,6 +197,9 @@ pub struct Build<'a> {
     pub joints: &'a [JointTuning],
     /// The active tool's config inertials (`None` = the variant URDF's).
     pub tool: Option<&'a ToolInertial>,
+    /// The forks' lateral flex `(stiffness [Nm/rad], damping [Nm·s/rad])`;
+    /// a zero stiffness leaves the arm rigid.
+    pub lateral: (f64, f64),
 }
 
 /// The world objects, installation layer then program layer.
@@ -569,18 +604,32 @@ impl Scene {
         }
 
         for (name, tuning) in ARM_JOINTS.iter().zip(joints) {
+            // A compliant drivetrain moves the rotor inertia onto its own
+            // coordinate, which the encoder reads and the motor drives,
+            // tied to the link by a spring; drivetrain friction stays on
+            // the link.
+            let k = tuning.transmission_nm_rad;
+            let compliant = k > 0.0;
             let joint = spec.joint_mut(name).ok_or_else(|| SceneError::Missing {
                 kind: "joint",
                 name: (*name).to_owned(),
             })?;
-            joint.set_armature(tuning.armature);
+            joint.set_armature(if compliant { 0.0 } else { tuning.armature });
             joint.set_frictionloss(tuning.frictionloss);
             let mut damping = *joint.damping();
             damping.fill(0.0);
             damping[0] = tuning.damping;
             joint.with_damping(damping);
-            joint.with_range(tuning.range);
-            // The config hard limits are the plant's endstops: a stiff,
+            match tuning.endstops {
+                Some((lo, hi)) => {
+                    joint.with_range([lo, hi]);
+                    joint.with_limited(MjtLimited::mjLIMITED_TRUE);
+                }
+                None => {
+                    joint.with_limited(MjtLimited::mjLIMITED_FALSE);
+                }
+            }
+            // For limited joints, the range defines a stiff,
             // critically damped limit constraint (reference time two
             // substeps) that admits sub-milliradian penetration at the
             // homing currents.
@@ -592,6 +641,56 @@ impl Scene {
             // per second under the shoulder's load.
             *joint.solref_friction_mut() = [2.0 * timestep, 1.0];
             *joint.solimp_friction_mut() = [0.9999, 0.9999, 0.001, 0.5, 2.0];
+            if !compliant {
+                continue;
+            }
+            let rotor = format!("{ROTOR_PREFIX}{name}");
+            let body = spec.world_body_mut().add_body().with_name(&rotor);
+            // MuJoCo needs a positive body inertia; the armature carries
+            // the rotor's.
+            body.set_mass(1e-6);
+            body.with_inertia([1e-9; 3]);
+            body.set_explicitinertial(true);
+            let rotor_joint = body
+                .add_joint()
+                .with_name(&rotor)
+                .with_type(MjtJoint::mjJNT_HINGE)
+                .with_axis([0.0, 0.0, 1.0])
+                .with_armature(tuning.armature)
+                .with_limited(MjtLimited::mjLIMITED_FALSE);
+            // The landing clamp holds the rotor through its friction too,
+            // at the same impedance as the link's.
+            *rotor_joint.solref_friction_mut() = [2.0 * timestep, 1.0];
+            *rotor_joint.solimp_friction_mut() = [0.9999, 0.9999, 0.001, 0.5, 2.0];
+            let tendon = spec
+                .add_tendon()
+                .with_name(&format!("{TRANSMISSION_PREFIX}{name}"))
+                .with_stiffness([k, 0.0, 0.0])
+                .with_damping([tuning.transmission_damping_nm_s, 0.0, 0.0])
+                .with_springlength([0.0; 2])
+                .with_limited(MjtLimited::mjLIMITED_FALSE);
+            tendon.wrap_joint(&rotor, 1.0);
+            tendon.wrap_joint(name, -1.0);
+        }
+
+        let (stiffness, damping) = build.lateral;
+        if stiffness > 0.0 {
+            for (body_name, name, axis) in FLEX_HINGES {
+                // Listed after the fork's own joint, so the hinge rides on
+                // the body that joint drives.
+                spec.body_mut(body_name)
+                    .ok_or_else(|| SceneError::Missing {
+                        kind: "body",
+                        name: body_name.to_owned(),
+                    })?
+                    .add_joint()
+                    .with_name(name)
+                    .with_type(MjtJoint::mjJNT_HINGE)
+                    .with_axis(axis)
+                    .with_pos([0.0; 3])
+                    .with_stiffness([stiffness, 0.0, 0.0])
+                    .with_damping([damping, 0.0, 0.0]);
+            }
         }
 
         if self.tool == Tool::Flange {
@@ -888,13 +987,27 @@ fn apply_tool_inertial(
     }
     let body_com: [f64; 3] =
         std::array::from_fn(|k| (tool.mass_kg * com[k] - jaw_moment[k]) / mass);
-    let (moments, iquat) = principal_axes(inertia);
     let body = spec
         .body_mut("gripper")
         .ok_or_else(|| SceneError::Missing {
             kind: "body",
             name: "gripper".to_owned(),
         })?;
+    // A passive tool's config states its mass and where it sits and stops
+    // there: the base attachment carries no tensor at all. Writing those
+    // zeros in would leave a moving body MuJoCo refuses to compile, so an
+    // unstated tensor keeps the variant's own, rescaled to the config mass.
+    let (moments, iquat) = if inertia.iter().all(|i| *i == 0.0) {
+        let scale = if body.mass() > 0.0 {
+            mass / body.mass()
+        } else {
+            1.0
+        };
+        let scaled: [f64; 3] = std::array::from_fn(|k| body.inertia()[k] * scale);
+        (scaled, *body.iquat())
+    } else {
+        principal_axes(inertia)
+    };
     body.set_mass(mass);
     body.with_ipos(body_com);
     body.with_iquat(iquat);

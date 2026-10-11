@@ -36,24 +36,27 @@ impl CollisionWorld {
     #[new]
     #[pyo3(signature = (urdf, package_dir=None, srdf=None, clearance=par6d::COLLISION_CLEARANCE_M))]
     fn new(
+        py: Python<'_>,
         urdf: &str,
         package_dir: Option<&str>,
         srdf: Option<&str>,
         clearance: f64,
     ) -> PyResult<Self> {
-        let mut collision =
-            Collision::from_urdf(Path::new(urdf), package_dir.map(Path::new), clearance)
-                .map_err(|e| PyRuntimeError::new_err(format!("{urdf}: {e}")))?;
-        if let Some(srdf) = srdf {
-            collision
-                .apply_srdf(Path::new(srdf))
-                .map_err(|e| PyRuntimeError::new_err(format!("{srdf}: {e}")))?;
-        }
-        Ok(Self {
-            inner: Mutex::new(World {
-                collision,
-                names: ShapeNames::default(),
-            }),
+        py.allow_threads(|| {
+            let mut collision =
+                Collision::from_urdf(Path::new(urdf), package_dir.map(Path::new), clearance)
+                    .map_err(|e| PyRuntimeError::new_err(format!("{urdf}: {e}")))?;
+            if let Some(srdf) = srdf {
+                collision
+                    .apply_srdf(Path::new(srdf))
+                    .map_err(|e| PyRuntimeError::new_err(format!("{srdf}: {e}")))?;
+            }
+            Ok(Self {
+                inner: Mutex::new(World {
+                    collision,
+                    names: ShapeNames::default(),
+                }),
+            })
         })
     }
 

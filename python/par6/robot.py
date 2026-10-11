@@ -410,8 +410,9 @@ class Robot(_RobotABC):
         ``TOPPRA`` (the runtime's startup default) time-optimally
         parameterizes the path, ``RUCKIG`` is jerk-limited point-to-point,
         ``TRAPEZOID`` and ``LINEAR`` run the path at constant velocity with
-        ramps at the acceleration limit, and ``QUINTIC`` is a
-        point-to-point polynomial with zero end acceleration.
+        ramps at the acceleration limit, ``QUINTIC`` is a point-to-point
+        polynomial with zero end acceleration, and ``SEPTIC`` with zero end
+        jerk too.
         """
         return tuple(Preview.profiles())
 

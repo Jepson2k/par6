@@ -15,8 +15,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    EnterFlashing, JogJ, MoveJ, SaveConfig, SelectProfile, SelectTool, SetCanId,
-    SetCompletionPolicy, Stop, Teleport, ToolAction, ToolParam,
+    EnterFlashing, JogJ, MoveJ, Pause, SaveConfig, SelectProfile, SelectTool, SetCanId,
+    SetCompletionPolicy, SetGravityComp, Stop, Teleport, ToolAction, ToolParam, WriteIo,
 };
 use par6_proto::{
     ActionState, Command, CompletionPolicy, ControllerMode, ErrorCode, FlashingAssertion, Frame,
@@ -25,7 +25,7 @@ use par6_proto::{
 use par6d::{Daemon, Options};
 
 mod common;
-use common::{Client, Rig, BUDGET};
+use common::{Client, Par6dChild, Rig, BUDGET};
 
 /// The PAR6 config re-ticked to 50 Hz for the in-process session test.
 /// Loaded CI machines without RT scheduling miss 4 ms deadlines and
@@ -59,15 +59,22 @@ fn shutdown_seconds(config: PathBuf, delta_deg: f64) -> f64 {
     started.elapsed().as_secs_f64()
 }
 
-/// `[shutdown] safe_park = true` on the real runtime: the exit drives
-/// the arm back to the rest pose through the real streaming executor
-/// under the configured velocity ceiling, so a shutdown from 30° off
-/// the pose takes the time that distance costs at 0.25 rad/s. The
-/// shipped default retreats nowhere and exits at once.
+/// `[shutdown] safe_park = true` wired into par6d's exit: the retreat
+/// runs, so a shutdown from 30° off the pose takes at least the time
+/// that distance costs at the configured velocity ceiling, and arrives
+/// inside the configured timeout. The rig's config switches the retreat
+/// off, so its exit is the baseline. The server and STATUS stop before
+/// the retreat starts, so where it lands and how fast each joint moves
+/// are checked on the RT core's own exit path (par6-rt
+/// `shutdown_stop.rs`).
 #[test]
 fn a_shutdown_retreats_to_the_rest_pose_under_the_configured_speed() {
     const DELTA_DEG: f64 = 30.0;
-    let retreat_floor_s = DELTA_DEG.to_radians() / 0.25 * 0.8;
+    let shutdown = par6_config::RobotConfig::load(&test_config())
+        .expect("test config")
+        .shutdown;
+    // Less a fifth for the wall-clock jitter between the two runs.
+    let retreat_floor_s = DELTA_DEG.to_radians() / shutdown.velocity_limit_rad_s * 0.8;
 
     let plain = shutdown_seconds(test_config(), DELTA_DEG);
     let parked = shutdown_seconds(parking_config(), DELTA_DEG);
@@ -77,8 +84,9 @@ fn a_shutdown_retreats_to_the_rest_pose_under_the_configured_speed() {
          parked {parked:.2} s vs plain {plain:.2} s (floor {retreat_floor_s:.2} s)"
     );
     assert!(
-        parked < 15.0,
-        "the retreat must arrive well inside its 15 s timeout, took {parked:.2} s"
+        parked < shutdown.timeout_s,
+        "the retreat must arrive inside its {} s timeout, took {parked:.2} s",
+        shutdown.timeout_s
     );
 }
 
@@ -149,15 +157,157 @@ fn teleport(angles_deg: [f64; NUM_JOINTS]) -> Command {
         tool_positions: None,
     })
 }
-
-/// The gripper `par6d` is actually fitted with, in the canonical
-/// (upper-case) spelling the python client sends.
-fn fitted_tool() -> String {
+/// The tool the runtime booted wearing.
+///
+/// Read once so the case can put it back: `select_tool` really does fit a
+/// different tool, so a case that swaps has to swap back before it goes on
+/// to drive the jaw. Swapping to a DIFFERENT driven tool additionally
+/// needs the gripper node re-provisioned for it, which is not this.
+fn boot_tool() -> String {
     par6_config::RobotConfig::load(&common::shipped_config())
         .expect("PAR6 config")
         .robot
-        .active_gripper
+        .active_tool
         .to_uppercase()
+}
+
+/// Another driven tool, different from the one the runtime booted with.
+///
+/// Discovered rather than named: which tools the config ships is the
+/// operator's business, and a case that hard-codes one breaks the moment
+/// a tool file is added or renamed.
+fn other_driven_tool(boot: &str) -> String {
+    par6_config::ConfigBundle::load(&common::shipped_config())
+        .expect("PAR6 config")
+        .tools
+        .iter()
+        .find(|g| {
+            g.driver.as_ref().is_some_and(|d| d.gear_r_m > 0.0)
+                && !g.name.eq_ignore_ascii_case(boot)
+        })
+        .expect("the config carries a second driven tool")
+        .name
+        .to_uppercase()
+}
+
+/// A copy of the boot tool under a name the vendor prefix rule reads as
+/// the bare flange, keyed to the MSG tree: which model the runtime runs
+/// says whether the `urdf_variant` key was read. Its drive id is dropped,
+/// since two tools may not claim one.
+const KEYED_TOOL: &str = "WIDGET";
+
+/// The 50 Hz config booting [`KEYED_TOOL`].
+fn keyed_tool_config() -> PathBuf {
+    let dst = common::retimed_config("keyed-tool", 0.02);
+    let boot = par6_config::RobotConfig::load(&dst)
+        .expect("test config")
+        .robot
+        .active_tool;
+    let grippers = dst.parent().unwrap().join("grippers");
+    let src =
+        std::fs::read_to_string(grippers.join(format!("{boot}.toml"))).expect("boot tool toml");
+    assert!(
+        src.contains("urdf_variant = \"msg\""),
+        "the boot tool is keyed to the MSG tree"
+    );
+    assert_eq!(
+        par6_kin::GripperVariant::by_name_prefix(KEYED_TOOL),
+        par6_kin::GripperVariant::Flange,
+        "the name alone must point at a different tree than the key"
+    );
+    let keyed: String = src
+        .lines()
+        .filter(|l| !l.starts_with("can_tool_id"))
+        .map(|l| {
+            if l.starts_with("name = ") {
+                format!("name = \"{KEYED_TOOL}\"\n")
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    std::fs::write(grippers.join(format!("{KEYED_TOOL}.toml")), keyed).expect("keyed tool");
+    let robot = std::fs::read_to_string(&dst).expect("read test config");
+    let patched = robot.replace(
+        &format!("active_tool = \"{boot}\""),
+        &format!("active_tool = \"{KEYED_TOOL}\""),
+    );
+    assert_ne!(patched, robot, "active_tool patch point must exist");
+    std::fs::write(&dst, patched).expect("write keyed config");
+    dst
+}
+
+/// What the runtime must run for `tool` at `angles_deg`: the TCP \[mm\]
+/// of the URDF variant its config keys, and the gravity of the model
+/// built from its `[kinematics]`.
+fn tool_model(
+    bundle: &par6_config::ConfigBundle,
+    tool: &str,
+    angles_deg: &[f64; NUM_JOINTS],
+) -> ([f64; 3], [f64; NUM_JOINTS]) {
+    let cfg = bundle
+        .tools
+        .iter()
+        .find(|t| t.name.eq_ignore_ascii_case(tool))
+        .expect("a configured tool");
+    let key = cfg
+        .urdf_variant
+        .as_deref()
+        .expect("shipped tools are keyed");
+    let variant = par6_kin::GripperVariant::from_key(key).expect("a known key");
+    let q = angles_deg.map(f64::to_radians);
+    let mut fk = par6_kin::Kin::load(&common::assets_dir(), variant).expect("FK model");
+    let mut pose = [0.0; 16];
+    fk.fk(&q, &mut pose).expect("FK");
+    let mut gravity =
+        par6d::kin::load_gravity_kin(&common::assets_dir(), Some(cfg)).expect("gravity model");
+    gravity
+        .set_gravity_correction(&bundle.robot.gravity_correction)
+        .expect("gravity correction");
+    let mut g = [0.0; NUM_JOINTS];
+    gravity.gravity(&q, &mut g).expect("gravity");
+    for (g, scale) in g.iter_mut().zip(bundle.robot.gravity_scale) {
+        *g *= scale;
+    }
+    ([pose[3] * 1e3, pose[7] * 1e3, pose[11] * 1e3], g)
+}
+
+fn distance_mm(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(a, b)| (a - b) * (a - b))
+        .sum::<f64>()
+        .sqrt()
+}
+
+/// `tool` is what the runtime runs: STATUS names it, puts the TCP where
+/// its own model does, and implies its gravity — filtered torque minus
+/// external torque is the model's G(q).
+fn assert_fitted(rig: &Rig, bundle: &par6_config::ConfigBundle, tool: &str) -> Status {
+    rig.drain_status();
+    rig.wait_status("the tool reaches STATUS", |s| {
+        s.tool_status
+            .as_ref()
+            .is_some_and(|t| t.key.eq_ignore_ascii_case(tool))
+    });
+    // The swap lands inside one tick; the frame it lands in can still
+    // carry that tick's pre-swap pose.
+    let s = frames_later(rig, 2);
+    let (tcp, g) = tool_model(bundle, tool, &s.angles);
+    let at = [s.pose[3], s.pose[7], s.pose[11]];
+    let off = distance_mm(tcp, at);
+    assert!(
+        off < 0.05,
+        "{tool}: STATUS puts the TCP {off:.3} mm from its model's ({at:?} vs {tcp:?})"
+    );
+    for (j, want) in g.iter().enumerate() {
+        let got = s.torques[j] - s.torques_ext[j];
+        assert!(
+            (got - want).abs() < 1e-3,
+            "{tool}: J{j} runs gravity {got:.4} Nm, its model says {want:.4}"
+        );
+    }
+    s
 }
 
 fn select_tool(key: u64, tool: &str, variant: Option<&str>) -> Command {
@@ -379,7 +529,9 @@ fn full_sim_session_over_protocol_v3() {
 /// python `Robot.start()` bootstrap relies on.
 #[test]
 fn daemon_binary_ephemeral_port_ready_line_and_sigterm() {
-    let (mut child, port, _status_rx) = spawn_par6d(&[]);
+    let cwd = common::private_shm_dir();
+    let shm = common::private_shm_dir();
+    let (mut child, port, _status_rx) = spawn_par6d_at(&shm, &cwd, &[]);
     assert_ne!(port, 0, "ephemeral port must be resolved");
 
     let mut c = Client::new(SocketAddr::from(([127, 0, 0, 1], port)));
@@ -390,12 +542,35 @@ fn daemon_binary_ephemeral_port_ready_line_and_sigterm() {
 
     let status = sigterm_and_wait(&mut child);
     assert!(status.success(), "clean exit expected, got {status:?}");
+    let written: Vec<_> = std::fs::read_dir(&cwd)
+        .expect("working dir")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    assert!(
+        written.is_empty(),
+        "a run without --log-dir must write no file: {written:?}"
+    );
 }
 
 /// The binary on `--sim` with ephemeral/unicast ports plus `extra`
-/// arguments: the child, the command port from its ready line, and the
-/// status sink it was pointed at (kept open for its lifetime).
-fn spawn_par6d(extra: &[&str]) -> (std::process::Child, u16, UdpSocket) {
+/// arguments, its bus-grant segments and its working directory both
+/// private and empty: the child, the command port from its ready line,
+/// and the status sink it was pointed at (kept open for its lifetime).
+fn spawn_par6d(extra: &[&str]) -> (Par6dChild, u16, UdpSocket) {
+    spawn_par6d_in(&common::private_shm_dir(), extra)
+}
+
+/// [`spawn_par6d`] with its bus-grant segments in `shm_dir`.
+fn spawn_par6d_in(shm_dir: &std::path::Path, extra: &[&str]) -> (Par6dChild, u16, UdpSocket) {
+    spawn_par6d_at(shm_dir, &common::private_shm_dir(), extra)
+}
+
+/// [`spawn_par6d_in`], running in `cwd`.
+fn spawn_par6d_at(
+    shm_dir: &std::path::Path,
+    cwd: &std::path::Path,
+    extra: &[&str],
+) -> (Par6dChild, u16, UdpSocket) {
     let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status sink");
     let status_port = status_rx.local_addr().unwrap().port().to_string();
     let config = common::shipped_config();
@@ -415,13 +590,15 @@ fn spawn_par6d(extra: &[&str]) -> (std::process::Child, u16, UdpSocket) {
         &status_port,
     ];
     args.extend_from_slice(extra);
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_par6d"))
-        .args(&args)
-        .stdout(Stdio::piped())
-        .spawn()
-        .expect("spawn par6d");
+    let mut child = Par6dChild::spawn(
+        std::process::Command::new(env!("CARGO_BIN_EXE_par6d"))
+            .args(&args)
+            .env("PAR6_SHM_DIR", shm_dir)
+            .current_dir(cwd)
+            .stdout(Stdio::piped()),
+    );
 
-    let stdout = child.stdout.take().expect("piped stdout");
+    let stdout = child.child.stdout.take().expect("piped stdout");
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut line = String::new();
@@ -442,12 +619,12 @@ fn spawn_par6d(extra: &[&str]) -> (std::process::Child, u16, UdpSocket) {
     (child, port, status_rx)
 }
 
-fn sigterm_and_wait(child: &mut std::process::Child) -> std::process::ExitStatus {
+fn sigterm_and_wait(child: &mut Par6dChild) -> std::process::ExitStatus {
     // SAFETY: plain kill(2) on our own child with a standard signal.
-    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    unsafe { libc::kill(child.child.id() as i32, libc::SIGTERM) };
     let deadline = Instant::now() + BUDGET;
     loop {
-        if let Some(st) = child.try_wait().expect("try_wait") {
+        if let Some(st) = child.child.try_wait().expect("try_wait") {
             return st;
         }
         assert!(
@@ -475,7 +652,7 @@ fn the_activity_logs_record_commands_refusals_and_the_rt_latch() {
         other => panic!("unexpected ping result {other:?}"),
     }
     // A move on an unhomed arm is refused; the e-stop latches the RT.
-    c.expect_error(&Command::MoveJ(MoveJ {
+    let refusal = c.expect_error(&Command::MoveJ(MoveJ {
         key: 1,
         angles: park_deg(),
         duration: Some(1.0),
@@ -500,16 +677,30 @@ fn the_activity_logs_record_commands_refusals_and_the_rt_latch() {
     let status = sigterm_and_wait(&mut child);
     assert!(status.success(), "clean exit expected, got {status:?}");
 
-    for needle in [
-        "system name=estop",
-        "refused req_id=",
-        "code=",
-        "remedy=",
-        "par6d::vitals load1=",
-    ] {
+    for needle in ["system name=estop", "par6d::vitals load1="] {
         assert!(
             commands.contains(needle),
             "commands.log lacks {needle:?}:\n{commands}"
+        );
+    }
+    // The refusal line carries the catalog entry the client was sent.
+    let refused = commands
+        .lines()
+        .find(|l| l.contains("refused req_id="))
+        .unwrap_or_else(|| panic!("commands.log records no refusal:\n{commands}"));
+    for needle in [
+        format!("code={}", refusal.code),
+        format!("remedy={:?}", refusal.remedy),
+    ] {
+        assert!(refused.contains(&needle), "{refused:?} lacks {needle:?}");
+    }
+    // stderr keeps the same lines.
+    let stderr = child.stderr.lock().unwrap().clone();
+    let refused_record = &refused[refused.find("refused req_id=").expect("record")..];
+    for record in [refused_record, "system name=estop"] {
+        assert!(
+            stderr.contains(record),
+            "stderr lacks {record:?}:\n{stderr}"
         );
     }
     let rt = std::fs::read_to_string(dir.join("rt.log")).expect("rt.log exists");
@@ -536,9 +727,11 @@ fn the_activity_logs_record_commands_refusals_and_the_rt_latch() {
 ///
 /// Booted in HARDWARE mode against an interface that does not exist: the
 /// budget is what must answer, which is only true if it is checked
-/// before the bus is opened.
+/// before the bus is opened. The other startup failures answer as
+/// clearly: the missing interface itself, a missing config file, and a
+/// `[timing]` section the runtime cannot resolve.
 #[test]
-fn a_tick_the_bus_cannot_carry_is_refused_before_the_interface_opens() {
+fn startup_refusals_are_clear_errors_and_the_bus_budget_answers_first() {
     let opts = Options {
         sim: false,
         config: Some(common::retimed_config_with_interface(
@@ -584,89 +777,71 @@ fn a_tick_the_bus_cannot_carry_is_refused_before_the_interface_opens() {
         err.to_string().contains("par6-no-such-can-budget-ok"),
         "the shipped rate must clear the budget: {err}"
     );
-}
 
-/// Startup failure paths are clear errors, never panics: hardware mode
-/// whose CAN interface does not exist names the interface and points at
-/// `--sim`; a missing config file names the path it tried.
-#[test]
-fn hardware_mode_and_bad_config_fail_with_clear_errors() {
-    let opts = Options {
-        sim: false,
-        config: Some(common::config_with_interface("par6-no-such-can")),
-        assets: Some(common::assets_dir()),
-        ..Options::default()
-    };
-    let err = Daemon::start(&opts)
-        .err()
-        .expect("hardware mode without its interface must fail cleanly");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("par6-no-such-can"),
-        "names the CAN interface: {msg}"
-    );
-    assert!(msg.contains("--sim"), "points at the simulator: {msg}");
+    // Startup failure paths are clear errors, never panics: hardware mode whose CAN interface does not exist names it and points at --sim; a missing config file names the path; a declared [timing] section the runtime cannot resolve is refused.
+    {
+        let opts = Options {
+            sim: false,
+            config: Some(common::config_with_interface("par6-no-such-can")),
+            assets: Some(common::assets_dir()),
+            ..Options::default()
+        };
+        let err = Daemon::start(&opts)
+            .err()
+            .expect("hardware mode without its interface must fail cleanly");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("par6-no-such-can"),
+            "names the CAN interface: {msg}"
+        );
+        assert!(msg.contains("--sim"), "points at the simulator: {msg}");
 
-    let opts = Options {
-        sim: true,
-        config: Some(PathBuf::from("/nonexistent/par6.toml")),
-        ..Options::default()
-    };
-    let err = Daemon::start(&opts)
-        .err()
-        .expect("missing config must fail cleanly");
-    assert!(
-        err.to_string().contains("/nonexistent/par6.toml"),
-        "names the missing path: {err}"
-    );
-}
+        let opts = Options {
+            sim: true,
+            config: Some(PathBuf::from("/nonexistent/par6.toml")),
+            ..Options::default()
+        };
+        let err = Daemon::start(&opts)
+            .err()
+            .expect("missing config must fail cleanly");
+        assert!(
+            err.to_string().contains("/nonexistent/par6.toml"),
+            "names the missing path: {err}"
+        );
 
-/// Issue #15 regression: a `stop` immediately followed by a queued move.
-/// The stop's EXEC flush rides the RT command queue (one command per
-/// tick) while the new move's samples ride the SPSC ring (immediate), so
-/// an unbounded flush lands AFTER those samples and erases them — EXEC
-/// then holds forever and the move never completes. The move must run to
-/// COMPLETE and the arm must actually be at the target.
-#[test]
-fn stop_then_move_completes_without_losing_samples() {
-    let rig = Rig::boot(test_config());
-    let mut c = Client::new(rig.addr());
-    rig.wait_status("link_ok", |s| s.link_ok == 1);
-    c.ok(&Command::Reset);
-
-    let park = park_deg();
-    teleport_home(&rig, &mut c, park);
-
-    // A long move to stop in the middle of, then — back to back with the
-    // stop — a fresh short move.
-    let i_long = c.ok_index(&move_j(3001, with_j0(park, 40.0), 6.0));
-    rig.wait_status("the long move is executing", |s| {
-        s.executing_index == i_long as i64
-    });
-    c.ok(&Command::Stop(Stop { clear_queue: true }));
-    let target = with_j0(park, 10.0);
-    let i_next = c.ok_index(&move_j(3002, target, 0.5));
-    let (ok, detail) = c.wait_complete(i_next);
-    assert!(
-        ok,
-        "the move queued right after a stop must complete, got {detail:?}"
-    );
-    let s = rig.wait_status("completed_index reaches the move", |s| {
-        s.completed_index >= i_next as i64
-    });
-    assert!(
-        (s.angles[0] - target[0]).abs() < 6.0,
-        "the move after the stop never drove J0 to the target: {:?}",
-        s.angles
-    );
-    let (ok, detail) = c.wait_complete(i_long);
-    assert!(!ok, "the stopped move must report its cancellation");
-    assert_eq!(
-        detail.expect("cancelled COMPLETE carries detail").code,
-        ErrorCode::MotnCancelled as u16
-    );
-
-    rig.shutdown();
+        // A declared `[timing]` section rules under --sim too: one whose
+        // sustain the percentile recompute cannot resolve is refused, where
+        // the simulator's own bands would have started.
+        let dt = 0.02;
+        let config = common::retimed_config("declared-timing", dt);
+        let text = std::fs::read_to_string(&config).expect("read test config");
+        assert!(
+            !text.contains("[timing]"),
+            "the shipped config leaves the bands to the runtime"
+        );
+        let sustain = par6_rt::timing::sustain_resolution_s(dt) / 2.0;
+        std::fs::write(
+            &config,
+            format!(
+                "{text}\n[timing]\ndegraded_factor = 1.05\ncritical_factor = 1.10\n\
+                 critical_sustain_s = {sustain}\n"
+            ),
+        )
+        .expect("write timing config");
+        let opts = Options {
+            sim: true,
+            config: Some(config),
+            assets: Some(common::assets_dir()),
+            ..Options::default()
+        };
+        let err = Daemon::start(&opts)
+            .err()
+            .expect("a declared sustain under the recompute must refuse startup");
+        assert!(
+            err.to_string().contains("critical_sustain_s"),
+            "the refusal names the declared field: {err}"
+        );
+    }
 }
 
 /// `stop()` promises an arm HELD where it stopped: braked along its path
@@ -674,14 +849,21 @@ fn stop_then_move_completes_without_losing_samples() {
 /// back-driveable. IDLE would be the gravity float on a homed arm: no
 /// velocity authority to brake with, and nothing holding the pose once
 /// stopped.
+///
+/// And a move queued right behind a stop runs (issue #15): the stop's
+/// EXEC flush rides the RT command queue (one command per tick) while the
+/// new move's samples ride the SPSC ring (immediate), so an unbounded
+/// flush lands AFTER those samples and erases them — EXEC then holds
+/// forever and the move never completes.
 #[test]
-fn a_stop_brakes_the_arm_and_then_holds_it() {
+fn a_stop_brakes_and_holds_the_arm_and_a_move_right_behind_it_runs() {
     let rig = Rig::boot(test_config());
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
     let park = park_deg();
     teleport_home(&rig, &mut c, park);
+    let robot = par6_config::RobotConfig::load(&test_config()).expect("test config");
 
     let i = c.ok_index(&move_j(3101, with_j0(park, 60.0), 2.0));
     rig.wait_status("J0 is under way", |s| {
@@ -691,9 +873,30 @@ fn a_stop_brakes_the_arm_and_then_holds_it() {
     let (ok, _) = c.wait_complete(i);
     assert!(!ok, "the stopped move reports its cancellation");
 
-    let rest = rig.wait_status("the arm at rest after the stop", |s| {
+    // At rest by position, not by one speed sample: a drive's speed is
+    // quantized, and reads zero at the turning point of a settle that is
+    // still going on.
+    rig.wait_status("the arm stopped after the stop", |s| {
         s.speeds.iter().all(|v| v.abs() < 1e-3)
     });
+    let deadline = Instant::now() + common::BUDGET;
+    let rest = loop {
+        assert!(
+            Instant::now() < deadline,
+            "the arm never came to rest after the stop"
+        );
+        let settle = rig.collect_status(Duration::from_millis(300));
+        let (first, last) = (
+            settle.first().expect("status"),
+            settle.last().expect("status"),
+        );
+        if settle
+            .iter()
+            .all(|s| max_deg_error(&s.angles, &first.angles) < 0.01)
+        {
+            break last.clone();
+        }
+    };
     let floating = |s: &Status| s.mode == ControllerMode::Idle && s.homed && s.gravity_comp;
     assert!(rest.enabled, "a stop leaves the controller enabled");
     assert!(
@@ -712,6 +915,163 @@ fn a_stop_brakes_the_arm_and_then_holds_it() {
         );
     }
 
+    // A fresh short move back to back with a stop of a long one runs to
+    // COMPLETE, settled on its target.
+    let i_long = c.ok_index(&move_j(3001, with_j0(park, 40.0), 6.0));
+    rig.wait_status("the long move is executing", |s| {
+        s.executing_index == i_long as i64
+    });
+    c.ok(&Command::Stop(Stop { clear_queue: true }));
+    // At full speed the arm still trails its trajectory when the plan
+    // ends, so the COMPLETE has to wait for the settle it reports.
+    let target = with_j0(park, 10.0);
+    let i_next = c.ok_index(&Command::MoveJ(MoveJ {
+        key: 3002,
+        angles: target,
+        duration: None,
+        speed: Some(1.0),
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    }));
+    let (ok, detail) = c.wait_complete(i_next);
+    assert!(
+        ok,
+        "the move queued right after a stop must complete, got {detail:?}"
+    );
+    let s = rig.wait_status("completed_index reaches the move", |s| {
+        s.completed_index >= i_next as i64
+    });
+    let tolerance_deg = robot.motion.settle_tolerance_rad.to_degrees();
+    assert!(
+        max_deg_error(&s.angles, &target) <= tolerance_deg,
+        "the move after the stop completed {:.3}° from its target, outside the \
+         {tolerance_deg:.3}° settle tolerance: {:?}",
+        max_deg_error(&s.angles, &target),
+        s.angles
+    );
+    let (ok, detail) = c.wait_complete(i_long);
+    assert!(!ok, "the stopped move must report its cancellation");
+    assert_eq!(
+        detail.expect("cancelled COMPLETE carries detail").code,
+        ErrorCode::MotnCancelled as u16
+    );
+    rig.shutdown();
+}
+
+/// The `n`th STATUS frame broadcast after this call: a bound measured in
+/// the runtime's own ticks for checks that something did NOT happen.
+fn frames_later(rig: &Rig, n: u64) -> Status {
+    rig.drain_status();
+    let first = rig.wait_status("a fresh frame", |_| true).seq;
+    rig.wait_status("frames later", |s| s.seq >= first + n)
+}
+
+fn pause(c: &mut Client, on: bool) {
+    c.ok(&Command::Pause(Pause { on }));
+}
+
+/// The execution and I/O switches over the wire, read back from what the
+/// runtime does with them:
+/// - the runtime enables itself once out of BOOTING, unasked;
+/// - gravity compensation follows SET_GRAVITY_COMP both ways;
+/// - `write_io` drives the addressed output to the written level and
+///   leaves the others;
+/// - a pause reaches the RT on a disabled arm, which cannot plan motion
+///   but can still be told to hold it;
+/// - a stop that keeps the queue keeps the pause holding it, and only the
+///   resume starts the kept move;
+/// - a clearing stop, `reset_state` and an e-stop each drop the pause, so
+///   the next queued move runs without a resume.
+#[test]
+fn pause_io_and_gravity_switches_act_on_the_runtime() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    // No reset: the runtime enables itself once the core is out of BOOTING.
+    rig.wait_status("enabled from boot", |s| s.enabled);
+    let park = park_deg();
+    teleport_home(&rig, &mut c, park);
+
+    for on in [false, true] {
+        c.ok(&Command::SetGravityComp(SetGravityComp { on }));
+        rig.wait_status("the compensation follows the switch", |s| {
+            s.gravity_comp == on
+        });
+    }
+
+    let cfg = par6_config::RobotConfig::load(&common::shipped_config()).expect("PAR6 config");
+    let outputs_at = cfg.io.inputs.len();
+    let outputs = |s: &Status| s.io[outputs_at..outputs_at + 3].to_vec();
+    let mut write_io = |key: u64, port: u8, value: u8| {
+        let i = c.ok_index(&Command::WriteIo(WriteIo { key, port, value }));
+        let (ok, detail) = c.wait_complete(i);
+        assert!(
+            ok,
+            "write_io({port}, {value}) must complete, got {detail:?}"
+        );
+    };
+    write_io(7091, 2, 1);
+    rig.wait_status("the third output is driven high", |s| {
+        outputs(s) == [0, 0, 1]
+    });
+    write_io(7092, 0, 1);
+    write_io(7093, 2, 0);
+    rig.wait_status("the first output high, the third low again", |s| {
+        outputs(s) == [1, 0, 0]
+    });
+    write_io(7094, 0, 0);
+
+    // Disabled by the e-stop: the pause still reaches the RT.
+    c.ok(&Command::Estop);
+    rig.wait_status("disabled", |s| !s.enabled);
+    pause(&mut c, true);
+    rig.wait_status("the disabled arm's RT holds the pause", |s| s.paused);
+    pause(&mut c, false);
+    rig.wait_status("and lets it go", |s| !s.paused);
+    c.ok(&Command::Reset);
+    rig.wait_status("enabled again", |s| s.enabled);
+
+    // A stop that keeps the queue keeps the pause holding it.
+    pause(&mut c, true);
+    let held_at = rig.wait_status("paused", |s| s.paused).angles[0];
+    let kept = c.ok_index(&move_j(7101, with_j0(park, 5.0), 0.5));
+    c.ok(&Command::Stop(Stop { clear_queue: false }));
+    let s = frames_later(&rig, 5);
+    assert!(s.paused, "a stop that keeps the queue dropped the pause");
+    assert!(
+        s.executing_index < 0 && (s.angles[0] - held_at).abs() < 0.05,
+        "the kept move ran without a resume: executing {}, J0 {} from {held_at}",
+        s.executing_index,
+        s.angles[0]
+    );
+    pause(&mut c, false);
+    let (ok, detail) = c.wait_complete(kept);
+    assert!(ok, "the resume runs the kept move, got {detail:?}");
+
+    // Each of these drops the pause, so the next move needs no resume.
+    let mut key = 7110;
+    for clear in [
+        Command::Stop(Stop { clear_queue: true }),
+        Command::ResetState,
+        Command::Estop,
+    ] {
+        pause(&mut c, true);
+        rig.wait_status("paused", |s| s.paused);
+        c.ok(&clear);
+        rig.wait_status("the pause is dropped", |s| !s.paused);
+        if matches!(clear, Command::Estop) {
+            c.ok(&Command::Reset);
+            rig.wait_status("enabled again", |s| s.enabled);
+        }
+        teleport_home(&rig, &mut c, park);
+        key += 1;
+        let i = c.ok_index(&move_j(key, with_j0(park, 3.0), 0.3));
+        let (ok, detail) = c.wait_complete(i);
+        assert!(
+            ok,
+            "after {clear:?} a queued move runs without a resume, got {detail:?}"
+        );
+    }
     rig.shutdown();
 }
 
@@ -760,17 +1120,34 @@ fn flashing_window_over_protocol_v2() {
     assert_eq!(err.code, ErrorCode::CommValidationError as u16);
     c.ok(&Command::Stop(Stop { clear_queue: true }));
     c.drain();
-    rig.wait_status("at rest after the stop", |s| {
-        s.executing_index < 0 && s.speeds.iter().all(|v| v.abs() < 1e-3)
-    });
 
     // From rest with the assertion: acked once the mode is FLASHING, and
     // the silent bus reads as a stale link — the wire really is handed
-    // to the flasher.
-    c.ok(&enter);
-    rig.wait_status("the mode is FLASHING", |s| {
-        s.mode == ControllerMode::Flashing
-    });
+    // to the flasher. STATUS does not say when the brake STOP started has
+    // run out, so the entry is retried until the RT admits it.
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        match c.request(&enter) {
+            Reply::Ok { index: None, .. } => break,
+            Reply::Error { error, .. }
+                if error.code == ErrorCode::CommValidationError as u16
+                    && error.cause.contains("enter_flashing needs an arm at rest:") =>
+            {
+                assert!(
+                    Instant::now() < deadline,
+                    "the stopped arm never became eligible for FLASHING: {}",
+                    error.cause
+                );
+                let _ = rig.recv_status();
+            }
+            other => panic!("unexpected maintenance entry reply: {other:?}"),
+        }
+    }
+    assert_eq!(
+        frames_later(&rig, 1).mode,
+        ControllerMode::Flashing,
+        "the entry was acked before the mode changed"
+    );
     rig.wait_status("the silent bus reads stale", |s| s.link_ok == 0);
 
     // A referencing seek would start by requesting IDLE, ending the
@@ -827,22 +1204,16 @@ fn peak_speed_under(rig: &Rig, c: &mut Client, profile: &str, key: u64) -> f64 {
     });
     rig.drain_status();
     let index = c.ok_index(&cmd);
-    let mut peak = 0.0f64;
-    let mut moved = false;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let Some(s) = rig.recv_status() else { continue };
-        let v = s.speeds[0].abs();
-        peak = peak.max(v);
-        if v > 0.02 {
-            moved = true;
-        } else if moved {
-            break;
-        }
-    }
+    // Read through the COMPLETE: the drive's speed is quantised (a slow
+    // ramp reads zero between quanta), so a zero sample says nothing
+    // about the move being over.
+    let peak = rig
+        .collect_through(index, Duration::from_secs(5))
+        .iter()
+        .fold(0.0f64, |m, s| m.max(s.speeds[0].abs()));
     let (ok, detail) = c.wait_complete(index);
     assert!(ok, "{profile} move must complete, got {detail:?}");
-    assert!(moved, "the {profile} probe never moved the joint");
+    assert!(peak > 0.02, "the {profile} probe never moved the joint");
     println!("PEAK {profile} {peak:.4}");
     peak
 }
@@ -942,7 +1313,11 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     // exactly the time its longer plan cost. The shape survives both.
     // Over a move too short to reach cruise, a jerk limit is visible
     // directly: ruckig spends the whole probe ramping and never gets
-    // near the speed an unlimited-jerk profile reaches.
+    // near the speed an unlimited-jerk profile reaches. Analytically the
+    // unlimited-jerk peaks over this probe are more than 3.5× the
+    // jerk-limited ones; the plant's lag on a move that short eats into
+    // the fast ones, so 1.4× keeps the check on the profile family, and
+    // which shape each profile plans is pinned in `preview.rs`.
     c.ok(&Command::SetCompletionPolicy(SetCompletionPolicy {
         policy: CompletionPolicy::Settled,
     }));
@@ -961,6 +1336,14 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         "the QUINTIC selection did not reach the planner: peak speed \
          QUINTIC {quintic:.3} vs RUCKIG {ruckig:.3} rad/s"
     );
+    // SEPTIC holds the jerk limit the quintic ignores, so over the same
+    // probe it is held under the quintic just as ruckig is.
+    let septic = peak_speed_under(&rig, &mut c, "SEPTIC", 5104);
+    assert!(
+        septic * 1.4 < quintic,
+        "the SEPTIC selection did not reach the planner: peak speed \
+         SEPTIC {septic:.3} vs QUINTIC {quintic:.3} rad/s"
+    );
     let toppra = peak_speed_under(&rig, &mut c, "TOPPRA", 5102);
     assert!(
         toppra > ruckig,
@@ -968,22 +1351,17 @@ fn tool_actions_profiles_and_unsupported_parameters() {
          jerk-limited RUCKIG: peak speed {toppra:.3} vs {ruckig:.3} rad/s"
     );
 
-    // ---- tools. The fitted tool reports from boot — a client does not
-    // have to ask for the tool the runtime is physically wearing — and
-    // no other tool can be selected.
-    let tool = fitted_tool();
+    // ---- tools. The tool the runtime boots wearing reports from boot; a
+    // client does not have to ask for what the arm is physically wearing.
+    // Fitting a DIFFERENT tool is `select_tool_fits_a_different_tool`.
+    let tool = boot_tool();
     let s = rig.wait_status("tool status reaches STATUS", |s| s.tool_status.is_some());
-    let ts = tool_status(&s);
-    assert_eq!(ts.key.to_uppercase(), tool);
-    assert_eq!(ts.fault_code, 0, "a healthy gripper must report no fault");
-    let err = c.expect_error(&select_tool(6001, "FLANGE", None));
+    assert_eq!(tool_status(&s).key.to_uppercase(), tool);
     assert_eq!(
-        err.code,
-        ErrorCode::CommValidationError as u16,
-        "selecting a tool the runtime is not fitted with must be refused, got {err:?}"
+        tool_status(&s).fault_code,
+        0,
+        "a healthy gripper must report no fault"
     );
-    // The key is matched case-insensitively (clients canonicalise it),
-    // and the variant does reach STATUS.
     let i = c.ok_index(&select_tool(6002, &tool, Some("wide")));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "select_tool must complete, got {detail:?}");
@@ -992,7 +1370,6 @@ fn tool_actions_profiles_and_unsupported_parameters() {
             .as_ref()
             .is_some_and(|t| t.variant_key == "wide")
     });
-
     // ---- a move before calibration is refused: the RT send gate never
     // streams to an uncalibrated gripper (the firmware's own gate drops
     // it), so admitting the move could only pretend.
@@ -1043,10 +1420,18 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         "a settled move leaves the jaws holding, not released"
     );
 
+    // Completion means arrival: the close's verdict is still standing
+    // when the open is sent, and must not answer for it.
     let i = c.ok_index(&tool_action(6004, &tool, "move", &[0.0, 0.5, 0.3]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "gripper open must complete, got {detail:?}");
-    rig.wait_status("the jaw reaches the open command", |s| jaw(s) < 0.05);
+    rig.drain_status();
+    let s = rig.wait_status("a status after the open completed", |_| true);
+    assert!(
+        jaw(&s) < 0.1,
+        "the open completed with the jaws still at {:.3}",
+        jaw(&s)
+    );
 
     // ---- the release verb drops the standing command, and only then
     // does the tool report itself idle.
@@ -1113,7 +1498,7 @@ fn a_tool_action_runs_in_queue_order_between_moves() {
     c.ok(&Command::Reset);
     let park = park_deg();
     teleport_home(&rig, &mut c, park);
-    let tool = fitted_tool();
+    let tool = boot_tool();
     let i = c.ok_index(&tool_action(8001, &tool, "calibrate", &[]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "gripper calibrate must complete, got {detail:?}");
@@ -1196,6 +1581,91 @@ fn a_tool_action_runs_in_queue_order_between_moves() {
         "a stop must halt the jaws, not release the grip"
     );
 
+    // Tool stops back to back while the jaws travel: the planner holds
+    // one stop at a time, and every one sent is still answered.
+    let closing = c.ok_index(&tool_action(8006, &tool, "move", &[1.0, 0.1, 0.3]));
+    rig.wait_status("the jaws start closing", |s| jaw(s) > jaw(last) + 0.05);
+    let stops = c.ok_indices(&[
+        tool_action(8007, &tool, "stop", &[]),
+        tool_action(8008, &tool, "stop", &[]),
+    ]);
+    for stop in stops {
+        let (ok, detail) = c.wait_complete(stop);
+        assert!(ok, "tool stop {stop} must be answered ok, got {detail:?}");
+    }
+    let (ok, detail) = c.wait_complete(closing);
+    assert!(
+        !ok && detail
+            .as_ref()
+            .is_some_and(|e| e.code == ErrorCode::MotnCancelled as u16),
+        "the stopped close must report its cancellation: ok={ok} {detail:?}"
+    );
+
+    rig.shutdown();
+}
+
+/// A clearing stop answers every command it drops — the one executing,
+/// the ones blended into it and any still queued — each with its own
+/// MOTN_CANCELLED, and the arm stops short of where the chain ends.
+#[test]
+fn a_stop_cancels_a_blended_chain_command_by_command() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let park = park_deg();
+    teleport_home(&rig, &mut c, park);
+
+    let blended = |key: u64, delta: f64| {
+        Command::MoveJ(MoveJ {
+            key,
+            angles: with_j0(park, delta),
+            duration: Some(3.0),
+            speed: None,
+            accel: None,
+            blend_radius: Some(10.0),
+            rel: false,
+        })
+    };
+    let ids = c.ok_indices(&[
+        blended(9001, 20.0),
+        blended(9002, 40.0),
+        move_j(9003, with_j0(park, 60.0), 3.0),
+    ]);
+    rig.wait_status("the chain's head is executing", |s| {
+        s.executing_index == ids[0] as i64
+    });
+    // The successor has been folded into the running motion: it is no
+    // longer waiting in the queue.
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        match c.query(&Command::Queue) {
+            QueryResult::Queue { queue, .. } if queue.len() <= 1 => break,
+            other => assert!(
+                Instant::now() < deadline,
+                "the blend never formed: {other:?}"
+            ),
+        }
+    }
+
+    c.ok(&Command::Stop(Stop { clear_queue: true }));
+    for index in &ids {
+        let (ok, detail) = c.wait_complete(*index);
+        assert!(
+            !ok && detail
+                .as_ref()
+                .is_some_and(|e| e.code == ErrorCode::MotnCancelled as u16),
+            "command {index} must complete cancelled, got ok={ok} {detail:?}"
+        );
+    }
+    let rest = rig.wait_status("at rest after the stop", |s| {
+        s.speeds.iter().all(|v| v.abs() < 1e-3)
+    });
+    assert!(
+        rest.angles[0] < park[0] + 55.0,
+        "the stop let the chain run to its end: J0 at {:.2}",
+        rest.angles[0]
+    );
     rig.shutdown();
 }
 
@@ -1261,7 +1731,7 @@ fn joint_enablement_slots_are_positive_direction_first() {
 
 /// Gap 14: `home` on an arm that is already referenced is a planned
 /// return to the configured park pose, not another full referencing
-/// seek (parol6 `server/motion_planner.py:239-241` routes `HomeCmd` to
+/// seek — unless `calibrate=true` asks for one (parol6 `server/motion_planner.py:239-241` routes `HomeCmd` to
 /// a `MoveJCmd(HOME_ANGLES_DEG, HOME_RETURN_SPEED_FRAC)` when
 /// `Homed_in[:6].all()`).
 ///
@@ -1321,57 +1791,20 @@ fn home_on_a_referenced_arm_returns_to_the_park_pose_without_reseeking() {
     // return never does.
     assert!(s.homed, "the return move must not drop the home reference");
 
-    rig.shutdown();
-}
-
-/// `home(calibrate=true)` on an ALREADY-referenced arm runs the seek, not
-/// the planned park return the sibling test above pins.
-///
-/// The flag crosses a wire field, the server's dispatch and the RT's mode
-/// request before anything acts on it, and a runtime that dropped it
-/// anywhere on that path would return to park and report success — the
-/// operator asking to re-reference a drifted arm would be told it had
-/// happened. `preview.rs` covers the flag through the offline planner;
-/// this is the live runtime.
-///
-/// Deliberately does NOT wait for completion: the shipped sequence takes
-/// ~60 s of wall clock (the sim runs in real time) and the two facts that
-/// discriminate a seek from a return — HOMING mode, and `homed` dropping
-/// — are both true within a second of the request.
-#[test]
-fn home_calibrate_on_a_referenced_arm_reseeks_instead_of_returning_to_park() {
-    let rig = Rig::boot(test_config());
-    let mut c = Client::new(rig.addr());
-    rig.wait_status("link_ok", |s| s.link_ok == 1);
-    c.ok(&Command::Reset);
-
-    let park = park_deg();
-    teleport_home(&rig, &mut c, park);
-    let s = rig.wait_status("referenced after the teleport", |s| s.homed);
-    assert!(
-        max_deg_error(&s.angles, &park) < 1.0,
-        "the arm must start on the park pose, got {:?}",
-        s.angles
-    );
-
-    // Acceptance is `ok_index`'s own contract — it panics on anything but
-    // an OK carrying an index. What the flag DID is what follows.
+    // `calibrate=true` on the same referenced arm, standing on park, runs
+    // the seek instead. The flag crosses a wire field, the server's
+    // dispatch and the RT's mode request, and a runtime that dropped it
+    // would return to park and report success. The seek is not waited
+    // out (~60 s): HOMING and `homed` dropping are both true within a
+    // second, and a planned return shows neither.
     c.ok_index(&Command::Home(par6_proto::command::Home {
         key: 7402,
         calibrate: true,
     }));
-
-    // The RT drops into HOMING: a planned return never leaves EXEC, which
-    // is what `home_on_a_referenced_arm_returns_to_the_park_pose_without_reseeking`
-    // asserts for the same command with the flag clear.
     rig.wait_status("calibrate=true re-enters HOMING", |s| {
         s.mode == ControllerMode::Homing
     });
-    // And un-references on the way: the seek is establishing the reference
-    // it is about to replace.
     rig.wait_status("the seek drops the home reference", |s| !s.homed);
-
-    // Abandon the seek rather than paying its ~60 s.
     c.ok(&Command::Stop(Stop { clear_queue: true }));
     rig.wait_status("the stop takes the RT out of HOMING", |s| {
         s.mode != ControllerMode::Homing
@@ -1546,10 +1979,22 @@ fn loop_stats_reports_the_whole_window_not_three_zeros() {
         "a wall-clock loop has real jitter, got {stats:?}"
     );
     assert!(
-        stats.min_period_s <= stats.p95_period_s
-            && stats.p95_period_s <= stats.p99_period_s
+        stats.min_period_s <= stats.p50_period_s
+            && stats.p50_period_s <= stats.p90_period_s
+            && stats.p90_period_s <= stats.p95_period_s
             && stats.p99_period_s <= stats.max_period_s,
         "the window statistics must be ordered: {stats:?}"
+    );
+    // Periods are timed to the nanosecond, so the 4 % of a jittered
+    // window between p95 and p99 does not collapse onto one value.
+    assert!(
+        stats.p95_period_s < stats.p99_period_s,
+        "p95 and p99 are different statistics: {stats:?}"
+    );
+    // No spread exceeds half the range.
+    assert!(
+        stats.std_period_s <= 0.5 * (stats.max_period_s - stats.min_period_s),
+        "the standard deviation exceeds what the range allows: {stats:?}"
     );
 
     rig.shutdown();
@@ -1649,22 +2094,26 @@ fn a_flood_of_identical_jog_setpoints_does_not_delay_the_release() {
     }
     rig.wait_status("the arm is jogging", |s| s.angles[0] > start + 1.0);
 
-    // Let go, and count STATUS frames until the arm is at rest. Frames are
-    // published once per tick, so this measures the backlog in the RT's own
-    // units rather than in wall-clock time — the arm's ramp-down costs a
-    // handful of ticks, while a per-datagram queue costs one tick per
-    // datagram before the release is even read.
-    let released_at = rig
-        .wait_status("a status frame to anchor the release", |_| true)
-        .seq;
+    // Let go, and time the arm to rest on the runtime's own clock. The
+    // ramp-down from the release speed is v/a plus the jerk-limited ends
+    // (a/jerk = 1/jerk_factor); a per-datagram queue would add one tick
+    // per datagram before the release is even read. Half that backlog on
+    // top of the ramp separates the two with the drives' settle to spare.
+    let robot = par6_config::RobotConfig::load(&test_config()).expect("test config");
+    let l = robot.joints[0].limits.for_mode(par6_config::LimitMode::Jog);
+    let a = (l.velocity_rad_s / robot.jog.accel_time_s).min(l.acceleration_rad_s2);
+    let released = rig.wait_status("a status frame to anchor the release", |_| true);
     c.send(&jog_j(0.0, 5.0));
     let stopped = rig.wait_status("the jog ramps to rest after the release", |s| {
         s.speeds.iter().all(|v| v.abs() < 1e-3)
     });
-    let ticks = stopped.seq.saturating_sub(released_at);
+    let ramp_s = released.speeds[0].abs() / a + 1.0 / robot.jog.jerk_factor;
+    let took_s = (stopped.mono_time_ns - released.mono_time_ns) as f64 * 1e-9;
+    let backlog_s = 300.0 * robot.robot.tick_dt_s;
     assert!(
-        ticks < 150,
-        "the release waited {ticks} ticks behind a backlog of 300 datagrams"
+        took_s < ramp_s + backlog_s / 2.0,
+        "the release took {took_s:.3} s to rest; its ramp is {ramp_s:.3} s — it \
+         waited behind a backlog of 300 datagrams"
     );
 
     rig.shutdown();
@@ -1774,31 +2223,31 @@ fn the_rt_jog_latch_greys_the_enablement_flag() {
     rig.shutdown();
 }
 
-/// A jog's `accel` fraction changes how fast it ramps, and a servo
-/// stream's `speed` fraction changes how fast it converges.
+/// Every streaming command's `speed` and `accel` fractions change what
+/// the arm does: a jog's and a servo stream's acceleration fraction how
+/// far it gets during its ramp, a servo stream's speed fraction how fast
+/// it converges.
 ///
 /// Regression for the whole class: `JogJ.accel`, `ServoJ.speed`/`accel`
 /// and friends decoded, validated, and were then dropped on the floor —
-/// every slider in a UI moved and none of them did anything.
+/// every slider in a UI moved and none of them did anything. Ignoring a
+/// fraction makes its two measurements equal.
 ///
-/// Both halves measure DISPLACEMENT over a fixed window rather than the
-/// time to reach a mark. Time-to-mark carries the fixed command→RT→sim
-/// latency in every sample, which dilutes the ratio and moves with how
-/// loaded the box is; distance covered in a fixed window is the quantity
-/// the fraction scales directly. Against the unwired code both fractions
-/// produce the same displacement, so either assertion fails.
+/// Every window is timed on the runtime's own clock (the STATUS frames'
+/// `mono_time_ns`), not the test's.
 #[test]
 fn stream_speed_and_accel_fractions_reach_the_arm() {
     let rig = Rig::boot(common::shipped_config());
     let mut c = Client::new(rig.addr());
 
-    /// How far J0 travels in `window` while `command` is streamed at it.
+    /// How far the arm travels in `window` of runtime time while
+    /// `command` is streamed at it: J0 in degrees, the TCP in mm.
     fn travel(
         rig: &Rig,
         c: &mut Client,
         window: Duration,
         mut command: impl FnMut() -> Command,
-    ) -> f64 {
+    ) -> (f64, f64) {
         c.ok(&Command::Reset);
         teleport_home(rig, c, park_deg());
         rig.drain_status();
@@ -1807,44 +2256,89 @@ fn stream_speed_and_accel_fractions_reach_the_arm() {
         // an RT tick consumes it, and the measurement loop below would
         // overwrite it within a tick.
         c.send(&command());
-        rig.wait_status("the stream opened", |_| true);
-        let start = park_deg()[0];
-        let mut last = start;
-        let until = Instant::now() + window;
-        while Instant::now() < until {
+        let first = rig.wait_status("the stream opened", |_| true);
+        let until = first.mono_time_ns + window.as_nanos() as u64;
+        let mut last = first.clone();
+        while last.mono_time_ns < until {
             c.send(&command());
             if let Some(s) = rig.recv_status() {
-                last = s.angles[0];
+                last = s;
             }
         }
-        (last - start).abs()
+        let tcp = |s: &Status| [s.pose[3], s.pose[7], s.pose[11]];
+        (
+            (last.angles[0] - first.angles[0]).abs(),
+            distance_mm(tcp(&last), tcp(&first)),
+        )
     }
 
-    fn jog(accel: Option<f64>) -> Command {
-        Command::JogJ(JogJ {
-            speeds: [0.6, 0.0, 0.0, 0.0, 0.0, 0.0],
-            duration: 2.0,
-            accel,
-        })
-    }
-
-    // Short enough that a full-accel jog is still near the start of its
-    // ramp, so the whole window is the part the fraction scales.
+    // Short enough that a full-accel stream is still near the start of
+    // its ramp, so the whole window is the part the fraction scales.
     let ramp = Duration::from_millis(400);
-    let brisk = travel(&rig, &mut c, ramp, || jog(None));
-    let gentle = travel(&rig, &mut c, ramp, || jog(Some(0.2)));
-    assert!(
-        brisk > 0.5,
-        "the full-accel jog barely moved ({brisk:.3} deg); nothing to compare"
-    );
-    assert!(
-        gentle < brisk * 0.5,
-        "a fifth of the acceleration must cover far less ground in {ramp:?}: \
-         {gentle:.3} deg vs {brisk:.3} at full accel"
-    );
+    let jog_j = |accel| {
+        move || {
+            Command::JogJ(JogJ {
+                speeds: [0.6, 0.0, 0.0, 0.0, 0.0, 0.0],
+                duration: 2.0,
+                accel,
+            })
+        }
+    };
+    let jog_l = |accel| {
+        move || {
+            Command::JogL(par6_proto::command::JogL {
+                velocities: [0.0, 0.0, 0.6, 0.0, 0.0, 0.0],
+                duration: 2.0,
+                frame: Frame::Wrf,
+                accel,
+            })
+        }
+    };
+    let mut far = park_deg();
+    far[0] += 90.0;
+    let servo = |speed, accel| {
+        move || {
+            Command::ServoJ(par6_proto::command::ServoJ {
+                angles: far,
+                speed,
+                accel,
+            })
+        }
+    };
+    for (name, brisk, gentle) in [
+        (
+            "jog_j",
+            travel(&rig, &mut c, ramp, jog_j(None)).0,
+            travel(&rig, &mut c, ramp, jog_j(Some(0.2))).0,
+        ),
+        (
+            "jog_l",
+            travel(&rig, &mut c, ramp, jog_l(None)).1,
+            travel(&rig, &mut c, ramp, jog_l(Some(0.2))).1,
+        ),
+        (
+            "servo_j",
+            travel(&rig, &mut c, ramp, servo(Some(0.3), None)).0,
+            travel(&rig, &mut c, ramp, servo(Some(0.3), Some(0.2))).0,
+        ),
+    ] {
+        assert!(
+            brisk > 0.5,
+            "{name}: the full-accel stream barely moved ({brisk:.3}); nothing to compare"
+        );
+        // Under constant acceleration the distance covered scales with
+        // it: a fifth of the acceleration covers a fifth of the ground
+        // while both are still ramping, and no more than half of it even
+        // if the full-accel leg had already reached its cruise.
+        assert!(
+            gentle < brisk * 0.5,
+            "{name}: a fifth of the acceleration must cover far less ground in \
+             {ramp:?}: {gentle:.3} vs {brisk:.3} at full accel"
+        );
+    }
 
-    // Servo: one far target held for a fixed window, so the fraction shows
-    // up as distance covered.
+    // Servo speed: one far target held for a fixed window, so the
+    // fraction shows up as distance covered.
     //
     // Both legs are well under half speed because that is the only regime
     // where the fraction is what limits the arm. Above it this joint runs
@@ -1854,30 +2348,20 @@ fn stream_speed_and_accel_fractions_reach_the_arm() {
     // the scaling regime gives. A reference taken up there is a measure of
     // the motor, not of the setting under test, so halving IT proves
     // nothing about whether the fraction arrived.
-    let mut target = park_deg();
-    target[0] += 90.0;
-    let servo = |speed: Option<f64>| {
-        move || {
-            Command::ServoJ(par6_proto::command::ServoJ {
-                angles: target,
-                speed,
-                accel: None,
-            })
-        }
-    };
     let cruise = Duration::from_millis(600);
-    let faster = travel(&rig, &mut c, cruise, servo(Some(0.30)));
-    let slower = travel(&rig, &mut c, cruise, servo(Some(0.15)));
+    let faster = travel(&rig, &mut c, cruise, servo(Some(0.30), None)).0;
+    let slower = travel(&rig, &mut c, cruise, servo(Some(0.15), None)).0;
     assert!(
         faster > 1.0,
         "the 0.30 stream barely moved ({faster:.3} deg); nothing to compare"
     );
-    // Proportionality, not just "less": half the fraction, half the ground,
-    // with room for the shared acceleration ramp that both legs pay and
-    // the slower one amortises over more of the window.
+    // Half the fraction covers half the ground, plus its share of the
+    // ramp both legs pay: the faster leg spends longer reaching its
+    // speed, so the ratio sits at or a little over one half — never at
+    // the 1.0 an ignored fraction gives.
     let ratio = slower / faster;
     assert!(
-        (0.40..=0.65).contains(&ratio),
+        (0.45..=0.7).contains(&ratio),
         "halving the speed fraction must halve the ground covered in \
          {cruise:?}: {slower:.3} deg at 0.15 against {faster:.3} at 0.30 \
          (ratio {ratio:.3})"
@@ -1914,7 +2398,8 @@ fn loop_stats_carries_the_stream_statistics() {
 
     // A servo stream toward a far target: the first setpoint sits at
     // the measured pose (the start-pose gate), the rest stream the
-    // target at a rate the 40 ms watchdog is happy with.
+    // target four to a tick, paced by the broadcast. A tick applies at
+    // most one setpoint, so at least three of every four are discarded.
     let mut target = park_deg();
     target[0] += 45.0;
     let servo = |angles| {
@@ -1925,11 +2410,16 @@ fn loop_stats_carries_the_stream_statistics() {
         })
     };
     c.send(&servo(park_deg()));
+    let first = rig.wait_status("the stream opened", |_| true);
     let mut live: Option<(f64, f64)> = None;
-    let until = Instant::now() + Duration::from_millis(1500);
-    while Instant::now() < until {
-        c.send(&servo(target));
-        std::thread::sleep(Duration::from_millis(5));
+    let mut last = first.clone();
+    while last.mono_time_ns < first.mono_time_ns + 1_500_000_000 {
+        for _ in 0..4 {
+            c.send(&servo(target));
+        }
+        if let Some(s) = rig.recv_status() {
+            last = s;
+        }
         let s = stream_stats(&mut c);
         if s.0 > 0.0 {
             live = Some(s);
@@ -1942,8 +2432,9 @@ fn loop_stats_carries_the_stream_statistics() {
         "most ticks of a live stream apply a setpoint: {success_rate}"
     );
     assert!(
-        (0.0..=100.0).contains(&discard_pct),
-        "discard percentage {discard_pct} out of range"
+        (50.0..=100.0).contains(&discard_pct),
+        "a stream sent several setpoints a tick must discard most of them: \
+         {discard_pct} %"
     );
 
     c.ok(&Command::Stop(Stop { clear_queue: true }));
@@ -2058,18 +2549,21 @@ fn the_status_rate_override_changes_the_broadcast_and_refuses_a_bad_rate() {
     rig.set_status_timeout(Duration::from_secs(1));
     rig.wait_status("first broadcast", |_| true);
 
-    // Time five INTERVALS, not five frames: the first read lands mid-period.
-    let start = Instant::now();
+    // Consecutive frames describe snapshots one period apart on the
+    // runtime's own clock — not the shipped 50 Hz, not any other rate.
+    let period_ns = 1e9 / f64::from(HZ);
+    let mut prev = rig.recv_status().expect("a broadcast within the timeout");
     for _ in 0..5 {
-        rig.recv_status().expect("a broadcast within the timeout");
+        let s = rig.recv_status().expect("a broadcast within the timeout");
+        let gap = (s.mono_time_ns - prev.mono_time_ns) as f64;
+        assert!(
+            (gap - period_ns).abs() < 0.25 * period_ns,
+            "frames {:.1} ms apart, not the {HZ} Hz override's {:.1} ms",
+            gap * 1e-6,
+            period_ns * 1e-6
+        );
+        prev = s;
     }
-    let elapsed = start.elapsed();
-    let nominal = Duration::from_secs_f64(5.0 / f64::from(HZ));
-    assert!(
-        elapsed > nominal.mul_f64(0.8),
-        "five frames at {HZ} Hz took {elapsed:?}, which is the shipped 50 Hz cadence, \
-         not the override (expected about {nominal:?})"
-    );
     rig.shutdown();
 
     // A rate that does not divide 250 Hz is a startup failure, in the
@@ -2162,7 +2656,7 @@ fn a_program_shape_with_physics_is_something_the_live_jaws_close_on() {
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
     teleport_home(&rig, &mut c, park_deg());
-    let tool = fitted_tool();
+    let tool = boot_tool();
     let i = c.ok_index(&tool_action(7101, &tool, "calibrate", &[]));
     let (ok, detail, _) = c.wait_complete_full(i);
     assert!(ok, "gripper calibrate must complete, got {detail:?}");
@@ -2206,7 +2700,8 @@ fn a_program_shape_with_physics_is_something_the_live_jaws_close_on() {
         Some(1),
         "closing on the block must report an object while closing"
     );
-    let s = rig.wait_status("the jaws rest on the block", |_| true);
+    // A frame from after the grip completed, not one already queued.
+    let s = frames_later(&rig, 2);
     assert!(
         jaw(&s) < 0.9,
         "the jaws closed through the block: {} — the program world never reached the simulator",
@@ -2261,32 +2756,13 @@ fn the_shipped_binary_publishes_the_bus_grant_signal_and_takes_it_away() {
         false
     };
 
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_par6d"))
-        .args([
-            "--sim",
-            "--config",
-            common::shipped_config().to_str().expect("utf-8 path"),
-            "--port",
-            "0",
-            "--bind",
-            "127.0.0.1",
-        ])
-        .env("PAR6_SHM_DIR", &dir)
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("spawn par6d");
-
+    let (child, port, _status_rx) = spawn_par6d_in(&dir, &[]);
     assert!(
         poll(Box::new(|| read_tick().is_some() && read_mode().is_some())),
         "a running par6d published no bus-grant signal; every CAN tool would \
          read this box as having no runtime"
     );
     let first = read_tick().expect("loop_tick");
-    let mode = read_mode().expect("robot_mode");
-    assert!(
-        !mode.is_empty() && mode != "FLASHING",
-        "a runtime that is not in FLASHING must not read as granting the bus: {mode:?}"
-    );
     // Liveness is "advancing", sampled twice — a fixed value reads as a
     // runtime that has stopped, which is a grant by another name.
     assert!(
@@ -2294,45 +2770,44 @@ fn the_shipped_binary_publishes_the_bus_grant_signal_and_takes_it_away() {
         "loop_tick never advanced past {first}; a live runtime would read as stopped"
     );
 
-    // A KILLED runtime cannot clean up after itself, and the design
-    // does not ask it to: the tools read liveness before the mode
-    // precisely because these segments outlive their writer. What has to
-    // hold is that the tick STOPS — a stale value that kept advancing
-    // would be a dead runtime still claiming the bus.
-    // SAFETY: plain kill(2) on our own child with a standard signal.
-    unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
-    let _ = child.wait();
-    let killed_at = read_tick().expect("the segment outlives the process");
-    std::thread::sleep(Duration::from_millis(400));
-    assert_eq!(
-        read_tick(),
-        Some(killed_at),
-        "loop_tick advanced after the runtime was killed; it would read as live"
+    // The mode is the runtime's own, followed into and out of FLASHING —
+    // the one value that hands the bus over.
+    assert!(
+        poll(Box::new(|| read_mode().as_deref() == Some("IDLE"))),
+        "the booted runtime must read IDLE, read {:?}",
+        read_mode()
     );
+    let mut c = Client::new(SocketAddr::from(([127, 0, 0, 1], port)));
+    c.ok(&Command::EnterFlashing(EnterFlashing {
+        assertion: FlashingAssertion::Parked,
+    }));
+    assert!(
+        poll(Box::new(|| read_mode().as_deref() == Some("FLASHING"))),
+        "an open flashing window must read FLASHING, read {:?}",
+        read_mode()
+    );
+    c.ok(&Command::ExitFlashing);
+    assert!(
+        poll(Box::new(|| read_mode().as_deref() == Some("IDLE"))),
+        "a closed flashing window must take the grant back, read {:?}",
+        read_mode()
+    );
+
+    // A KILLED runtime cannot clean up after itself, and the design does
+    // not ask it to: the tools read liveness before the mode precisely
+    // because these segments outlive their writer.
+    drop(child);
+    let killed_at = read_tick().expect("the segment outlives the process");
 
     // The clean path DOES take the claim away, so a restart never has to
     // wait out a stale one.
-    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_par6d"))
-        .args([
-            "--sim",
-            "--config",
-            common::shipped_config().to_str().expect("utf-8 path"),
-            "--port",
-            "0",
-            "--bind",
-            "127.0.0.1",
-        ])
-        .env("PAR6_SHM_DIR", &dir)
-        .stdout(Stdio::null())
-        .spawn()
-        .expect("spawn par6d");
+    let (mut child, _, _status_rx) = spawn_par6d_in(&dir, &[]);
     assert!(
         poll(Box::new(|| read_tick().is_some_and(|t| t != killed_at))),
         "the restarted runtime never republished loop_tick"
     );
-    // SAFETY: as above.
-    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
-    let _ = child.wait();
+    let status = sigterm_and_wait(&mut child);
+    assert!(status.success(), "clean exit expected, got {status:?}");
     assert!(
         poll(Box::new(|| !tick_path.exists() && !mode_path.exists())),
         "a cleanly stopped par6d left its claim on the bus behind"
@@ -2344,10 +2819,17 @@ fn the_shipped_binary_publishes_the_bus_grant_signal_and_takes_it_away() {
 /// be accepted. The homed gate reads the RT snapshot, which is a tick or
 /// more behind the accepted teleport — a script that teleports and then
 /// moves, as `examples/keepout_preview.py` does, must not race the
-/// broadcast.
+/// broadcast. A 20 Hz tick leaves 50 ms between snapshots for two
+/// back-to-back datagrams to land in, so the move is gated before any
+/// tick has seen the teleport.
 #[test]
 fn a_move_sent_right_behind_a_teleport_is_not_refused_as_unhomed() {
-    let rig = Rig::boot(test_config());
+    let config = common::retimed_config("teleport-race", 0.05);
+    let text = std::fs::read_to_string(&config).expect("read race config");
+    let patched = text.replace("status_rate_hz = 50", "status_rate_hz = 20");
+    assert_ne!(patched, text, "status_rate_hz patch point must exist");
+    std::fs::write(&config, patched).expect("write race config");
+    let rig = Rig::boot(config);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2362,5 +2844,187 @@ fn a_move_sent_right_behind_a_teleport_is_not_refused_as_unhomed() {
     let (ok, detail) = c.wait_complete(index);
     assert!(ok, "the move behind a teleport must run, got {detail:?}");
 
+    rig.shutdown();
+}
+
+/// `select_tool` fits a different tool, which is what waldoctl's
+/// "set the active end-effector tool on the controller" means.
+///
+/// It used to accept only the tool already named in `robot.active_gripper`
+/// — anything else was refused with "change robot.active_gripper and
+/// restart par6d" — so a tool change was an edit-and-restart and every
+/// test that wanted a particular tool had to pin the shipped config.
+///
+/// A real swap moves together: the load the gravity feedforward carries,
+/// the frame FK resolves at, the collision geometry, the home offsets on
+/// the joints whose reference is tool-dependent, and whether the tool has
+/// a jaw to actuate at all. This observes the FK frame and the gravity
+/// load through STATUS at every step, and the jaw through its actions.
+/// The boot tool's name and its `urdf_variant` key point at different
+/// URDF trees, so both the boot fit and a swap back must read the key.
+#[test]
+fn select_tool_fits_a_different_tool() {
+    let config = keyed_tool_config();
+    let bundle = par6_config::ConfigBundle::load(&config).expect("keyed config");
+    let rig = Rig::boot(config);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    rig.wait_status("enabled", |s| s.enabled);
+
+    // Booted on the key: the prefix rule would have fitted the flange.
+    let s = assert_fitted(&rig, &bundle, KEYED_TOOL);
+    let (keyed_tcp, keyed_g) = tool_model(&bundle, KEYED_TOOL, &s.angles);
+    let (flange_tcp, flange_g) = tool_model(&bundle, "Flange", &s.angles);
+    assert!(
+        distance_mm(keyed_tcp, flange_tcp) > 20.0 && (keyed_g[1] - flange_g[1]).abs() > 0.1,
+        "the two tools' models must differ at this posture for the checks to tell them \
+         apart: TCP {keyed_tcp:?} vs {flange_tcp:?}, shoulder {:.3} vs {:.3} Nm",
+        keyed_g[1],
+        flange_g[1]
+    );
+
+    let err = c.expect_error(&select_tool(7001, "NO_SUCH_TOOL", None));
+    assert_eq!(
+        err.code,
+        ErrorCode::CommValidationError as u16,
+        "an unknown tool must be refused, got {err:?}"
+    );
+
+    // The bare flange has no jaw, so the actions a driven tool accepts
+    // are now refused.
+    let i = c.ok_index(&select_tool(7002, "FLANGE", None));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "selecting the bare flange must complete, got {detail:?}"
+    );
+    assert_fitted(&rig, &bundle, "Flange");
+    // The jaw's drive came off with it: what it last reported is no
+    // reading of anything on the arm now.
+    let node = usize::from(bundle.robot.bus.gripper_node);
+    rig.drain_status();
+    let s = rig.wait_status("the jaw drive's readings are gone", |_| true);
+    assert!(
+        s.drive_health.temperatures_c[node].is_nan() && s.drive_health.currents_ma[node].is_nan(),
+        "the removed jaw still reports {} C, {} mA",
+        s.drive_health.temperatures_c[node],
+        s.drive_health.currents_ma[node]
+    );
+    let err = c.expect_error(&tool_action(7003, "FLANGE", "calibrate", &[]));
+    assert_eq!(
+        err.code,
+        ErrorCode::CommValidationError as u16,
+        "a passive tool must refuse an action, got {err:?}"
+    );
+
+    // And back, through the key again; the jaw comes back with it.
+    let i = c.ok_index(&select_tool(7004, KEYED_TOOL, None));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "selecting the keyed tool back must complete, got {detail:?}"
+    );
+    assert_fitted(&rig, &bundle, KEYED_TOOL);
+    let i = c.ok_index(&tool_action(7005, KEYED_TOOL, "calibrate", &[]));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "the driven tool's jaw must work again, got {detail:?}");
+
+    // A different DRIVEN tool: the jaw itself changes. The gripper
+    // node's re-tune is not observable here — the simulated driver keeps
+    // its own calibrated flag across the swap — so what is checked is
+    // the model and a jaw that still drives.
+    let other = other_driven_tool(KEYED_TOOL);
+    let i = c.ok_index(&select_tool(7006, &other, None));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "selecting another driven tool must complete, got {detail:?}"
+    );
+    assert_fitted(&rig, &bundle, &other);
+    let i = c.ok_index(&tool_action(7007, &other, "calibrate", &[]));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "the second driven tool's jaw must work, got {detail:?}");
+    rig.shutdown();
+}
+
+/// The move the arm's base was probed with — a 60° septic from the ready
+/// pose, timed for half J1's EXEC speed — then a two-second hold, through
+/// the runtime's own executor. The arm runs it with no ring and rests at
+/// 0.26°/s RMS afterwards; the simulated base is held to the same.
+#[test]
+fn the_base_moves_quietly_through_the_runtime_at_the_config_gains() {
+    // The config tick and a status per tick: a ring at the base's
+    // crossover (19 Hz folded) has to be sampled to be seen, and the
+    // status torque is the commanded one, which never carries it.
+    const STATUS_HZ: u32 = 250;
+    // One period of the ring, over which the profile itself bends by
+    // under half a degree per second.
+    const RING_WINDOW_S: f64 = 0.052;
+    const SPAN_DEG: f64 = 60.0;
+    let cfg = par6_config::RobotConfig::load(&common::shipped_config()).expect("PAR6 config");
+    let exec_speed = cfg.joints[0]
+        .limits
+        .for_mode(par6_config::LimitMode::Exec)
+        .velocity_rad_s;
+    let dur = par6_motion::SEPTIC_PEAK_VEL * SPAN_DEG.to_radians() / (0.5 * exec_speed);
+    let rig = Rig::boot_at_status_rate(common::retimed_config("base-move", 0.004), STATUS_HZ);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let ready = ready_pose_deg();
+    teleport_home(&rig, &mut c, ready);
+    c.ok(&select_profile("SEPTIC"));
+    let mut target = ready;
+    target[0] += SPAN_DEG;
+    rig.drain_status();
+    let idx = c.ok_index(&move_j(4201, target, dur));
+    let moving = rig.collect_through(idx, Duration::from_secs_f64(dur + 5.0));
+    let (ok, detail) = c.wait_complete(idx);
+    assert!(ok, "the probe move must complete, got {detail:?}");
+    let rest = rig.collect_status(Duration::from_secs(2));
+    let rms = |v: &[f64]| (v.iter().map(|x| x * x).sum::<f64>() / v.len() as f64).sqrt();
+    // What the drive's speed does around its own average over the window.
+    let window = (RING_WINDOW_S * f64::from(STATUS_HZ)).round() as usize;
+    let speed: Vec<f64> = moving.iter().map(|s| s.speeds[0].to_degrees()).collect();
+    assert!(
+        speed.len() > 2 * window,
+        "the probe move reported only {} frames",
+        speed.len()
+    );
+    let ripple: Vec<f64> = speed
+        .windows(window)
+        .map(|w| w[window / 2] - w.iter().sum::<f64>() / window as f64)
+        .collect();
+    let ripple = rms(&ripple);
+    let tail: Vec<f64> = rest
+        .iter()
+        .skip(rest.len() / 4)
+        .map(|s| s.speeds[0].to_degrees())
+        .collect();
+    let rest_rms = rms(&tail);
+    eprintln!(
+        "base probe move through the runtime: {} frames, speed ripple {ripple:.2} deg/s RMS; \
+         at rest after {rest_rms:.2} deg/s RMS",
+        moving.len()
+    );
+    assert!(
+        ripple < 3.0,
+        "the simulated base rings through the probe move: {ripple:.2} deg/s RMS around its \
+         own {RING_WINDOW_S} s average (the arm: under 1 deg/s)"
+    );
+    assert!(
+        rest_rms < 1.0,
+        "the simulated base does not come to rest after the probe move: {rest_rms:.2} deg/s RMS"
+    );
+    // Quiet because it moved cleanly, not because it stayed put.
+    let end = rest.last().expect("frames at rest");
+    let tolerance_deg = cfg.motion.settle_tolerance_rad.to_degrees();
+    assert!(
+        (end.angles[0] - target[0]).abs() <= tolerance_deg,
+        "the base rests at {:.3}°, not on the move's end {:.3}° (± {tolerance_deg:.3}°)",
+        end.angles[0],
+        target[0]
+    );
     rig.shutdown();
 }

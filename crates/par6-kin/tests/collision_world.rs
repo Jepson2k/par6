@@ -1,7 +1,8 @@
 //! The collision world's contract on the shipped PAR6 URDF variants,
 //! derived from what the runtime and the frontend need of it: the arm's
 //! own poses are clear, a keep-out where the tool is gets reported by
-//! name, one a metre away does not, the floor catches the base, a margin
+//! name, one a metre away does not, the floor the base stands on pairs with
+//! no link but the moving ones, a margin
 //! moves the verdict, the layers stay independent, a rejected world
 //! changes nothing, and a segment sweep finds what its endpoints hide.
 //! Every shape is placed from the model's own TCP so the scenarios hold on
@@ -289,25 +290,36 @@ fn verdicts_follow_the_world_on_every_variant() {
             .unwrap();
         assert_eq!(col.pair_count() - self_pairs, with_one / 2);
 
-        // The floor is an installation keep-out the base stands on.
-        let floor = Shape {
+        // The floor the base stands on, here a slab up through the base
+        // itself: the base is fixed to the world as the floor is, so their
+        // contact is no motion's doing and is never a pair; the arm at home
+        // stands clear of a floor at the mounting plane.
+        let slab = |top: f64| Shape {
             attachment: None,
             name: "floor".to_owned(),
             kind: ShapeKind::Box,
             params: [2.0, 2.0, 0.04],
-            pose: [0.0; 6],
+            pose: [0.0, 0.0, top - 0.02, 0.0, 0.0, 0.0],
             collision: true,
             margin: None,
         };
-        col.set_layer(Layer::Installation, &[floor]).unwrap();
+        col.set_layer(Layer::Installation, &[slab(0.02)]).unwrap();
         let pairs = pair_set(&mut col, &HOME);
         assert!(
-            pairs
+            !pairs
                 .iter()
-                .any(|(a, b)| (a == "floor" && b.starts_with("base_link"))
-                    || (b == "floor" && a.starts_with("base_link"))),
-            "{variant:?}: the floor must catch the base: {pairs:?}"
+                .any(|(a, b)| a.starts_with("base_link") || b.starts_with("base_link")),
+            "{variant:?}: the fixed base must not pair with the floor: {pairs:?}"
         );
+        // Within the runtime's own clearance, too.
+        let mut gated = load(variant, COLLISION_CLEARANCE_M);
+        gated.set_layer(Layer::Installation, &[slab(0.0)]).unwrap();
+        for (name, q) in [("home", HOME), ("reach", REACH)] {
+            assert!(
+                pair_set(&mut gated, &q).is_empty(),
+                "{variant:?}: {name} must stand clear of the floor it is mounted on"
+            );
+        }
         col.set_layer(Layer::Installation, &[]).unwrap();
         col.set_layer(Layer::Program, &[]).unwrap();
 
@@ -341,6 +353,22 @@ fn verdicts_follow_the_world_on_every_variant() {
             pair_set(&mut col, &REACH).is_empty(),
             "{variant:?}: a margin short of the gap must not"
         );
+
+        // A shape with no margin of its own stands off by the model's
+        // clearance instead, the same way.
+        for (clearance, want_hit) in [(gap - 0.01, false), (gap + 0.01, true)] {
+            let mut cleared = load(variant, clearance);
+            assert_eq!(cleared.clearance(), clearance);
+            cleared
+                .set_layer(Layer::Program, std::slice::from_ref(&standoff))
+                .unwrap();
+            let pairs = pair_set(&mut cleared, &REACH);
+            assert_eq!(
+                involves(&pairs, "standoff"),
+                want_hit,
+                "{variant:?}: clearance {clearance} against a shape {gap:.3} m away: {pairs:?}"
+            );
+        }
     }
 }
 
@@ -358,17 +386,9 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
     assert_eq!(col.clearance(), 0.0);
     assert!(!col.check(&REACH, false).unwrap().active());
 
-    // Installation keep-out: the arm's own floor, always in contact.
-    let floor = Shape {
-        attachment: None,
-        name: "floor".to_owned(),
-        kind: ShapeKind::Box,
-        params: [2.0, 2.0, 0.04],
-        pose: [0.0; 6],
-        collision: true,
-        margin: None,
-    };
-    assert_eq!(col.set_layer(Layer::Installation, &[floor]).unwrap(), 1);
+    // Installation keep-out: a fence where the tool reaches.
+    let fence = box_shape("fence", 0.06, tcp_at(variant, &REACH), None);
+    assert_eq!(col.set_layer(Layer::Installation, &[fence]).unwrap(), 1);
     assert_eq!(
         col.set_layer(Layer::Program, std::slice::from_ref(&keepout))
             .unwrap(),
@@ -377,7 +397,7 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
 
     let names = pair_set(&mut col, &REACH);
     assert!(
-        involves(&names, "floor"),
+        involves(&names, "fence"),
         "installation layer must be enforced: {names:?}"
     );
     assert!(
@@ -389,7 +409,7 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
     assert_eq!(col.set_layer(Layer::Program, &[]).unwrap(), 3);
     let names = pair_set(&mut col, &REACH);
     assert!(
-        involves(&names, "floor"),
+        involves(&names, "fence"),
         "clearing the program layer must not drop installation keep-outs: {names:?}"
     );
     assert!(
@@ -426,33 +446,6 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
         involves(&names, "keepout"),
         "a refused SET_SHAPES must leave the previous world enforced: {names:?}"
     );
-}
-
-/// A shape without its own margin inherits the model-wide clearance — the
-/// "robot's global clearance applies" half of waldoctl's margin contract.
-#[test]
-fn model_clearance_applies_to_shapes_without_a_margin() {
-    let variant = GripperVariant::Flange;
-    let standoff = standoff_sphere(variant);
-    assert!(standoff.margin.is_none());
-    let gap = {
-        let mut col = load(variant, 0.0);
-        col.set_layer(Layer::Program, std::slice::from_ref(&standoff))
-            .unwrap();
-        col.world_distance(&REACH).unwrap()
-    };
-    assert!(gap > 0.02, "the standoff must stand clear, gap {gap} m");
-    for (clearance, want_hit) in [(0.0, false), (gap + 0.01, true)] {
-        let mut col = load(variant, clearance);
-        assert_eq!(col.clearance(), clearance);
-        col.set_layer(Layer::Program, std::slice::from_ref(&standoff))
-            .unwrap();
-        assert_eq!(
-            col.check(&REACH, false).unwrap().active(),
-            want_hit,
-            "clearance {clearance} against a shape {gap:.3} m away"
-        );
-    }
 }
 
 /// The planner's per-segment question: does the straight joint-space path
@@ -765,17 +758,33 @@ fn the_srdf_silences_rest_contact_and_permanent_overlap_and_nothing_else() {
         );
         // The arm-only check API holds the jaws still, so a pair the jaw
         // sweep put in rest contact cannot be reproduced here; every
-        // other silenced pair has to be one the meshes actually touch.
-        let over: Vec<_> = srdf
-            .iter()
-            .filter(|(a, b)| !a.contains("jaw") && !b.contains("jaw"))
-            .filter(|p| !ever.contains(p))
-            .collect();
+        // other silenced pair has to be one the arm cannot help — in
+        // contact at park, or in overlap across the window.
+        let unavoidable: BTreeSet<(String, String)> = rest.union(&always).cloned().collect();
+        let overreach = |silenced: &BTreeSet<(String, String)>| -> Vec<(String, String)> {
+            silenced
+                .iter()
+                .filter(|(a, b)| !a.contains("jaw") && !b.contains("jaw"))
+                .filter(|p| !unavoidable.contains(*p))
+                .cloned()
+                .collect()
+        };
+        let over = overreach(&srdf);
         assert!(
             over.is_empty(),
-            "{variant:?}: the SRDF silences {over:?}, which never touched in {SAMPLES} \
-             soft-window samples or at park: a real contact there would go unreported"
+            "{variant:?}: the SRDF silences {over:?}, which only touch in some poses: \
+             a real contact there would go unreported"
         );
+        // The control: silencing a pair that touches only in some folds
+        // is exactly what that check reports.
+        let intermittent = ever
+            .iter()
+            .find(|p| !unavoidable.contains(*p) && !p.0.contains("jaw") && !p.1.contains("jaw"))
+            .expect("the window has folds that are contact only some of the time")
+            .clone();
+        let mut too_much = srdf.clone();
+        too_much.insert(intermittent.clone());
+        assert_eq!(overreach(&too_much), [intermittent]);
 
         // And the consequence the runtime depends on: with the SRDF
         // applied, the pose the config declares valid checks clean.

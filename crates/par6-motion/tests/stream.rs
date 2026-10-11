@@ -19,7 +19,7 @@ fn stream_setup() -> (StreamingExecutor, MotionLimits, f64) {
 }
 
 #[test]
-fn converges_to_moved_target_without_overshoot() {
+fn the_tracker_converges_without_overshoot_inside_the_limits_it_is_given() {
     let (mut exec, limits, dt) = stream_setup();
     exec.activate(&HOME);
 
@@ -86,19 +86,15 @@ fn converges_to_moved_target_without_overshoot() {
         Some(&limits.jerk),
         "stream",
     );
-}
 
-#[test]
-fn set_limits_rescales_the_tracker() {
-    let (mut exec, limits, dt) = stream_setup();
+    // Rescaled limits rescale the tracker.
     let mut reduced = limits;
     for v in reduced.velocity.iter_mut() {
         *v *= 0.3;
     }
     exec.set_limits(&reduced).unwrap();
     exec.activate(&HOME);
-    let target: [f64; NUM_JOINTS] = std::array::from_fn(|j| HOME[j] + DELTA[j]);
-    exec.set_target(&target).unwrap();
+    exec.set_target(&t1).unwrap();
     let mut qs = vec![HOME];
     for _ in 0..20_000 {
         let s = exec.step().unwrap();
@@ -107,7 +103,7 @@ fn set_limits_rescales_the_tracker() {
             break;
         }
     }
-    assert!(max_err(qs.last().unwrap(), &target) < 1e-6);
+    assert!(max_err(qs.last().unwrap(), &t1) < 1e-6);
     assert_within_limits(
         &qs,
         dt,

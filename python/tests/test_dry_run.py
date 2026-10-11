@@ -242,9 +242,12 @@ class TestPlannedMotion:
         Driven through the dry-run client — the plan under test is the one
         the runtime's own planner produces — with the config as the oracle.
         """
-        cfg = _cfg.config()
+        config_path = sim_config(tmp_path / "config", config_patch=_row_rate_tick)
+        # The host may have a commissioned overlay; this preview uses the
+        # isolated test config, so its limits must be the oracle too.
+        cfg = _cfg.Config(str(config_path))
         velocity = np.array(cfg.limits("exec")["velocity"])
-        start = _cfg.homing_ready_pose_rad()
+        start = np.array(cfg.homing_ready_pose_rad())
         # Long enough that speed, not the default half accel, bounds it.
         target = start + np.radians([60.0, -20.0, 30.0, 0.0, 40.0, 0.0])
         # Ticked at the record's row rate, so every tick is a row and the
@@ -252,9 +255,7 @@ class TestPlannedMotion:
         # average, which would smear a fast tick across several.
         client = Robot().create_dry_run_client(
             initial_joints_deg=np.degrees(start).tolist(),
-            config_path=str(
-                sim_config(tmp_path / "config", config_patch=_row_rate_tick)
-            ),
+            config_path=str(config_path),
         )
         dt = client._dt
         assert dt == pytest.approx(_ROW_DT_S)
@@ -351,7 +352,7 @@ class TestCartesianMotion:
         np.testing.assert_allclose(dry_run.angles(), before, atol=1e-9)
 
     @pytest.mark.parametrize(
-        "profile", ["RUCKIG", "TRAPEZOID", "QUINTIC", "TOPPRA", "LINEAR"]
+        "profile", ["RUCKIG", "TRAPEZOID", "QUINTIC", "SEPTIC", "TOPPRA", "LINEAR"]
     )
     def test_move_l_is_straight_under_every_profile(self, dry_run, profile) -> None:
         """The profile decides how a linear move is timed, not where it goes:
@@ -588,7 +589,7 @@ class TestCartesianMotion:
         assert empty.value.code == ErrorCode.COMM_VALIDATION_ERROR
 
         with pytest.raises(RobotError) as tool:
-            dry_run.select_tool("SSG48")
+            dry_run.select_tool("NO_SUCH_TOOL")
         assert tool.value.code == ErrorCode.COMM_VALIDATION_ERROR
 
         with pytest.raises(RobotError) as profile:
@@ -924,10 +925,23 @@ class TestLiveParity:
         # Clear of the wrist singularity park folds J5 into.
         dry_run.teleport([0.0, -60.0, 150.0, 0.0, 45.0, 180.0])
         start = np.asarray(dry_run.pose())
-        dry_run.jog_l("WRF", "X", speed=1.0, duration=0.5)
+        duration = 0.5
+        dry_run.jog_l("WRF", "X", speed=1.0, duration=duration)
         jog = _last(dry_run)
         end = np.asarray(dry_run.pose())
-        assert end[0] - start[0] > 20.0, "half a second of full-scale +X must travel"
+        # Full scale is the configured TCP rate, reached over the jog ramp. A
+        # straight ramp would cover `straight` inside the window; the release
+        # then ramps down rather than stopping dead, which adds ground but
+        # never more than full speed held for one more ramp.
+        full_mm_s = _cfg.config().motion()["jog_l_linear_max_m_s"] * 1000.0
+        ramp = _cfg.config().jog_defaults()["accel_time_s"]
+        inside = min(duration, ramp)
+        straight = full_mm_s * (inside**2 / (2.0 * ramp) + max(0.0, duration - ramp))
+        travel = end[0] - start[0]
+        assert 0.8 * straight < travel <= full_mm_s * (duration + ramp), (
+            f"half a second of full-scale +X travelled {travel:.2f} mm; "
+            f"a straight ramp covers {straight:.2f} mm inside the window"
+        )
         assert abs(end[1] - start[1]) < 3.0 and abs(end[2] - start[2]) < 3.0
         # The watchdog releases the tool rather than stopping it dead, so
         # the jog occupies the arm for its window PLUS the ramp down —
@@ -1032,9 +1046,11 @@ class TestProgramWorkflow:
             )
         # The record keeps every stride-th sample, so its last row is up to
         # one row short of the landing the virtual arm is placed on — a
-        # profile's last stride, at rest by then.
+        # profile's last stride, decelerating at most at the EXEC limit.
+        accel = max(_cfg.config().limits("exec")["acceleration"])
+        stride_deg = np.degrees(0.5 * accel * record.row_dt_s**2)
         assert client.angles() == pytest.approx(
-            np.degrees(results[-1].end_joints_rad), abs=0.05
+            np.degrees(results[-1].end_joints_rad), abs=max(0.05, stride_deg)
         )
         assert sum(r.duration for r in results) > 0.0
 

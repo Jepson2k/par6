@@ -82,9 +82,14 @@ pub struct ServerConfig {
     /// Tool registry keys (`select_tool` / `tool_action` validation and
     /// the TOOLS query). Matched case-insensitively on the wire.
     pub tools: Vec<String>,
-    /// The tool the runtime is actually fitted with — active from startup
-    /// (and after `reset_state`), and the only key `select_tool` accepts:
-    /// swapping a tool changes the kinematic model, which is a restart.
+    /// Of [`tools`](Self::tools), the ones carrying a driver — what
+    /// `select_tool` sets [`tool_dof`](Self::tool_dof) from when it fits a
+    /// different tool. Matched case-insensitively, like `tools`.
+    pub driven_tools: Vec<String>,
+    /// The tool the runtime is fitted with now: the configured one from
+    /// startup, then whichever `select_tool` last fitted (see
+    /// [`fit_tool`](Self::fit_tool)). `reset_state` keeps it — the tool on
+    /// the arm does not change because a program's state was cleared.
     /// Empty = no tool.
     pub fitted_tool: String,
     /// Controllable degrees of freedom of the fitted tool. 0 = passive:
@@ -105,16 +110,23 @@ pub struct ServerConfig {
     /// ceilings its configuration declares. Empty = a runtime with no
     /// tunable drives, and every `set_pid_gains` is refused.
     pub tunable_nodes: Vec<TunableNode>,
+    /// Each driven tool's drive on the gripper node, by tool key: what
+    /// [`fit_tool`](Self::fit_tool) puts in
+    /// [`tunable_nodes`](Self::tunable_nodes) for it.
+    pub tool_drives: Vec<(String, TunableNode)>,
+    /// The `can_tool_id`s the configured tools carry: what `set_tool_id`
+    /// may provision a drive with.
+    pub tool_ids: Vec<u8>,
     /// Motion profile names (`select_profile` validation).
     pub profiles: Vec<String>,
     /// Profile active at startup (and after `reset_state`).
     pub initial_profile: String,
-    /// Per-joint hard travel window \[degrees\], `(min, max)` in wire
-    /// units and kinematic order. `teleport` is refused outside it: the
-    /// runtime cannot place a joint there, and clamping into range put
-    /// the arm somewhere the client never asked for and reported
-    /// success. Unbounded by default so a config that declares no limits
-    /// constrains nothing.
+    /// Per-joint travel \[degrees\], `(min, max)` in wire units and
+    /// kinematic order: the endstops, or the software window of a joint
+    /// without them. `teleport` is refused outside it: the runtime cannot
+    /// place a joint there, and clamping into range put the arm somewhere
+    /// the client never asked for and reported success. Unbounded by
+    /// default so a config that declares no limits constrains nothing.
     pub joint_hard_limits_deg: [(f64, f64); NUM_JOINTS],
     /// Installation-layer collision shapes (persistent keep-outs,
     /// reported by the SHAPES query alongside the program layer).
@@ -151,7 +163,7 @@ pub struct ConfigInfoData {
     pub robot_toml: String,
     /// Gripper TOMLs as `(file name, content)`, sorted by file name,
     /// served by CONFIG_BUNDLE.
-    pub grippers: Vec<(String, String)>,
+    pub tools: Vec<(String, String)>,
 }
 
 /// A drive `set_pid_gains` may retune, with the limits its configured
@@ -198,11 +210,14 @@ impl Default for ServerConfig {
             blend_hold: Duration::from_millis(100),
             simulator: false,
             tools: Vec::new(),
+            driven_tools: Vec::new(),
             fitted_tool: String::new(),
             tool_dof: 0,
             cartesian: true,
             digital_outputs: Vec::new(),
             tunable_nodes: Vec::new(),
+            tool_drives: Vec::new(),
+            tool_ids: Vec::new(),
             profiles: vec!["default".to_owned()],
             initial_profile: "default".to_owned(),
             joint_hard_limits_deg: [(f64::NEG_INFINITY, f64::INFINITY); NUM_JOINTS],
@@ -213,6 +228,35 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// Record `name` as the fitted tool and return the spelling stored.
+    ///
+    /// Clients canonicalise registry keys to upper case, so the name is
+    /// matched case-insensitively, but what is stored is the registry's own
+    /// spelling — everything downstream looks the tool up by it. The tool
+    /// DOF follows, since tool actions are gated on it.
+    pub fn fit_tool(&mut self, name: &str) -> String {
+        let tool = self
+            .tools
+            .iter()
+            .find(|t| t.eq_ignore_ascii_case(name))
+            .cloned()
+            .unwrap_or_else(|| name.to_owned());
+        self.tool_dof = usize::from(
+            self.driven_tools
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(&tool)),
+        );
+        // The gripper node is the tool's drive: its ceilings, or none.
+        let drives = &self.tool_drives;
+        self.tunable_nodes
+            .retain(|n| !drives.iter().any(|(_, d)| d.node == n.node));
+        if let Some((_, drive)) = drives.iter().find(|(t, _)| t.eq_ignore_ascii_case(&tool)) {
+            self.tunable_nodes.push(*drive);
+        }
+        self.fitted_tool.clone_from(&tool);
+        tool
+    }
+
     /// Build a config from the robot TOML `[protocol]` section, leaving
     /// every other knob at its default.
     pub fn from_protocol(p: &ProtocolConfig) -> Self {

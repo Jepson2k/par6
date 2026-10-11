@@ -108,7 +108,7 @@ def test_sync_facade_smoke(daemon):
 
         # The halt verbs on the sync tool are sends, not coroutines: each
         # comes back as the queued command's index.
-        client.select_tool(_cfg.fitted_tool_key())
+        client.select_tool(_cfg.Config(str(daemon.config)).active_tool())
         for verb in ("stop", "release"):
             assert getattr(client.tool, verb)() >= 0, verb
 
@@ -189,8 +189,11 @@ def test_skill_runs_nested_motion_on_the_existing_sync_connection(daemon):
         events = []
         with observe_skills(events.append):
             outward, homeward = round_trip(client)
-        assert outward[0] == pytest.approx(park[0] + 5, abs=0.5)
-        assert homeward[0] == pytest.approx(park[0], abs=0.5)
+        # Each move lands within the runtime's settle tolerance of a target
+        # taken from where the arm was, and the teleport within 0.5 deg.
+        tolerance = math.degrees(_cfg.config().motion()["settle_tolerance_rad"])
+        assert outward[0] == pytest.approx(park[0] + 5, abs=0.5 + tolerance)
+        assert homeward[0] == pytest.approx(outward[0] - 5, abs=tolerance)
         assert [e.phase for e in events] == [
             "started",
             "started",

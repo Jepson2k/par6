@@ -138,9 +138,21 @@ mod tests {
     /// publish a STATUS slot that mirrors another slot forever.
     #[test]
     fn collisions_and_reserved_pins_are_refused_by_name() {
-        let ok = IoConfig::default();
-        ok.validate().expect("the shipped box validates");
-        assert_eq!(ok.status_slots(), 11, "7 in + 3 out + e-stop");
+        let ok: IoConfig = toml::from_str(
+            "inputs = [{ name = \"a\", offset = 19 }, { name = \"b\", offset = 13 }]\n\
+             outputs = [{ name = \"c\", offset = 25 }]\n",
+        )
+        .expect("an [io] section parses");
+        ok.validate().expect("distinct names on free pins validate");
+        assert_eq!(ok.status_slots(), 4, "2 in + 1 out + e-stop");
+
+        let mut nameless = IoConfig::default();
+        nameless.outputs[2].name = " ".to_owned();
+        let err = nameless.validate().expect_err("a line needs a name");
+        assert!(
+            err.to_string().contains("io.outputs[2].name"),
+            "names the field: {err}"
+        );
 
         let mut dup_pin = IoConfig::default();
         dup_pin.outputs[1].offset = dup_pin.inputs[0].offset;
@@ -187,6 +199,10 @@ mod tests {
             outputs: Vec::new(),
         };
         full.validate().expect("exactly the budget is allowed");
-        assert_eq!(full.status_slots(), MAX_IO_LINES + 1);
+        assert_eq!(
+            full.status_slots(),
+            par6_proto::MAX_IO_SLOTS,
+            "a full declaration fills the wire's io array exactly, e-stop included"
+        );
     }
 }

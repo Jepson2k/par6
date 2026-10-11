@@ -449,6 +449,13 @@ par6_status par6_kin_set_tool(par6_kin *h, double mass, const double *com3,
 int32_t par6_shim_abi_version(void);
 #define PAR6_SHIM_ABI_VERSION 12
 
+/* The byte layout of the value structs that cross this boundary, so the
+ * Rust mirrors can check they read the same bytes: each struct's size,
+ * then its fields' offsets in declaration order — par6_tool_params,
+ * par6_shape, par6_shape_placement. Writes at most `n` values; returns
+ * how many there are. */
+int32_t par6_shim_layout(uint64_t *out, int32_t n);
+
 #ifdef __cplusplus
 } /* extern "C" */
 #endif

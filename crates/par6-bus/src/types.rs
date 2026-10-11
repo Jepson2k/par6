@@ -200,6 +200,10 @@ pub enum GripperCommand {
 /// Telemetry request kinds a poll slot can carry (RTR frames).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PollKind {
+    /// cmd 37 → temperature, voltage, error flags and current in one
+    /// reply (par6 firmware). The vendor firmware does not answer it,
+    /// and gets the three polls below instead.
+    Telemetry,
     /// cmd 23 → `NodeState::temperature_c`.
     Temperature,
     /// cmd 24 → `NodeState::voltage_mv`.
@@ -237,6 +241,133 @@ pub enum PollAction {
         /// Target node.
         node: NodeId,
     },
+    /// One stored configuration field, consuming exactly one poll slot.
+    ConfigFrame {
+        /// Target node.
+        node: NodeId,
+        /// Field to transmit.
+        kind: crate::ConfigKind,
+    },
+    /// A read request (RTR) on one configuration frame, consuming one poll
+    /// slot; the answer lands in [`NodeState::readback`].
+    ConfigRead {
+        /// Target node.
+        node: NodeId,
+        /// Configuration frame to read.
+        kind: crate::ConfigKind,
+    },
+    /// One capture read (cmd 39): pair `chunk` of `channel` (0 velocity,
+    /// 1 Iq, `CAPTURE_STATUS_CHANNEL` the status), one poll slot. The reply
+    /// lands in the backend's [`CaptureBuffer`] for the node.
+    CaptureRead {
+        /// Target node.
+        node: NodeId,
+        /// 0 velocity, 1 Iq, 0xFF status.
+        channel: u8,
+        /// Which pair.
+        chunk: u16,
+    },
+}
+
+/// A loop-rate capture (cmd 38/39) as read back so far: the velocity the
+/// drive's loop acted on and its measured Iq, one row per sample. The
+/// backend keeps one per node, sized once at boot, so a read on the tick
+/// path stores without allocating.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureBuffer {
+    /// Samples the drive reports recorded (status reply).
+    pub recorded: u16,
+    /// Samples the capture was asked for (status reply).
+    pub wanted: u16,
+    /// Control loops per sample (status reply).
+    pub divisor: u16,
+    /// Channel 0 \[ticks/s / `CAPTURE_VEL_SCALE`\], indexed by sample.
+    pub velocity: Vec<i16>,
+    /// Channel 1 \[mA\], indexed by sample.
+    pub current: Vec<i16>,
+    /// Channel 2: the rotor's electrical phase, 0..16383 per cycle.
+    pub phase: Vec<i16>,
+    /// Which pairs of each channel have been answered.
+    received: [Vec<bool>; 3],
+}
+
+impl Default for CaptureBuffer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CaptureBuffer {
+    /// Room for a full capture, zeroed.
+    pub fn new() -> Self {
+        let len = usize::from(crate::spectral::codec::CAPTURE_LEN);
+        Self {
+            recorded: 0,
+            wanted: 0,
+            divisor: 0,
+            velocity: vec![0; len],
+            current: vec![0; len],
+            phase: vec![0; len],
+            received: [
+                vec![false; len / 2],
+                vec![false; len / 2],
+                vec![false; len / 2],
+            ],
+        }
+    }
+
+    /// Forget the previous capture: a new one is starting.
+    pub fn clear(&mut self) {
+        self.recorded = 0;
+        self.wanted = 0;
+        self.divisor = 0;
+        self.velocity.fill(0);
+        self.current.fill(0);
+        self.phase.fill(0);
+        for r in &mut self.received {
+            r.fill(false);
+        }
+    }
+
+    /// A cmd 39 data reply.
+    pub fn store(&mut self, channel: u8, chunk: u16, samples: [i16; 2]) {
+        let rows = match channel {
+            0 => &mut self.velocity,
+            1 => &mut self.current,
+            2 => &mut self.phase,
+            _ => return,
+        };
+        let at = usize::from(chunk) * 2;
+        for (k, s) in samples.iter().enumerate() {
+            if let Some(slot) = rows.get_mut(at + k) {
+                *slot = *s;
+            }
+        }
+        if let Some(seen) = self.received[usize::from(channel)].get_mut(usize::from(chunk)) {
+            *seen = true;
+        }
+    }
+
+    /// The pairs of `channel` not answered yet, of those the drive recorded:
+    /// a reply lost on the bus is read again.
+    pub fn missing(&self, channel: u8) -> impl Iterator<Item = u16> + '_ {
+        let seen = self.received.get(usize::from(channel));
+        (0..self.chunks()).filter(move |&c| {
+            !seen.is_some_and(|s| s.get(usize::from(c)).copied().unwrap_or(false))
+        })
+    }
+
+    /// A cmd 39 status reply.
+    pub fn status(&mut self, recorded: u16, wanted: u16, divisor: u16) {
+        self.recorded = recorded;
+        self.wanted = wanted;
+        self.divisor = divisor;
+    }
+
+    /// Pairs to read per channel for what the drive recorded.
+    pub fn chunks(&self) -> u16 {
+        self.recorded.div_ceil(2)
+    }
 }
 
 /// Per-type driver fault flags (cmd 26 reply, DLC 2; list index 0 = bit 7).
@@ -337,7 +468,8 @@ impl ErrorFlags {
     }
 }
 
-/// Device identity (cmd 25 reply, DLC 7).
+/// Device identity (cmd 25 reply, DLC 7 from the vendor firmware, DLC 8
+/// from the par6 firmware).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DeviceInfo {
     /// Hardware version.
@@ -348,17 +480,20 @@ pub struct DeviceInfo {
     pub sw_ver: u8,
     /// Serial number.
     pub serial: i32,
+    /// Which tool the drive is built into, as the drive's EEPROM says
+    /// (`ToolConfig::can_tool_id`); 0 = not set, or a vendor firmware
+    /// that has no such byte.
+    pub tool_id: u8,
 }
 
 /// HALL homing reply bits (cmd 32, DLC 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HallState {
-    /// HALL_trigger bit (b7). Vendor hit condition: trigger == 0 or
-    /// `edge` set; position is latched AT trigger.
+    /// HALL_trigger bit (b7): true while searching, false while holding the hit.
     pub trigger: bool,
     /// Pin-2 state (b6).
     pub pin2: bool,
-    /// Hall index / edge bit (b5).
+    /// Hall index / edge bit (b5), retained until a new Hall-mode entry.
     pub edge: bool,
 }
 
@@ -371,6 +506,9 @@ pub struct HallState {
 pub struct NodeState {
     /// Motor position \[encoder ticks\] (cmd 3 / 28 / 32 replies).
     pub position_ticks: Option<i32>,
+    /// Changes on every received position sample, including unchanged positions.
+    /// Other telemetry does not advance this wrapping counter.
+    pub position_generation: u64,
     /// Motor speed \[encoder ticks/s\].
     pub speed_ticks_s: Option<i32>,
     /// Motor current \[mA\].
@@ -385,12 +523,19 @@ pub struct NodeState {
     pub kt_nm_a: Option<f32>,
     /// Device identity (cmd 25).
     pub device_info: Option<DeviceInfo>,
+    /// The node has answered the combined telemetry poll (cmd 37): it
+    /// runs the par6 firmware, and one poll refreshes what the vendor
+    /// firmware needs three for.
+    pub combined_telemetry: bool,
     /// HALL reply bits (cmd 32), present only while hall-driven.
     pub hall: Option<HallState>,
     /// Live fault bit: the err bit of the CAN id, set by the driver on
     /// EVERY reply while it has an active fault. Authoritative and
     /// per-frame fresh, unlike `error_flags`.
     pub live_error_bit: bool,
+    /// What the drive answered to configuration read requests, per
+    /// configuration frame; `None` until one answered.
+    pub readback: [Option<crate::spectral::codec::Readback>; 7],
     /// Ticks since this node's last frame; `u64::MAX` = never seen.
     pub data_age_ticks: u64,
 }
@@ -399,6 +544,7 @@ impl Default for NodeState {
     fn default() -> Self {
         Self {
             position_ticks: None,
+            position_generation: 0,
             speed_ticks_s: None,
             current_ma: None,
             temperature_c: None,
@@ -406,10 +552,24 @@ impl Default for NodeState {
             error_flags: None,
             kt_nm_a: None,
             device_info: None,
+            combined_telemetry: false,
             hall: None,
             live_error_bit: false,
             data_age_ticks: u64::MAX,
+            readback: [None; 7],
         }
+    }
+}
+
+impl NodeState {
+    /// The drive's last answer to a read request on `kind`.
+    pub fn readback(&self, kind: crate::ConfigKind) -> Option<crate::spectral::codec::Readback> {
+        self.readback[kind.index()]
+    }
+
+    pub(crate) fn record_position(&mut self, position_ticks: i32) {
+        self.position_ticks = Some(position_ticks);
+        self.position_generation = self.position_generation.wrapping_add(1);
     }
 }
 

@@ -11,7 +11,8 @@
 //! at construction — never hardcoded tick counts. Use
 //! [`RobotConfig::ticks`] for the conversion.
 //!
-//! Layout on disk (repo `config/` directory):
+//! Layout on disk (repo `config/`, a symlink to `python/par6/_data/config/`
+//! so the pip package ships the same files rather than a copy):
 //!
 //! ```text
 //! config/PAR6.toml            robot + homing + bus + protocol
@@ -19,27 +20,34 @@
 //! ```
 //!
 //! Load a robot alone with [`RobotConfig::load`], a single gripper with
-//! [`GripperConfig::load`], or everything (robot + every gripper next to
-//! it, cross-validated) with [`ConfigBundle::load`].
+//! [`ToolConfig::load`], or everything (robot + every gripper next to
+//! it, cross-validated) with [`ConfigBundle::load`]. An installation's own
+//! values layer over the shipped robot file from a local overlay (see
+//! [`local_overlay`]) through [`ConfigBundle::load_with`].
 
 mod gripper;
 mod homing;
 mod io;
+mod overlay;
 mod robot;
 
 pub use gripper::{
-    ArmJointHomeOffset, GripperConfig, GripperDriverConfig, SettleTimings, ToolKinematics,
+    ArmJointHomeOffset, GripperDriverConfig, SettleTimings, ToolConfig, ToolKinematics,
 };
 pub use homing::{
     GripperHomeMode, HomeGroup, HomingConfig, HomingStrategy, JointHoming, MoveTo, PostHomeConfig,
     PreMove, ReleaseConfig, SequenceStep,
 };
 pub use io::{IoConfig, IoLine, MAX_IO_LINES};
+pub use overlay::{
+    config_fingerprint, effective_robot_toml, effective_tool_tomls, fitted_robot_toml,
+    local_overlay, LOCAL_CONFIG_ENV, LOCAL_CONFIG_NAME,
+};
 pub use robot::{
-    BusConfig, ControlMode, DriverType, FreedriveConfig, Gains, JogDefaults, JogProfile,
-    JointConfig, JointLimits, KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits,
-    MotionConfig, ProtocolConfig, ResolvedLimits, RobotConfig, RobotSection, ScanConfig, SimConfig,
-    StreamDefaults, TimingConfig, WatchdogAction, MAX_OPEN_RETRY_S,
+    BusConfig, ControlMode, DriverType, Gains, JogDefaults, JogProfile, JointConfig, JointLimits,
+    KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits, MotionConfig, ProtocolConfig,
+    ResolvedLimits, RippleHarmonic, RobotConfig, RobotSection, ScanConfig, SimConfig,
+    StreamDefaults, TimingConfig, WatchdogAction, MAX_OPEN_RETRY_S, MAX_RIPPLE_HARMONICS,
 };
 
 use std::path::Path;
@@ -100,75 +108,15 @@ pub struct ConfigBundle {
     pub robot: RobotConfig,
     /// All gripper configurations from `<robot dir>/grippers/*.toml`,
     /// sorted by file name.
-    pub grippers: Vec<GripperConfig>,
+    pub tools: Vec<ToolConfig>,
     /// Installation-layer keep-out shapes from the robot TOML's
     /// `[[installation_shapes]]` array (empty when the section is
     /// absent).
     pub installation_shapes: Vec<par6_proto::Shape>,
 }
 
-impl ConfigBundle {
-    /// Load `robot_toml` plus every `grippers/*.toml` in the same
-    /// directory, drop the sequence steps the active tool cannot run,
-    /// then cross-validate.
-    pub fn load(robot_toml: &Path) -> Result<Self, ConfigError> {
-        let (robot, installation_shapes) = load_robot_with_shapes(robot_toml)?;
-        let dir = robot_toml
-            .parent()
-            .map(|p| p.join("grippers"))
-            .unwrap_or_else(|| Path::new("grippers").to_path_buf());
-        let mut paths: Vec<_> = std::fs::read_dir(&dir)
-            .map_err(|source| ConfigError::Io {
-                path: dir.display().to_string(),
-                source,
-            })?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
-            .collect();
-        paths.sort();
-        let grippers = paths
-            .iter()
-            .map(|p| GripperConfig::load(p))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut bundle = Self {
-            robot,
-            grippers,
-            installation_shapes,
-        };
-        bundle.drop_gripper_homing_without_a_gripper();
-        bundle.validate()?;
-        Ok(bundle)
-    }
-
-    /// The gripper selected by `robot.active_gripper`.
-    pub fn active_gripper(&self) -> Option<&GripperConfig> {
-        self.grippers
-            .iter()
-            .find(|g| g.name == self.robot.robot.active_gripper)
-    }
-
-    /// Effective home offset for an arm joint under the ACTIVE gripper:
-    /// the gripper's `arm_joint_home_offsets` override when the joint is
-    /// flagged `home_offset_gripper_dependent` and the gripper provides
-    /// one, else the joint's own `home_offset_rad` fallback.
-    /// `None` when `joint` is out of range.
-    pub fn effective_home_offset(&self, joint: usize) -> Option<f64> {
-        let jh = self.robot.homing.joints.get(joint)?;
-        if jh.home_offset_gripper_dependent {
-            if let Some(g) = self.active_gripper() {
-                if let Some(o) = g
-                    .arm_joint_home_offsets
-                    .iter()
-                    .find(|o| usize::from(o.joint) == joint)
-                {
-                    return Some(o.home_offset_rad);
-                }
-            }
-        }
-        Some(jh.home_offset_rad)
-    }
-
-    /// Strip the gripper work out of the homing sequence when the active
+impl HomingConfig {
+    /// The sequence as `tool` runs it: without the gripper work when the
     /// tool has no CAN driver to run it on.
     ///
     /// The sequence in `PAR6.toml` is written for the shipped gripper and
@@ -180,46 +128,144 @@ impl ConfigBundle {
     /// operator to hand-edit the shared sequence this file exists to stop
     /// them transcribing. The vendor resolves it the same way, skipping
     /// both gripper homing modes with a warning
-    /// (`rcb-runtime/robotics/homing.py`).
+    /// (`rcb-runtime/robotics/homing.py`). Asked per tool rather than
+    /// applied at load, since `select_tool` changes the tool under a
+    /// running runtime in either direction.
     ///
-    /// A home group left with no joints and no gripper is a no-op step
-    /// the FSM walks straight through, so the surrounding sequence and
-    /// its arm-joint references are untouched.
-    fn drop_gripper_homing_without_a_gripper(&mut self) {
-        if self.active_gripper().is_none_or(|g| g.driver.is_some()) {
-            return;
+    /// Stripping can empty a step completely — the two gripper-homing
+    /// steps do nothing else. An empty group, and an empty step, are both
+    /// config errors when someone writes them by hand, and
+    /// [`Self::validate`] says so, so the emptied ones are removed rather
+    /// than left behind. Steps are addressed by order and never by index,
+    /// and the joints they home are named inside them, so dropping one
+    /// leaves the remaining sequence and its arm-joint references intact.
+    pub fn for_tool(&self, tool: Option<&ToolConfig>) -> Self {
+        let mut homing = self.clone();
+        if tool.is_none_or(|g| g.driver.is_some()) {
+            return homing;
         }
-        let tool = self.robot.robot.active_gripper.clone();
-        let strip = |where_: String, moves: &mut Vec<PreMove>| {
-            let before = moves.len();
+        let strip = |moves: &mut Vec<PreMove>| {
             moves.retain(|m| !matches!(m, PreMove::GripperMove { .. }));
-            if moves.len() < before {
-                log::warn!(
-                    "{where_}: skipping {} gripper move(s) — tool `{tool}` has no CAN driver",
-                    before - moves.len()
-                );
-            }
         };
-        for (i, step) in self.robot.homing.sequence.iter_mut().enumerate() {
-            if let Some(mode) = step.home.as_mut().and_then(|h| h.gripper.take()) {
-                log::warn!(
-                    "homing.sequence[{i}]: skipping {mode:?} gripper homing — \
-                     tool `{tool}` has no CAN driver"
-                );
+        for step in &mut homing.sequence {
+            if let Some(h) = step.home.as_mut() {
+                h.gripper = None;
             }
-            strip(
-                format!("homing.sequence[{i}].pre_moves"),
-                &mut step.pre_moves,
-            );
-            strip(
-                format!("homing.sequence[{i}].post_moves"),
-                &mut step.post_moves,
-            );
+            if step.home.as_ref().is_some_and(|h| h.joints.is_empty()) {
+                step.home = None;
+            }
+            strip(&mut step.pre_moves);
+            strip(&mut step.post_moves);
         }
-        strip(
-            "homing.post_moves".into(),
-            &mut self.robot.homing.post_moves,
-        );
+        strip(&mut homing.post_moves);
+        homing.sequence.retain(|step| {
+            !(step.pre_moves.is_empty()
+                && step.home.is_none()
+                && step.move_to.is_empty()
+                && step.post_moves.is_empty())
+        });
+        homing
+    }
+}
+
+impl ConfigBundle {
+    /// Load `robot_toml` plus every `grippers/*.toml` in the same
+    /// directory, then cross-validate.
+    pub fn load(robot_toml: &Path) -> Result<Self, ConfigError> {
+        Self::load_with(robot_toml, None, None)
+    }
+
+    /// [`load`](Self::load), fitted with the tool named `tool` rather than
+    /// the one `active_tool` boots with — the tool on the arm is the
+    /// operator's to say. Matched case-insensitively; an unknown name is
+    /// refused.
+    pub fn load_fitted(robot_toml: &Path, tool: &str) -> Result<Self, ConfigError> {
+        Self::load_with(robot_toml, None, Some(tool))
+    }
+
+    /// [`load`](Self::load) with `local` merged over the robot file (see
+    /// [`local_overlay`]), fitted with `tool` when given (see
+    /// [`load_fitted`](Self::load_fitted)).
+    pub fn load_with(
+        robot_toml: &Path,
+        local: Option<&Path>,
+        fitted: Option<&str>,
+    ) -> Result<Self, ConfigError> {
+        let (mut robot, installation_shapes) = load_robot_with_shapes(robot_toml, local)?;
+        // `tools/` is the name; `grippers/` is what it used to be called,
+        // and a config on disk is the operator's, not ours to invalidate.
+        // A tool is not necessarily a gripper — the bare flange is one.
+        let overlays = overlay::tool_overlays(local)?;
+        let mut layered = vec![false; overlays.len()];
+        let tools = overlay::tool_files(robot_toml)?
+            .iter()
+            .map(|path| {
+                let (table, entry) = overlay::layered_tool(path, &overlays, local)?;
+                if let Some(k) = entry {
+                    layered[k] = true;
+                }
+                ToolConfig::from_table(table, &overlay::layered_label(path, local))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(k) = layered.iter().position(|done| !done) {
+            return Err(invalid(
+                "local overlay",
+                format!(
+                    "[[tools]] names `{}`, which no tool file defines",
+                    overlays[k]["name"].as_str().unwrap_or_default()
+                ),
+            ));
+        }
+        if let Some(name) = fitted {
+            let tool = tools
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(name.trim()))
+                .ok_or_else(|| invalid("tool", format!("no tool named `{name}`")))?;
+            robot.robot.active_tool.clone_from(&tool.name);
+        }
+        let bundle = Self {
+            robot,
+            tools,
+            installation_shapes,
+        };
+        bundle.validate()?;
+        Ok(bundle)
+    }
+
+    /// The tool selected by `robot.active_tool` — a gripper, or a passive
+    /// attachment like the bare flange.
+    pub fn active_tool(&self) -> Option<&ToolConfig> {
+        self.tools
+            .iter()
+            .find(|g| g.name == self.robot.robot.active_tool)
+    }
+
+    /// The tool whose drive reports `tool_id` in its device info
+    /// (`ToolConfig::can_tool_id`); `None` for 0 and for an id no tool
+    /// carries.
+    pub fn tool_by_can_id(&self, tool_id: u8) -> Option<&ToolConfig> {
+        (tool_id != 0).then(|| self.tools.iter().find(|g| g.can_tool_id == Some(tool_id)))?
+    }
+
+    /// Effective home offset for an arm joint under the ACTIVE gripper:
+    /// the gripper's `arm_joint_home_offsets` override when the joint is
+    /// flagged `home_offset_gripper_dependent` and the gripper provides
+    /// one, else the joint's own `home_offset_rad` fallback.
+    /// `None` when `joint` is out of range.
+    pub fn effective_home_offset(&self, joint: usize) -> Option<f64> {
+        let jh = self.robot.homing.joints.get(joint)?;
+        if jh.home_offset_gripper_dependent {
+            if let Some(g) = self.active_tool() {
+                if let Some(o) = g
+                    .arm_joint_home_offsets
+                    .iter()
+                    .find(|o| usize::from(o.joint) == joint)
+                {
+                    return Some(o.home_offset_rad);
+                }
+            }
+        }
+        Some(jh.home_offset_rad)
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -235,31 +281,51 @@ impl ConfigBundle {
                 ));
             }
         }
-        let Some(active) = self.active_gripper() else {
+        for (i, tool) in self.tools.iter().enumerate() {
+            let Some(id) = tool.can_tool_id else {
+                continue;
+            };
+            if let Some(other) = self.tools[..i].iter().find(|t| t.can_tool_id == Some(id)) {
+                return Err(invalid(
+                    "can_tool_id",
+                    format!(
+                        "tools `{}` and `{}` both claim id {id}; a drive reports one id \
+                         and it must name one tool",
+                        other.name, tool.name
+                    ),
+                ));
+            }
+        }
+        if self.active_tool().is_none() {
             return Err(invalid(
-                "robot.active_gripper",
+                "robot.active_tool",
                 format!(
                     "no gripper named `{}` found in grippers/ directory",
-                    self.robot.robot.active_gripper
+                    self.robot.robot.active_tool
                 ),
             ));
-        };
+        }
         // Motor-mode gripper homing runs the joint FSM against the
         // gripper's own `[homing]` parameters; without them the step
         // would report Done on the tick it started and the jaws would
-        // never be referenced. A tool WITHOUT a driver never gets here —
-        // its gripper steps were dropped above.
+        // never be referenced. Every driven tool, not only the one fitted
+        // at boot: `select_tool` fits any of them. A tool without a driver
+        // runs the sequence without its gripper work (`for_tool`).
         let motor_homed = self.robot.homing.sequence.iter().any(|s| {
             s.home
                 .as_ref()
                 .is_some_and(|h| h.gripper == Some(GripperHomeMode::Motor))
         });
-        if motor_homed && active.homing.is_none() {
+        if let Some(tool) = self
+            .tools
+            .iter()
+            .find(|t| motor_homed && t.driver.is_some() && t.homing.is_none())
+        {
             return Err(invalid(
                 "homing.sequence",
                 format!(
                     "sequence homes the gripper motor but gripper `{}` has no [homing] section",
-                    active.name
+                    tool.name
                 ),
             ));
         }
@@ -275,36 +341,25 @@ impl ConfigBundle {
 /// they are a server-layer vocabulary, not a robot parameter — so
 /// `RobotConfig` keeps its own schema and its `deny_unknown_fields` typo
 /// protection, and the split hands it exactly the document minus this one
-/// key. A file without the key takes the plain [`RobotConfig::load`]
-/// path, byte for byte.
+/// key. A file without the key, with nothing layered over it, takes the
+/// plain [`RobotConfig::load`] path, byte for byte.
 fn load_robot_with_shapes(
     path: &Path,
+    local: Option<&Path>,
 ) -> Result<(RobotConfig, Vec<par6_proto::Shape>), ConfigError> {
-    let text = read_to_string(path)?;
+    let label = overlay::layered_label(path, local);
     let parse_err = |source: toml::de::Error| ConfigError::Parse {
-        path: path.display().to_string(),
+        path: label.clone(),
         source: Box::new(source),
     };
-    let mut table: toml::Table = toml::from_str(&text).map_err(parse_err)?;
-    let Some(value) = table.remove("installation_shapes") else {
-        return Ok((RobotConfig::load(path)?, Vec::new()));
+    let mut table = overlay::layered_table(path, local)?;
+    let shapes: Vec<par6_proto::Shape> = match table.remove("installation_shapes") {
+        Some(value) => value.try_into().map_err(parse_err)?,
+        None if local.is_none() => return Ok((RobotConfig::load(path)?, Vec::new())),
+        None => Vec::new(),
     };
-    let shapes: Vec<par6_proto::Shape> = value.try_into().map_err(parse_err)?;
-    let rest = toml::to_string(&table).map_err(|e| {
-        invalid(
-            "installation_shapes",
-            format!("cannot re-serialize the remaining config: {e}"),
-        )
-    })?;
-    let robot = RobotConfig::from_toml_str(&rest).map_err(|e| match e {
-        // Re-attach the real path: the round-trip through a string names
-        // `<string>` otherwise, which is useless in a startup error.
-        ConfigError::Parse { source, .. } => ConfigError::Parse {
-            path: path.display().to_string(),
-            source,
-        },
-        other => other,
-    })?;
+    let robot: RobotConfig = toml::Value::Table(table).try_into().map_err(parse_err)?;
+    robot.validate()?;
     Ok((robot, shapes))
 }
 
@@ -365,14 +420,26 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
+    /// The driven tool these cases exercise. They SELECT it rather than
+    /// asserting the shipped config names it: which tool is bolted on is the
+    /// operator's to change, and a test that pins `active_tool` turns a
+    /// tool swap into a suite failure.
+    const DRIVEN_TOOL: &str = "MSG_small_motor_200mm_rail";
 
     fn select_tool(name: &str) -> impl Fn(&str, &str) -> String + '_ {
         move |file, text| {
             if file == "PAR6.toml" {
-                text.replace(
-                    "active_gripper = \"MSG_small_motor_150mm_rail\"",
-                    &format!("active_gripper = \"{name}\""),
-                )
+                // By line, so the shipped tool can change (and carry a
+                // trailing comment) without silently selecting nothing.
+                text.split_inclusive('\n')
+                    .map(|line| {
+                        if line.trim_start().starts_with("active_tool") {
+                            format!("active_tool = \"{name}\"\n")
+                        } else {
+                            line.to_owned()
+                        }
+                    })
+                    .collect()
             } else {
                 text.to_owned()
             }
@@ -394,41 +461,13 @@ mod tests {
     fn par6_toml_loads_and_roundtrips() {
         let path = config_dir().join("PAR6.toml");
         let cfg = RobotConfig::load(&path).expect("PAR6.toml must load");
-
-        // Spot-check transcribed vendor values (robots/PAR6.xml).
-        assert_eq!(cfg.robot.name, "PAR6");
-        assert_eq!(cfg.robot.tick_dt_s, 0.004);
-        assert_eq!(cfg.tick_rate_hz(), 250.0);
         assert_eq!(cfg.joints.len(), 6);
-        let ratios: Vec<f64> = cfg.joints.iter().map(|j| j.gear_ratio).collect();
-        assert_eq!(ratios, vec![6.4, 25.0, 18.0952381, 4.0, 4.0, 10.0]);
-        assert_eq!(cfg.joints[0].kt_nm_a, 0.28);
-        assert_eq!(cfg.joints[1].ilim_ma, 2500.0);
-        assert_eq!(cfg.joints[1].gains.kpp, 3.0);
-        assert_eq!(cfg.joints[2].dir, 1);
-        assert_eq!(cfg.joints[5].limits.soft_max_rad, 7.14);
-        // Per-mode limits: exec is the pre-liberal set, stream the ceiling.
-        let exec = cfg.joints[0].limits.for_mode(LimitMode::Exec);
-        assert_eq!(exec.acceleration_rad_s2, 9.6);
-        assert_eq!(exec.jerk_rad_s3, Some(28.8));
-        let jog = cfg.joints[0].limits.for_mode(LimitMode::Jog);
-        assert_eq!(jog.acceleration_rad_s2, 32.0); // falls back to ceiling
-                                                   // Homing values (robots/PAR6.xml homing fields).
-        assert_eq!(cfg.homing.joints[0].timeout_s, 13.0);
-        assert_eq!(cfg.homing.joints[0].two_pass_max_diff_ticks, 3500);
-        assert_eq!(
-            cfg.homing.joints[1].release.as_ref().unwrap().current_ma,
-            150.0
-        );
-        assert_eq!(
-            cfg.homing.joints[2].release.as_ref().unwrap().current_ma,
-            -150.0
-        );
-        assert!(cfg.homing.joints[3].release.is_none());
-        assert_eq!(cfg.homing.joints[5].strategy, HomingStrategy::Hall);
-        assert!(cfg.homing.joints[3].home_offset_gripper_dependent);
-        // Seconds→ticks conversion helper.
-        assert_eq!(cfg.ticks(0.08), 20);
+        assert_eq!(cfg.homing.joints.len(), cfg.joints.len());
+        // Seconds become ticks by rounding, not truncating.
+        let dt = cfg.robot.tick_dt_s;
+        assert_eq!(cfg.tick_rate_hz(), 1.0 / dt);
+        assert_eq!(cfg.ticks(2.4 * dt), 2);
+        assert_eq!(cfg.ticks(2.6 * dt), 3);
 
         // Round-trip: serialize → reparse → identical.
         let text = toml::to_string(&cfg).expect("serialize");
@@ -436,41 +475,165 @@ mod tests {
         assert_eq!(cfg, back);
     }
 
+    /// A mode's limits fall back to the ceiling field by field: a mode
+    /// table that leaves jerk or torque rate out runs those at the
+    /// ceiling, never at zero.
+    #[test]
+    fn a_mode_table_falls_back_to_the_ceiling_field_by_field() {
+        let path = config_dir().join("PAR6.toml");
+        let mut limits = RobotConfig::load(&path)
+            .expect("PAR6.toml must load")
+            .joints[1]
+            .limits;
+        limits.jerk_rad_s3 = 30.0;
+        limits.torque_rate_nm_s = 364.0;
+        limits.exec = Some(ModeLimits {
+            velocity_rad_s: 1.0,
+            acceleration_rad_s2: 2.0,
+            jerk_rad_s3: None,
+            torque_rate_nm_s: None,
+        });
+        limits.jog = Some(ModeLimits {
+            velocity_rad_s: 1.0,
+            acceleration_rad_s2: 2.0,
+            jerk_rad_s3: Some(5.0),
+            torque_rate_nm_s: Some(50.0),
+        });
+        limits.stream = None;
+        let exec = limits.for_mode(LimitMode::Exec);
+        assert_eq!((exec.velocity_rad_s, exec.acceleration_rad_s2), (1.0, 2.0));
+        assert_eq!(
+            (exec.jerk_rad_s3, exec.torque_rate_nm_s),
+            (Some(30.0), Some(364.0))
+        );
+        let jog = limits.for_mode(LimitMode::Jog);
+        assert_eq!(
+            (jog.jerk_rad_s3, jog.torque_rate_nm_s),
+            (Some(5.0), Some(50.0))
+        );
+        let stream = limits.for_mode(LimitMode::Stream);
+        assert_eq!(
+            (
+                stream.velocity_rad_s,
+                stream.acceleration_rad_s2,
+                stream.jerk_rad_s3,
+                stream.torque_rate_nm_s
+            ),
+            (
+                limits.velocity_rad_s,
+                limits.acceleration_rad_s2,
+                Some(30.0),
+                Some(364.0)
+            )
+        );
+    }
+
+    /// A config written before the tool/gripper rename still loads.
+    ///
+    /// `active_gripper` became `active_tool` because not every tool is a
+    /// gripper — the bare flange has no jaw and no driver — but a config
+    /// already on disk belongs to whoever wrote it, and a rename that
+    /// invalidates it is a rename that breaks a running arm. Same for the
+    /// directory: `tools/` is preferred, `grippers/` still resolves.
+    #[test]
+    fn a_config_using_the_old_gripper_spelling_still_loads() {
+        let old = TempConfig::new(|file, text| {
+            if file == "PAR6.toml" {
+                text.split_inclusive('\n')
+                    .map(|line| {
+                        if line.trim_start().starts_with("active_tool") {
+                            format!("active_gripper = \"{DRIVEN_TOOL}\"\n")
+                        } else {
+                            line.to_owned()
+                        }
+                    })
+                    .collect()
+            } else {
+                text.to_owned()
+            }
+        });
+        let text = std::fs::read_to_string(old.robot()).expect("read");
+        assert!(
+            text.contains("active_gripper ="),
+            "the fixture must actually use the old spelling"
+        );
+        let bundle = ConfigBundle::load(&old.robot()).expect("the old spelling must still load");
+        assert_eq!(
+            bundle.active_tool().map(|t| t.name.as_str()),
+            Some(DRIVEN_TOOL),
+            "the aliased key must select the tool it names"
+        );
+    }
+
     #[test]
     fn bundle_resolves_gripper_dependent_offsets() {
-        let bundle = ConfigBundle::load(&config_dir().join("PAR6.toml")).expect("bundle");
+        // The tool also lists J0, which is not gripper-dependent: its own
+        // offset has to win there.
+        let tool_file = format!("{DRIVEN_TOOL}.toml");
+        let driven = TempConfig::new(|file, text| {
+            let text = select_tool(DRIVEN_TOOL)(file, text);
+            if file == tool_file {
+                format!("{text}\n[[arm_joint_home_offsets]]\njoint = 0\nhome_offset_rad = 1.234\n")
+            } else {
+                text
+            }
+        });
+        let bundle = ConfigBundle::load(&driven.robot()).expect("bundle");
         // Every shipped TOML is loaded and cross-validated, under a name
         // no other file claims — a duplicate would make
-        // `active_gripper` pick by file order.
+        // `active_tool` pick by file order.
         let files = std::fs::read_dir(config_dir().join("grippers"))
             .expect("gripper dir")
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().is_some_and(|e| e == "toml"))
             .count();
-        assert_eq!(bundle.grippers.len(), files, "one config per shipped file");
-        let mut names: Vec<&str> = bundle.grippers.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(bundle.tools.len(), files, "one config per shipped file");
+        let mut names: Vec<&str> = bundle.tools.iter().map(|g| g.name.as_str()).collect();
         names.sort_unstable();
         let distinct = names.len();
         names.dedup();
         assert_eq!(names.len(), distinct, "gripper names collide: {names:?}");
 
-        let active = bundle.active_gripper().expect("active gripper");
-        assert_eq!(active.name, "MSG_small_motor_150mm_rail");
-        assert_eq!(active.driver.as_ref().unwrap().stroke_mm, 106.0);
-        // J4 (index 4) is gripper-dependent and overridden by the MSG gripper.
-        assert_eq!(bundle.effective_home_offset(4), Some(-2.070));
-        // J3 (index 3) is gripper-dependent but no gripper overrides it → fallback.
-        assert_eq!(bundle.effective_home_offset(3), Some(-2.717));
-        // J0 is not gripper-dependent.
-        assert_eq!(bundle.effective_home_offset(0), Some(2.96279));
-        // Flange is a passive tool: no driver, no homing, but kinematics + offsets.
-        let flange = bundle.grippers.iter().find(|g| g.name == "Flange").unwrap();
+        let active = bundle.active_tool().expect("active gripper");
+        assert_eq!(active.name, DRIVEN_TOOL);
+        // A joint homes to the tool's offset only where it is flagged
+        // gripper-dependent and the tool overrides it; everywhere else, to
+        // its own — including a joint the tool lists but is not flagged.
+        let mut cases = [false; 3];
+        for (j, jh) in bundle.robot.homing.joints.iter().enumerate() {
+            let tool = active
+                .arm_joint_home_offsets
+                .iter()
+                .find(|o| usize::from(o.joint) == j)
+                .map(|o| o.home_offset_rad);
+            let want = match (jh.home_offset_gripper_dependent, tool) {
+                (true, Some(v)) => {
+                    cases[0] = true;
+                    v
+                }
+                (true, None) => {
+                    cases[1] = true;
+                    jh.home_offset_rad
+                }
+                (false, Some(_)) => {
+                    cases[2] = true;
+                    jh.home_offset_rad
+                }
+                (false, None) => jh.home_offset_rad,
+            };
+            assert_eq!(bundle.effective_home_offset(j), Some(want), "J{j}");
+        }
+        assert_eq!(
+            cases, [true; 3],
+            "overridden, fallback and unflagged-but-listed joints must all occur"
+        );
+        // Flange is a passive tool: no driver, no homing.
+        let flange = bundle.tools.iter().find(|g| g.name == "Flange").unwrap();
         assert!(flange.driver.is_none());
         assert!(flange.homing.is_none());
-        assert_eq!(flange.arm_joint_home_offsets[0].home_offset_rad, -2.258);
         // Gripper round-trip.
         let text = toml::to_string(active).expect("serialize gripper");
-        let back = GripperConfig::from_toml_str(&text).expect("reparse gripper");
+        let back = ToolConfig::from_toml_str(&text).expect("reparse gripper");
         assert_eq!(*active, back);
     }
 
@@ -484,8 +647,11 @@ mod tests {
     fn the_bare_flange_loads_and_takes_the_gripper_out_of_the_sequence() {
         let flanged = TempConfig::new(select_tool("Flange"));
 
-        // The premise: the shipped sequence does home the gripper.
-        let stock = ConfigBundle::load(&config_dir().join("PAR6.toml")).expect("stock bundle");
+        // The premise: with a driven tool selected, the sequence homes the
+        // gripper. Selected here, not read off the shipped config, so which
+        // tool is actually bolted on stays the operator's choice.
+        let driven = TempConfig::new(select_tool(DRIVEN_TOOL));
+        let stock = ConfigBundle::load(&driven.robot()).expect("driven bundle");
         let stock_modes: Vec<_> = stock
             .robot
             .homing
@@ -496,49 +662,86 @@ mod tests {
         assert_eq!(
             stock_modes,
             vec![GripperHomeMode::Firmware, GripperHomeMode::Motor],
-            "the shipped sequence must still exercise both gripper modes"
+            "the sequence for a driven tool must still exercise both gripper modes"
         );
 
         let bundle = ConfigBundle::load(&flanged.robot()).expect("the bare flange must load");
         assert_eq!(
-            bundle.active_gripper().map(|g| g.name.as_str()),
+            bundle.active_tool().map(|g| g.name.as_str()),
             Some("Flange")
         );
+        let homing = bundle.robot.homing.for_tool(bundle.active_tool());
+        // Whatever stripping leaves behind has to satisfy the sequence's
+        // own validation: an emptied home group (or an emptied step) left
+        // behind would refuse a homing run with nothing on the flange.
+        homing
+            .validate(bundle.robot.joints.len())
+            .expect("the stripped sequence must still validate");
         assert!(
-            bundle
-                .robot
-                .homing
+            homing
                 .sequence
                 .iter()
                 .all(|s| s.home.as_ref().is_none_or(|h| h.gripper.is_none())),
             "no step may home a gripper that has no driver"
         );
         assert!(
-            bundle
-                .robot
-                .homing
+            homing
                 .sequence
                 .iter()
                 .flat_map(|s| s.pre_moves.iter().chain(s.post_moves.iter()))
-                .chain(bundle.robot.homing.post_moves.iter())
+                .chain(homing.post_moves.iter())
                 .all(|m| !matches!(m, PreMove::GripperMove { .. })),
             "no move may command a gripper that has no driver"
         );
 
         // The arm's own homing work survives intact — this drops the
-        // gripper, not the sequence.
-        let arm_steps: Vec<Vec<u8>> = bundle
-            .robot
-            .homing
-            .sequence
-            .iter()
-            .filter_map(|s| s.home.as_ref())
-            .map(|h| h.joints.clone())
-            .filter(|j| !j.is_empty())
-            .collect();
-        assert_eq!(arm_steps, vec![vec![0], vec![1, 2], vec![3, 5], vec![4]]);
+        // gripper, not the sequence: every arm home group, nudge and
+        // move_to the driven tool's sequence has, in order.
+        let arm_work = |b: &ConfigBundle| {
+            let arm = |moves: &[PreMove]| -> Vec<PreMove> {
+                moves
+                    .iter()
+                    .filter(|m| !matches!(m, PreMove::GripperMove { .. }))
+                    .copied()
+                    .collect()
+            };
+            let homing = b.robot.homing.for_tool(b.active_tool());
+            let mut steps: Vec<_> = homing
+                .sequence
+                .iter()
+                .map(|s| {
+                    (
+                        arm(&s.pre_moves),
+                        s.home
+                            .as_ref()
+                            .map(|h| h.joints.clone())
+                            .unwrap_or_default(),
+                        s.move_to.clone(),
+                        arm(&s.post_moves),
+                    )
+                })
+                .filter(|(pre, home, to, post)| {
+                    !(pre.is_empty() && home.is_empty() && to.is_empty() && post.is_empty())
+                })
+                .collect();
+            steps.push((arm(&homing.post_moves), vec![], vec![], vec![]));
+            steps
+        };
+        let driven_work = arm_work(&stock);
+        assert!(
+            driven_work.iter().any(|(pre, ..)| !pre.is_empty())
+                && driven_work.iter().any(|(_, _, to, _)| !to.is_empty()),
+            "the premise: the sequence has arm nudges and move_to entries to keep"
+        );
+        assert_eq!(arm_work(&bundle), driven_work);
         // ...and the flange's own J4 offset is what the runtime homes to.
-        assert_eq!(bundle.effective_home_offset(4), Some(-2.258));
+        let flange = bundle.active_tool().expect("the flange");
+        let j4 = flange
+            .arm_joint_home_offsets
+            .iter()
+            .find(|o| o.joint == 4)
+            .expect("the flange sets J4's offset");
+        assert_eq!(bundle.effective_home_offset(4), Some(j4.home_offset_rad));
     }
 
     /// A gripper that IS on the bus but has no `[homing]` parameters
@@ -570,9 +773,11 @@ mod tests {
     /// `[[installation_shapes]]` rides in the robot TOML and comes out of
     /// `ConfigBundle::load` as typed shapes, without costing `RobotConfig`
     /// its strict schema: the same file's robot half still validates, and
-    /// a file WITHOUT the section still loads to an empty list.
+    /// the shipped file, which declares none — the ground a PAR6 stands on
+    /// is its installation's — loads to an empty list.
     #[test]
     fn installation_shapes_load_from_the_robot_toml() {
+        // The stock arm stands on the surface it is mounted on.
         let stock = ConfigBundle::load(&config_dir().join("PAR6.toml")).expect("stock bundle");
         assert_eq!(
             stock
@@ -580,8 +785,7 @@ mod tests {
                 .iter()
                 .map(|s| s.name.as_str())
                 .collect::<Vec<_>>(),
-            ["floor"],
-            "the shipped config declares the ground the robot stands on"
+            ["floor"]
         );
 
         let with_shapes = TempConfig::new(|file, text| {
@@ -626,7 +830,6 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(bundle.installation_shapes[0].name, "floor");
         // The robot half of the same file went through its normal
         // parse-and-validate path.
         assert_eq!(bundle.robot, stock.robot);
@@ -714,6 +917,15 @@ mod tests {
 
     #[test]
     fn validation_errors_name_the_field() {
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY, 2.01] {
+            let mut cfg = RobotConfig::load(&config_dir().join("PAR6.toml")).unwrap();
+            cfg.gravity_scale[2] = value;
+            assert!(cfg
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("gravity_scale"));
+        }
         let path = config_dir().join("PAR6.toml");
         let good = RobotConfig::load(&path).unwrap();
 
@@ -775,10 +987,8 @@ mod tests {
         // A config that says nothing about timing runs the vendor bands,
         // so hardware behavior does not depend on this section existing.
         let stock = RobotConfig::from_toml_str(&text).unwrap();
-        let bands = stock.loop_timing();
-        assert_eq!(bands.degraded_factor, 1.05);
-        assert_eq!(bands.critical_factor, 1.10);
-        assert_eq!(bands.critical_sustain_s, 1.0);
+        assert!(stock.timing.is_none(), "the shipped config is silent");
+        assert_eq!(stock.loop_timing(), TimingConfig::default());
 
         // A declared section is what the runtime then uses.
         let declared = RobotConfig::from_toml_str(&format!(
@@ -804,6 +1014,7 @@ mod tests {
             ),
             ("critical_sustain_s = 0.0", "timing.critical_sustain_s"),
             ("critical_sustain_s = -1.0", "timing.critical_sustain_s"),
+            ("fifo_priority = 100", "timing.fifo_priority"),
         ] {
             let err = RobotConfig::from_toml_str(&format!("{text}\n[timing]\n{section}\n"))
                 .expect_err(&format!("`{section}` must be refused"))
@@ -816,76 +1027,5 @@ mod tests {
             "{text}\n[timing]\ncritical_factor_x = 4.0\n"
         ))
         .is_err());
-    }
-
-    /// The sim dynamics table is the vendor's motor model
-    /// (robots/PAR6.py at rcb-runtime 307477c), and J1's dynamics gear
-    /// is the 20 the vendor's dynamics were modeled with — deliberately
-    /// NOT the 25 the wire conversion uses (the vendor's own two tables
-    /// disagree; user decision 2026-09-01: follow the dynamics table,
-    /// switch to 25 if real movement proves it stale).
-    #[test]
-    fn sim_dynamics_table_matches_the_vendor_model() {
-        // The raw table, not the loaded config: `[sim]` fills in from
-        // `Default` when absent, so only the file itself proves the
-        // shipped values are declared.
-        let path = config_dir().join("PAR6.toml");
-        let text = std::fs::read_to_string(&path).expect("shipped PAR6 config");
-        let table: toml::Table = toml::from_str(&text).expect("shipped PAR6 config parses");
-        let sim = table["sim"]
-            .as_table()
-            .expect("the shipped config declares [sim] explicitly");
-        let jm: Vec<f64> = sim["motor_jm_kg_m2"]
-            .as_array()
-            .expect("sim.motor_jm_kg_m2 is an array")
-            .iter()
-            .map(|v| v.as_float().expect("sim.motor_jm_kg_m2 holds floats"))
-            .collect();
-        assert_eq!(jm, vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6]);
-        assert_eq!(sim["motor_b_nm_s"].as_float(), Some(1.0e-4));
-        assert_eq!(sim["motor_tc_nm"].as_float(), Some(0.02));
-        let robot = RobotConfig::load(&path).expect("shipped PAR6 config");
-        assert_eq!(robot.joints[1].gear_ratio, 25.0, "wire conversion keeps 25");
-        assert_eq!(
-            robot.joints[1].dynamics_gear_ratio,
-            Some(20.0),
-            "the dynamics follow the vendor's dynamics table"
-        );
-        assert!(
-            robot
-                .joints
-                .iter()
-                .enumerate()
-                .all(|(i, j)| i == 1 || j.dynamics_gear_ratio.is_none()),
-            "every other joint's tables agree, so no override is declared"
-        );
-    }
-
-    /// The shipped SSG48 values are the vendor's arm-measured retune
-    /// (grippers/SSG48.xml at rcb-runtime 307477c); the shipped defaults
-    /// before it were copied from the MSG and never verified against the
-    /// hardware. These are transmitted at boot and on every config
-    /// re-push, so a drifted transcription drives the real output stage —
-    /// this pin makes the next vendor tune show up as a red diff instead
-    /// of a silent divergence.
-    #[test]
-    fn ssg48_driver_values_match_the_vendor_retune() {
-        let cfg = GripperConfig::load(&config_dir().join("grippers/SSG48.toml"))
-            .expect("shipped SSG48.toml must load");
-        let drv = cfg.driver.expect("SSG48 is a CAN gripper");
-        assert_eq!(drv.stroke_mm, 47.0);
-        assert_eq!(drv.kt_nm_a, 0.3);
-        assert_eq!(drv.ilim_ma, 1700.0);
-        assert_eq!(
-            drv.voltage_limit_mv, 0,
-            "0 = use VBUS (vendor removed the 6 V clamp)"
-        );
-        assert_eq!(drv.gains.kpp, 11.0);
-        assert_eq!(drv.gains.kpv, 0.03);
-        assert_eq!(drv.gains.kiv, 0.0003);
-        assert_eq!(drv.gains.kpiq, 3.0);
-        assert_eq!(drv.gains.kiiq, 1.5);
-        assert_eq!(drv.gains.kp, 0.12);
-        assert_eq!(drv.gains.kd, 0.002);
     }
 }

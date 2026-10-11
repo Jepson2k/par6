@@ -21,8 +21,9 @@ use par6_bus::{
     BusError, BusState, DriverBus, Freshness, GripperCommand, GripperReply, JointCommand,
     LinkHealth, LoopbackBus, NodeId, PollAction, Reply,
 };
-use par6_config::{ConfigBundle, GripperConfig, RobotConfig};
-use par6_rt::hooks::{ClampStream, RampJog};
+use par6_config::{ConfigBundle, RobotConfig, ToolConfig};
+use par6_rt::adapters::{MotionJog, MotionStream};
+use par6_rt::hooks::ClampStream;
 use par6_rt::{
     sample_ring, ArmState, CompletionPolicy, ErrorCode, Mode, NoFk, RtCommand, RtCore, RtHandles,
     RtHooks, SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle, StateSnapshot,
@@ -61,6 +62,46 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static A: CountingAlloc = CountingAlloc;
 
+// ------------------------------------------------------------------ logger
+
+/// Formats every record, at every level, into a stack buffer. Without a
+/// logger the `log!` arguments are never evaluated, so an allocating
+/// argument on the failure arm would go unseen; the daemon's sink writing
+/// a throttled line is the accepted one-shot cost and is not measured.
+struct StackLogger;
+
+static LOGGER: StackLogger = StackLogger;
+
+struct StackLine {
+    bytes: [u8; 512],
+    len: usize,
+}
+
+impl std::fmt::Write for StackLine {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let n = s.len().min(self.bytes.len() - self.len);
+        self.bytes[self.len..self.len + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.len += n;
+        Ok(())
+    }
+}
+
+impl log::Log for StackLogger {
+    fn enabled(&self, _meta: &log::Metadata) -> bool {
+        true
+    }
+
+    fn log(&self, record: &log::Record) {
+        let mut line = StackLine {
+            bytes: [0; 512],
+            len: 0,
+        };
+        let _ = std::fmt::write(&mut line, *record.args());
+    }
+
+    fn flush(&self) {}
+}
+
 // ------------------------------------------------------------- failing bus
 
 /// A `DriverBus` delegating everything to the loopback reference
@@ -89,6 +130,10 @@ impl FailingBus {
 impl DriverBus for FailingBus {
     fn begin_tick(&mut self, tick: u64) {
         self.inner.begin_tick(tick);
+    }
+
+    fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>) {
+        self.inner.fit_tool(robot, tool);
     }
 
     fn drain_rx(&mut self, state: &mut BusState) -> Result<usize, BusError> {
@@ -126,7 +171,7 @@ impl DriverBus for FailingBus {
     fn boot_configure(
         &mut self,
         robot: &RobotConfig,
-        gripper: Option<&GripperConfig>,
+        gripper: Option<&ToolConfig>,
         repeats: u8,
     ) -> Result<(), BusError> {
         self.inner.boot_configure(robot, gripper, repeats)
@@ -151,6 +196,34 @@ impl DriverBus for FailingBus {
 
     fn save_config(&mut self, node: NodeId) -> Result<(), BusError> {
         self.inner.save_config(node)
+    }
+
+    fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError> {
+        self.inner.set_tool_id(node, tool_id)
+    }
+
+    fn set_ripple(
+        &mut self,
+        node: NodeId,
+        ripple: &[par6_config::RippleHarmonic],
+    ) -> Result<(), BusError> {
+        self.inner.set_ripple(node, ripple)
+    }
+
+    fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError> {
+        self.inner.set_velocity_window(node, window)
+    }
+
+    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
+        self.inner.capture_stream(node)
+    }
+
+    fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {
+        self.inner.capture_start(node, divisor, wanted)
+    }
+
+    fn capture(&self, node: NodeId) -> Option<&par6_bus::CaptureBuffer> {
+        self.inner.capture(node)
     }
 
     fn send_limits(
@@ -216,6 +289,7 @@ struct Rig {
 
 impl Rig {
     fn new() -> Self {
+        let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Trace));
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
         let bundle = ConfigBundle::load(&path).expect("PAR6 config bundle");
         let robot = &bundle.robot;
@@ -227,8 +301,8 @@ impl Rig {
         let (_producer, consumer) = sample_ring(64);
         let hooks = RtHooks {
             gravity: Box::new(ZeroGravity),
-            jog: Box::new(RampJog::new(robot)),
-            stream: Box::new(ClampStream::new(robot)),
+            jog: Box::new(MotionJog::from_config(robot).expect("jog engine")),
+            stream: Box::new(MotionStream::from_config(robot).expect("stream limiter")),
             stream_shaped: Box::new(ClampStream::new(robot)),
             settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
             estop: Box::new(gpio),
@@ -246,7 +320,12 @@ impl Rig {
         let pose = std::array::from_fn(|i| robot.joints[i].sector_home_offset_rad);
         let node_of = std::array::from_fn(|i| robot.joints[i].node_id);
         let lost_ticks = robot.ticks(robot.bus.lost_s);
-        let (core, handles) = RtCore::new(&bundle, FailingBus::new(), hooks).expect("core");
+        let (mut core, handles) = RtCore::new(&bundle, FailingBus::new(), hooks).expect("core");
+        if let Some(tool_id) = bundle.active_tool().and_then(|t| t.can_tool_id) {
+            core.bus_mut()
+                .inner
+                .report_tool(robot.bus.gripper_node, tool_id);
+        }
         Self {
             core,
             handles,
@@ -322,7 +401,7 @@ fn can_lost(s: &StateSnapshot, joint: u8) -> bool {
 
 // ------------------------------------------------------------------ tests
 
-/// The counting allocator is process-global, so the four tests here must
+/// The counting allocator is process-global, so the tests here must
 /// not run concurrently: a sibling test allocating inside the measured
 /// window would fail `the_failure_arm_allocates_nothing` spuriously.
 /// (The repo's other allocator tests isolate by living alone in their
@@ -401,67 +480,63 @@ fn sustained_joint_tx_failure_latches_disconnect_and_disables() {
     assert_eq!(s.mode, Mode::Idle, "auto-recovery from ACTIVE_ERROR");
     rig.cmd(RtCommand::Enable);
     assert_eq!(rig.snap().state, ArmState::Enabled);
-}
 
-/// A gripper-slot-only TX failure latches the gripper node's disconnect
-/// and nothing else.
-#[test]
-fn gripper_only_tx_failure_latches_only_the_gripper_node() {
-    let _serial = serial();
-    let mut rig = Rig::new();
-    rig.ready();
-    rig.core.bus_mut().fail_gripper_tx = true;
-    let lost = rig.lost_ticks;
-    rig.tick_n(lost + 4);
-    let s = rig.snap();
-    assert!(s.error_active);
-    assert_eq!(s.state, ArmState::Disabled);
-    assert!(can_lost(&s, GRIPPER_ERR_IDX));
-    for j in 0..MAX_JOINTS as u8 {
+    // A gripper-slot-only TX failure latches the gripper node's disconnect
+    // and nothing else.
+    {
+        let mut rig = Rig::new();
+        rig.ready();
+        rig.core.bus_mut().fail_gripper_tx = true;
+        let lost = rig.lost_ticks;
+        rig.tick_n(lost + 4);
+        let s = rig.snap();
+        assert!(s.error_active);
+        assert_eq!(s.state, ArmState::Disabled);
+        assert!(can_lost(&s, GRIPPER_ERR_IDX));
+        for j in 0..MAX_JOINTS as u8 {
+            assert!(
+                !can_lost(&s, j),
+                "J{j}: joint sends kept working — no joint latch"
+            );
+        }
+        assert_eq!(s.loop_stats.bus_tx_failures, lost + 4);
+    }
+
+    // Transient failures are tolerated: counted into the stats, never
+    // latched. The backend's own `LinkHealth` rides the snapshot.
+    {
+        let mut rig = Rig::new();
+        rig.ready();
+        let lost = rig.lost_ticks;
+
+        // A TX blip shorter than the lost window, then a long healthy run:
+        // the streak reset on the first successful send, so nothing latches
+        // no matter how much later the check runs.
+        rig.core.bus_mut().fail_joint_tx = true;
+        rig.tick_n(10);
+        rig.core.bus_mut().fail_joint_tx = false;
+        rig.tick_n(3 * lost);
+        let s = rig.snap();
+        assert!(!s.error_active, "a transient TX blip must not latch");
+        assert_eq!(s.state, ArmState::Enabled);
+        assert_eq!(s.mode, Mode::Idle);
+        assert_eq!(s.loop_stats.bus_tx_failures, 10, "every refusal counted");
+
+        // Same for the RX drain.
+        rig.core.bus_mut().fail_rx = true;
+        rig.tick_n(7);
+        rig.core.bus_mut().fail_rx = false;
+        rig.tick_n(5);
+        let s = rig.snap();
+        assert!(!s.error_active);
+        assert_eq!(s.loop_stats.bus_rx_failures, 7);
+
+        // The backend's aggregated link health reaches STATUS.
         assert!(
-            !can_lost(&s, j),
-            "J{j}: joint sends kept working — no joint latch"
+            s.link.rx_frames > 0,
+            "the backend's LinkHealth counters must ride the snapshot"
         );
     }
-    assert_eq!(s.loop_stats.bus_tx_failures, lost + 4);
-}
-
-/// Transient failures are tolerated: counted into the stats, never
-/// latched. The backend's own `LinkHealth` rides the snapshot.
-#[test]
-fn transient_failures_are_counted_but_never_latch() {
-    let _serial = serial();
-    let mut rig = Rig::new();
-    rig.ready();
-    let lost = rig.lost_ticks;
-
-    // A TX blip shorter than the lost window, then a long healthy run:
-    // the streak reset on the first successful send, so nothing latches
-    // no matter how much later the check runs.
-    rig.core.bus_mut().fail_joint_tx = true;
-    rig.tick_n(10);
-    rig.core.bus_mut().fail_joint_tx = false;
-    rig.tick_n(3 * lost);
-    let s = rig.snap();
-    assert!(!s.error_active, "a transient TX blip must not latch");
-    assert_eq!(s.state, ArmState::Enabled);
-    assert_eq!(s.mode, Mode::Idle);
-    assert_eq!(s.loop_stats.bus_tx_failures, 10, "every refusal counted");
-
-    // Same for the RX drain.
-    rig.core.bus_mut().fail_rx = true;
-    rig.tick_n(7);
-    rig.core.bus_mut().fail_rx = false;
-    rig.tick_n(5);
-    let s = rig.snap();
-    assert!(!s.error_active);
-    assert_eq!(s.loop_stats.bus_rx_failures, 7);
-
-    // The backend's aggregated link health reaches STATUS.
-    assert!(
-        s.link.rx_frames > 0,
-        "the backend's LinkHealth counters must ride the snapshot"
-    );
 }
 
 /// The failure arm is on the RT tick path: a fully dead bus — every

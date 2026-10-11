@@ -21,7 +21,7 @@
     0
    ]
   },
-  "MSG": {
+  "MSG_small_motor_150mm_rail": {
    "d_m": -0.1409,
    "a_m": -0.02835,
    "alpha_rad": 3.141592653589793,
@@ -86,7 +86,7 @@
     -4.7188e-08,
     -0.0
    ],
-   "tau_arm_msg_tool": [
+   "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
     4.10698222065,
     0.71275575137,
@@ -128,7 +128,7 @@
     -0.00179948813,
     -0.0
    ],
-   "tau_arm_msg_tool": [
+   "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
     6.816004871715,
     -2.123016020287,
@@ -170,7 +170,7 @@
     -0.003896933312,
     0.0
    ],
-   "tau_arm_msg_tool": [
+   "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
     0.823722947004,
     -0.139867739702,
@@ -212,7 +212,7 @@
     -0.008150222843,
     0.0
    ],
-   "tau_arm_msg_tool": [
+   "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
     6.559008769454,
     -2.552402471173,
@@ -254,7 +254,7 @@
     0.001981263673,
     0.0
    ],
-   "tau_arm_msg_tool": [
+   "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
     6.451097979287,
     -2.18980315443,
@@ -296,7 +296,7 @@
     0.002399253554,
     -0.0
    ],
-   "tau_arm_msg_tool": [
+   "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
     5.812907157079,
     -2.640459922396,
@@ -338,7 +338,7 @@
     -0.004713288315,
     -0.0
    ],
-   "tau_arm_msg_tool": [
+   "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
     6.052108506425,
     -1.561694429687,
@@ -380,7 +380,7 @@
     -0.000398800932,
     0.0
    ],
-   "tau_arm_msg_tool": [
+   "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
     3.451135341794,
     1.364833213015,
@@ -422,7 +422,7 @@
     0.010745023187,
     0.0
    ],
-   "tau_arm_msg_tool": [
+   "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
     1.309116646188,
     0.719545922903,
@@ -464,7 +464,7 @@
     -0.00734766697,
     -0.0
    ],
-   "tau_arm_msg_tool": [
+   "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
     5.566795558556,
     -0.772821041566,

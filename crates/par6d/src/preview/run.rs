@@ -21,6 +21,7 @@
 //! against the world it ends up in. Each keeps its line in the record,
 //! with no rows, so the two records still name the same commands.
 
+use crate::planner::PlannerSwap;
 use par6_bus::sim::scene::Scene;
 use par6_bus::sim::SimulationScenario;
 use par6_proto::{
@@ -207,12 +208,18 @@ impl Preview {
                 "must be finite and in (0, 3600]",
             ));
         }
-        let bundle = par6_config::ConfigBundle::load(&self.config_path)?;
+        // The engine this run boots is fitted with the tool the session has
+        // now, which a `select_tool` may have changed since startup.
+        let (bundle, _) = crate::options::load_config(
+            &self.config_path,
+            self.opts.local_config.as_deref(),
+            Some(&self.tool),
+        )?;
         let stack = load_kin_stack(
             &self.opts,
             &self.config_path,
             &bundle.robot,
-            bundle.active_gripper(),
+            bundle.active_tool(),
         )?;
         let scene = Scene {
             tool: scene_tool(stack.variant),
@@ -250,6 +257,11 @@ impl Preview {
                 kin: stack.planner,
                 collision: stack.collision,
                 tool_offset: stack.tool_offset,
+            },
+            PlannerSwap {
+                source: stack.source,
+                bundle: std::sync::Arc::new(bundle.clone()),
+                tools: Default::default(),
             },
         )?;
         // Nothing offline serves STATUS or answers REACHABLE, and the

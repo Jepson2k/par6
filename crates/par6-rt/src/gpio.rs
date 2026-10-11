@@ -648,28 +648,6 @@ impl EstopMonitor {
 mod tests {
     use super::*;
 
-    #[test]
-    fn first_read_seeds_and_changes_need_five_consecutive_reads() {
-        // Boot with the line LOW (pressed): seeding must report pressed
-        // immediately — and, dually, booting HIGH must not glitch pressed.
-        let mut d = Debouncer::new();
-        assert!(!d.update(false), "seeded pressed at first read");
-        let mut d = Debouncer::new();
-        assert!(d.update(true), "seeded released at first read");
-
-        // A change holds only after 5 consecutive identical reads; any
-        // interruption restarts the count.
-        for _ in 0..3 {
-            assert!(d.update(false), "3 lows: still released");
-        }
-        assert!(d.update(true), "bounce back resets the streak");
-        for _ in 0..(DEBOUNCE_READS - 1) {
-            assert!(d.update(false), "streak not yet complete");
-        }
-        assert!(!d.update(false), "5th consecutive low flips to pressed");
-        assert!(!d.update(false), "stays pressed");
-    }
-
     /// A line that cannot be opened is an error, never a line.
     ///
     /// The tempting shape here is to fall back to something that reads

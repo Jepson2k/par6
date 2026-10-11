@@ -16,13 +16,15 @@
 # Installs to:
 #   /usr/local/bin/par6d              the runtime binary
 #   /usr/local/lib/par6/*.so          the Pinocchio shim, libmujoco and their runtime closure
-#   /etc/par6/PAR6.toml               robot config (kept on re-install unless --force-config)
+#   /etc/par6/PAR6.toml               robot config, as shipped (replaced on every install)
 #   /etc/par6/grippers/*.toml         gripper configs (same rule)
+#   /etc/par6/local.toml              this arm's own values: yours, never written here
 #   /usr/share/par6/par6_description  URDF/meshes (the kinematics/collision models)
 #   /etc/systemd/system/par6d.service the unit
 #
-# RESTARTING par6d STOPS THE ROBOT. The service is restarted unless
-# --no-restart is passed.
+# RESTARTING par6d MOVES A HOMED ARM TO ITS PARK POSE, unchecked against
+# keep-outs ([shutdown] safe_park), then stops it. The service is restarted
+# unless --no-restart is passed.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -34,7 +36,6 @@ BUNDLE=""
 STAGE_ONLY=""
 LOCAL=0
 RESTART=1
-FORCE_CONFIG=0
 BINARY="$ROOT/target/$TARGET_TRIPLE/release/par6d"
 CONFIG_DIR="$ROOT/config"
 ASSETS_DIR="$ROOT/assets/par6_description"
@@ -72,7 +73,6 @@ while [ $# -gt 0 ]; do
     --stage-only) STAGE_ONLY="${2:?--stage-only needs a directory}"; shift 2;;
     --local) LOCAL=1; shift;;
     --no-restart) RESTART=0; shift;;
-    --force-config) FORCE_CONFIG=1; shift;;
     -h|--help) usage 0;;
     *) echo "install: unknown argument $1" >&2; usage 2;;
   esac
@@ -93,6 +93,26 @@ install_local() {
   if command -v file >/dev/null && [ "$(uname -m)" = "aarch64" ]; then
     file -b "$bundle/par6d" | grep -q "ARM aarch64" \
       || die "bundled par6d is not an aarch64 binary: $(file -b "$bundle/par6d")"
+  fi
+
+  # A config file that differs from the shipped one may hold this arm's own
+  # values. Until there is a local.toml for them, replacing it would restart
+  # the arm without them.
+  if [ -e "$ETC_DEST/local.toml" ] && [ ! -f "$ETC_DEST/local.toml" ]; then
+    die "$ETC_DEST/local.toml is not a file; the arm's own values belong in one"
+  fi
+  if [ ! -e "$ETC_DEST/local.toml" ]; then
+    local shipped edited
+    for shipped in "$bundle/config/PAR6.toml" "$bundle"/config/grippers/*.toml; do
+      [ -e "$shipped" ] || continue
+      edited="$ETC_DEST/${shipped#"$bundle"/config/}"
+      if [ -e "$edited" ] && ! cmp -s "$shipped" "$edited"; then
+        die "$edited differs from the shipped one and there is no
+  $ETC_DEST/local.toml. Move this arm's own values into local.toml -- a tool's
+  under a [[tools]] entry named after it -- or create it empty if it has none
+  (see README.md, \"Local overlay\"), then install again"
+      fi
+    done
   fi
 
   if ! id -u "$SERVICE_USER" >/dev/null 2>&1; then
@@ -164,11 +184,17 @@ install_local() {
   fi
 }
 
+# The shipped config describes the PAR6 and is replaced whole, so an upgrade
+# never leaves a stale copy behind; this arm's own values live in
+# local.toml, which no install writes. A file that was edited in place is
+# kept beside the new one for its values to be moved over.
 install_config() {
   local src="$1" dest="$2"
-  if [ -e "$dest" ] && [ "$FORCE_CONFIG" -eq 0 ]; then
-    say "keeping existing $dest (pass --force-config to overwrite)"
-    return
+  if [ -e "$dest" ] && ! cmp -s "$src" "$dest"; then
+    local kept
+    kept="$dest.previous-$(date +%Y%m%dT%H%M%S)"
+    cp -p "$dest" "$kept"
+    say "replacing $dest; the old one is $kept"
   fi
   install -m 0644 "$src" "$dest"
   say "installed $dest"
@@ -217,7 +243,6 @@ install_remote() {
 
   local flags="--local --bundle '$remote_dir'"
   if [ "$RESTART" -eq 0 ]; then flags="$flags --no-restart"; fi
-  if [ "$FORCE_CONFIG" -eq 1 ]; then flags="$flags --force-config"; fi
   # -t so sudo can prompt for a password on the box.
   ssh -t "$HOST" "set -e
     cd '$remote_dir'

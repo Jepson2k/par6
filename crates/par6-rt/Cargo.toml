@@ -21,6 +21,7 @@ gpio = ["dep:gpiocdev"]
 par6-config = { workspace = true }
 par6-bus = { workspace = true }
 par6-kin = { workspace = true }
+par6-motion = { workspace = true }
 thread-priority = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

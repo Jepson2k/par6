@@ -1,8 +1,9 @@
 """Packaged PAR6 configuration and asset paths.
 
-The runtime's own config files (``config/PAR6.toml`` and
-``config/grippers/*.toml``) and URDF trees are mirrored into ``par6/_data``
-by ``scripts/sync_pkg_data.py`` and read through the engine's own loader
+The runtime's own config files (``par6/_data/config/PAR6.toml`` and its
+``grippers/*.toml``; the repo-root ``config`` is a symlink to them), with any
+local overlay layered over them, and the URDF trees ``scripts/sync_pkg_data.py``
+copies into ``par6/_data`` are read through the engine's own loader
 (:class:`par6._par6.Config`), so every limit, pose and name the Python
 surface exposes is the value the Rust runtime enforces.  This module only
 turns those values into paths and waldoctl dataclasses.
@@ -115,8 +116,9 @@ def can_interface(robot_toml: str | None) -> str:
 
 
 def config_files(path: str | Path) -> dict:
-    """The robot TOML at *path* and the ``grippers/*.toml`` beside it,
-    verbatim, in the shape of the daemon's CONFIG_BUNDLE answer.
+    """The robot TOML at *path* and the tool files beside it as the runtime
+    runs them (each with the local overlay merged in), in the shape of the
+    daemon's CONFIG_BUNDLE answer.
 
     ``fingerprint`` is computed the way the daemon computes CONFIG_INFO's:
     sha256 over each file's name, a newline and its content — the robot
@@ -125,16 +127,13 @@ def config_files(path: str | Path) -> dict:
     """
     robot = Path(path)
     digest = hashlib.sha256()
-
-    def read(file: Path) -> tuple[str, str]:
-        content = file.read_text()
-        digest.update(file.name.encode())
+    config = Config(str(robot))
+    robot_filename, robot_toml = robot.name, config.robot_toml()
+    grippers = config.tool_tomls()
+    for name, content in [(robot_filename, robot_toml), *grippers]:
+        digest.update(name.encode())
         digest.update(b"\n")
         digest.update(content.encode())
-        return file.name, content
-
-    robot_filename, robot_toml = read(robot)
-    grippers = [read(f) for f in sorted((robot.parent / "grippers").glob("*.toml"))]
     return {
         "path": str(robot),
         "fingerprint": digest.hexdigest(),
@@ -360,5 +359,5 @@ def canonical_tool_key(name: str) -> str:
 
 
 def fitted_tool_key() -> str:
-    """Canonical key of the gripper the runtime is configured with."""
-    return canonical_tool_key(config().active_gripper())
+    """Canonical key of the tool the runtime boots fitted with."""
+    return canonical_tool_key(config().active_tool())

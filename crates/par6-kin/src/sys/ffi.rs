@@ -297,4 +297,5 @@ extern "C" {
     ) -> par6_status;
 
     pub fn par6_shim_abi_version() -> i32;
+    pub fn par6_shim_layout(out: *mut u64, n: i32) -> i32;
 }

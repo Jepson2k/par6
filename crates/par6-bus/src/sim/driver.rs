@@ -5,34 +5,29 @@
 //! and carries the driver-side watchdog, per-type fault flags, the live
 //! err bit and the telemetry values the RTR polls report.
 
-use crate::spectral::codec::{unpack_f32, unpack_i16, unpack_i24, unpack_u32, CommandId};
+use crate::spectral::codec::{
+    unpack_f32, unpack_i16, unpack_i24, unpack_u32, CommandId, CAPTURE_LEN, CAPTURE_STATUS_CHANNEL,
+    CAPTURE_VEL_SCALE, RIPPLE_SLOTS,
+};
 use crate::types::{DeviceInfo, ErrorFlags, NodeId};
-use std::collections::VecDeque;
 
-/// Firmware control-loop period \[s\]: STEPFOC's `LOOP_TIME`
-/// (`constants.h:56`). Position loop, velocity PI and current loop all
-/// run once per iteration of that loop, so the config `kiv` is a
-/// per-iteration gain and the sim integrates `kiv · err` once per
-/// firmware iteration rather than once per plant substep.
-///
-/// A 1 ms plant substep is 6.25 iterations, which is why [`loop_step`]
-/// takes the count as a fraction: a whole-number count winds the
-/// velocity integral at the wrong rate, and every `kiv`- or
-/// `kpp`-dependent behaviour is then measured against a drive the vendor
-/// does not ship.
-///
-/// [`loop_step`]: VirtualDriver::loop_step
-pub(crate) const FW_LOOP_DT: f64 = 0.00016;
-
-/// Samples in the firmware's velocity moving average (`movingAverage`,
-/// `utils.cpp:177`), which is what the velocity PI reads — NOT the raw
-/// finite difference.
-///
-/// The lag matters, the sample rate does not: the sim cannot afford a
-/// 160 us plant substep, so `loop_step` averages over the same WINDOW of
-/// time at whatever rate the plant runs. An exact instantaneous velocity
-/// would hand the PI derivative information no drive has.
-const FW_VEL_AVG_SAMPLES: f64 = 20.0;
+/// Firmware cascade frequency [Hz], from STEPFOC constants.h at 32fb5b5.
+/// The physics integrates between loop evaluations; scaling the integral
+/// without updating plant feedback adds a phase lag the drive does not have.
+const FW_LOOP_HZ: f64 = 6250.0;
+/// The raw encoder's counts per motor revolution, and the NEMA 17 steppers' pole
+/// pairs (1.8 degree step), which set the electrical phase the ripple
+/// feedforward follows.
+const ENCODER_COUNTS: f64 = 16384.0;
+const POLE_PAIRS: u32 = 50;
+pub(crate) const FW_LOOP_DT: f64 = 1.0 / FW_LOOP_HZ;
+/// STEPFOC's measured-velocity moving average, sampled each drive
+/// iteration. This plant's encoder is exact, so a shorter window looks
+/// better here than it is: on the arm's base 8 samples hunted after every
+/// move where 20 hold still.
+const VELOCITY_WINDOW: usize = 20;
+/// The longest speed filter the firmware takes (cmd 41).
+const VELOCITY_WINDOW_MAX: usize = 64;
 
 /// Bridge MOSFET on-resistance \[ohm\] (STEPFOC `Rdson`). Two of them
 /// sit in the winding's current path.
@@ -127,7 +122,15 @@ enum Mode {
     Velocity { vel: f64, cur_ff: f64 },
     Current { cur: f64 },
     Pd { pos: f64, vel: f64, cur_ff: f64 },
-    Hall { vel: f64 },
+    Hall { vel: f64, trigger_value: u8 },
+}
+
+impl Mode {
+    /// Position and velocity frames run the same cascade and carry its
+    /// velocity integral on from each other.
+    fn is_cascade(&self) -> bool {
+        matches!(self, Mode::Position { .. } | Mode::Velocity { .. })
+    }
 }
 
 /// What the bus must transmit back for a delivered data frame.
@@ -162,6 +165,14 @@ pub(crate) struct VirtualDriver {
     // -- control state --
     mode: Mode,
     integral_ma: f64,
+    loop_phase: f64,
+    last_drive: PlantCmd,
+    velocity_history: [f64; VELOCITY_WINDOW_MAX],
+    /// The speed filter's length in loops (cmd 41).
+    velocity_window: usize,
+    velocity_samples: usize,
+    previous_encoder: Option<f64>,
+    pub measured_velocity: f64,
     /// The motor's electrical model; `None` leaves the driver with the
     /// commanded current applied instantly, which is a drive that can
     /// change its torque infinitely fast.
@@ -170,21 +181,31 @@ pub(crate) struct VirtualDriver {
     /// \[V\].
     iq_ma: f64,
     iq_err_sum: f64,
-    /// Last integer encoder count, the other half of the firmware's
-    /// finite difference.
-    enc_prev: Option<f64>,
-    /// Rolling window behind the firmware's `Velocity_Filter`.
-    vel_window: VecDeque<f64>,
-    vel_window_len: usize,
-    vel_sum: f64,
     armed: bool,
     ticks_since_data: u64,
     pub cur_out_ma: f64,
+    capture_wanted: u16,
+    capture_div: u16,
+    capture_tick: u16,
+    capture_pos: u16,
+    capture_vel: Vec<i16>,
+    capture_iq: Vec<i16>,
+    capture_phase: Vec<i16>,
+    /// Ripple feedforward slots (cmd 40): (harmonic, cosine mA, sine mA).
+    ripple: [(u8, i16, i16); RIPPLE_SLOTS as usize],
+    /// The rotor's electrical phase this loop, 0..16383 per cycle, as the
+    /// firmware derives it from the raw count.
+    phase: u32,
+    /// Each configuration frame as last written, echoed to a read request
+    /// the way the firmware reports the values in force.
+    written: [Option<([u8; 8], usize)>; 7],
     // -- faults --
     flags: ErrorFlags,
     // -- HALL sensor runtime (band logic evaluated by the bus) --
     pub hall_in_band: bool,
-    pub hall_edge_pending: bool,
+    pub hall_trigger: bool,
+    pub hall_edge: bool,
+    hall_needs_initial_sample: bool,
     pub hall_latched_ticks: Option<i32>,
     // -- telemetry constants --
     pub temperature_c: i16,
@@ -217,23 +238,43 @@ impl VirtualDriver {
             kt_nm_a: kt_nm_a as f32,
             mode: Mode::Idle,
             integral_ma: 0.0,
+            loop_phase: 0.0,
+            last_drive: PlantCmd {
+                current_ma: 0.0,
+                ff_ma: 0.0,
+                vel_limit_ticks_s: vel_limit,
+                idle: true,
+            },
+            velocity_history: [0.0; VELOCITY_WINDOW_MAX],
+            velocity_window: VELOCITY_WINDOW,
+            velocity_samples: 0,
+            previous_encoder: None,
+            measured_velocity: 0.0,
             electrical,
             iq_ma: 0.0,
             iq_err_sum: 0.0,
-            enc_prev: None,
-            vel_window: VecDeque::new(),
-            vel_window_len: 1,
-            vel_sum: 0.0,
             armed: false,
             ticks_since_data: 0,
             cur_out_ma: 0.0,
+            capture_wanted: 0,
+            capture_div: 1,
+            capture_tick: 0,
+            capture_pos: 0,
+            capture_vel: vec![0; usize::from(CAPTURE_LEN)],
+            capture_iq: vec![0; usize::from(CAPTURE_LEN)],
+            capture_phase: vec![0; usize::from(CAPTURE_LEN)],
+            ripple: [(0, 0, 0); RIPPLE_SLOTS as usize],
+            phase: 0,
+            written: [None; 7],
             flags: ErrorFlags {
                 calibrated: true,
                 activated: true,
                 ..ErrorFlags::default()
             },
             hall_in_band: false,
-            hall_edge_pending: false,
+            hall_trigger: true,
+            hall_edge: false,
+            hall_needs_initial_sample: true,
             hall_latched_ticks: None,
             temperature_c: 32 + i16::from(node),
             voltage_mv: 24_000,
@@ -242,16 +283,76 @@ impl VirtualDriver {
                 batch: 1,
                 sw_ver: 3,
                 serial: 1_000 + i32::from(node),
+                tool_id: 0,
             },
         }
     }
 
+    /// cmd 38: record `wanted` samples, one every `divisor` loops, from
+    /// the next loop; the firmware caps at its buffer and floors the
+    /// divisor at one.
+    pub fn capture_start(&mut self, divisor: u8, wanted: u16) {
+        self.capture_wanted = wanted.min(CAPTURE_LEN);
+        self.capture_div = u16::from(divisor.max(1));
+        self.capture_tick = 0;
+        self.capture_pos = 0;
+    }
+
+    /// A read request on a configuration frame: what was last written, the
+    /// firmware's answer; nothing if it was never written.
+    pub fn config_readback(&self, kind: crate::ConfigKind) -> Option<([u8; 8], usize)> {
+        self.written[kind.index()]
+    }
+
+    /// Pairs recorded so far: what a stream sends per channel.
+    pub fn capture_pairs(&self) -> u16 {
+        self.capture_pos.div_ceil(2)
+    }
+
+    /// cmd 39 reply payload: pair `chunk` of `channel`, zero past what
+    /// was recorded; the status for `CAPTURE_STATUS_CHANNEL`.
+    pub fn capture_reply(&self, channel: u8, chunk: u16) -> [u8; 7] {
+        let mut p = [0u8; 7];
+        p[0] = channel;
+        let words: [i16; 3] = if channel == CAPTURE_STATUS_CHANNEL {
+            [
+                self.capture_pos as i16,
+                self.capture_wanted as i16,
+                self.capture_div as i16,
+            ]
+        } else {
+            let rows = match channel {
+                0 => &self.capture_vel,
+                1 => &self.capture_iq,
+                _ => &self.capture_phase,
+            };
+            let at = usize::from(chunk) * 2;
+            let sample = |k: usize| {
+                let i = at + k;
+                if i < usize::from(self.capture_pos) {
+                    rows[i]
+                } else {
+                    0
+                }
+            };
+            [chunk as i16, sample(0), sample(1)]
+        };
+        for (k, w) in words.iter().enumerate() {
+            p[1 + 2 * k..3 + 2 * k].copy_from_slice(&w.to_be_bytes());
+        }
+        p
+    }
     /// Handle one host→driver DATA frame. Feeds the watchdog (any valid
     /// data frame counts as command traffic; RTR polls do not), updates
     /// config/mode, and names the reply the bus owes. Wrong-DLC frames are
     /// discarded whole — no state change, no watchdog feed.
     pub fn on_data_frame(&mut self, cmd: CommandId, d: &[u8]) -> ReplyKind {
         use CommandId::*;
+        if let Some(kind) = config_kind(cmd).filter(|k| d.len() == config_dlc(*k)) {
+            let mut bytes = [0u8; 8];
+            bytes[..d.len()].copy_from_slice(d);
+            self.written[kind.index()] = Some((bytes, d.len()));
+        }
         // Firmware sets `watchdog_reset = 1` only in the data-pack cases
         // that install a Controller_mode, and only on a well-formed frame:
         // the wrong-DLC branch sets `Wrong_DL` instead and feeds nothing.
@@ -261,7 +362,29 @@ impl VirtualDriver {
                 | (CommandId::DataPackPd, 8)
                 | (CommandId::DataPackHall, 4)
         );
+        let was_cascade = self.mode.is_cascade();
         let reply = match (cmd, d.len()) {
+            (SetGripperId, 1) => {
+                self.device.tool_id = d[0];
+                ReplyKind::None
+            }
+            (VelocityWindow, 1) => {
+                // The firmware clamps, and restarts the average on a change.
+                let window = usize::from(d[0]).clamp(4, VELOCITY_WINDOW_MAX);
+                if window != self.velocity_window {
+                    self.velocity_window = window;
+                    self.velocity_samples = 0;
+                }
+                ReplyKind::None
+            }
+            (Ripple, 6) if d[0] < RIPPLE_SLOTS => {
+                self.ripple[usize::from(d[0])] = (
+                    d[1],
+                    i16::from_be_bytes([d[2], d[3]]),
+                    i16::from_be_bytes([d[4], d[5]]),
+                );
+                ReplyKind::None
+            }
             (DataPack1, 8) => {
                 self.mode = Mode::Position {
                     pos: f64::from(unpack_i24([d[0], d[1], d[2]])),
@@ -283,7 +406,6 @@ impl VirtualDriver {
                 self.mode = Mode::Current {
                     cur: f64::from(unpack_i16([d[0], d[1]])),
                 };
-                self.integral_ma = 0.0;
                 self.armed = true;
                 ReplyKind::Motion
             }
@@ -293,13 +415,19 @@ impl VirtualDriver {
                     vel: f64::from(unpack_i24([d[3], d[4], d[5]])),
                     cur_ff: f64::from(unpack_i16([d[6], d[7]])),
                 };
-                self.integral_ma = 0.0;
                 self.armed = true;
                 ReplyKind::Motion
             }
             (DataPackHall, 4) => {
+                if !matches!(self.mode, Mode::Hall { .. }) {
+                    self.hall_trigger = true;
+                    self.hall_edge = false;
+                    self.hall_latched_ticks = None;
+                    self.hall_needs_initial_sample = true;
+                }
                 self.mode = Mode::Hall {
                     vel: f64::from(unpack_i24([d[0], d[1], d[2]])),
+                    trigger_value: d[3],
                 };
                 self.armed = true;
                 ReplyKind::Hall
@@ -348,7 +476,6 @@ impl VirtualDriver {
             }
             (Idle, 0) => {
                 self.mode = Mode::Idle;
-                self.integral_ma = 0.0;
                 ReplyKind::None
             }
             (Estop, 0) => {
@@ -379,7 +506,44 @@ impl VirtualDriver {
         if fed {
             self.ticks_since_data = 0;
         }
+        // The par6 firmware starts the velocity integral afresh when the
+        // position/velocity cascade is entered from any other mode: its
+        // charge is against the load the loop last drove, and after a
+        // current-mode release it is the wind-up of the push before it.
+        // The vendor firmware keeps the charge, and slams a joint that a
+        // current-mode push left wound up; this plant is the par6 build,
+        // which every drive is meant to run.
+        if !was_cascade && self.mode.is_cascade() {
+            self.integral_ma = 0.0;
+        }
         reply
+    }
+
+    /// Edge mode latches either transition until the host leaves Hall mode.
+    pub fn sample_hall(&mut self, in_band: bool, position_ticks: i32) {
+        let changed = self.hall_in_band != in_band;
+        self.hall_in_band = in_band;
+        let Mode::Hall { trigger_value, .. } = self.mode else {
+            return;
+        };
+        if self.hall_needs_initial_sample {
+            self.hall_needs_initial_sample = false;
+            if trigger_value == 2 {
+                return;
+            }
+        }
+        let hit = if trigger_value == 2 {
+            changed
+        } else {
+            u8::from(in_band) == trigger_value
+        };
+        if hit && self.hall_trigger {
+            self.hall_latched_ticks = Some(position_ticks);
+            self.hall_trigger = false;
+            self.hall_edge = true;
+        } else if !hit && trigger_value != 2 {
+            self.hall_trigger = true;
+        }
     }
 
     /// Feed the watchdog for an answered RTR telemetry poll.
@@ -394,29 +558,64 @@ impl VirtualDriver {
         self.ticks_since_data = 0;
     }
 
-    /// One control-loop step at the measured plant state: the mode's
-    /// Ilim-saturated current output, integrating the velocity loop over
-    /// `fw_steps` firmware iterations. The watchdog ages separately, once
-    /// per bus tick ([`Self::age_watchdog`]), so a plant can close the
-    /// loops at its physics substep rate (the firmware's own loops run at
-    /// ~6 kHz; a current held over a whole coarse bus tick destabilizes a
-    /// strongly-driven joint).
-    ///
-    /// A latched fault removes drive authority entirely, as it does on the
-    /// arm: firmware runs its mode switch only while `Error == 0`, and the
-    /// else branch forces `Controller_mode = 0` and drops SLEEP/RESET
-    /// until `Clear_Error`.
+    /// A physics step can be shorter than one drive iteration. Carry
+    /// its fraction forward so host retiming cannot change the drive's
+    /// sampling window or integral gain.
     pub fn loop_step(&mut self, pos_ticks: f64, vel_ticks_s: f64, fw_steps: f64) -> PlantCmd {
-        // The firmware's loops read `Velocity_Filter`, never the raw
-        // difference, so the filter is inside the loop and its lag is part
-        // of the plant the gains were tuned against. One plant substep
-        // stands for `fw_steps` firmware iterations, so the firmware's
-        // 20-sample window is that many substeps wide.
-        self.vel_window_len = (FW_VEL_AVG_SAMPLES / fw_steps).round().max(1.0) as usize;
+        self.loop_phase += fw_steps;
+        if self.loop_phase >= 1.0 - 1e-10 {
+            self.loop_phase = (self.loop_phase - 1.0).max(0.0);
+            self.last_drive = self.control_iteration(pos_ticks, vel_ticks_s);
+        }
+        self.last_drive
+    }
+
+    fn control_iteration(&mut self, pos_ticks: f64, vel_ticks_s: f64) -> PlantCmd {
         // The shaft's true speed, which only the winding sees.
         let shaft_ticks_s = vel_ticks_s;
-        let (pos_ticks, vel_ticks_s) = self.read_encoder(pos_ticks, fw_steps);
-        let vel_ticks_s = self.filter_velocity(vel_ticks_s);
+        let pos_ticks = pos_ticks.round();
+        self.phase = ((pos_ticks.rem_euclid(ENCODER_COUNTS) as u32) * POLE_PAIRS) & 16383;
+        let vel_ticks_s = self
+            .previous_encoder
+            .map_or(vel_ticks_s, |previous| (pos_ticks - previous) * FW_LOOP_HZ)
+            .trunc();
+        self.previous_encoder = Some(pos_ticks);
+        let window = self.velocity_window;
+        self.velocity_history.rotate_left(1);
+        self.velocity_history[VELOCITY_WINDOW_MAX - 1] = vel_ticks_s;
+        self.velocity_samples = (self.velocity_samples + 1).min(window);
+        let vel_ticks_s = (self.velocity_history[VELOCITY_WINDOW_MAX - self.velocity_samples..]
+            .iter()
+            .sum::<f64>()
+            / self.velocity_samples as f64)
+            .trunc();
+        self.measured_velocity = vel_ticks_s;
+        let driven = self.cur_out_ma;
+        let out = self.control_law(pos_ticks, vel_ticks_s, shaft_ticks_s);
+        self.record_capture(vel_ticks_s, driven);
+        out
+    }
+
+    /// Loop-rate capture (cmd 38), after the loop the way the firmware takes
+    /// it: this loop's filtered velocity, the current the last loop drove,
+    /// and the electrical phase.
+    fn record_capture(&mut self, vel_ticks_s: f64, driven: f64) {
+        if self.capture_pos >= self.capture_wanted {
+            return;
+        }
+        self.capture_tick += 1;
+        if self.capture_tick >= self.capture_div.max(1) {
+            self.capture_tick = 0;
+            let i = usize::from(self.capture_pos);
+            self.capture_vel[i] = (vel_ticks_s / f64::from(CAPTURE_VEL_SCALE)) as i16;
+            self.capture_iq[i] = driven as i16;
+            self.capture_phase[i] = self.phase as i16;
+            self.capture_pos += 1;
+        }
+    }
+
+    fn control_law(&mut self, pos_ticks: f64, vel_ticks_s: f64, shaft_ticks_s: f64) -> PlantCmd {
+        let fw_steps = 1.0;
         // Without this a test could fault a joint, keep commanding it, and
         // pass — against hardware where the arm simply freewheels.
         if self.flags.error {
@@ -466,8 +665,15 @@ impl VirtualDriver {
                 let vt = vel.clamp(-self.vel_limit, self.vel_limit);
                 self.velocity_pi(vt, vel_ticks_s, cur_ff, fw_steps)
             }
-            Mode::Hall { vel } => {
-                let vt = vel.clamp(-self.vel_limit, self.vel_limit);
+            Mode::Hall { vel, .. } => {
+                let target = if self.hall_trigger {
+                    vel
+                } else {
+                    self.kpp
+                        * (f64::from(self.hall_latched_ticks.unwrap_or(pos_ticks as i32))
+                            - pos_ticks)
+                };
+                let vt = target.clamp(-self.vel_limit, self.vel_limit);
                 self.velocity_pi(vt, vel_ticks_s, 0.0, fw_steps)
             }
             Mode::Current { cur } => cur,
@@ -494,20 +700,34 @@ impl VirtualDriver {
     /// teleported pose (about a thousand ticks after a fast jog) and
     /// rings, violating the teleport contract that the arm lands exactly
     /// where the client asked. The latched motion command goes with it,
-    /// replaced by a position hold at the new wire reading `pos_ticks`:
+    /// replaced by a position hold at the new wire reading `pos_ticks`
+    /// already putting out `hold_ma`, the current the landed load takes:
     /// until the runtime's next frame re-commands the joint it stays
-    /// held — a limp tick lets a wrist loaded past its gearbox's holding
-    /// friction back-drive a degree before the feedforward arrives.
-    pub fn reseed_hold(&mut self, pos_ticks: f64) {
+    /// held, as a drive that had been holding there would — a limp tick
+    /// lets a wrist loaded past its gearbox's holding friction back-drive
+    /// a degree before the feedforward arrives, and a cold one sags a
+    /// milliradian onto its drivetrain while its current loop catches up.
+    pub fn reseed_hold(&mut self, pos_ticks: f64, hold_ma: f64) {
+        self.loop_phase = 0.0;
+        self.last_drive = PlantCmd {
+            current_ma: hold_ma,
+            ff_ma: hold_ma,
+            vel_limit_ticks_s: self.vel_limit,
+            idle: false,
+        };
+        self.velocity_history.fill(0.0);
+        self.velocity_samples = 0;
+        self.previous_encoder = None;
+        self.measured_velocity = 0.0;
         self.integral_ma = 0.0;
-        self.iq_ma = 0.0;
+        self.iq_ma = hold_ma;
         self.iq_err_sum = 0.0;
         self.reset_velocity_filter();
-        self.cur_out_ma = 0.0;
+        self.cur_out_ma = hold_ma;
         self.mode = Mode::Position {
             pos: pos_ticks,
             speed: 0.0,
-            cur_ff: 0.0,
+            cur_ff: hold_ma,
         };
     }
 
@@ -528,7 +748,6 @@ impl VirtualDriver {
         self.ticks_since_data = self.ticks_since_data.saturating_add(1);
         if self.ticks_since_data == self.watchdog_ticks {
             self.mode = Mode::Idle;
-            self.integral_ma = 0.0;
             self.flags.watchdog = true;
             self.flags.error = true;
         }
@@ -540,56 +759,10 @@ impl VirtualDriver {
         self.armed && self.ticks_since_data >= self.watchdog_ticks
     }
 
-    /// The firmware's `Velocity_Filter`: a moving average over
-    /// [`FW_VEL_AVG_SAMPLES`] firmware samples of measurement, resampled to the plant's substep.
-    ///
-    /// The window is sized from the substep the plant actually calls with,
-    /// so a scene timestep change keeps the firmware's averaging TIME
-    /// rather than its sample count.
-    fn filter_velocity(&mut self, vel_ticks_s: f64) -> f64 {
-        self.vel_sum += vel_ticks_s;
-        self.vel_window.push_back(vel_ticks_s);
-        while self.vel_window.len() > self.vel_window_len {
-            self.vel_sum -= self.vel_window.pop_front().expect("len checked");
-        }
-        self.vel_sum / self.vel_window.len() as f64
-    }
-
-    /// Drop the velocity history: a re-seeded pose makes every sample in
-    /// it a difference across a teleport, which is not a speed.
-    /// One encoder read, as the firmware makes it: the count is an
-    /// INTEGER, and `Velocity = (Position_Ticks - Old_Position_Ticks) /
-    /// LOOP_TIME` differences two of them. Returns the count the position
-    /// loop closes on and the raw velocity the moving average smooths.
-    ///
-    /// Handing the loops the plant's own continuous position and velocity
-    /// is a measurement no encoder can make, and the difference is not
-    /// cosmetic where it matters most: a held joint's residual motion is
-    /// about one count per loop period, so the real drive reads it as a
-    /// coarse dither around zero while the sim read it exactly and chased
-    /// it. Differencing the rounded count reproduces that dither — and,
-    /// unlike rounding the velocity itself, it keeps the sub-count
-    /// information the moving average recovers, which is how the real
-    /// drive resolves a creep slower than one count per period.
-    ///
-    /// One plant substep stands for `fw_steps` firmware iterations, so the
-    /// difference spans that long; averaging the iterations it covers is
-    /// exactly what the shortened [`Self::filter_velocity`] window then
-    /// completes.
-    fn read_encoder(&mut self, pos_ticks: f64, fw_steps: f64) -> (f64, f64) {
-        let count = pos_ticks.round();
-        let vel = match self.enc_prev {
-            Some(prev) => (count - prev) / (fw_steps * FW_LOOP_DT),
-            None => 0.0,
-        };
-        self.enc_prev = Some(count);
-        (count, vel)
-    }
-
     fn reset_velocity_filter(&mut self) {
-        self.vel_window.clear();
-        self.vel_sum = 0.0;
-        self.enc_prev = None;
+        self.velocity_history.fill(0.0);
+        self.velocity_samples = 0;
+        self.previous_encoder = None;
     }
 
     /// The firmware's `Torque_mode()` current loop and the winding it
@@ -632,7 +805,20 @@ impl VirtualDriver {
         let err = vel_target - vel_meas;
         self.integral_ma =
             (self.integral_ma + self.kiv * err * fw_steps).clamp(-self.ilim_ma, self.ilim_ma);
-        self.kpv * err + self.integral_ma + cur_ff
+        self.kpv * err + self.integral_ma + cur_ff + self.ripple_ff()
+    }
+
+    /// The firmware's ripple feedforward at this loop's phase \[mA\].
+    fn ripple_ff(&self) -> f64 {
+        let phase = std::f64::consts::TAU * f64::from(self.phase) / 16384.0;
+        self.ripple
+            .iter()
+            .filter(|(h, _, _)| *h != 0)
+            .map(|(h, a, b)| {
+                let x = f64::from(*h) * phase;
+                f64::from(*a) * x.cos() + f64::from(*b) * x.sin()
+            })
+            .sum()
     }
 
     pub fn set_fault(&mut self, kind: FaultKind) {
@@ -649,6 +835,7 @@ impl VirtualDriver {
     }
 
     pub fn clear_faults(&mut self) {
+        self.mode = Mode::Idle;
         let (calibrated, activated) = (self.flags.calibrated, self.flags.activated);
         self.flags = ErrorFlags {
             calibrated,
@@ -675,5 +862,29 @@ impl VirtualDriver {
     /// Current cmd-26 flag state.
     pub fn flags(&self) -> ErrorFlags {
         self.flags
+    }
+}
+
+/// The configuration frame a command writes, if it writes one.
+pub(crate) fn config_kind(cmd: CommandId) -> Option<crate::ConfigKind> {
+    use crate::ConfigKind as K;
+    Some(match cmd {
+        CommandId::Watchdog => K::Watchdog,
+        CommandId::Limits => K::Limits,
+        CommandId::VoltageLimit => K::VoltageLimit,
+        CommandId::PdGains => K::PdGains,
+        CommandId::CurrentGains => K::CurrentGains,
+        CommandId::VelocityGains => K::VelocityGains,
+        CommandId::PositionGains => K::PositionGains,
+        _ => return None,
+    })
+}
+
+fn config_dlc(kind: crate::ConfigKind) -> usize {
+    use crate::ConfigKind as K;
+    match kind {
+        K::Watchdog => 5,
+        K::VoltageLimit | K::PositionGains => 4,
+        K::Limits | K::PdGains | K::CurrentGains | K::VelocityGains => 8,
     }
 }

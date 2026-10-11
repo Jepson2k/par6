@@ -257,7 +257,14 @@ struct par6_col {
             }
             for (std::size_t i = 0; i < gi; ++i) {
                 const auto *other = owners[i];
-                if (other != nullptr && w.parent_frame == 0 && other->parent_frame == 0)
+                // Two things fixed to the world never move relative to each
+                // other -- two world shapes, or a world shape and the arm's
+                // own fixed base -- so their contact is a fact of the
+                // installation, not of any motion. The floor the base
+                // stands on is the case that matters.
+                if (w.parent_frame == 0 &&
+                    (other != nullptr ? other->parent_frame == 0
+                                      : candidate.geometryObjects[i].parentJoint == 0))
                     continue;
                 if (allows(&w, names[i]) || allows(other, names[gi])) continue;
                 candidate.addCollisionPair(pinocchio::CollisionPair(i, gi));

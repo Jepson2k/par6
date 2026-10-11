@@ -4,8 +4,8 @@
 //! `move_j` is planned from the latest measured pose under the selected
 //! [`Profile`] (EXEC limits), converted sample-for-sample into the RT
 //! ring format, and fed into the SPSC ring under backpressure —
-//! [`ProgramBuilder`] for RUCKIG/TRAPEZOID/QUINTIC, the TOPPRA path parameterizer
-//! for TOPPRA. Completion is observed through the RT snapshot: the
+//! [`ProgramBuilder`] for RUCKIG/TRAPEZOID/QUINTIC/SEPTIC, the TOPPRA
+//! path parameterizer for TOPPRA. Completion is observed through the RT snapshot: the
 //! EXEC playback publishes a high-water `completed_index` over the
 //! per-command ring indexes this planner allocates, and the settle
 //! policy (commanded/settled/strict) runs RT-side — so a `poll()`
@@ -50,6 +50,8 @@
 //!
 //! [`cart`]: par6_motion::cart
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use par6_config::ConfigBundle;
@@ -137,6 +139,9 @@ pub(crate) enum Profile {
     /// Quintic on the path coordinate: zero velocity AND acceleration at
     /// both ends, no cruise, no jerk limiting, point-to-point only.
     Quintic,
+    /// Septic on the path coordinate: zero velocity, acceleration AND
+    /// jerk at both ends, jerk-limited, point-to-point only.
+    Septic,
     /// Time-optimal path parameterization (toppra-cpp): the velocity and
     /// acceleration limits bind, nothing else. The default.
     Toppra,
@@ -147,11 +152,12 @@ pub(crate) enum Profile {
 }
 
 /// Every profile by its wire name, the default first.
-const PROFILES: [(&str, Profile); 5] = [
+const PROFILES: [(&str, Profile); 6] = [
     ("TOPPRA", Profile::Toppra),
     ("RUCKIG", Profile::Ruckig),
     ("TRAPEZOID", Profile::Trapezoid),
     ("QUINTIC", Profile::Quintic),
+    ("SEPTIC", Profile::Septic),
     ("LINEAR", Profile::Linear),
 ];
 
@@ -255,6 +261,10 @@ enum InFlightKind {
         target_tick: u64,
         paused_ticks_at_start: u64,
     },
+    /// A tool swap, done when the RT core has applied it.
+    ToolSwap {
+        applied: Arc<AtomicBool>,
+    },
     Instant,
 }
 
@@ -284,6 +294,11 @@ enum CartTiming {
     ConstantToolSpeed,
 }
 
+/// Config passes the gripper node gets when a `select_tool` fits a new
+/// tool. Four, the same as the boot sequence and every reconnect resend:
+/// the node has to hear its new current limit before anything drives the
+/// jaw, and a single frame on a busy bus is a frame that can be missed.
+const GRIPPER_RETUNE_REPEATS: u8 = 4;
 /// The planner's kinematics kit (feature `ffi`): its own model instance,
 /// the enforced collision world, and the shared TCP-offset cell it
 /// publishes into.
@@ -291,6 +306,13 @@ pub(crate) struct PlannerKin {
     pub(crate) kin: crate::kin::CartKin,
     pub(crate) collision: par6_kin::Collision,
     pub(crate) tool_offset: crate::kin::ToolOffset,
+}
+
+/// What the planner needs to rebuild its models when the tool changes.
+pub(crate) struct PlannerSwap {
+    pub(crate) source: crate::daemon::KinSource,
+    pub(crate) bundle: std::sync::Arc<ConfigBundle>,
+    pub(crate) tools: crate::bridge::ToolMailbox,
 }
 
 /// The `Planner` implementation `par6d` hands to the server.
@@ -341,6 +363,18 @@ pub(crate) struct Par6Planner {
     /// The applied runtime payload, mirrored so `sync` only touches the
     /// model on a change.
     payload: par6_server::PayloadSpec,
+    /// Everything a `select_tool` rebuild needs: where the models come
+    /// from, the tool registry to look the new one up in, the name in
+    /// force, and the drop box the other model owners read.
+    source: crate::daemon::KinSource,
+    bundle: std::sync::Arc<ConfigBundle>,
+    /// A tool swap just made, for the command plane to follow.
+    tool_change: Option<(String, Option<String>)>,
+    fitted_tool: String,
+    /// A tool id the gripper drive reports that could not be fitted, so it
+    /// is reported once rather than retried every pass.
+    drive_tool_refused: Option<u8>,
+    tools: crate::bridge::ToolMailbox,
 }
 
 impl Par6Planner {
@@ -350,6 +384,205 @@ impl Par6Planner {
     pub(crate) fn set_enablement_probe(&mut self, on: bool) {
         self.probe.enabled = on;
     }
+    /// Adopt a newly selected tool.
+    ///
+    /// Everything a tool decides has to move together: the load the
+    /// gravity feedforward carries, the frame FK resolves at, the geometry
+    /// the collision world checks, and the home offsets on the joints
+    /// whose reference is tool-dependent. Half a swap is worse than none —
+    /// a feedforward for one tool against the geometry of another holds
+    /// the arm against a load that is not there.
+    ///
+    /// The RT models go through a `CoreOp`, so they land between ticks
+    /// rather than inside one; the returned flag is raised once they have,
+    /// which is when `select_tool` completes — STATUS reports the new TCP
+    /// from then on. `None` means there was nothing to swap. The other
+    /// owners take theirs from the mailbox at their own next safe point.
+    /// A tool-dependent home offset is the next home's to latch against;
+    /// the reference already latched stands.
+    fn adopt_tool(&mut self, name: &str) -> Result<Option<Arc<AtomicBool>>, WireError> {
+        if name.eq_ignore_ascii_case(&self.fitted_tool) {
+            return Ok(None);
+        }
+        let refused = |detail: String| {
+            make_error(
+                ErrorCode::MotnSetupFailed,
+                UNATTRIBUTED,
+                &[("detail", &detail)],
+            )
+        };
+        let Some(gripper) = self
+            .bundle
+            .tools
+            .iter()
+            .find(|g| g.name.eq_ignore_ascii_case(name))
+        else {
+            return Err(refused(format!("no tool named '{name}'")));
+        };
+        // A provisioned drive reports the tool it was set up for: that is
+        // the tool on the arm, and modelling another — a frontend syncing its
+        // own selection, say — would run the gravity and the keep-outs of a
+        // tool that is not there.
+        let snap = self.snapshots.latest();
+        // Only a drive still answering speaks for the arm: one unbolted
+        // with its tool has gone quiet, and what it said last is not what
+        // is fitted now.
+        let heard = matches!(
+            snap.node_freshness[MAX_JOINTS],
+            par6_rt::Freshness::Fresh | par6_rt::Freshness::Stale
+        );
+        if !snap.bus_simulated && heard {
+            let info = snap.nodes[MAX_JOINTS].device_info;
+            // A drive answering on the gripper node that has not said which
+            // tool it is yet — just after the last change — is asked again
+            // before another is fitted on its word.
+            if info.is_none() {
+                return Err(refused(
+                    "the gripper drive has not reported which tool it is yet; select again in \
+                     a moment"
+                        .to_owned(),
+                ));
+            }
+            let reported = info
+                .map(|d| d.tool_id)
+                .filter(|id| *id != 0)
+                .and_then(|id| self.bundle.tool_by_can_id(id).map(|t| (id, t.name.clone())));
+            if let Some((id, on_arm)) = reported.filter(|(_, n)| *n != gripper.name) {
+                return Err(refused(format!(
+                    "the gripper drive reports tool id {id}, `{on_arm}`: that is the tool on \
+                     the arm; select it, or provision the drive with `par6 tool-id` after \
+                     changing the tool"
+                )));
+            }
+        }
+        let source = self.source.for_gripper(Some(gripper));
+        let rebuilt = (|| {
+            Ok::<_, crate::daemon::DaemonError>((
+                source.cart_kin(&self.tool_offset)?,
+                source.cart_kin(&self.tool_offset)?,
+                source.cart_kin(&self.tool_offset)?,
+                source.collision()?,
+                source.collision()?,
+                crate::kin::load_gravity_kin(source.assets_dir(), Some(gripper))
+                    .map_err(crate::daemon::DaemonError::Kinematics)?,
+                source.kin_fk(&self.tool_offset)?,
+            ))
+        })();
+        let (mut planner, bridge, housekeeping, mut collision, gate_collision, mut gravity, fk) =
+            rebuilt.map_err(|e| refused(format!("cannot load tool '{name}': {e}")))?;
+        // The declared payload is held in the new tool's jaws as it was in
+        // the old one's (the RT puts its own copy on its new model).
+        let payload = self.payload;
+        planner
+            .set_tool(payload.mass, payload.com, payload.inertia)
+            .map_err(|e| refused(format!("tool '{name}': the payload does not apply: {e}")))?;
+        collision
+            .adopt_layers(&self.collision)
+            .map_err(|e| refused(format!("tool '{name}': the keep-outs do not apply: {e}")))?;
+        gravity
+            .set_gravity_correction(&self.bundle.robot.gravity_correction)
+            .map_err(|e| refused(format!("tool '{name}': gravity correction refused: {e}")))?;
+        // The offsets the new tool declares, for the joints whose home
+        // reference is tool-dependent.
+        let mut offsets: Vec<(usize, f64)> = Vec::new();
+        for j in 0..self.bundle.robot.homing.joints.len().min(MAX_JOINTS) {
+            if self.bundle.robot.homing.joints[j].home_offset_gripper_dependent {
+                let offset = gripper
+                    .arm_joint_home_offsets
+                    .iter()
+                    .find(|o| usize::from(o.joint) == j)
+                    .map_or(self.bundle.robot.homing.joints[j].home_offset_rad, |o| {
+                        o.home_offset_rad
+                    });
+                offsets.push((j, offset));
+            }
+        }
+        let gripper_node = self.bundle.robot.bus.gripper_node;
+        let fitted = gripper.clone();
+        let applied = Arc::new(AtomicBool::new(false));
+        let raised = Arc::clone(&applied);
+        self.link.op(Box::new(move |core| {
+            core.set_gravity(Box::new(crate::kin::KinGravity::new(gravity)));
+            core.set_fk(Box::new(fk));
+            // The jaw is part of the tool: its limits, its pinion and the
+            // reference it homed against all belong to the one that just
+            // came off.
+            core.set_gripper_tool(Some(&fitted), gripper_node, GRIPPER_RETUNE_REPEATS);
+            for (j, offset) in offsets {
+                core.set_tool_home_offset(j, offset);
+            }
+            raised.store(true, Ordering::Release);
+        }));
+        if let Ok(mut swap) = self.tools.lock() {
+            swap.bridge = Some(bridge);
+            swap.housekeeping = Some(housekeeping);
+            swap.gate_collision = Some(gate_collision);
+        }
+        self.kin = planner;
+        self.collision = collision;
+        self.tool = gripper
+            .driver
+            .as_ref()
+            .map(|d| ToolSpec { ilim_ma: d.ilim_ma });
+        self.fitted_tool.clone_from(&gripper.name);
+        log::info!("select_tool: now running '{name}'");
+        Ok(Some(applied))
+    }
+
+    /// The gripper drive is the authority on which tool is on the arm. One
+    /// the daemon's boot probe did not hear — a link that came back only on
+    /// recovery, a bus swapped in — holds the runtime in BOOTING until its
+    /// tool is fitted (see `RtCore`), and it is fitted here, as the boot
+    /// probe would have: nothing moves in BOOTING. A tool that cannot be
+    /// fitted is reported once and keeps the hold.
+    fn follow_drive_tool(&mut self, snap: &StateSnapshot) {
+        if snap.bus_simulated || self.inflight.is_some() || snap.mode != Mode::Booting {
+            return;
+        }
+        let Some(id) = snap.nodes[MAX_JOINTS]
+            .device_info
+            .map(|d| d.tool_id)
+            .filter(|id| *id != 0)
+        else {
+            return;
+        };
+        let fitted = self
+            .bundle
+            .tools
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(&self.fitted_tool))
+            .and_then(|t| t.can_tool_id);
+        if fitted == Some(id) || self.drive_tool_refused == Some(id) {
+            return;
+        }
+        let node = self.bundle.robot.bus.gripper_node;
+        let Some(name) = self.bundle.tool_by_can_id(id).map(|t| t.name.clone()) else {
+            self.drive_tool_refused = Some(id);
+            log::error!(
+                "gripper node {node} reports tool id {id}, which no configured tool carries \
+                 (can_tool_id); the runtime stays in BOOTING. Add it to that tool's config, or \
+                 provision the drive with `par6 tool-id`"
+            );
+            return;
+        };
+        let was = self.fitted_tool.clone();
+        match self.adopt_tool(&name) {
+            Ok(Some(_)) => {
+                log::info!(
+                    "gripper node {node} reports tool id {id}: fitting `{name}` in place of `{was}`"
+                );
+                self.tool_change = Some((self.fitted_tool.clone(), None));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                self.drive_tool_refused = Some(id);
+                log::error!(
+                    "gripper node {node} reports tool `{name}`, which cannot be fitted, so the \
+                     runtime stays in BOOTING: {e}"
+                );
+            }
+        }
+    }
 
     pub(crate) fn new(
         link: CoreLink,
@@ -358,6 +591,7 @@ impl Par6Planner {
         snapshots: SnapshotReader<StateSnapshot>,
         bundle: &ConfigBundle,
         models: PlannerKin,
+        swap: PlannerSwap,
     ) -> Result<Self, MotionError> {
         let exec_limits = MotionLimits::from_config(&bundle.robot, par6_config::LimitMode::Exec)?;
         let PlannerKin {
@@ -367,7 +601,7 @@ impl Par6Planner {
         } = models;
         let dt = bundle.robot.robot.tick_dt_s;
         let tool = bundle
-            .active_gripper()
+            .active_tool()
             .and_then(|g| g.driver.as_ref())
             .map(|d| ToolSpec { ilim_ma: d.ilim_ma });
         let mut home_pose_rad = [0.0; MAX_JOINTS];
@@ -410,6 +644,12 @@ impl Par6Planner {
             collision_latch: CollisionState::default(),
             invalidated: None,
             motion,
+            source: swap.source,
+            tool_change: None,
+            fitted_tool: swap.bundle.robot.robot.active_tool.clone(),
+            drive_tool_refused: None,
+            tools: swap.tools,
+            bundle: swap.bundle,
             payload: par6_server::PayloadSpec::default(),
         })
     }
@@ -650,7 +890,6 @@ impl Par6Planner {
                     meta: SampleMeta {
                         command_index: ring_index,
                         checkpoint_id: ring_index,
-                        blend_continues: false,
                         is_last: k + 1 == n,
                     },
                 };
@@ -746,6 +985,7 @@ impl Par6Planner {
             Profile::Ruckig => ProfileKind::Ruckig,
             Profile::Trapezoid | Profile::Linear => ProfileKind::Trapezoid,
             Profile::Quintic => ProfileKind::Quintic,
+            Profile::Septic => ProfileKind::Septic,
             // TOPPRA times the straight joint-space path instead of
             // shaping a point-to-point profile: same waypoints, a
             // different (time-optimal) parameterization.
@@ -789,7 +1029,6 @@ impl Par6Planner {
                     profile: kind,
                     speed_fraction: speed.unwrap_or(1.0),
                     min_duration_s: duration,
-                    blend_with_next: false,
                     checkpoint_id: None,
                 },
             )
@@ -1638,8 +1877,14 @@ impl Par6Planner {
                     paused_ticks_at_start: snap.exec.paused_ticks,
                 }
             }
+            Command::SelectTool(p) => match self.adopt_tool(&p.tool_name)? {
+                Some(applied) => {
+                    self.tool_change = Some((self.fitted_tool.clone(), p.variant_key.clone()));
+                    InFlightKind::ToolSwap { applied }
+                }
+                None => InFlightKind::Instant,
+            },
             Command::Checkpoint(_)
-            | Command::SelectTool(_)
             | Command::SetTcpOffset(_)
             | Command::SetTcpTransform(_)
             | Command::WriteIo(_) => InFlightKind::Instant,
@@ -1801,6 +2046,9 @@ impl Par6Planner {
             } => (snap.exec.target_scale > 0.0
                 && delay_remaining_ticks(snap, *target_tick, *paused_ticks_at_start) == 0)
                 .then_some(Ok(None)),
+            InFlightKind::ToolSwap { applied } => {
+                applied.load(Ordering::Acquire).then_some(Ok(None))
+            }
             InFlightKind::Instant => Some(Ok(None)),
         }
     }
@@ -2283,6 +2531,7 @@ impl Planner for Par6Planner {
             self.pump_ring();
         } else {
             self.update_enablement(&snap);
+            self.follow_drive_tool(&snap);
         }
         if let Some(out) = self.invalidated.take() {
             return Some(out);
@@ -2422,6 +2671,10 @@ impl Planner for Par6Planner {
 
     fn warnings(&self) -> Vec<WireError> {
         self.near_singularity.iter().cloned().collect()
+    }
+
+    fn take_fitted_tool(&mut self) -> Option<(String, Option<String>)> {
+        self.tool_change.take()
     }
 
     fn sync(&mut self, ctx: PlanContext<'_>) {
@@ -2744,4 +2997,187 @@ fn rt_error(snap: &StateSnapshot) -> WireError {
             &[("detail", "the RT core latched a hard error")],
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use par6_rt::{sample_ring, snapshot_channel, RtCommand, SampleConsumer, SnapshotWriter};
+    use std::sync::mpsc;
+
+    /// A planner on the shipped config, and the ends that see what it does:
+    /// the snapshot it reads, and the mailbox its rebuilt models land in.
+    struct Rig {
+        p: Par6Planner,
+        snap_w: SnapshotWriter<StateSnapshot>,
+        tools: crate::bridge::ToolMailbox,
+        _ops: mpsc::Receiver<crate::bridge::CoreOp>,
+        _cmds: mpsc::Receiver<RtCommand>,
+        _ring: SampleConsumer,
+    }
+
+    fn rig() -> Rig {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+        let bundle = ConfigBundle::load(&path).expect("config");
+        let opts = crate::Options {
+            sim: true,
+            config: Some(path.clone()),
+            ..Default::default()
+        };
+        let stack =
+            crate::daemon::load_kin_stack(&opts, &path, &bundle.robot, bundle.active_tool())
+                .expect("kinematics");
+        let (cmds_tx, cmds_rx) = mpsc::channel();
+        let (ops_tx, ops_rx) = mpsc::channel();
+        let (producer, ring) = sample_ring(64);
+        let (snap_w, snap_r) = snapshot_channel::<StateSnapshot>();
+        let tools = crate::bridge::ToolMailbox::default();
+        let planner = Par6Planner::new(
+            CoreLink::new(cmds_tx, ops_tx, Arc::new(AtomicBool::new(false))),
+            producer,
+            ExecHeartbeat::unmonitored(),
+            snap_r,
+            &bundle,
+            PlannerKin {
+                kin: stack.planner,
+                collision: stack.collision,
+                tool_offset: stack.tool_offset,
+            },
+            PlannerSwap {
+                source: stack.source,
+                bundle: Arc::new(bundle.clone()),
+                tools: Arc::clone(&tools),
+            },
+        )
+        .expect("planner");
+        Rig {
+            p: planner,
+            snap_w,
+            tools,
+            _ops: ops_rx,
+            _cmds: cmds_rx,
+            _ring: ring,
+        }
+    }
+
+    /// The runtime in `mode` with the gripper drive reporting `tool_id`.
+    fn reporting(mode: Mode, tool_id: u8, simulated: bool) -> StateSnapshot {
+        let mut snap = StateSnapshot {
+            mode,
+            bus_simulated: simulated,
+            ..Default::default()
+        };
+        snap.nodes[MAX_JOINTS].device_info = Some(par6_bus::DeviceInfo {
+            tool_id,
+            ..Default::default()
+        });
+        snap
+    }
+
+    /// A drive the boot probe did not hear reports another tool than the
+    /// one fitted: while the runtime holds in BOOTING, where nothing moves,
+    /// that tool is fitted with every model rebuilt for it — and only then.
+    /// The simulator's drive reports whatever the bundle fitted, and is not
+    /// followed; a tool no config carries is not fitted at all.
+    #[test]
+    fn the_tool_the_gripper_drive_reports_is_fitted_while_booting() {
+        let Rig {
+            mut p,
+            mut snap_w,
+            tools,
+            ..
+        } = rig();
+        let fitted = p.fitted_tool.clone();
+        let other = p
+            .bundle
+            .tools
+            .iter()
+            .find(|t| t.can_tool_id.is_some() && t.name != fitted)
+            .expect("a second keyed tool")
+            .clone();
+        let fitted_id = p
+            .bundle
+            .tools
+            .iter()
+            .find(|t| t.name == fitted)
+            .and_then(|t| t.can_tool_id)
+            .expect("the shipped tool is keyed");
+        let id = other.can_tool_id.unwrap();
+        let unknown = (1..=u8::MAX)
+            .find(|n| p.bundle.tool_by_can_id(*n).is_none())
+            .expect("an id no tool carries");
+
+        for (snap, what) in [
+            (
+                reporting(Mode::Booting, fitted_id, false),
+                "the fitted tool",
+            ),
+            (reporting(Mode::Booting, id, true), "a simulated drive"),
+            (
+                reporting(Mode::Idle, id, false),
+                "a drive heard out of BOOTING",
+            ),
+            (
+                reporting(Mode::Booting, unknown, false),
+                "a tool no config carries",
+            ),
+        ] {
+            snap_w.publish(&snap);
+            let _ = p.poll();
+            assert_eq!(p.take_fitted_tool(), None, "{what} changed the tool");
+            assert_eq!(p.fitted_tool, fitted, "{what} changed the tool");
+        }
+
+        snap_w.publish(&reporting(Mode::Booting, id, false));
+        let _ = p.poll();
+        assert_eq!(p.take_fitted_tool(), Some((other.name.clone(), None)));
+        assert_eq!(p.fitted_tool, other.name);
+        let swap = tools.lock().unwrap();
+        assert!(
+            swap.bridge.is_some() && swap.housekeeping.is_some() && swap.gate_collision.is_some(),
+            "the other model owners were not handed the new tool's models"
+        );
+    }
+
+    /// A drive that reports a tool refuses the selection of another — but
+    /// only while it is still heard: unbolted with its tool, its last word
+    /// is not the arm's, and the tool fitted in its place can be selected.
+    #[test]
+    fn only_a_drive_still_heard_refuses_another_tool() {
+        let Rig {
+            mut p, mut snap_w, ..
+        } = rig();
+        let fitted = p.fitted_tool.clone();
+        let reported = p
+            .bundle
+            .tools
+            .iter()
+            .find(|t| t.can_tool_id.is_some() && t.name != fitted)
+            .expect("a second keyed tool")
+            .clone();
+        let passive = p
+            .bundle
+            .tools
+            .iter()
+            .find(|t| t.driver.is_none())
+            .expect("a passive tool")
+            .name
+            .clone();
+        let mut snap = reporting(Mode::Idle, reported.can_tool_id.unwrap(), false);
+        snap.node_freshness[MAX_JOINTS] = par6_rt::Freshness::Fresh;
+        snap_w.publish(&snap);
+        assert!(
+            p.adopt_tool(&passive).is_err(),
+            "a drive still answering let another tool be fitted"
+        );
+        snap.node_freshness[MAX_JOINTS] = par6_rt::Freshness::Lost;
+        snap_w.publish(&snap);
+        assert!(
+            p.adopt_tool(&passive)
+                .is_ok_and(|applied| applied.is_some()),
+            "a drive no longer heard still refused the tool fitted in its place"
+        );
+        assert_eq!(p.fitted_tool, passive);
+    }
 }
