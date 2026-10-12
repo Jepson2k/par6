@@ -22,7 +22,7 @@ name = "PAR6"
 tick_dt_s = 0.004
 gravity_m_s2 = 9.81
 park_pose_rad = [0.0, -1.5708, 3.1416, 0.0, 0.0, 3.1416]
-active_gripper = "MSG_small_motor_150mm_rail"
+active_gripper = "MSG_SM_150mm"
 kt_source = "auto"
 
 # ---------------------------------------------------------------- joint 1 (J0)

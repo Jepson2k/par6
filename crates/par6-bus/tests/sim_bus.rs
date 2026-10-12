@@ -29,8 +29,8 @@ fn par6() -> RobotConfig {
 }
 
 fn msg_gripper() -> GripperConfig {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../config/grippers/MSG_small_motor_150mm_rail.toml");
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/grippers/MSG_SM_150mm.toml");
     GripperConfig::load(&path).expect("MSG gripper TOML")
 }
 

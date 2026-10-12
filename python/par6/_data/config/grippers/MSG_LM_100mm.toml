@@ -1,11 +1,11 @@
-# MSG_large_motor_100mm_rail — CAN-driven motor gripper.
+# MSG_LM_100mm — CAN-driven motor gripper.
 # Values transcribed from vendor grippers/MSG_large_motor_100mm_rail.xml.
 # Vendor TODO markers carried over: kt, kinematics d/mass/com unverified.
 # Motor size names the mechanical build, not the drive: the vendor gives
 # every small/medium/large variant identical kt, current/velocity limits,
 # gains and pinion radius. Only stroke and the tool link change.
 
-name = "MSG_large_motor_100mm_rail"
+name = "MSG_LM_100mm"
 urdf_variant = "msg"
 
 [driver]

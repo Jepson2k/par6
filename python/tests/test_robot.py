@@ -224,7 +224,7 @@ class TestToolTransforms:
         lim = robot.joints.limits.position.rad
         q = np.array([rng.uniform(lo, hi) for lo, hi in lim])
         out = np.zeros(6)
-        for key in ("FLANGE", "MSG_SMALL_MOTOR_150MM_RAIL", "SSG48"):
+        for key in ("FLANGE", "MSG_SM_150MM", "SSG48"):
             # Both frames off the SAME tree: the trees are separate CAD
             # exports and their arm chains are written to different
             # precisions, so a cross-tree comparison drifts by microns for
@@ -243,7 +243,7 @@ class TestToolTransforms:
         # micron the trees' differing chain precision costs, not to 1e-9.
         robot.set_active_tool("FLANGE")
         p_flange = robot.fk(q, out)[:3].copy()
-        for key, reach in (("MSG_SMALL_MOTOR_150MM_RAIL", 0.14), ("SSG48", 0.16)):
+        for key, reach in (("MSG_SM_150MM", 0.14), ("SSG48", 0.16)):
             robot.set_active_tool(key)
             p_tool = robot.fk(q, out)[:3].copy()
             assert np.linalg.norm(p_tool - p_flange) == pytest.approx(reach, abs=1e-5)
@@ -265,7 +265,7 @@ class TestToolTransforms:
         rz_pi[:3, :3] = np.diag([-1.0, -1.0, 1.0])
         grippers = {g["key"]: g for g in config().grippers()}
         for key, jaw in (
-            ("MSG_SMALL_MOTOR_150MM_RAIL", "joint_jaw1"),
+            ("MSG_SM_150MM", "joint_jaw1"),
             ("SSG48", "jaw1_JOINT"),
         ):
             kin = grippers[key]["kinematics"]
@@ -282,7 +282,7 @@ class TestToolTransforms:
     # Both gripper variants. Not the bare flange: the shipped homing
     # sequence references the fitted gripper's driver, so a runtime
     # configured with `Flange` refuses to start on its own config.
-    @pytest.mark.parametrize("fitted_gripper", ["MSG_small_motor_150mm_rail", "SSG48"])
+    @pytest.mark.parametrize("fitted_gripper", ["MSG_SM_150mm", "SSG48"])
     async def test_tcp_agrees_with_a_live_daemon(
         self, tmp_path: Path, fitted_gripper: str
     ) -> None:
@@ -355,7 +355,7 @@ class TestToolTransforms:
         enforces them at the TCP."""
         motion = config().motion()
         ramp = config().jog_defaults()["accel_time_s"]
-        for key in ("FLANGE", "MSG_SMALL_MOTOR_150MM_RAIL", "SSG48"):
+        for key in ("FLANGE", "MSG_SM_150MM", "SSG48"):
             robot.set_active_tool(key)
             limits = robot.cartesian_limits
             assert limits.velocity.linear == pytest.approx(
@@ -373,7 +373,7 @@ class TestToolTransforms:
         robot.set_active_tool("FLANGE")
 
     def test_urdf_tree_follows_active_tool(self, robot: Robot) -> None:
-        robot.set_active_tool("MSG_SMALL_MOTOR_150MM_RAIL")
+        robot.set_active_tool("MSG_SM_150MM")
         assert "par6_msg_gripper" in robot.urdf_path
         assert Path(robot.urdf_path).is_file()
         assert (
@@ -533,7 +533,7 @@ class TestPackagedData:
         from par6.robot import Robot
 
         bot = Robot()
-        for key in ("FLANGE", "MSG_SMALL_MOTOR_150MM_RAIL", "SSG48"):
+        for key in ("FLANGE", "MSG_SM_150MM", "SSG48"):
             bot.set_active_tool(key)
             urdf = Path(bot.urdf_path)
             text = urdf.read_text()

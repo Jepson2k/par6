@@ -58,10 +58,7 @@ const TEST_TICK_DT_S: f64 = 0.02;
 /// replaced — the knob the gravity-wiring test turns.
 fn test_config_with_tool_mass(tag: &str, mass_kg: f64) -> PathBuf {
     let dst = test_config(tag);
-    let toml = dst
-        .parent()
-        .unwrap()
-        .join("grippers/MSG_small_motor_150mm_rail.toml");
+    let toml = dst.parent().unwrap().join("grippers/MSG_SM_150mm.toml");
     let text = std::fs::read_to_string(&toml).expect("gripper toml");
     // contains(), not assert_ne on the output: the baseline call passes
     // the default 0.37, whose patch is a no-op by construction.

@@ -370,7 +370,7 @@ mod tests {
         move |file, text| {
             if file == "PAR6.toml" {
                 text.replace(
-                    "active_gripper = \"MSG_small_motor_150mm_rail\"",
+                    "active_gripper = \"MSG_SM_150mm\"",
                     &format!("active_gripper = \"{name}\""),
                 )
             } else {
@@ -455,7 +455,7 @@ mod tests {
         assert_eq!(names.len(), distinct, "gripper names collide: {names:?}");
 
         let active = bundle.active_gripper().expect("active gripper");
-        assert_eq!(active.name, "MSG_small_motor_150mm_rail");
+        assert_eq!(active.name, "MSG_SM_150mm");
         assert_eq!(active.driver.as_ref().unwrap().stroke_mm, 106.0);
         // J4 (index 4) is gripper-dependent and overridden by the MSG gripper.
         assert_eq!(bundle.effective_home_offset(4), Some(-2.070));
