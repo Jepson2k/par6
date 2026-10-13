@@ -20,7 +20,7 @@ use par6_proto::command::{
 };
 use par6_proto::{
     ActionState, Command, CompletionPolicy, ControllerMode, ErrorCode, FlashingAssertion, Frame,
-    QueryResult, Reply, Status, ToolState, NUM_JOINTS,
+    QueryResult, Status, ToolState, NUM_JOINTS,
 };
 use par6d::{Daemon, Options};
 
@@ -236,8 +236,7 @@ fn full_sim_session_over_protocol_v3() {
         "un-homed/disabled move must be rejected, got {err:?}"
     );
 
-    // reset enables the controller (the RT clear sequence settles first,
-    // so the effect is polled, not assumed).
+    // Reset confirms that the RT clear sequence and enable have finished.
     c.ok(&Command::Reset);
 
     // Teleport: accepted in sim once ENABLED; homed=true plus the pose
@@ -311,46 +310,14 @@ fn full_sim_session_over_protocol_v3() {
         other => panic!("standing e-stop error expected, got {other:?}"),
     }
     c.ok(&Command::Reset);
-    // Re-enable propagates through the RT clear-sequence settle window,
-    // so early attempts are either rejected (DISABLED) or accepted and
-    // then truthfully failed via COMPLETE(ok=false) with the e-stop
-    // error — acceptance is not success. Retry with fresh keys until a
-    // move runs to a clean COMPLETE, like a real client would.
-    let retriable = |code: u16| {
-        code == ErrorCode::SysControllerDisabled as u16
-            || code == ErrorCode::SysEstopActive as u16
-            || code == ErrorCode::MotnSetupFailed as u16
-    };
-    let deadline = Instant::now() + BUDGET;
-    let mut attempt = 0u64;
-    let i5 = loop {
-        attempt += 1;
-        match c.request(&move_j(2000 + attempt, park, 0.5)) {
-            Reply::Ok { index: Some(i), .. } => {
-                let (ok, detail) = c.wait_complete(i);
-                if ok {
-                    break i;
-                }
-                let detail = detail.expect("failed COMPLETE carries detail");
-                assert!(
-                    retriable(detail.code),
-                    "unexpected failure while re-enabling: {detail:?}"
-                );
-            }
-            Reply::Error { error, .. } => {
-                assert!(
-                    retriable(error.code),
-                    "unexpected rejection while re-enabling: {error:?}"
-                );
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            other => panic!("unexpected reply {other:?}"),
-        }
-        assert!(
-            Instant::now() < deadline,
-            "controller did not re-enable after reset"
-        );
-    };
+    // Reset's OK confirms the clear sequence and enable. The next command
+    // must work immediately, without status polling or another attempt.
+    let i5 = c.ok_index(&move_j(2001, park, 0.5));
+    let (ok, detail) = c.wait_complete(i5);
+    assert!(
+        ok,
+        "motion immediately after reset must succeed: {detail:?}"
+    );
     assert!(
         i5 > i4,
         "the index allocator is never reset ({i5} must follow {i4})"

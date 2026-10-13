@@ -91,7 +91,7 @@ fn home_and_measure(q0: &[f64; MAX_JOINTS]) -> [f64; MAX_JOINTS] {
         core.tick(dt, false);
     }
     assert_eq!(handles.snapshots.latest().mode, Mode::Idle, "boot settles");
-    tx.send(RtCommand::Enable).unwrap();
+    tx.send(RtCommand::Enable(0)).unwrap();
     core.tick(dt, false);
     tx.send(RtCommand::SetMode(Mode::Homing)).unwrap();
     core.tick(dt, false);

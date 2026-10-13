@@ -98,7 +98,7 @@ fn land_at(
         core.tick(dt, false);
     }
     assert_eq!(handles.snapshots.latest().mode, Mode::Idle, "boot settles");
-    tx.send(RtCommand::Enable).unwrap();
+    tx.send(RtCommand::Enable(0)).unwrap();
     core.tick(dt, false);
     for deg in poses {
         let q: [f64; MAX_JOINTS] = std::array::from_fn(|i| deg[i].to_radians());

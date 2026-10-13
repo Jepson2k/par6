@@ -560,7 +560,7 @@ pub struct RtCore<B: DriverBus> {
     // State-machine variables: mode, state, homed, errors.
     mode: Mode,
     state: ArmState,
-    enable_seq: u64,
+    enabled_request_id: u64,
     homed: bool,
     soft_estop: bool,
     hw_estop: bool,
@@ -813,7 +813,7 @@ impl<B: DriverBus> RtCore<B> {
             tx_fault_latch_ticks: robot.ticks(robot.bus.lost_s).max(1),
             mode: Mode::Booting,
             state: ArmState::Disabled,
-            enable_seq: 0,
+            enabled_request_id: 0,
             homed: false,
             soft_estop: false,
             hw_estop: false,
@@ -1459,10 +1459,7 @@ impl<B: DriverBus> RtCore<B> {
                     log::warn!("mode request {target:?} refused: {e:?}");
                 }
             }
-            RtCommand::Enable => {
-                // Counted whether granted or refused: the counter is what
-                // ties the published `state` to THIS request.
-                self.enable_seq += 1;
+            RtCommand::Enable(request_id) => {
                 if self.mode == Mode::Booting {
                     // ENABLED before the bus selfcheck lets the command
                     // plane accept motion the transition table then
@@ -1471,8 +1468,11 @@ impl<B: DriverBus> RtCore<B> {
                     log::warn!("enable refused: the core is still BOOTING");
                 } else if self.estop_condition() || self.errors.any_hard() {
                     log::warn!("enable refused: e-stop or errors active");
+                } else if self.errors.clearing() {
+                    log::debug!("enable deferred: error clear still settling");
                 } else {
                     self.state = ArmState::Enabled;
+                    self.enabled_request_id = request_id;
                 }
             }
             RtCommand::Disable => self.state = ArmState::Disabled,
@@ -2686,7 +2686,7 @@ impl<B: DriverBus> RtCore<B> {
         s.tick = self.tick;
         s.mode = self.mode;
         s.state = self.state;
-        s.enable_seq = self.enable_seq;
+        s.enabled_request_id = self.enabled_request_id;
         s.homed = self.homed;
         s.q = self.q;
         s.qd = self.qd;

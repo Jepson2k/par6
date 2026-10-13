@@ -59,7 +59,7 @@ fn idle_gravity_hold_is_torque_only_and_gated() {
 
     // homed ∧ enabled ∧ grav-on ⇒ torque-only hold, mA = trunc(g·factor).
     rig.core.set_homed(true);
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
     rig.tick();
     let expect: [i16; MAX_JOINTS] = std::array::from_fn(|i| {
         let j = &robot.joints[i];
@@ -132,7 +132,7 @@ fn boot_adopts_each_drivers_own_kt_and_falls_back_per_joint() {
     rig.boot_to_idle();
 
     rig.core.set_homed(true);
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
     rig.tick();
     let expect: [i16; MAX_JOINTS] = std::array::from_fn(|i| {
         let j = &robot.joints[i];
@@ -195,7 +195,7 @@ fn gate_matrix_enforces_transitions_enable_homed_and_park() {
     // One external command per tick: Enable and Jog queued together —
     // after one tick only Enable has been consumed.
     rig.core.set_homed(true);
-    rig.send(RtCommand::Enable);
+    rig.send(RtCommand::Enable(0));
     rig.send(RtCommand::SetMode(Mode::Jog));
     rig.tick();
     let s = rig.snap();
@@ -229,7 +229,7 @@ fn gate_matrix_enforces_transitions_enable_homed_and_park() {
 fn homed_gate_refuses_motion_and_raises_not_homed_warning() {
     let mut rig = Rig::new();
     rig.boot_to_idle();
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
 
     // EXEC and STREAM target absolute positions, so they need a
     // reference. JOG does not: it asks for a direction and a speed, and an

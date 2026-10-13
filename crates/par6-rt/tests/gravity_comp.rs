@@ -20,7 +20,7 @@ fn status_reports_the_gravity_feedforward_actually_applied() {
     );
 
     rig.core.set_homed(true);
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
     let s = rig.tick_until(50, |s| s.gravity_comp);
     assert_eq!(
         s.state,

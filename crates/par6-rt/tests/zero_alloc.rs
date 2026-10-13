@@ -135,7 +135,7 @@ fn steady_state_ticks_allocate_nothing() {
     // filled BEFORE the window (try_push is allocation-free, but the
     // measurement isolates the tick itself).
     core.set_homed(true);
-    tx.send(RtCommand::Enable).unwrap();
+    tx.send(RtCommand::Enable(0)).unwrap();
     core.tick(dt, false);
     tx.send(RtCommand::SetMode(Mode::Exec)).unwrap();
     core.tick(dt, false);

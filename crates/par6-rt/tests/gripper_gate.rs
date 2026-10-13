@@ -314,7 +314,7 @@ fn homing_exit_hands_the_hold_back_as_a_release() {
         true,
     );
     rig.boot_to_idle();
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
     rig.cmd(RtCommand::SetMode(Mode::Homing));
     assert_eq!(rig.snap().mode, Mode::Homing);
 
@@ -366,7 +366,7 @@ fn a_homing_abort_hands_the_hold_back_too() {
         true,
     );
     rig.boot_to_idle();
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
     rig.cmd(RtCommand::SetMode(Mode::Homing));
     rig.tick_n(20);
     assert!(

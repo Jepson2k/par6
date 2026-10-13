@@ -308,7 +308,7 @@ impl Rig {
         self.tick_n(10);
         assert_eq!(self.snap().mode, Mode::Idle, "boot must reach IDLE");
         self.core.set_homed(true);
-        self.cmd(RtCommand::Enable);
+        self.cmd(RtCommand::Enable(0));
         assert_eq!(self.snap().state, ArmState::Enabled);
     }
 }
@@ -399,7 +399,7 @@ fn sustained_joint_tx_failure_latches_disconnect_and_disables() {
     let s = rig.snap();
     assert!(s.errors.is_empty(), "clear wipes the latch: {:?}", s.errors);
     assert_eq!(s.mode, Mode::Idle, "auto-recovery from ACTIVE_ERROR");
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
     assert_eq!(rig.snap().state, ArmState::Enabled);
 }
 

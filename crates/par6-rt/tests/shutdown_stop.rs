@@ -311,7 +311,7 @@ fn an_unhomed_errored_or_unconfigured_arm_does_not_retreat() {
     // Unhomed.
     let mut f = parking_rig(0.004);
     f.boot_to_idle();
-    f.cmd(RtCommand::Enable);
+    f.cmd(RtCommand::Enable(0));
     assert!(!f.core.shutdown_park_begin(), "no reference, no retreat");
     f.tick();
     assert_eq!(f.snap().mode, Mode::Idle);

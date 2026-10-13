@@ -71,7 +71,7 @@ fn start_homing(core: &mut RtCore<SimBus>, handles: &mut RtHandles, tx: &mpsc::S
         core.tick(dt, false);
     }
     assert_eq!(handles.snapshots.latest().mode, Mode::Idle);
-    tx.send(RtCommand::Enable).unwrap();
+    tx.send(RtCommand::Enable(0)).unwrap();
     core.tick(dt, false);
     tx.send(RtCommand::SetMode(Mode::Homing)).unwrap();
     core.tick(dt, false);
@@ -1038,7 +1038,7 @@ fn a_gripper_calibration_timeout_clears_without_a_restart() {
     rig.auto_inject = false;
     tick_uncalibrated(&mut rig, 10);
     assert_eq!(rig.snap().mode, Mode::Idle, "boot one-shot reaches IDLE");
-    rig.send(RtCommand::Enable);
+    rig.send(RtCommand::Enable(0));
     tick_uncalibrated(&mut rig, 1);
     rig.send(RtCommand::SetMode(Mode::Homing));
     tick_uncalibrated(&mut rig, 1);
@@ -1079,7 +1079,7 @@ fn a_gripper_calibration_timeout_clears_without_a_restart() {
     assert_eq!(s.mode, Mode::Idle, "ACTIVE_ERROR auto-recovers");
 
     // ... and the runtime is homable again, not restart-only.
-    rig.send(RtCommand::Enable);
+    rig.send(RtCommand::Enable(0));
     tick_uncalibrated(&mut rig, 1);
     rig.send(RtCommand::SetMode(Mode::Homing));
     tick_uncalibrated(&mut rig, 1);

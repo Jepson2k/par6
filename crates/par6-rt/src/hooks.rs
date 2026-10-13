@@ -35,9 +35,10 @@ pub enum RtCommand {
     /// errors/homed, FLASHING park assertion) are applied by the core;
     /// refused requests are logged and dropped.
     SetMode(Mode),
-    /// Enable motion. Refused while the e-stop condition or any hard
-    /// error is active.
-    Enable,
+    /// Enable motion once error clearing has settled and no e-stop or
+    /// hard error is active. Echo the request identity in the snapshot on
+    /// success; zero is for callers that do not await a correlated reply.
+    Enable(u64),
     /// Disable motion.
     Disable,
     /// Run the error clear sequence (Clear_Error ×3 to faulted nodes +

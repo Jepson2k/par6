@@ -283,7 +283,7 @@ impl Rig {
     pub fn ready(&mut self) {
         self.boot_to_idle();
         self.core.set_homed(true);
-        self.cmd(RtCommand::Enable);
+        self.cmd(RtCommand::Enable(0));
     }
 
     /// The most recent per-joint frame set on the bus.
