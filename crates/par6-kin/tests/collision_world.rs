@@ -46,6 +46,123 @@ fn tcp_at(variant: GripperVariant, q: &[f64; NQ]) -> [f64; 3] {
 }
 
 #[test]
+fn clearances_report_nearest_world_points_per_keepout() {
+    let variant = GripperVariant::Flange;
+    let mut col = load(variant, COLLISION_CLEARANCE_M);
+    let q = [0.0; NQ];
+    assert!(col.clearances(&q).unwrap().is_empty());
+
+    // The existing distance-boundary scenario: a 0.3 m box above the arm,
+    // then lowered far enough to intersect it at this configuration.
+    for z in [0.75, 0.48] {
+        let obstacle = box_shape("overhead", 0.15, [0.0, 0.0, z], Some(0.1));
+        col.set_layer(Layer::Program, &[obstacle]).unwrap();
+        let entries = col.clearances(&q).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "one result despite multiple arm geometries"
+        );
+        let entry = &entries[0];
+        assert_eq!(entry.obstacle, "shape:overhead");
+        assert!((entry.distance - col.world_distance(&q).unwrap()).abs() < 1e-9);
+        let length = entry
+            .part_point
+            .iter()
+            .zip(entry.obstacle_point)
+            .map(|(a, b)| (a - b).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!((length - entry.distance.abs()).abs() < 1e-6, "{entry:?}");
+        let local = [
+            entry.obstacle_point[0],
+            entry.obstacle_point[1],
+            entry.obstacle_point[2] - z,
+        ];
+        assert!(local.iter().all(|x| x.abs() <= 0.15 + 1e-6), "{entry:?}");
+        assert!(
+            local.iter().any(|x| (x.abs() - 0.15).abs() < 1e-6),
+            "{entry:?}"
+        );
+        if z == 0.75 {
+            assert!(entry.distance > 0.0, "{entry:?}");
+        } else {
+            assert!(entry.distance < 0.0, "{entry:?}");
+            assert!(col.check(&q, false).unwrap().pairs().any(|(a, b)| {
+                (link_of(a) == entry.part && b == "overhead")
+                    || (link_of(b) == entry.part && a == "overhead")
+            }));
+        }
+    }
+
+    col.set_layer(
+        Layer::Installation,
+        &[box_shape("distant", 0.15, [0.0, 0.0, 1.5], None)],
+    )
+    .unwrap();
+    let entries = col.clearances(&q).unwrap();
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].obstacle, "shape:overhead");
+    assert_eq!(entries[1].obstacle, "install:distant");
+    assert!(entries[0].distance < entries[1].distance);
+    col.set_layer(Layer::Program, &[]).unwrap();
+    col.set_layer(Layer::Installation, &[]).unwrap();
+    assert!(col.clearances(&q).unwrap().is_empty());
+
+    // An isolated flange-attached sphere makes the winning arm/tool part
+    // unambiguous, with the keep-out first in the shim's geometry order.
+    let mut kin = Kin::load(&assets_dir(), variant).unwrap();
+    let mut flange = [0.0; 16];
+    kin.fk(&REACH, &mut flange).unwrap();
+    let at: [f64; 3] = std::array::from_fn(|i| flange[4 * i + 3] + 2.0 * flange[4 * i + 2]);
+    let mut part = sphere("held", 0.025, [0.0, 0.0, 2.0], None);
+    part.attachment = Some(par6_proto::Attachment {
+        epoch: 1,
+        allowed_contacts: vec![],
+    });
+    col.set_layer(Layer::Program, std::slice::from_ref(&part))
+        .unwrap();
+    assert!(
+        col.clearances(&REACH).unwrap().is_empty(),
+        "attachments are not keep-outs"
+    );
+    let fence_at = [at[0], at[1], at[2] + 0.07];
+    col.set_layer(
+        Layer::Installation,
+        &[sphere("fence", 0.025, fence_at, None)],
+    )
+    .unwrap();
+    let entries = col.clearances(&REACH).unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(
+        (&*entry.part, &*entry.obstacle),
+        ("shape:held", "install:fence")
+    );
+    assert!((entry.distance - 0.02).abs() < 1e-6, "{entry:?}");
+    for (actual, expected) in entry.part_point.iter().zip([at[0], at[1], at[2] + 0.025]) {
+        assert!((actual - expected).abs() < 1e-6, "{entry:?}");
+    }
+    for (actual, expected) in entry
+        .obstacle_point
+        .iter()
+        .zip([at[0], at[1], at[2] + 0.045])
+    {
+        assert!((actual - expected).abs() < 1e-6, "{entry:?}");
+    }
+    part.attachment
+        .as_mut()
+        .unwrap()
+        .allowed_contacts
+        .push("install:fence".into());
+    col.set_layer(Layer::Program, &[part]).unwrap();
+    let entries = col.clearances(&REACH).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_ne!(entries[0].part, "shape:held");
+    assert!(entries[0].distance > 1.0);
+}
+
+#[test]
 fn attached_geometry_follows_the_flange_and_exempts_only_named_partners() {
     let variant = GripperVariant::Flange;
     let mut kin = Kin::load(&assets_dir(), variant).unwrap();

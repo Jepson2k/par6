@@ -38,8 +38,8 @@ fn box_at(x: f64, y: f64, z: f64, side: f64) -> ShapeDesc {
 }
 
 #[test]
-fn abi_version_is_v12() {
-    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 12);
+fn abi_version_is_v13() {
+    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 13);
 }
 
 #[test]
@@ -442,4 +442,29 @@ fn world_distance_reads_world_pairs_only_and_tracks_approach() {
             "lowering the box must never raise the signal ({depths:?})"
         );
     }
+
+    assert!(matches!(
+        col.world_clearances_into(&q, &mut []),
+        Err(Error::Status(ffi::PAR6_ERR_BUFFER_TOO_SMALL))
+    ));
+    let mut out = vec![ffi::par6_clearance::default(); col.pair_count()];
+    assert!(matches!(
+        col.world_clearances_into(&q[..5], &mut out),
+        Err(Error::Dimension { .. })
+    ));
+    for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut bad = q;
+        bad[0] = invalid;
+        assert!(matches!(
+            col.world_clearances_into(&bad, &mut out),
+            Err(Error::Status(ffi::PAR6_ERR_INVALID_ARG))
+        ));
+    }
+    let count = col.world_clearances_into(&q, &mut out).unwrap();
+    assert_eq!(count, col.robot_geom_count());
+    let nearest = out[..count]
+        .iter()
+        .map(|p| p.distance)
+        .fold(f64::INFINITY, f64::min);
+    assert!((nearest - col.world_distance(&q).unwrap()).abs() < 1e-9);
 }

@@ -31,6 +31,7 @@ typedef enum par6_status {
     PAR6_ERR_URDF = -2,          /* URDF load/parse failure */
     PAR6_ERR_FRAME = -3,         /* named frame not found in model */
     PAR6_ERR_EXCEPTION = -4,     /* unexpected C++ exception */
+    PAR6_ERR_BUFFER_TOO_SMALL = -5, /* caller-provided output capacity */
 } par6_status;
 
 /* Optional tool attached rigidly to the end-effector frame.
@@ -406,6 +407,30 @@ par6_status par6_col_distance(par6_col *h, const double *q,
 par6_status par6_col_world_distance(par6_col *h, const double *q,
                                     double *out_distance);
 
+/* One arm/tool-to-keep-out pair. Geometry indices use par6_col_geom_name;
+ * both witness points are in world metres. Margins do not affect distance. */
+typedef struct par6_clearance {
+    int32_t part;
+    int32_t obstacle;
+    double distance;
+    double part_point[3];
+    double obstacle_point[3];
+} par6_clearance;
+
+/* Signed distance and nearest points for every active arm/tool-to-keep-out
+ * pair at q (nq doubles). Self pairs, including attached-to-arm pairs, are
+ * excluded. Respects allowed contacts. Mesh penetration has the same
+ * patch-local semantics as par6_col_world_distance.
+ *
+ * out_count is required: on success it is the number written; on
+ * PAR6_ERR_BUFFER_TOO_SMALL it is the required capacity and out is untouched.
+ * NULL out is valid only with capacity == 0. Other errors set out_count to
+ * zero when non-NULL; discard the buffer on error. Non-finite q is rejected.
+ * No shim-side allocation per call; coal's narrow phase may allocate. */
+par6_status par6_col_world_clearances(par6_col *h, const double *q,
+                                     par6_clearance *out, int32_t capacity,
+                                     int32_t *out_count);
+
 
 /* Replace the runtime payload attached at the end-effector frame.
  * Reversible: each call restores the create-time parent-joint inertia
@@ -445,9 +470,11 @@ par6_status par6_kin_set_tool(par6_kin *h, double mass, const double *com3,
  *     fails to link it.
  * v10: par6_kin_set_tool added (reversible runtime payload attach at the
  *     end-effector frame). Purely additive; a stale v9 library fails to
- *     link it. */
+ *     link it.
+ * v13: par6_col_world_clearances added (signed world-pair witnesses in a
+ *      caller-provided buffer) and PAR6_ERR_BUFFER_TOO_SMALL. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 12
+#define PAR6_SHIM_ABI_VERSION 13
 
 #ifdef __cplusplus
 } /* extern "C" */

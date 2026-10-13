@@ -32,7 +32,7 @@ from waldoctl import (
 from waldoctl import (
     Robot as _RobotABC,
 )
-from waldoctl.results import IKResult
+from waldoctl.results import Clearance, IKResult
 
 from par6 import _daemon
 from par6 import config as _cfg
@@ -650,6 +650,17 @@ class Robot(_RobotABC):
         if w is None:
             return float("inf")
         return w.min_distance(self._q6(q_rad))
+
+    def clearances(self, q_rad: NDArray[np.float64]) -> list[Clearance]:
+        """Nearest arm/tool pair per keep-out, closest first, in world metres.
+
+        Distances are signed (negative = penetration), without margins.
+        Names match :meth:`colliding_pairs`; self pairs are excluded.
+        """
+        w = self._world
+        if w is None:
+            return []
+        return [Clearance(*row) for row in w.clearances(self._q6(q_rad))]
 
     def apply_shapes(self, shapes: list) -> None:
         """Replace this process's keep-outs — the local twin of the

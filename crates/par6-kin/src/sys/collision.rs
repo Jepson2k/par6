@@ -369,6 +369,41 @@ impl CollisionModel {
         }
         Ok(distance)
     }
+
+    /// Signed world-pair distances and witness points, with geometry indices
+    /// in the same order as [`Self::geom_name`]. Self pairs are excluded,
+    /// including attached-to-arm pairs. Points are in world metres.
+    ///
+    /// No Rust-side allocation. A buffer of [`Self::pair_count`] entries is
+    /// sufficient; a smaller buffer may return `PAR6_ERR_BUFFER_TOO_SMALL`.
+    pub fn world_clearances_into(
+        &mut self,
+        q: &[f64],
+        out: &mut [ffi::par6_clearance],
+    ) -> Result<usize, Error> {
+        if q.len() != self.nq {
+            return Err(Error::Dimension {
+                expected: self.nq,
+                got: q.len(),
+            });
+        }
+        let capacity =
+            i32::try_from(out.len()).map_err(|_| Error::Status(ffi::PAR6_ERR_INVALID_ARG))?;
+        let mut count = 0;
+        let status = unsafe {
+            ffi::par6_col_world_clearances(
+                self.raw.as_ptr(),
+                q.as_ptr(),
+                out.as_mut_ptr(),
+                capacity,
+                &mut count,
+            )
+        };
+        if status != ffi::PAR6_OK {
+            return Err(Error::Status(status));
+        }
+        Ok(count as usize)
+    }
 }
 
 impl Drop for CollisionModel {

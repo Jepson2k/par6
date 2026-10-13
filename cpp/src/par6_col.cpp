@@ -202,6 +202,12 @@ struct par6_col {
      * rebuild_world() — the depth query walks only the world tail. */
     std::size_t world_pairs_from = 0;
 
+    struct ClearancePair {
+        std::size_t pair;
+        bool obstacle_first;
+    };
+    std::vector<ClearancePair> clearance_pairs;
+
     Eigen::VectorXd q;
 
     par6_col() : data(pinocchio::Model()) {}
@@ -234,6 +240,7 @@ struct par6_col {
         std::vector<double> margins(first_world_pair, clearance);
         std::vector<const WorldShape *> owners(robot_geoms, nullptr);
         std::vector<std::string> names;
+        std::vector<ClearancePair> next_clearance_pairs;
         for (const auto &obj : candidate.geometryObjects)
             names.push_back(reporting_name(obj.name));
 
@@ -260,6 +267,10 @@ struct par6_col {
                 if (other != nullptr && w.parent_frame == 0 && other->parent_frame == 0)
                     continue;
                 if (allows(&w, names[i]) || allows(other, names[gi])) continue;
+                const bool obstacle_first = other != nullptr && other->parent_frame == 0;
+                if (w.parent_frame == 0 || obstacle_first)
+                    next_clearance_pairs.push_back({candidate.collisionPairs.size(),
+                                                    obstacle_first});
                 candidate.addCollisionPair(pinocchio::CollisionPair(i, gi));
                 const double m = w.margin >= 0.0 ? w.margin : clearance;
                 const double other_margin = other != nullptr && other->margin >= 0.0 ?
@@ -272,8 +283,15 @@ struct par6_col {
         auto next_data = std::make_unique<pinocchio::GeometryData>(candidate);
         for (std::size_t k = 0; k < next_data->collisionRequests.size(); ++k)
             next_data->collisionRequests[k].security_margin = margins[k];
+        for (auto &request : next_data->distanceRequests) {
+            // Preserve Pinocchio's solver/cache settings for both distance paths.
+            coal::DistanceRequest points_request(true, true, request.rel_err, request.abs_err);
+            static_cast<coal::QueryRequest &>(points_request) = request;
+            request = points_request;
+        }
         geom.swap(next_geom);
         geom_data.swap(next_data);
+        clearance_pairs.swap(next_clearance_pairs);
         world_pairs_from = first_world_pair;
     }
 };
@@ -605,6 +623,49 @@ par6_status par6_col_world_distance(par6_col *h, const double *q,
             }
         }
         *out_distance = best;
+        return PAR6_OK;
+    } catch (const std::exception &) {
+        return PAR6_ERR_EXCEPTION;
+    }
+}
+
+par6_status par6_col_world_clearances(par6_col *h, const double *q,
+                                     par6_clearance *out, int32_t capacity,
+                                     int32_t *out_count) {
+    if (out_count != nullptr) *out_count = 0;
+    if (h == nullptr || q == nullptr || out_count == nullptr || capacity < 0 ||
+        (out == nullptr && capacity > 0))
+        return PAR6_ERR_INVALID_ARG;
+    for (Eigen::Index i = 0; i < h->model.nq; ++i) {
+        if (!std::isfinite(q[i])) return PAR6_ERR_INVALID_ARG;
+    }
+    if (h->clearance_pairs.size() > static_cast<std::size_t>(
+            std::numeric_limits<int32_t>::max()))
+        return PAR6_ERR_INVALID_ARG;
+    const auto count = static_cast<int32_t>(h->clearance_pairs.size());
+    if (capacity < count) {
+        *out_count = count;
+        return PAR6_ERR_BUFFER_TOO_SMALL;
+    }
+    try {
+        h->q = Eigen::Map<const Eigen::VectorXd>(q, h->model.nq);
+        pinocchio::updateGeometryPlacements(h->model, h->data, *h->geom,
+                                            *h->geom_data, h->q);
+        for (int32_t i = 0; i < count; ++i) {
+            const auto &entry = h->clearance_pairs[i];
+            const auto &pair = h->geom->collisionPairs[entry.pair];
+            const auto &result = pinocchio::computeDistance(*h->geom, *h->geom_data,
+                                                            entry.pair);
+            const int obstacle = entry.obstacle_first ? 0 : 1;
+            out[i].part = static_cast<int32_t>(obstacle == 0 ? pair.second : pair.first);
+            out[i].obstacle = static_cast<int32_t>(obstacle == 0 ? pair.first : pair.second);
+            out[i].distance = result.min_distance;
+            for (int axis = 0; axis < 3; ++axis) {
+                out[i].part_point[axis] = result.nearest_points[1 - obstacle][axis];
+                out[i].obstacle_point[axis] = result.nearest_points[obstacle][axis];
+            }
+        }
+        *out_count = count;
         return PAR6_OK;
     } catch (const std::exception &) {
         return PAR6_ERR_EXCEPTION;

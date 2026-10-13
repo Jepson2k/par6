@@ -132,7 +132,7 @@ pub use kin::{IkOutcome, Kin, KinError, Pose, IK_POSE_TOL};
 pub use opw::{relative_pose, Opw, OpwError, FIT_TOL};
 
 pub use collision::{
-    link_of, Collision, CollisionReport, COLLISION_CLEARANCE_M, MAX_REPORTED_PAIRS,
+    link_of, Clearance, Collision, CollisionReport, COLLISION_CLEARANCE_M, MAX_REPORTED_PAIRS,
 };
 
 pub use shapes::{Shape, ShapeError, ShapeKind, MAX_SHAPE_PARAMS};

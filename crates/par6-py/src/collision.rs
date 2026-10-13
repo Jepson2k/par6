@@ -21,6 +21,9 @@ struct World {
     names: ShapeNames,
 }
 
+type Point = (f64, f64, f64);
+type ClearanceRow = (String, String, f64, Point, Point);
+
 /// Self-collision plus keep-out checking on one URDF tree.
 #[pyclass(module = "par6._par6")]
 pub struct CollisionWorld {
@@ -133,6 +136,41 @@ impl CollisionWorld {
             .collision
             .min_distance(&q)
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Minimum signed distance over world pairs only, in metres.
+    fn world_distance(&self, q: Vec<f64>) -> PyResult<f64> {
+        let q = joints(&q, "q")?;
+        self.inner
+            .lock()
+            .unwrap()
+            .collision
+            .world_distance(&q)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Nearest arm/tool pair per keep-out, closest first, in world metres.
+    fn clearances(&self, q: Vec<f64>) -> PyResult<Vec<ClearanceRow>> {
+        let q = joints(&q, "q")?;
+        let clearances = self
+            .inner
+            .lock()
+            .unwrap()
+            .collision
+            .clearances(&q)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+        Ok(clearances
+            .into_iter()
+            .map(|c| {
+                (
+                    c.part,
+                    c.obstacle,
+                    c.distance,
+                    c.part_point.into(),
+                    c.obstacle_point.into(),
+                )
+            })
+            .collect())
     }
 
     /// Index of the first colliding configuration along `rows`, or -1

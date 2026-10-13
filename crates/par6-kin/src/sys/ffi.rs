@@ -37,6 +37,19 @@ pub const PAR6_ERR_INVALID_ARG: par6_status = -1;
 pub const PAR6_ERR_URDF: par6_status = -2;
 pub const PAR6_ERR_FRAME: par6_status = -3;
 pub const PAR6_ERR_EXCEPTION: par6_status = -4;
+pub const PAR6_ERR_BUFFER_TOO_SMALL: par6_status = -5;
+
+/// One arm/tool-to-keep-out pair, with signed distance and world-frame
+/// witness points in metres. Geometry indices use `par6_col_geom_name`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct par6_clearance {
+    pub part: i32,
+    pub obstacle: i32,
+    pub distance: f64,
+    pub part_point: [f64; 3],
+    pub obstacle_point: [f64; 3],
+}
 
 /// Mirror of `par6_tool_params`: rigid tool attached to the ee frame.
 /// `transform` is T_ee_tool row-major; `com` in ee-frame coordinates;
@@ -236,6 +249,15 @@ extern "C" {
         h: *mut par6_col,
         q: *const f64,
         out_distance: *mut f64,
+    ) -> par6_status;
+    /// World-pair witnesses; `out_count` is the required capacity on
+    /// `PAR6_ERR_BUFFER_TOO_SMALL`, with no partial output on overflow.
+    pub fn par6_col_world_clearances(
+        h: *mut par6_col,
+        q: *const f64,
+        out: *mut par6_clearance,
+        capacity: i32,
+        out_count: *mut i32,
     ) -> par6_status;
     pub fn par6_col_nq(h: *const par6_col) -> i32;
     /// Robot-link geometry objects; the world layers start at this index.
