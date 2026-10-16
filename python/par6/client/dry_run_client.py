@@ -1112,6 +1112,7 @@ class DryRunRobotClient(RobotOwner):
         buf.last_checkpoint = self._last_checkpoint
         buf.completed_index = self._completed_index()
         buf.accepted_index = len(self._program) - 1
+        buf.motion_profile = self.profile()
         if status.tool_status is not None:
             buf.tool_status = status.tool_status
             buf.tool_status_present = True

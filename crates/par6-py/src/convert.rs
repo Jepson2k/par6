@@ -132,6 +132,7 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     d.set_item("proto_version", s.proto_version)?;
     d.set_item("controller_id", s.controller_id)?;
     d.set_item("session_id", s.session_id)?;
+    d.set_item("motion_profile", &s.motion_profile)?;
     d.set_item("seq", s.seq)?;
     d.set_item("mono_time_ns", s.mono_time_ns)?;
     d.set_item("link_ok", s.link_ok)?;

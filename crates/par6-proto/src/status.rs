@@ -17,10 +17,11 @@
 //!  rx_frames u64], homing [active bool, step u8, [[status u8, phase u8]]],
 //!  torques_ext f64[6], paused bool,
 //!  drive_health [temperatures_c f64[], currents_ma f64[], bus_voltage_v nil|f64],
-//!  loop_health [p99_period_s f64, overruns u64], session_id u64]
+//!  loop_health [p99_period_s f64, overruns u64], session_id u64,
+//!  motion_profile str]
 //! ```
 //!
-//! 43 elements total. STATUS is broadcast even when the bus link is down —
+//! 44 elements total. STATUS is broadcast even when the bus link is down —
 //! `link_ok`/`data_age_ms` report staleness instead of going silent. Decoders
 //! must tolerate a LONGER array (future fields append at the tail) but never a
 //! shorter one.
@@ -33,8 +34,8 @@ use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
 use crate::{DecodeError, EN_SLOTS, IO_SLOTS, MAX_IO_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION};
 use crate::{HomingJointState, HomingPhase, LinkState};
 
-/// Total number of elements in a v5 STATUS array (including the tag).
-pub const STATUS_LEN: usize = 43;
+/// Total number of elements in a v7 STATUS array (including the tag).
+pub const STATUS_LEN: usize = 44;
 /// Decode cap on the `warnings` list (the RT latch holds at most 32
 /// entries; a longer claim is hostile input).
 const MAX_WARNINGS: usize = 64;
@@ -142,6 +143,9 @@ pub struct Status {
     pub loop_health: LoopHealthWire,
     /// Identifies one command-plane lifetime; changes when the daemon restarts.
     pub session_id: u64,
+    /// Motion profile the planner times moves with, in the registry's
+    /// spelling.
+    pub motion_profile: String,
 }
 
 /// Per-drive readings and faults as STATUS carries them (slot 40).
@@ -253,6 +257,7 @@ impl Default for Status {
             drive_health: DriveHealthWire::default(),
             loop_health: LoopHealthWire::default(),
             session_id: 0,
+            motion_profile: String::new(),
         }
     }
 }
@@ -375,6 +380,7 @@ pub fn encode_status_into(s: &Status, buf: &mut Vec<u8>) {
     w_f64(buf, s.loop_health.p99_period_s);
     w_uint(buf, s.loop_health.overruns);
     w_uint(buf, s.session_id);
+    w_str(buf, &s.motion_profile);
 }
 
 /// Reusable STATUS encoder: owns the broadcast buffer so the hot path
@@ -720,6 +726,7 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
         overruns: r.uint()?,
     };
     let session_id = r.uint()?;
+    let motion_profile = r.str()?.to_owned();
 
     // Forward compatibility: skip any fields a newer producer appended.
     for _ in STATUS_LEN..n {
@@ -770,5 +777,6 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
         drive_health,
         loop_health,
         session_id,
+        motion_profile,
     })
 }
