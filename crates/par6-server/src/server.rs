@@ -2663,6 +2663,7 @@ impl<R: RtCommands> Core<R> {
             proto_version: PROTO_VERSION,
             controller_id: self.cfg.controller_id,
             session_id: self.session_id,
+            motion_profile: self.profile.clone(),
             seq: self.status_seq,
             mono_time_ns: self.mono_ns(),
             link_ok: u8::from(self.link_ok()),

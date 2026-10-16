@@ -99,6 +99,7 @@ fn populated() -> Status {
             overruns: 8,
         },
         session_id: u64::MAX - 1,
+        motion_profile: "QUINTIC".to_owned(),
     }
 }
 
@@ -160,15 +161,29 @@ fn every_status_slot_survives_encode_and_decode() {
 }
 
 #[test]
-fn session_metadata_requires_an_unsigned_integer_and_complete_field() {
+fn the_trailing_session_and_profile_fields_must_be_present_and_typed() {
     let mut encoder = StatusEncoder::new();
-    let mut prefix = encoder.encode(&Status::default()).to_vec();
-    prefix.pop();
-    assert!(decode_status(&prefix).is_err());
+    let full = encoder.encode(&Status::default()).to_vec();
+    // The default frame ends in `session_id` 0 and an empty
+    // `motion_profile`, one byte each.
+    let (prefix, tail) = full.split_at(full.len() - 2);
+    let (session, profile) = (tail[0], tail[1]);
+    assert!(decode_status(&full[..full.len() - 1]).is_err());
+    assert!(decode_status(prefix).is_err());
     for invalid in [vec![0xc0], vec![0xc3], vec![0xff], vec![0xa1, b'1']] {
-        let mut packet = prefix.clone();
+        let mut packet = prefix.to_vec();
         packet.extend_from_slice(&invalid);
-        assert!(decode_status(&packet).is_err());
+        packet.push(profile);
+        assert!(decode_status(&packet).is_err(), "session_id {invalid:02x?}");
+    }
+    for invalid in [vec![0xc0], vec![0xc3], vec![0x01]] {
+        let mut packet = prefix.to_vec();
+        packet.push(session);
+        packet.extend_from_slice(&invalid);
+        assert!(
+            decode_status(&packet).is_err(),
+            "motion_profile {invalid:02x?}"
+        );
     }
 }
 

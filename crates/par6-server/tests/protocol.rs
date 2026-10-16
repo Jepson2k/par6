@@ -10,9 +10,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use par6_proto::command::{
-    EnterFlashing, JogJ, JogL, MoveJ, MoveJPose, MoveS, SaveConfig, SetCanId, SetPayload,
-    SetPidGains, SetShapes, SetToolId, Shape, Simulator, Stop, Teleport, ToolAction, ToolParam,
-    WriteIo,
+    EnterFlashing, JogJ, JogL, MoveJ, MoveJPose, MoveS, SaveConfig, SelectProfile, SetCanId,
+    SetPayload, SetPidGains, SetShapes, SetToolId, Shape, Simulator, Stop, Teleport, ToolAction,
+    ToolParam, WriteIo,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
@@ -940,6 +940,35 @@ async fn status_identifies_new_publisher_sessions_and_actual_snapshot_times() {
     let next = recv_status(&restarted.status_rx).await;
     assert_eq!(next.controller_id, before.controller_id);
     assert_ne!(next.session_id, before.session_id);
+}
+
+#[tokio::test]
+async fn status_reports_the_selected_profile_until_reset_state_restores_the_initial_one() {
+    let h = start(|cfg| {
+        cfg.profiles = vec!["TOPPRA".to_owned(), "RUCKIG".to_owned()];
+        cfg.initial_profile = "TOPPRA".to_owned();
+    })
+    .await;
+    let mut c = Client::new(&h).await;
+    status_where(&h.status_rx, "the initial profile", |s| {
+        s.motion_profile == "TOPPRA"
+    })
+    .await;
+    // Selection matches case-insensitively; STATUS carries the registry's
+    // spelling, which is what a client compares against.
+    c.ok(&Command::SelectProfile(SelectProfile {
+        profile: "ruckig".to_owned(),
+    }))
+    .await;
+    status_where(&h.status_rx, "the selected profile", |s| {
+        s.motion_profile == "RUCKIG"
+    })
+    .await;
+    c.request(&Command::ResetState).await;
+    status_where(&h.status_rx, "the restored profile", |s| {
+        s.motion_profile == "TOPPRA"
+    })
+    .await;
 }
 
 /// A TCP rotation with three substantial components \[rad\] — the only
