@@ -3,7 +3,7 @@
 //! the home reference the hall FSM latches against the sim's own sensor,
 //! the failure signatures (two-pass mismatch, position-never-valid,
 //! approach timeout), the stall false-positive guards (startup inrush,
-//! current-window duty), and the release phase's sign/duration/sample
+//! current-window duty, pass-2 travel), and the release phase's sign/duration/sample
 //! contract — the scripted cases at the HomingSystem seam. The latched
 //! reference itself is checked against plant ground truth in
 //! homing_reference.rs.
@@ -14,18 +14,20 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use par6_bus::sim::SimBus;
-use par6_bus::spectral::{trunc_to_wire, JointConversion};
+use par6_bus::spectral::codec::Readback;
+use par6_bus::spectral::{torque_to_ma_factor, trunc_to_wire, JointConversion};
 use par6_bus::{
-    BusState, DriverBus, GripperCommand, GripperReply, HallState, JointCommand, LoopbackBus, Pack,
-    Reply, TxRecord,
+    BusState, ConfigKind, DriverBus, GripperCommand, GripperReply, HallState, JointCommand,
+    LoopbackBus, NodeState, Pack, PollAction, Reply, TxRecord,
 };
-use par6_config::{ConfigBundle, GripperHomeMode, HomeGroup, SequenceStep};
-use par6_rt::homing::{HomingSystem, SeqStatus};
-use par6_rt::hooks::{ClampStream, RampJog};
+use par6_config::{ConfigBundle, GripperHomeMode, HomeGroup, MoveTo, SequenceStep};
+use par6_rt::adapters::{MotionJog, MotionStream};
+use par6_rt::homing::{HomingSystem, SeqStatus, DETECT_WINDOW_S, REHOME_SPEED_FACTOR};
+use par6_rt::hooks::ClampStream;
 use par6_rt::{
-    sample_ring, ArmState, CompletionPolicy, ErrorCode, HomingJointStatus, HomingPhase, Mode, NoFk,
-    RtCommand, RtCore, RtHandles, RtHooks, SharedDigitalIo, SharedFlashMarker, SharedLineGpio,
-    SpecSettle, ZeroGravity, MAX_JOINTS,
+    sample_ring, ArmState, CompletionPolicy, ErrorCode, GravityModel, HomingJointStatus,
+    HomingPhase, Mode, NoFk, RtCommand, RtCore, RtHandles, RtHooks, SharedDigitalIo,
+    SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity, MAX_JOINTS,
 };
 
 /// An RtCore over the closed-loop sim bus. J5's hall band is moved onto
@@ -38,7 +40,29 @@ fn sim_core() -> (
     mpsc::Sender<RtCommand>,
     Arc<AtomicBool>,
 ) {
-    let bundle = common::bundle();
+    sim_core_with_bundle(&common::bundle())
+}
+
+fn sim_core_with_bundle(
+    bundle: &ConfigBundle,
+) -> (
+    RtCore<SimBus>,
+    RtHandles,
+    mpsc::Sender<RtCommand>,
+    Arc<AtomicBool>,
+) {
+    sim_core_with_gravity(bundle, Box::new(ZeroGravity))
+}
+
+fn sim_core_with_gravity(
+    bundle: &ConfigBundle,
+    gravity: Box<dyn GravityModel>,
+) -> (
+    RtCore<SimBus>,
+    RtHandles,
+    mpsc::Sender<RtCommand>,
+    Arc<AtomicBool>,
+) {
     let robot = &bundle.robot;
     let dt = robot.robot.tick_dt_s;
     let (tx, rx) = mpsc::channel();
@@ -47,9 +71,9 @@ fn sim_core() -> (
     let (io, _io_lines) = SharedDigitalIo::new(robot.io.inputs.len(), robot.io.outputs.len());
     let (_producer, consumer) = sample_ring(64);
     let hooks = RtHooks {
-        gravity: Box::new(ZeroGravity),
-        jog: Box::new(RampJog::new(robot)),
-        stream: Box::new(ClampStream::new(robot)),
+        gravity,
+        jog: Box::new(MotionJog::from_config(robot).expect("jog engine")),
+        stream: Box::new(MotionStream::from_config(robot).expect("stream limiter")),
         stream_shaped: Box::new(ClampStream::new(robot)),
         settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
         estop: Box::new(gpio),
@@ -60,7 +84,7 @@ fn sim_core() -> (
         samples: consumer,
     };
     let (mut core, handles) =
-        RtCore::new(&bundle, SimBus::new(common::scene(&bundle)), hooks).expect("sim core");
+        RtCore::new(bundle, SimBus::new(common::scene(bundle)), hooks).expect("sim core");
     core.bus_mut().set_hall_trigger(5, -0.3, 0.02);
     (core, handles, tx, line)
 }
@@ -79,64 +103,229 @@ fn start_homing(core: &mut RtCore<SimBus>, handles: &mut RtHandles, tx: &mpsc::S
     assert!(handles.snapshots.latest().homing.active);
 }
 
+/// A tool changed under a running core homes as that tool, exactly as one
+/// booted with it does: the same sequence (no gripper work for a tool with
+/// no CAN driver) and the same tool-dependent J4 reference, so the arm ends
+/// where it would have.
 #[test]
-fn full_par6_sequence_homes_closed_loop_to_the_ready_pose() {
-    let (mut core, mut handles, tx, _line) = sim_core();
-    let bundle = common::bundle();
-    let dt = core.tick_dt_s();
-    start_homing(&mut core, &mut handles, &tx);
-
-    let mut saw_j0_running_at_homing_current = false;
-    let mut finished = false;
-    for _ in 0..30_000 {
-        core.tick(dt, false);
-        let s = handles.snapshots.latest();
-        if s.homing.active
-            && s.homing.per_joint[0] == HomingJointStatus::Running
-            && s.homing.effective_current_limit_ma[0]
-                == bundle.robot.homing.joints[0].current_ma as f32
-        {
-            saw_j0_running_at_homing_current = true;
-        }
-        if !s.homing.active && s.mode == Mode::Idle {
-            finished = true;
-            break;
-        }
-    }
-    assert!(finished, "sequence must finish within the tick budget");
+fn a_home_after_a_tool_change_homes_as_the_tool_now_fitted() {
+    let driven = common::bundle();
     assert!(
-        saw_j0_running_at_homing_current,
-        "effective current limit publishes the homing value while running"
+        driven.active_tool().is_some_and(|t| t.driver.is_some()),
+        "the premise: the shipped tool is driven"
+    );
+    let mut flanged = driven.clone();
+    flanged.robot.robot.active_tool = "Flange".to_owned();
+    let flange = flanged.active_tool().expect("the flange").clone();
+    assert_ne!(
+        driven.effective_home_offset(4),
+        flanged.effective_home_offset(4),
+        "the premise: the two tools reference J4 differently"
     );
 
-    let s = handles.snapshots.latest();
-    assert!(s.homed, "sequence success sets homed");
-    assert!(!s.error_active, "no errors from a clean sequence");
-    for (i, st) in s.homing.per_joint.iter().enumerate() {
-        assert_eq!(*st, HomingJointStatus::Done, "actuator {i} done");
-    }
-    // Normal current limits published again after completion.
-    for i in 0..MAX_JOINTS {
-        assert_eq!(
-            s.homing.effective_current_limit_ma[i], bundle.robot.joints[i].ilim_ma as f32,
-            "J{i} back to the normal Ilim"
-        );
-    }
+    // How far a home gets through its plan, and where J4 truly ends.
+    let home =
+        |core: &mut RtCore<SimBus>, handles: &mut RtHandles, tx: &mpsc::Sender<RtCommand>| {
+            let dt = core.tick_dt_s();
+            start_homing(core, handles, tx);
+            let mut steps = 0;
+            for _ in 0..(200.0 / dt) as usize {
+                core.tick(dt, false);
+                let s = handles.snapshots.latest();
+                steps = steps.max(s.homing.sequence_step);
+                if !s.homing.active {
+                    assert!(s.homed, "the home failed: {:?}", s.homing);
+                    return (steps, core.bus_mut().true_joint_rad()[4]);
+                }
+            }
+            panic!("the home never finished");
+        };
+    let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&flanged);
+    let booted = home(&mut core, &mut handles, &tx);
 
-    // Closed-loop tracking check only: the move_to targets and `s.q`
-    // both convert through the JointConversion that set_home re-based
-    // moments earlier, so this holds for essentially ANY latched
-    // reference — it proves the sequence completes and the position
-    // loops track, not that the reference is right. The reference is
-    // checked against the sim plant's ground truth in
-    // homing_reference.rs.
-    let want = [1.57, -1.85, 2.85, 0.0, -0.5, std::f64::consts::PI];
-    for (i, (got, want)) in s.q.iter().zip(&want).enumerate() {
+    let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&driven);
+    for _ in 0..10 {
+        core.tick(core.tick_dt_s(), false);
+    }
+    let before = handles.snapshots.latest().q[4];
+    core.set_gripper_tool(Some(&flange), driven.robot.bus.gripper_node, 1);
+    core.set_tool_home_offset(4, flanged.effective_home_offset(4).expect("J4 offset"));
+    core.tick(core.tick_dt_s(), false);
+    // The drivetrain gives a little under the new tool's weight; the
+    // tools' home offsets differ by about 0.19 rad.
+    let after = handles.snapshots.latest().q[4];
+    assert!(
+        (after - before).abs() < 0.01,
+        "the encoder reads the same angle whatever tool is bolted on: {before} -> {after}"
+    );
+    let changed = home(&mut core, &mut handles, &tx);
+
+    assert_eq!(
+        changed.0, booted.0,
+        "the changed tool ran another tool's sequence"
+    );
+    assert!(
+        (changed.1 - booted.1).abs() < 0.01,
+        "J4 ends at {:.4} rad after the change, {:.4} rad booted with the flange",
+        changed.1,
+        booted.1
+    );
+}
+
+/// A driven tool taken off leaves nothing reading on its node, whichever
+/// tick the change lands on: a reply in flight as the jaw came off is not
+/// a reading of anything on the arm, and with no poll after it would read
+/// on forever.
+#[test]
+fn a_removed_jaw_leaves_no_reading_behind() {
+    let driven = common::bundle();
+    let jaw = driven.active_tool().expect("the shipped tool").clone();
+    assert!(
+        jaw.driver.is_some(),
+        "the premise: the shipped tool is driven"
+    );
+    let mut flanged = driven.clone();
+    flanged.robot.robot.active_tool = "Flange".to_owned();
+    let flange = flanged.active_tool().expect("the flange").clone();
+    let gnode = driven.robot.bus.gripper_node;
+    let (mut core, handles, _tx, _line) = sim_core_with_bundle(&driven);
+    let dt = core.tick_dt_s();
+    let mut reads = handles.snapshots;
+    let mut tick = |core: &mut RtCore<SimBus>| {
+        core.tick(dt, false);
+        reads.latest().nodes
+    };
+    // Every phase of the telemetry round, so one of them catches a reply
+    // in flight.
+    for phase in 0..2 * par6_bus::MAX_NODES {
+        core.set_gripper_tool(Some(&jaw), gnode, 1);
+        let reported = (0..500).any(|_| tick(&mut core)[MAX_JOINTS].temperature_c.is_some());
+        assert!(reported, "the fitted jaw never reported a temperature");
+        for _ in 0..phase {
+            tick(&mut core);
+        }
+        core.set_gripper_tool(Some(&flange), gnode, 1);
+        for _ in 0..50 {
+            tick(&mut core);
+        }
+        let nodes = tick(&mut core);
+        let left = nodes[MAX_JOINTS];
         assert!(
-            (got - want).abs() < 0.05,
-            "J{i}: measured {got} want {want} after homing"
+            left.temperature_c.is_none()
+                && left.current_ma.is_none()
+                && left.voltage_mv.is_none()
+                && left.error_flags.is_none(),
+            "phase {phase}: the removed jaw still reads {left:?}"
+        );
+        assert!(
+            nodes[0].temperature_c.is_some(),
+            "phase {phase}: the arm's drives stopped reporting"
         );
     }
+}
+
+#[test]
+fn shoulder_reference_finishes_before_the_base_seek() {
+    fn shoulder_done_when_base_starts(bundle: &ConfigBundle) -> bool {
+        let (mut core, mut handles, tx, _line) = sim_core_with_bundle(bundle);
+        let dt = core.tick_dt_s();
+        start_homing(&mut core, &mut handles, &tx);
+        for _ in 0..30_000 {
+            core.tick(dt, false);
+            let s = handles.snapshots.latest();
+            assert!(!s.error_active, "homing failed before the base seek");
+            if s.homing.per_joint[0] == HomingJointStatus::Running {
+                return s.homing.per_joint[1] == HomingJointStatus::Done;
+            }
+        }
+        panic!("homing never reached the base seek");
+    }
+    let bundle = common::bundle();
+    assert!(shoulder_done_when_base_starts(&bundle));
+
+    // Negative control: the previous base-first sequence reaches J1 while
+    // the shoulder is still unreferenced, even when its home later succeeds.
+    let mut base_first = bundle.clone();
+    base_first.robot.homing.sequence[0].home = Some(HomeGroup {
+        joints: vec![0],
+        gripper: None,
+    });
+    base_first.robot.homing.sequence[1].home = Some(HomeGroup {
+        joints: vec![1, 2],
+        gripper: None,
+    });
+    assert!(!shoulder_done_when_base_starts(&base_first));
+}
+
+/// The whole-sequence deadline is the plan's own worst case, so it never
+/// cuts a slow but healthy home short: step 0 nudges J0, step 1 seeks J5
+/// toward a sensor it never reaches on a seek budget longer than any fixed
+/// deadline sized on a typical run, and the run ends on that budget, after
+/// both steps' time. A short run aborted first proves each run starts
+/// afresh.
+#[test]
+fn the_sequence_deadline_leaves_every_step_its_own_budget() {
+    const NUDGE_S: f64 = 10.0;
+    const SEEK_S: f64 = 100.0;
+    let mut bundle = common::bundle();
+    bundle.robot.homing.sequence = vec![
+        SequenceStep {
+            pre_moves: vec![par6_config::PreMove::Nudge {
+                joint: 0,
+                speed_ticks_s: 500.0,
+                duration_s: NUDGE_S,
+            }],
+            home: None,
+            move_to: vec![],
+            post_moves: vec![],
+        },
+        SequenceStep {
+            pre_moves: vec![],
+            home: Some(HomeGroup {
+                joints: vec![5],
+                gripper: None,
+            }),
+            move_to: vec![],
+            post_moves: vec![],
+        },
+    ];
+    bundle.robot.homing.post_moves.clear();
+    bundle.robot.homing.joints[5].timeout_s = SEEK_S;
+    let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&bundle);
+    core.bus_mut().set_hall_trigger(5, 3.0, 0.0);
+    let dt = core.tick_dt_s();
+
+    start_homing(&mut core, &mut handles, &tx);
+    for _ in 0..(1.0 / dt).round() as usize {
+        core.tick(dt, false);
+    }
+    tx.send(RtCommand::ExecStop).unwrap();
+    core.tick(dt, false);
+    assert!(!handles.snapshots.latest().homing.active, "the stop aborts");
+
+    start_homing(&mut core, &mut handles, &tx);
+    let started = handles.snapshots.latest().tick;
+    while handles.snapshots.latest().homing.active {
+        core.tick(dt, false);
+    }
+    let s = handles.snapshots.latest();
+    let ran_s = (s.tick - started) as f64 * dt;
+    assert!(
+        ran_s >= NUDGE_S + SEEK_S - 1.0,
+        "the sequence was cut short {ran_s:.1} s in, before J5's own {SEEK_S} s seek ran out"
+    );
+    assert_eq!(s.homing.per_joint[5], HomingJointStatus::Failed);
+    assert_eq!(s.mode, Mode::Idle);
+    assert!(!s.homed, "a timed-out sequence establishes no reference");
+    for _ in 0..(0.5 / dt).round() as usize {
+        core.tick(dt, false);
+    }
+    let s = handles.snapshots.latest();
+    assert!(
+        s.qd[5].abs() < 0.01,
+        "the seeking joint must actually stop: {}",
+        s.qd[5]
+    );
 }
 
 #[test]
@@ -155,6 +344,9 @@ fn hard_error_mid_homing_aborts_unhomes_and_zeroes_statuses() {
         s.homing.per_joint.contains(&HomingJointStatus::Running),
         "an FSM is running"
     );
+    // A sim teleport mid-sequence declares the arm homed; entering HOMING
+    // cleared it once, so only the abort itself can clear it again.
+    core.set_homed(true);
 
     // Hardware e-stop mid-homing: abort, un-home, zero statuses.
     line.store(false, Ordering::Relaxed);
@@ -180,6 +372,9 @@ fn hard_error_mid_homing_aborts_unhomes_and_zeroes_statuses() {
 /// A bundle whose sequence is a single step homing exactly `joint`.
 fn single_joint_bundle(joint: u8) -> ConfigBundle {
     let mut bundle = common::bundle();
+    // These cases drive the HomingSystem seam alone; the reference check
+    // is the core's (it needs the torque model), so its hold is left out.
+    bundle.robot.homing.reference_check_nm.clear();
     bundle.robot.homing.sequence = vec![SequenceStep {
         pre_moves: vec![],
         home: Some(HomeGroup {
@@ -206,7 +401,7 @@ struct HomingHarness {
 impl HomingHarness {
     fn new(bundle: &ConfigBundle) -> Self {
         let mut bus = LoopbackBus::new();
-        bus.boot_configure(&bundle.robot, bundle.active_gripper(), 1)
+        bus.boot_configure(&bundle.robot, bundle.active_tool(), 1)
             .unwrap();
         bus.tx_log.clear();
         let conv = std::array::from_fn(|i| JointConversion::from_config(&bundle.robot.joints[i]));
@@ -234,17 +429,6 @@ impl HomingHarness {
         )
     }
 
-    fn limits_count(&self, node: u8, current_ma: f32) -> usize {
-        self.bus
-            .tx_log
-            .iter()
-            .filter(|(_, r)| {
-                matches!(r, TxRecord::Limits { node: n, current_limit_ma, .. }
-                    if *n == node && *current_limit_ma == current_ma)
-            })
-            .count()
-    }
-
     fn config_passes(&self) -> usize {
         self.bus
             .tx_log
@@ -252,86 +436,6 @@ impl HomingHarness {
             .filter(|(_, r)| matches!(r, TxRecord::ConfigPass { .. }))
             .count()
     }
-}
-
-#[test]
-fn two_pass_mismatch_fails_the_joint_and_restores_config() {
-    let bundle = single_joint_bundle(0);
-    let jh = &bundle.robot.homing.joints[0];
-    let mut h = HomingHarness::new(&bundle);
-
-    // Entry swap: Limits(normal vel, homing current) ×4 to every arm
-    // node and the gripper motor.
-    for i in 0..MAX_JOINTS {
-        let node = bundle.robot.joints[i].node_id;
-        let ma = bundle.robot.homing.joints[i].current_ma as f32;
-        assert_eq!(h.limits_count(node, ma), 4, "entry limit swap for J{i}");
-    }
-    let gripper_ma = bundle
-        .active_gripper()
-        .unwrap()
-        .homing
-        .as_ref()
-        .unwrap()
-        .current_ma as f32;
-    assert_eq!(
-        h.limits_count(bundle.robot.bus.gripper_node, gripper_ma),
-        4,
-        "entry limit swap covers the gripper motor"
-    );
-
-    // Scripted plant for J0: velocity integrates; a plateau at `stop`
-    // with saturated current is the stall signature; the endstop MOVES
-    // by more than two_pass_max_diff before the re-approach, so pass 2
-    // latches a mismatching position.
-    let master = bundle.robot.joints[0].sector_master_position_ticks;
-    let mut pos = f64::from(master);
-    let mut stop = pos + 3000.0;
-    let mut shifted = false;
-    let n0 = usize::from(bundle.robot.joints[0].node_id);
-    h.state.nodes[n0].position_ticks = Some(master);
-    h.state.nodes[n0].current_ma = Some(0);
-
-    let mut outcome = SeqStatus::Running;
-    let mut fsm_started = false;
-    for t in 1..6000u64 {
-        let status = h.tick(t);
-        let cmd = h.cmds[0];
-        if let Some(v) = cmd.vel {
-            if v < 0 && !shifted {
-                // First backoff observed: shift the endstop for pass 2.
-                stop += f64::from(jh.two_pass_max_diff_ticks) + 500.0;
-                shifted = true;
-            }
-            pos = (pos + f64::from(v) * h.dt).min(stop);
-            if v > 0 {
-                fsm_started = true;
-            }
-        }
-        let seated = pos >= stop - 0.5 && matches!(cmd.vel, Some(v) if v > 0);
-        h.state.nodes[n0].position_ticks = Some(pos as i32);
-        h.state.nodes[n0].speed_ticks_s = Some(cmd.vel.unwrap_or(0));
-        h.state.nodes[n0].current_ma = Some(if seated { jh.current_ma as i16 } else { 100 });
-        match status {
-            SeqStatus::Running => {}
-            other => {
-                outcome = other;
-                break;
-            }
-        }
-    }
-    assert!(fsm_started, "the approach drove the joint");
-    assert!(shifted, "pass 2 ran against a moved endstop");
-    assert_eq!(outcome, SeqStatus::Failed, "two-pass mismatch fails");
-    assert_eq!(h.sys.statuses()[0], HomingJointStatus::Failed);
-    assert!(!h.sys.active());
-    // Failure restores every node's full stored config (6 joints + the
-    // CAN gripper).
-    assert!(
-        h.config_passes() > MAX_JOINTS,
-        "config reload on failure (got {})",
-        h.config_passes()
-    );
 }
 
 #[test]
@@ -428,8 +532,7 @@ fn a_joint_still_travelling_on_pass_two_is_not_a_stall() {
     // Pass 2 re-covers the backoff distance at the rehome speed factor
     // (the tracking factor scales both legs, so it cancels). A gate still
     // sized for pass 1 calls this travel a stall a quarter of the way in.
-    let rehome_speed_factor = 0.3;
-    let expected = jh.backoff_s / (rehome_speed_factor * h.dt);
+    let expected = jh.backoff_s / (REHOME_SPEED_FACTOR * h.dt);
     assert!(
         f64::from(pass2_ticks) > 0.8 * expected,
         "pass 2 must travel the backoff distance before it counts as stalled \
@@ -443,88 +546,57 @@ fn a_joint_still_travelling_on_pass_two_is_not_a_stall() {
     );
 }
 
-// ------------------------------------------------------------------
-// Stall false-positive guards (G4): the startup guard and the 60 %
-// current-window duty requirement, scripted at the HomingSystem seam.
-// ------------------------------------------------------------------
-
-/// Spin-up inrush: real drivers draw saturated current at velocity-mode
-/// start while the rotor has not yet moved — a displacement plateau AND
-/// high current, the full stall signature. The 0.15 s startup guard is
-/// what keeps that from latching the home reference at the start pose.
-/// Without the guard this run latches pass 1 at the boot pose, pass 2
-/// hits the real endstop 5000 ticks away, and the two-pass check FAILS
-/// the sequence — so `Complete` binds the guard.
+/// A loaded J0 — a load of 0.8× the homing current its own friction leaves,
+/// opposing its approach, so the drive sits near its homing current the
+/// whole time it seeks — reaches the same endstop reference as a free one. Each approach
+/// starts with the current saturated and the rotor barely moving, the
+/// full stall signature, which only the startup guard keeps from
+/// latching at the start pose.
 #[test]
-fn spinup_inrush_does_not_false_latch_a_stall() {
+fn a_loaded_joint_spinning_up_is_not_a_stall() {
     let bundle = single_joint_bundle(0);
     let jh = &bundle.robot.homing.joints[0];
     let eff = bundle
         .effective_home_offset(0)
         .unwrap_or(jh.home_offset_rad);
-    let mut h = HomingHarness::new(&bundle);
-    let n0 = usize::from(bundle.robot.joints[0].node_id);
+    let start = short_of_j0_stop(&bundle, 0.5);
 
-    // ~0.14 s of saturated current with the rotor parked (inrush), then
-    // normal travel at 80 % tracking and 100 mA to the endstop.
-    let inrush_ticks = (0.14 / h.dt).round() as u32;
-    const TRACKING: f64 = 0.8;
-    let master = bundle.robot.joints[0].sector_master_position_ticks;
-    let mut pos = f64::from(master);
-    let stop = pos + 5000.0;
-    h.state.nodes[n0].position_ticks = Some(master);
-    h.state.nodes[n0].current_ma = Some(0);
+    let (free, h) = home_j0(&bundle, start, |_, _, _| 0.0);
+    assert_eq!(free, SeqStatus::Complete, "the free joint homes");
+    let free_ref = i64::from(h.conv[0].motor_ticks(eff));
 
-    let mut outcome = SeqStatus::Running;
-    let mut drive_ticks = 0u32;
-    let mut pos_at_first_hit: Option<f64> = None;
-    for t in 1..20_000u64 {
-        let status = h.tick(t);
-        let v = h.cmds[0].vel.unwrap_or(0);
-        if v > 0 {
-            drive_ticks += 1;
-        } else if drive_ticks > 0 && pos_at_first_hit.is_none() {
-            // First non-approach command after driving = the pass-1 hit.
-            pos_at_first_hit = Some(pos);
+    let joint = &bundle.robot.joints[0];
+    let friction_ma = bundle.robot.sim.coulomb_nm[0]
+        * torque_to_ma_factor(
+            joint.gear_ratio,
+            joint.gear_efficiency,
+            joint.kt_nm_a,
+            joint.dir,
+        )
+        .abs();
+    let load_ma = 0.8 * (jh.current_ma - friction_ma);
+    let mut approach = None;
+    let (loaded, h) = home_j0(&bundle, start, |cmd, _, _| {
+        let v = f64::from(cmd.vel.unwrap_or(0));
+        if v == 0.0 || v.signum() != *approach.get_or_insert(v.signum()) {
+            return 0.0;
         }
-        let spinning_up = v > 0 && drive_ticks <= inrush_ticks;
-        if !spinning_up {
-            pos = (pos + f64::from(v) * TRACKING * h.dt).min(stop);
-        }
-        let seated = pos >= stop - 0.5 && v > 0;
-        h.state.nodes[n0].position_ticks = Some(pos as i32);
-        h.state.nodes[n0].speed_ticks_s = Some(v);
-        h.state.nodes[n0].current_ma = Some(if seated || spinning_up {
-            jh.current_ma as i16
-        } else {
-            100
-        });
-        match status {
-            SeqStatus::Running => {}
-            other => {
-                outcome = other;
-                break;
-            }
-        }
-    }
-
-    assert_eq!(
-        outcome,
-        SeqStatus::Complete,
-        "an inrush-latched pass 1 would fail the two-pass check"
-    );
+        load_ma * v.signum()
+    });
+    assert_eq!(loaded, SeqStatus::Complete, "the loaded joint homes");
     assert_eq!(h.sys.statuses()[0], HomingJointStatus::Done);
+    let loaded_ref = i64::from(h.conv[0].motor_ticks(eff));
     assert!(
-        pos_at_first_hit.expect("pass 1 must hit") >= stop - 200.0,
-        "pass 1 hit at {} — the endstop is {stop}, the inrush plateau was {master}",
-        pos_at_first_hit.unwrap()
-    );
-    let latched = i64::from(h.conv[0].motor_ticks(eff));
-    assert!(
-        (latched - stop as i64).abs() <= 50,
-        "home reference latched at {latched}, endstop at {stop}"
+        (loaded_ref - free_ref).abs() <= 50,
+        "the loaded reference {loaded_ref} is not the free one {free_ref}: \
+         a false stall latched short of the endstop"
     );
 }
+
+// ------------------------------------------------------------------
+// Stall false-positive guard (G4): the 60 % current-window duty
+// requirement, scripted at the HomingSystem seam.
+// ------------------------------------------------------------------
 
 /// A jammed joint whose current is above threshold only 40 % of the time
 /// (an oscillating load) must not read as a stall: the detector demands
@@ -541,7 +613,9 @@ fn a_forty_percent_current_duty_is_not_a_stall() {
     let mut h = HomingHarness::new(&bundle);
     let n0 = usize::from(bundle.robot.joints[0].node_id);
 
-    let duty_ticks = 250u32;
+    let window = (DETECT_WINDOW_S / h.dt).round().max(5.0) as u64;
+    // Several windows of 40 % duty, each of which must not latch.
+    let duty_ticks = 3 * window as u32;
     let master = bundle.robot.joints[0].sector_master_position_ticks;
     let mut pos = f64::from(master);
     let stop = pos + 3000.0;
@@ -608,8 +682,9 @@ fn a_forty_percent_current_duty_is_not_a_stall() {
         "stall latched at tick {hit}, before full duty began at {full_from}"
     );
     assert!(
-        hit <= full_from + 60,
-        "100 % duty should latch within a detection window (hit {hit}, full duty from {full_from})"
+        hit <= full_from + window,
+        "100 % duty should latch within a detection window of {window} ticks \
+         (hit {hit}, full duty from {full_from})"
     );
     assert_eq!(outcome, SeqStatus::Complete);
     assert_eq!(h.sys.statuses()[0], HomingJointStatus::Done);
@@ -625,17 +700,28 @@ fn a_forty_percent_current_duty_is_not_a_stall() {
 // ------------------------------------------------------------------
 
 /// A free-running joint (detached endstop: normal travel, low current,
-/// nothing ever stalls) must fail at exactly `round(timeout_s / dt)`
-/// approach ticks — not before — with the joint marked Failed and the
-/// full node config (normal current limits included) resent. Run at two
-/// tick rates so the seconds→ticks conversion is pinned, not an
-/// accident of the shipped dt.
+/// nothing ever stalls) gets one full-range crossing at its seek speed,
+/// with a quarter on top for the ramp and the stall confirmation, or
+/// its configured `timeout_s` if that is longer. It fails on the tick
+/// after that budget, with the joint marked Failed and the full node
+/// config (normal current limits included) resent. Run at two tick
+/// rates so the seconds→ticks conversion is pinned, not an accident of
+/// the shipped dt.
 #[test]
-fn a_free_running_approach_fails_at_the_configured_timeout_exactly() {
+fn a_free_running_approach_fails_after_one_full_range_crossing() {
     for dt in [0.004, 0.01] {
         let mut bundle = single_joint_bundle(0);
         bundle.robot.robot.tick_dt_s = dt;
-        let timeout_ticks = (bundle.robot.homing.joints[0].timeout_s / dt).round() as u64;
+        let (j, jh) = (&bundle.robot.joints[0], &bundle.robot.homing.joints[0]);
+        let span_ticks = (j.limits.hard_max_rad - j.limits.hard_min_rad) * j.gear_ratio
+            / std::f64::consts::TAU
+            * f64::from(1u32 << j.encoder_bits);
+        let crossing_s = span_ticks / jh.speed_ticks_s;
+        assert!(
+            1.25 * crossing_s > jh.timeout_s,
+            "the range, not the configured floor, sets this budget"
+        );
+        let timeout_ticks = (1.25 * crossing_s / dt).round() as u64;
         let mut h = HomingHarness::new(&bundle);
         let n0 = usize::from(bundle.robot.joints[0].node_id);
 
@@ -670,10 +756,7 @@ fn a_free_running_approach_fails_at_the_configured_timeout_exactly() {
         let first_drive = first_drive.expect("the approach must drive");
         let failed_at = failed_at.unwrap_or_else(|| panic!("dt {dt}: timeout never fired"));
         // elapsed == timeout is still within budget; the tick after is
-        // the failure — exactly `round(timeout_s / dt)` driven ticks.
-        // 13.0 is the shipped J0 timeout (config/PAR6.toml), spelled out
-        // so the conversion is pinned against the config seconds.
-        assert_eq!(timeout_ticks, (13.0f64 / dt).round() as u64, "dt {dt}");
+        // the failure — exactly `round(seek_timeout_s / dt)` driven ticks.
         assert_eq!(
             failed_at - first_drive,
             timeout_ticks,
@@ -696,10 +779,11 @@ fn a_free_running_approach_fails_at_the_configured_timeout_exactly() {
 /// Scripted release-phase plant for J1: seat against the endstop through
 /// both passes, then apply sign-sensitive release physics — positive
 /// current moves the motor positive (away from the low stop, relaxing
-/// the wound gearbox), negative current presses further in. Returns
-/// (release frames sent, position exposed at each release tick, latched
-/// reference, outcome).
-fn run_release_scenario(bundle: &ConfigBundle) -> (Vec<i16>, Vec<i32>, i64, SeqStatus) {
+/// the wound gearbox), negative current presses further in. Returns each
+/// unbroken run of current-only frames with the position exposed at each
+/// of its ticks, the latched reference, and the outcome.
+type CurrentRuns = Vec<(Vec<i16>, Vec<i32>)>;
+fn run_release_scenario(bundle: &ConfigBundle) -> (CurrentRuns, i64, SeqStatus) {
     let jh = &bundle.robot.homing.joints[1];
     let eff = bundle
         .effective_home_offset(1)
@@ -716,8 +800,8 @@ fn run_release_scenario(bundle: &ConfigBundle) -> (Vec<i16>, Vec<i32>, i64, SeqS
     h.state.nodes[n1].position_ticks = Some(master);
     h.state.nodes[n1].current_ma = Some(0);
 
-    let mut release_cmds: Vec<i16> = Vec::new();
-    let mut release_seen: Vec<i32> = Vec::new();
+    let mut runs: CurrentRuns = Vec::new();
+    let mut in_run = false;
     let mut outcome = SeqStatus::Running;
     for t in 1..30_000u64 {
         let exposed = h.state.nodes[n1].position_ticks.unwrap();
@@ -726,12 +810,18 @@ fn run_release_scenario(bundle: &ConfigBundle) -> (Vec<i16>, Vec<i32>, i64, SeqS
         if cmd.pos.is_none() && cmd.vel.is_none() {
             // Current-only frame (cmd 2 DLC 2) — the release drive.
             let c = cmd.cur_ma.expect("current-only frame carries current");
-            release_cmds.push(c);
-            release_seen.push(exposed);
+            if !in_run {
+                runs.push((Vec::new(), Vec::new()));
+                in_run = true;
+            }
+            let run = runs.last_mut().unwrap();
+            run.0.push(c);
+            run.1.push(exposed);
             // Sign-sensitive plant: the current's sign decides whether
             // the gearbox relaxes (away from the stop) or winds tighter.
             pos += RELEASE_STEP * f64::from(c.signum());
         } else {
+            in_run = false;
             let v = cmd.vel.unwrap_or(0);
             pos = (pos + f64::from(v) * TRACKING * h.dt).max(stop);
             let seated = pos <= stop + 0.5 && v < 0;
@@ -748,64 +838,87 @@ fn run_release_scenario(bundle: &ConfigBundle) -> (Vec<i16>, Vec<i32>, i64, SeqS
         }
     }
     let latched = i64::from(h.conv[1].motor_ticks(eff));
-    (release_cmds, release_seen, latched, outcome)
+    (runs, latched, outcome)
 }
 
 #[test]
-fn release_commands_the_config_sign_and_duration_and_samples_at_eighty_percent() {
+fn release_ramps_from_the_stall_push_holds_the_config_current_and_samples_at_eighty_percent() {
     let bundle = single_joint_bundle(1);
     let r = bundle.robot.homing.joints[1]
         .release
         .expect("J1 ships a release plan");
+    let stall_ma = -(bundle.robot.homing.joints[1].current_ma as i16);
     let dt = bundle.robot.robot.tick_dt_s;
     let dur_ticks = (r.duration_s / dt).round().max(1.0) as usize;
     let sample_tick = ((dur_ticks as f64 * r.sample_pct).round() as usize).clamp(1, dur_ticks);
+    let target = r.current_ma as i16;
 
-    let (cmds, seen, latched, outcome) = run_release_scenario(&bundle);
+    let (runs, latched, outcome) = run_release_scenario(&bundle);
     assert_eq!(outcome, SeqStatus::Complete);
-    // Exactly `duration_s` worth of current-only frames, every one with
-    // the CONFIG sign (+150 mA for J1: away from the stop).
-    assert_eq!(cmds.len(), dur_ticks, "release runs for round(duration/dt)");
+    // The release is the only current-mode phase: leaving current mode
+    // re-applies whatever the drive's velocity loop wound up during the
+    // push, so the pass-1 hit stays in velocity mode (2026-09-23).
+    let [(cmds, seen)] = runs.as_slice() else {
+        panic!("exactly one run of current-only frames, the release: {runs:?}");
+    };
+    // Ramp in, hold, ramp out: the hold is exactly `duration_s` of the
+    // config current, and the two ramps are equal and outside it.
+    let ramp = (cmds.len() - dur_ticks) / 2;
+    assert!(ramp > 1, "the release must ramp, not step: {cmds:?}");
+    assert_eq!(cmds.len(), 2 * ramp + dur_ticks, "ramps of equal length");
+    let (ramp_in, rest) = cmds.split_at(ramp);
+    let (hold, ramp_out) = rest.split_at(dur_ticks);
     assert!(
-        cmds.iter().all(|&c| c == r.current_ma as i16),
-        "every release frame carries the config current verbatim: {cmds:?}"
+        hold.iter().all(|&c| c == target),
+        "the hold carries the config current verbatim: {hold:?}"
+    );
+    // Stepping straight from the stall push to the release current is what
+    // flung the joint off its stop: the ramp starts at the push and moves
+    // monotonically to the target, then back monotonically to zero.
+    assert!(
+        (ramp_in[0] - stall_ma).abs() <= 5,
+        "the ramp starts at the stall push {stall_ma} mA, not at {} mA",
+        ramp_in[0]
+    );
+    assert!(ramp_in
+        .windows(2)
+        .all(|w| (w[1] - w[0]) * (target - stall_ma).signum() >= 0));
+    assert_eq!(
+        *ramp_in.last().unwrap(),
+        target,
+        "the ramp in ends at the config current"
+    );
+    assert!(ramp_out
+        .windows(2)
+        .all(|w| (w[1] - w[0]) * target.signum() <= 0));
+    assert_eq!(
+        *ramp_out.last().unwrap(),
+        0,
+        "the ramp out ends at zero current"
     );
     // The reference is the position the joint had relaxed to at the
-    // sample tick — the scripted plant moves a distinct 3 ticks per
-    // release tick, so the latched value identifies the tick exactly.
+    // sample tick of the hold — the scripted plant moves a distinct 3 ticks
+    // per release tick, so the latched value identifies the tick exactly.
     assert_eq!(
         latched,
-        i64::from(seen[sample_tick - 1]),
-        "reference sampled at round(dur · sample_pct) = tick {sample_tick}"
+        i64::from(seen[ramp + sample_tick - 1]),
+        "reference sampled at round(dur · sample_pct) = tick {sample_tick} of the hold"
     );
-    // And it is the RELAXED position: well away from the seated stop in
-    // the releasing direction.
-    let stop = i64::from(bundle.robot.joints[1].sector_master_position_ticks) - 3000;
-    assert!(
-        latched - stop >= 500,
-        "latched {latched} must sit relaxed above the stop {stop}"
-    );
-
-    // Inverting the config sign must move the reference the other way —
-    // the plant winds tighter instead of relaxing, and the relaxed-side
-    // assertion above would reject it. This pins that the test (and the
-    // FSM) are sign-sensitive, not |current|-sensitive.
+    // The FSM is sign-sensitive, not |current|-sensitive: an inverted
+    // config sign goes out inverted.
     let mut inverted = single_joint_bundle(1);
     let rel = inverted.robot.homing.joints[1]
         .release
         .as_mut()
         .expect("J1 ships a release plan");
     rel.current_ma = -rel.current_ma;
-    let (inv_cmds, _, inv_latched, inv_outcome) = run_release_scenario(&inverted);
+    let (inv_runs, _, inv_outcome) = run_release_scenario(&inverted);
     assert_eq!(inv_outcome, SeqStatus::Complete);
     assert!(
-        inv_cmds.iter().all(|&c| c == -(r.current_ma as i16)),
+        inv_runs[0].0[ramp..ramp + dur_ticks]
+            .iter()
+            .all(|&c| c == -target),
         "the FSM forwards the inverted sign verbatim"
-    );
-    assert!(
-        inv_latched - stop <= -400,
-        "inverted release must latch WOUND-IN ({inv_latched} vs stop {stop}) — \
-         the relaxed-side assertion would fail on it"
     );
 }
 
@@ -838,7 +951,7 @@ impl SimHomingHarness {
     ) -> Self {
         let mut bus = SimBus::new(common::scene(bundle));
         bus.set_initial_joint_rad(q0);
-        bus.boot_configure(&bundle.robot, bundle.active_gripper(), 1)
+        bus.boot_configure(&bundle.robot, bundle.active_tool(), 1)
             .expect("sim boot");
         bus.set_hall_trigger(joint, center, half);
         Self {
@@ -975,6 +1088,79 @@ fn hall_homing_latches_at_the_sensor_not_on_a_cached_trigger() {
         (second_ref - first_ref).abs() <= 150,
         "both homes must reference the same sensor: {first_ref} then {second_ref}"
     );
+
+    // A hall band WIDER than one backoff's travel, booted at its center:
+    // one backoff deep per side, the approach leaves it inside the
+    // pre-clear guard, so its exit edge reads as booting on the sensor,
+    // and a blind fixed backoff from that edge lands back at the band
+    // center. Accepting the re-approach's early exit edge then latches
+    // the wrong side of the band. The pre-clear must keep backing off
+    // until the sensor actually reads clear, then approach and latch the
+    // true edge.
+    {
+        let mut h = SimHomingHarness::new(&bundle, &q0, 5, q0[5], 0.02);
+        let half = jh.backoff_s * jh.speed_ticks_s / j5_ticks_per_rad(&h, q0[5]);
+        h.bus.set_hall_trigger(5, q0[5], half);
+
+        h.sys.start(&mut h.bus);
+        assert_eq!(h.run(20_000), SeqStatus::Complete, "the wide band homes");
+
+        // The reference must put the SENSOR EDGE at the home offset. The
+        // probe crosses that edge along the approach direction, and the brake
+        // left the joint just past it, so park one backoff's travel back
+        // inside the band (a quarter of its width) before measuring.
+        let backoff_ticks = (jh.backoff_s / bundle.robot.robot.tick_dt_s).round() as u32;
+        for _ in 0..backoff_ticks {
+            h.drive(
+                5,
+                JointCommand::velocity(trunc_to_wire(-jh.speed_ticks_s), 0),
+            );
+        }
+        let sensor = h.sensor_ticks(5, n5, jh.speed_ticks_s);
+        let sensor_rad = h.conv[5].joint_rad(sensor);
+        assert!(
+            (sensor_rad - eff).abs() < 0.02,
+            "the reference must be the band edge, not the boot pose: the \
+             sensor edge reads {sensor_rad:.4} rad, home offset is {eff:.4} \
+             (band half {half:.4})"
+        );
+    }
+
+    // A sensor that never clears — shorted, or the magnet fell onto the
+    // band — must FAIL the joint, never latch a reference. The drive's
+    // hall trigger fires on an edge, and a sensor that never changes gives
+    // none: the approach finds nothing to latch and fails on the tick its
+    // seek budget runs out.
+    {
+        // A band as wide as J5's whole travel: in band wherever it goes.
+        let limits = &bundle.robot.joints[5].limits;
+        let half = limits.hard_max_rad - limits.hard_min_rad;
+        let mut h = SimHomingHarness::new(&bundle, &q0, 5, q0[5], half);
+        let budget = (jh.seek_timeout_s(&bundle.robot.joints[5]) / bundle.robot.robot.tick_dt_s)
+            .round() as u32;
+        h.sys.start(&mut h.bus);
+        let (mut ticks, mut approach_from) = (0u32, None);
+        let status = loop {
+            ticks += 1;
+            assert!(ticks <= 2 * budget, "the approach never gave up");
+            if h.sys.status().phase[5] == HomingPhase::Approach {
+                approach_from.get_or_insert(ticks);
+            }
+            match h.tick() {
+                SeqStatus::Running => {}
+                other => break other,
+            }
+        };
+        let seeking = ticks - approach_from.expect("the joint approached");
+        assert_eq!(
+            status,
+            SeqStatus::Failed,
+            "an always-triggered sensor must fail, never latch a reference"
+        );
+        assert_eq!(h.sys.statuses()[5], HomingJointStatus::Failed);
+        assert_eq!(h.sys.status().phase[5], HomingPhase::Approach);
+        assert_eq!(seeking, budget, "failed after {seeking} seeking ticks");
+    }
 }
 
 // ------------------------------------------------------------------
@@ -984,6 +1170,7 @@ fn hall_homing_latches_at_the_sensor_not_on_a_cached_trigger() {
 /// A bundle whose whole sequence is the firmware gripper calibration.
 fn gripper_cal_bundle() -> ConfigBundle {
     let mut bundle = common::bundle();
+    bundle.robot.homing.reference_check_nm.clear();
     bundle.robot.homing.sequence = vec![SequenceStep {
         pre_moves: vec![],
         home: Some(HomeGroup {
@@ -1100,114 +1287,266 @@ fn j5_ticks_per_rad(h: &SimHomingHarness, q: f64) -> f64 {
     f64::from(h.conv[5].motor_ticks(q + 0.1) - h.conv[5].motor_ticks(q)).abs() / 0.1
 }
 
-/// A hall band WIDER than one backoff's travel: a blind fixed backoff
-/// re-approaches from inside the band, and accepting that early trigger
-/// latches the reference at the boot pose instead of the band edge —
-/// every later move is off by up to the band half-width. The pre-clear
-/// must keep backing off until the sensor actually reads clear, then
-/// approach and latch the true edge.
+/// Every position phase must fail if a physical stop blocks its target,
+/// even when that axis has already acquired a valid home reference — and
+/// a clearance `move_to` that fails stops the sequence before the wrist
+/// group it was clearing for.
 #[test]
-fn a_boot_inside_a_wide_hall_band_still_references_the_band_edge() {
-    let bundle = single_joint_bundle(5);
-    let jh = &bundle.robot.homing.joints[5];
-    let eff = bundle
-        .effective_home_offset(5)
-        .unwrap_or(jh.home_offset_rad);
-    let n5 = usize::from(bundle.robot.joints[5].node_id);
-    let q0: [f64; MAX_JOINTS] =
-        std::array::from_fn(|i| bundle.robot.joints[i].sector_home_offset_rad);
-
-    let mut h = SimHomingHarness::new(&bundle, &q0, 5, q0[5], 0.02);
-    let backoff_travel_rad = jh.backoff_s * jh.speed_ticks_s / j5_ticks_per_rad(&h, q0[5]);
-    // Boot at the band CENTER of a band two backoffs deep per side.
-    let half = 2.0 * backoff_travel_rad;
-    h.bus.set_hall_trigger(5, q0[5], half);
-
-    h.sys.start(&mut h.bus);
-    assert_eq!(h.run(20_000), SeqStatus::Complete, "the wide band homes");
-
-    // The reference must put the SENSOR EDGE at the home offset: drive
-    // back out of the band, then measure where the trigger latches.
-    for _ in 0..2000 {
-        h.drive(
-            5,
-            JointCommand::velocity(trunc_to_wire(-jh.speed_ticks_s), 0),
+fn unreachable_positions_fail_in_every_homing_phase() {
+    let mut failures = Vec::new();
+    for phase in ["pre", "post", "global_post", "joint_post", "move_to"] {
+        let mut bundle = single_joint_bundle(0);
+        let target = bundle.robot.joints[0].limits.hard_max_rad + 1.0;
+        let position = par6_config::PreMove::Position {
+            joint: 0,
+            position_rad: target,
+            duration_s: 0.5,
+        };
+        let mut last_step = 0;
+        match phase {
+            "pre" => {
+                bundle.robot.homing.sequence.push(SequenceStep {
+                    pre_moves: vec![position],
+                    home: Some(HomeGroup {
+                        joints: vec![3, 5],
+                        gripper: None,
+                    }),
+                    move_to: vec![],
+                    post_moves: vec![],
+                });
+                last_step = 1;
+            }
+            "post" => bundle.robot.homing.sequence[0].post_moves.push(position),
+            "global_post" => {
+                bundle.robot.homing.post_moves.push(position);
+                last_step = 1;
+            }
+            "joint_post" => {
+                bundle.robot.homing.joints[0].post_home = Some(par6_config::PostHomeConfig {
+                    position_rad: target,
+                    speed_ticks_s: 30_000.0,
+                })
+            }
+            "move_to" => {
+                bundle.robot.homing.sequence = vec![
+                    SequenceStep {
+                        pre_moves: vec![],
+                        home: None,
+                        move_to: vec![MoveTo {
+                            joint: 0,
+                            position_rad: target,
+                            duration_s: 0.5,
+                        }],
+                        post_moves: vec![],
+                    },
+                    SequenceStep {
+                        pre_moves: vec![],
+                        home: Some(HomeGroup {
+                            joints: vec![3, 5],
+                            gripper: None,
+                        }),
+                        move_to: vec![],
+                        post_moves: vec![],
+                    },
+                ];
+            }
+            _ => unreachable!(),
+        }
+        let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&bundle);
+        let dt = core.tick_dt_s();
+        start_homing(&mut core, &mut handles, &tx);
+        let mut referenced = false;
+        let mut stopped = false;
+        for _ in 0..(25.0 / dt).round() as usize {
+            core.tick(dt, false);
+            let s = handles.snapshots.latest();
+            referenced |= s.homing.per_joint[0] == HomingJointStatus::Done;
+            if s.homing.per_joint[3] != HomingJointStatus::Idle
+                || s.homing.per_joint[5] != HomingJointStatus::Idle
+            {
+                failures.push(format!("{phase}: wrist homing started without clearance"));
+                break;
+            }
+            if !s.homing.active {
+                stopped = true;
+                if s.homed || s.homing.per_joint[0] != HomingJointStatus::Failed {
+                    failures.push(format!(
+                        "{phase}: unreachable target was accepted: {:?}",
+                        s.homing
+                    ));
+                }
+                if s.homing.sequence_step > last_step {
+                    failures.push(format!(
+                        "{phase}: advanced beyond the failed positioning step"
+                    ));
+                }
+                break;
+            }
+        }
+        assert_eq!(
+            referenced,
+            phase != "move_to",
+            "{phase}: positioning runs after referencing J0, except the clearance move"
         );
-        if matches!(h.state.nodes[n5].hall, Some(hall) if hall.trigger && !hall.edge) {
-            break;
+        if !stopped {
+            failures.push(format!(
+                "{phase}: did not stop after the positioning failure"
+            ));
         }
-        h.drive(5, JointCommand::hall(trunc_to_wire(-jh.speed_ticks_s), 2));
     }
-    let sensor = h.sensor_ticks(5, n5, jh.speed_ticks_s);
-    let sensor_rad = h.conv[5].joint_rad(sensor);
-    assert!(
-        (sensor_rad - eff).abs() < 0.02,
-        "the reference must be the band edge, not the boot pose: the \
-         sensor edge reads {sensor_rad:.4} rad, home offset is {eff:.4} \
-         (band half {half:.4})"
-    );
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// A sensor that never clears — shorted, or the magnet fell onto the
-/// band — must FAIL the joint. Accepting the second early trigger after
-/// one blind backoff latches a reference at an arbitrary pose instead.
+/// A valid slow positioning profile must reach its destination; the
+/// settling budget starts after the planned travel, not at its start.
 #[test]
-fn a_hall_sensor_that_never_clears_fails_instead_of_latching() {
-    let bundle = single_joint_bundle(5);
-    let q0: [f64; MAX_JOINTS] =
-        std::array::from_fn(|i| bundle.robot.joints[i].sector_home_offset_rad);
-    // Half-width of PI covers the whole circle: always in band.
-    let mut h = SimHomingHarness::new(&bundle, &q0, 5, q0[5], std::f64::consts::PI);
+fn homing_positioning_waits_for_profiles_longer_than_four_seconds() {
+    let mut failures = Vec::new();
+    for phase in ["pre", "post", "global_post", "joint_post"] {
+        let mut bundle = single_joint_bundle(0);
+        let target = bundle.robot.homing.joints[0].home_offset_rad - 0.3;
+        let position = par6_config::PreMove::Position {
+            joint: 0,
+            position_rad: target,
+            duration_s: 6.0,
+        };
+        match phase {
+            "pre" => bundle.robot.homing.sequence.push(SequenceStep {
+                pre_moves: vec![position],
+                home: None,
+                move_to: vec![],
+                post_moves: vec![],
+            }),
+            "post" => bundle.robot.homing.sequence[0].post_moves.push(position),
+            "global_post" => bundle.robot.homing.post_moves.push(position),
+            "joint_post" => {
+                bundle.robot.homing.joints[0].post_home = Some(par6_config::PostHomeConfig {
+                    position_rad: target,
+                    // Six-second Hermite profile across 0.3 rad.
+                    speed_ticks_s: JointConversion::from_config(&bundle.robot.joints[0])
+                        .motor_speed_ticks_s(1.5 * 0.3 / 6.0)
+                        .abs(),
+                })
+            }
+            _ => unreachable!(),
+        }
+        let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&bundle);
+        let dt = core.tick_dt_s();
+        start_homing(&mut core, &mut handles, &tx);
+        let mut stopped = false;
+        for _ in 0..(25.0 / dt).round() as usize {
+            core.tick(dt, false);
+            let s = handles.snapshots.latest();
+            if !s.homing.active {
+                stopped = true;
+                if s.homing.per_joint[0] != HomingJointStatus::Done
+                    || (s.q[0] - target).abs() > 0.01
+                {
+                    failures.push(format!(
+                        "{phase}: ended at {} instead of {target}, {:?}",
+                        s.q[0], s.homing
+                    ));
+                }
+                break;
+            }
+        }
+        assert!(stopped, "{phase}: positioning never finished");
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// J0 homed alone on the simulator from `j0_rad`, its motor loaded by
+/// whatever `load` asks for given the command J0 was last sent, its
+/// latest reported state, and whether a backoff has happened yet.
+fn home_j0(
+    bundle: &ConfigBundle,
+    j0_rad: f64,
+    mut load: impl FnMut(&JointCommand, &NodeState, bool) -> f64,
+) -> (SeqStatus, SimHomingHarness) {
+    let mut q0: [f64; MAX_JOINTS] = std::array::from_fn(|i| {
+        let j = &bundle.robot.joints[i];
+        JointConversion::from_config(j).joint_rad(j.sector_master_position_ticks)
+    });
+    q0[0] = j0_rad;
+    // J5's hall band is out of the way: only J0 homes.
+    let mut h = SimHomingHarness::new(bundle, &q0, 5, 3.0, 0.0);
     h.sys.start(&mut h.bus);
-    assert_eq!(
-        h.run(20_000),
-        SeqStatus::Failed,
-        "an always-triggered sensor must fail, never latch a reference"
-    );
-    assert_eq!(h.sys.statuses()[5], HomingJointStatus::Failed);
-}
-
-/// A live retune replaces the "normal" limits homing restores on its way
-/// out: after SET_PID_GAINS lowered J1's current ceiling, a home() must
-/// hand the drive back the tuned ceiling, not the config-time one the
-/// sequence snapshotted at construction.
-#[test]
-fn a_retune_before_homing_is_the_limit_homing_restores() {
-    let (mut core, mut handles, tx, _line) = sim_core();
-    let bundle = common::bundle();
-    let j0 = &bundle.robot.joints[0];
-    let tune = par6_bus::DriveTune {
-        gains: j0.gains,
-        ilim_ma: j0.ilim_ma * 0.75,
-        velocity_limit_ticks_s: j0.velocity_limit_ticks_s,
-        voltage_limit_mv: j0.voltage_limit_mv,
-    };
-    let dt = core.tick_dt_s();
-    for _ in 0..10 {
-        core.tick(dt, false);
-    }
-    tx.send(RtCommand::RetuneNode {
-        node: j0.node_id,
-        tune,
-    })
-    .unwrap();
-    core.tick(dt, false);
-    start_homing(&mut core, &mut handles, &tx);
-
-    let mut finished = false;
-    for _ in 0..30_000 {
-        core.tick(dt, false);
-        let s = handles.snapshots.latest();
-        if !s.homing.active && s.mode == Mode::Idle {
-            finished = true;
-            break;
+    let node = bundle.robot.joints[0].node_id;
+    let mut backed_off = false;
+    let budget = (120.0 / bundle.robot.robot.tick_dt_s) as u32;
+    for _ in 0..budget {
+        backed_off |= h.cmds[0].vel.is_some_and(|v| v < 0);
+        let ma = load(&h.cmds[0], &h.state.nodes[usize::from(node)], backed_off);
+        h.bus.set_joint_load_ma(node, ma);
+        match h.tick() {
+            SeqStatus::Running => {}
+            other => return (other, h),
         }
     }
-    assert!(finished, "sequence must finish within the tick budget");
-    let s = handles.snapshots.latest();
-    assert!(s.homed, "sequence success sets homed");
-    assert_eq!(
-        s.homing.effective_current_limit_ma[0], tune.ilim_ma as f32,
-        "J1 must come back to the tuned Ilim, not the config-time one"
+    panic!("J0's homing did not finish");
+}
+
+/// J0's approach side and a start `rad` short of its stop on that side.
+fn short_of_j0_stop(bundle: &ConfigBundle, rad: f64) -> f64 {
+    let j = &bundle.robot.joints[0];
+    let jh = &bundle.robot.homing.joints[0];
+    let toward = JointConversion::from_config(j).joint_speed_rad_s(jh.speed_ticks_s);
+    if toward > 0.0 {
+        j.limits.hard_max_rad - rad
+    } else {
+        j.limits.hard_min_rad + rad
+    }
+}
+
+/// A first pass that stalls against something other than the endstop
+/// disagrees with the second, which finds the real one: the joint fails
+/// instead of keeping either reference, and the drive gets its normal
+/// limits back.
+#[test]
+fn two_passes_that_disagree_fail_the_joint_and_restore_its_limits() {
+    let bundle = single_joint_bundle(0);
+    let jh = &bundle.robot.homing.joints[0];
+    // Held in place through pass 1 by a load that matches the homing
+    // current; free once the backoff starts, half a radian from the
+    // endstop.
+    let (outcome, mut h) = home_j0(
+        &bundle,
+        short_of_j0_stop(&bundle, 0.5),
+        |_, _, backed_off| {
+            if backed_off {
+                0.0
+            } else {
+                jh.current_ma
+            }
+        },
     );
+    assert_eq!(outcome, SeqStatus::Failed, "two disagreeing passes fail");
+    assert_eq!(h.sys.statuses()[0], HomingJointStatus::Failed);
+    assert_eq!(
+        h.sys.status().phase[0],
+        HomingPhase::Settle,
+        "it fails comparing the passes, not on the way to the stop"
+    );
+    assert!(!h.sys.active());
+
+    let node = bundle.robot.joints[0].node_id;
+    h.bus.queue_poll_override(
+        PollAction::ConfigRead {
+            node,
+            kind: ConfigKind::Limits,
+        },
+        1,
+    );
+    h.drain();
+    h.bus.poll_step().expect("poll");
+    for _ in 0..3 {
+        h.drain();
+    }
+    match h.state.nodes[usize::from(node)].readback(ConfigKind::Limits) {
+        Some(Readback::Limits { current_ma, .. }) => assert_eq!(
+            current_ma, bundle.robot.joints[0].ilim_ma as f32,
+            "the drive is back on its normal current limit"
+        ),
+        other => panic!("no limits read back: {other:?}"),
+    }
 }

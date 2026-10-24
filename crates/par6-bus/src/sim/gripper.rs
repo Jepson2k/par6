@@ -6,7 +6,7 @@
 //! calibration sequence and object-detection codes from jaw travel vs
 //! the commanded position.
 
-use par6_config::GripperConfig;
+use par6_config::ToolConfig;
 
 use crate::spectral::codec::CommandId;
 use crate::types::{FirmwareGripperCommand, NodeId, ObjectDetection};
@@ -91,7 +91,7 @@ pub(crate) struct GripperSim {
 }
 
 impl GripperSim {
-    pub fn new(dt: f64, node: NodeId, cfg: &GripperConfig) -> Self {
+    pub fn new(dt: f64, node: NodeId, cfg: &ToolConfig) -> Self {
         let d = cfg
             .driver
             .as_ref()
@@ -104,17 +104,21 @@ impl GripperSim {
         let accel_max = d.velocity_limit_ticks_s * 20.0;
         let cal_ticks = (CALIBRATION_S / dt).round() as u64;
         let substep = timestep_for(dt);
+        // No datasheet constants for the gripper's motor, so its driver
+        // keeps the instant-current behaviour.
+        let mut driver = VirtualDriver::new(
+            dt,
+            node,
+            d.velocity_limit_ticks_s,
+            d.ilim_ma,
+            d.kt_nm_a,
+            None,
+        );
+        // The drive says which tool it is built into, as a provisioned
+        // gripper drive does over cmd 36.
+        driver.device.tool_id = cfg.can_tool_id.unwrap_or(0);
         Self {
-            // No datasheet constants for the gripper's motor, so its driver
-            // keeps the instant-current behaviour.
-            driver: VirtualDriver::new(
-                dt,
-                node,
-                d.velocity_limit_ticks_s,
-                d.ilim_ma,
-                d.kt_nm_a,
-                None,
-            ),
+            driver,
             joint: JawJoint::new(
                 substep,
                 stroke_ticks / 2.0,

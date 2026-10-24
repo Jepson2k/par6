@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from waldoctl import Robot as WaldoRobot
+
     from par6.robot import Robot
 
 
@@ -24,5 +26,11 @@ class RobotOwner:
         return self._robot
 
     @robot.setter
-    def robot(self, value: Robot | None) -> None:
+    def robot(self, value: WaldoRobot | None) -> None:
+        # The interface takes any backend's robot; this client drives only
+        # its own.
+        if value is not None:
+            from par6.robot import Robot
+
+            assert isinstance(value, Robot)
         self._robot = value

@@ -820,8 +820,10 @@ dependencies = [
  "log",
  "par6-proto",
  "serde",
+ "sha2",
  "thiserror 2.0.20",
  "toml",
+ "toml_edit",
 ]
 
 [[package]]
@@ -844,7 +846,6 @@ version = "0.8.0"
 dependencies = [
  "glam",
  "par6-config",
- "par6-rt",
  "rsruckig",
  "thiserror 2.0.20",
 ]
@@ -888,6 +889,7 @@ dependencies = [
  "par6-bus",
  "par6-config",
  "par6-kin",
+ "par6-motion",
  "thiserror 2.0.20",
  "thread-priority",
 ]
@@ -926,6 +928,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.20",
  "tokio",
+ "toml",
 ]
 
 [[package]]

@@ -162,6 +162,8 @@ pub struct BusNode {
     pub sw_ver: u8,
     /// Serial number (0 = not reported).
     pub serial: i32,
+    /// The tool the drive says it is built into (0 = none reported).
+    pub tool_id: u8,
 }
 
 /// A typed query result — the nested `[query_tag, ...fields]` payload of a
@@ -376,8 +378,8 @@ pub enum QueryResult {
         /// Context identifier required by attached geometry declarations.
         attachment_epoch: u64,
     },
-    /// CONFIG_BUNDLE result: the loaded config files verbatim, so a
-    /// client can run previews from exactly the daemon's numbers.
+    /// CONFIG_BUNDLE result: the loaded config files, so a client can run
+    /// previews from exactly the daemon's numbers.
     ConfigBundle {
         /// Config file path on the daemon host.
         path: String,
@@ -385,10 +387,12 @@ pub enum QueryResult {
         fingerprint: String,
         /// Robot TOML file name (base name, e.g. `PAR6.toml`).
         robot_filename: String,
-        /// Robot TOML content.
+        /// Robot TOML as the runtime runs it: the file, with the
+        /// installation's local overlay merged in when there is one.
         robot_toml: String,
-        /// Gripper TOMLs as `(file name, content)`, sorted by file name.
-        grippers: Vec<(String, String)>,
+        /// Tool TOMLs as `(file name, content)`, sorted by file name, each
+        /// as the runtime runs it: the overlay's entry for it merged in.
+        tools: Vec<(String, String)>,
     },
 }
 
@@ -717,7 +721,7 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             fingerprint,
             robot_filename,
             robot_toml,
-            grippers,
+            tools,
         } => {
             w_array(buf, 6);
             w_uint(buf, u64::from(tag));
@@ -725,8 +729,8 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_str(buf, fingerprint);
             w_str(buf, robot_filename);
             w_str(buf, robot_toml);
-            w_array(buf, grippers.len());
-            for (name, content) in grippers {
+            w_array(buf, tools.len());
+            for (name, content) in tools {
                 w_array(buf, 2);
                 w_str(buf, name);
                 w_str(buf, content);
@@ -764,7 +768,7 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_uint(buf, u64::from(tag));
             w_array(buf, nodes.len());
             for n in nodes {
-                w_array(buf, 7);
+                w_array(buf, 8);
                 w_uint(buf, u64::from(n.node));
                 w_bool(buf, n.configured);
                 w_bool(buf, n.present);
@@ -772,6 +776,7 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
                 w_uint(buf, u64::from(n.hw_ver));
                 w_uint(buf, u64::from(n.sw_ver));
                 w_int(buf, i64::from(n.serial));
+                w_uint(buf, u64::from(n.tool_id));
             }
         }
         Q::Shapes {
@@ -932,7 +937,7 @@ fn r_bus_nodes(r: &mut Reader<'_>) -> Result<Vec<BusNode>, DecodeError> {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let arity = r.array_len()?;
-        expect_arity("bus scan node row", arity, 7)?;
+        expect_arity("bus scan node row", arity, 8)?;
         out.push(BusNode {
             node: small(r.uint()?, "bus_scan.node")?,
             configured: r.bool()?,
@@ -944,6 +949,7 @@ fn r_bus_nodes(r: &mut Reader<'_>) -> Result<Vec<BusNode>, DecodeError> {
                 what: "bus_scan.serial",
                 why: "must fit i32".into(),
             })?,
+            tool_id: small(r.uint()?, "bus_scan.tool_id")?,
         });
     }
     Ok(out)
@@ -1253,22 +1259,22 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             // a corrupt packet, not a big deployment.
             if gn > 64 {
                 return Err(DecodeError::Arity {
-                    what: "config_bundle.grippers",
+                    what: "config_bundle.tools",
                     expected: 64,
                     got: gn,
                 });
             }
-            let mut grippers = Vec::with_capacity(gn);
+            let mut tools = Vec::with_capacity(gn);
             for _ in 0..gn {
-                expect_arity("config_bundle.grippers[]", r.array_len()?, 2)?;
-                grippers.push((r.str()?.to_owned(), r.str()?.to_owned()));
+                expect_arity("config_bundle.tools[]", r.array_len()?, 2)?;
+                tools.push((r.str()?.to_owned(), r.str()?.to_owned()));
             }
             QueryResult::ConfigBundle {
                 path,
                 fingerprint,
                 robot_filename,
                 robot_toml,
-                grippers,
+                tools,
             }
         }
         T::Payload => {

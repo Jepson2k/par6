@@ -41,9 +41,12 @@ fn main() {
                 std::process::exit(1);
             }
         };
-        match par6_config::ConfigBundle::load(&path) {
-            Ok(_) => {
-                println!("config OK: {}", path.display());
+        match par6d::options::load_config(&path, opts.local_config.as_deref(), None) {
+            Ok((_, local)) => {
+                match local {
+                    Some(local) => println!("config OK: {} + {}", path.display(), local.display()),
+                    None => println!("config OK: {}", path.display()),
+                }
                 return;
             }
             Err(e) => {
@@ -103,7 +106,10 @@ fn main() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    daemon.shutdown();
+    if let Err(e) = daemon.shutdown() {
+        eprintln!("par6d: {e}");
+        std::process::exit(1);
+    }
 }
 
 /// Whether `pid` is still this process's parent.

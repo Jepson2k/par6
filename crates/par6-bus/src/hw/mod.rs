@@ -39,15 +39,19 @@ mod xstats;
 use std::io::ErrorKind;
 use std::time::{Duration, Instant, SystemTime};
 
-use par6_config::{GripperConfig, KtSource, RobotConfig};
+use par6_config::{KtSource, RobotConfig, ToolConfig};
 use socketcan::{CanSocket, EmbeddedFrame, Frame as _, Socket, SocketOptions};
 
 use crate::bus::DriverBus;
 use crate::spectral::codec::{
-    decode_frame, encode_clear_error, encode_gripper_command, encode_joint_command, encode_limits,
-    encode_poll, encode_save_config, encode_set_can_id, unpack_can_id, CanFrame, CommandId,
-    DecodedFrame, Payload, CAN_MAX_DATA,
+    decode_frame, encode_clear_error, encode_gripper_command, encode_gripper_id,
+    encode_joint_command, encode_limits, encode_poll, encode_save_config, encode_set_can_id,
+    unpack_can_id, CanFrame, CommandId, DecodedFrame, Payload, CAN_MAX_DATA,
 };
+use crate::spectral::codec::{
+    encode_capture, encode_capture_read, encode_capture_stream, encode_readback_request,
+};
+use crate::types::CaptureBuffer;
 use crate::types::{
     BusError, BusState, DriveTune, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId,
     PollAction, PollKind, MAX_NODES,
@@ -65,6 +69,11 @@ pub use link::OpenError;
 /// application plane.
 const SILENT_RX_CAP: usize = 64;
 
+/// Combined telemetry polls a drive may leave unanswered in a row before it
+/// is polled the vendor way: past a dropped frame or two, short of a fault
+/// going unseen for long.
+const TELEMETRY_FALLBACK_POLLS: u8 = 3;
+
 /// SocketCAN [`DriverBus`] backend. Build with [`SocketCanBus::open`],
 /// then [`DriverBus::boot_configure`] before any per-tick call.
 #[derive(Debug)]
@@ -72,10 +81,13 @@ pub struct SocketCanBus {
     sock: CanSocket,
     monitor: link::LinkMonitor,
     interface: String,
+    /// Link parameters for a boot-time cycle (`recover_link`).
+    link_cfg: par6_config::BusConfig,
 
     // Node map, installed by boot_configure.
     joint_nodes: Vec<NodeId>,
     gripper_node: NodeId,
+    captures: Vec<CaptureBuffer>,
     timing_dummy_node: NodeId,
     node_configs: Vec<NodeConfig>,
     /// Poll targets: the joint nodes, then the gripper slot.
@@ -97,6 +109,8 @@ pub struct SocketCanBus {
     // Per-tick bookkeeping.
     fresh: FreshnessClock,
     poll: PollScheduler,
+    /// Combined telemetry polls each node has left unanswered in a row.
+    telemetry_unanswered: [u8; MAX_NODES],
     rx_cap: usize,
     config_pace: Duration,
     silent: bool,
@@ -139,11 +153,13 @@ impl SocketCanBus {
             sock,
             monitor: link::LinkMonitor::spawn(&cfg.interface),
             interface: cfg.interface.clone(),
+            link_cfg: cfg.clone(),
             joint_nodes: Vec::new(),
             gripper_node: 0,
             timing_dummy_node: 0,
             node_configs: Vec::new(),
             poll_nodes: Vec::new(),
+            captures: (0..MAX_NODES).map(|_| CaptureBuffer::new()).collect(),
             boot_plan: Vec::new(),
             boot_state: BusState::new(),
             boot_state_pending: false,
@@ -152,6 +168,7 @@ impl SocketCanBus {
             tick_start: SystemTime::now(),
             fresh: FreshnessClock::default(),
             poll: PollScheduler::default(),
+            telemetry_unanswered: [0; MAX_NODES],
             rx_cap: 32,
             config_pace: Duration::from_micros(500),
             silent: false,
@@ -268,7 +285,23 @@ impl SocketCanBus {
     fn apply_rx(&mut self, frame: &CanFrame, state: &mut BusState) {
         let node = match decode_frame(frame) {
             Ok(d) => {
-                apply_payload(&d, state);
+                state.nodes[usize::from(d.node)].live_error_bit = d.err_bit;
+                if matches!(d.payload, Payload::Telemetry { .. }) {
+                    self.telemetry_unanswered[usize::from(d.node)] = 0;
+                }
+                match d.payload {
+                    Payload::Capture {
+                        channel,
+                        chunk,
+                        samples,
+                    } => self.captures[usize::from(d.node)].store(channel, chunk, samples),
+                    Payload::CaptureStatus {
+                        recorded,
+                        wanted,
+                        divisor,
+                    } => self.captures[usize::from(d.node)].status(recorded, wanted, divisor),
+                    _ => apply_payload(&d, state),
+                }
                 d.node
             }
             Err(e) => {
@@ -283,6 +316,13 @@ impl SocketCanBus {
         self.connected |= 1 << n;
         if self.fresh.mark(node, self.tick, booted) {
             state.reconnected_mask |= 1 << n;
+            // A drive back from a silence may be back on other firmware
+            // (a flash): it is asked the combined way again, and falls back
+            // below if it does not answer that.
+            if let Some(target) = self.poll_nodes.iter().position(|p| *p == node) {
+                self.poll.set_legacy(target, false);
+                self.telemetry_unanswered[n] = 0;
+            }
         }
         let (_, raw_cmd, _) = unpack_can_id(frame.id);
         if raw_cmd == CommandId::RespondGripperData.raw() {
@@ -305,12 +345,17 @@ impl SocketCanBus {
         for n in 0..MAX_NODES {
             let b = &self.boot_state.nodes[n];
             let s = &mut state.nodes[n];
-            s.position_ticks = b.position_ticks.or(s.position_ticks);
+            if let Some(position) = b.position_ticks {
+                s.record_position(position);
+            }
             s.speed_ticks_s = b.speed_ticks_s.or(s.speed_ticks_s);
             s.current_ma = b.current_ma.or(s.current_ma);
             s.temperature_c = b.temperature_c.or(s.temperature_c);
             s.voltage_mv = b.voltage_mv.or(s.voltage_mv);
-            s.error_flags = b.error_flags.or(s.error_flags);
+            // Not the flags: the telemetry probe answered before the boot
+            // clear-error, so a startup watchdog fault would be published
+            // as current. What the probe learned is who answers it.
+            s.combined_telemetry |= b.combined_telemetry;
             s.kt_nm_a = b.kt_nm_a.or(s.kt_nm_a);
             s.device_info = b.device_info.or(s.device_info);
         }
@@ -333,10 +378,12 @@ impl SocketCanBus {
                 Ok(Some((frame, _))) => {
                     let (node, ..) = unpack_can_id(frame.id);
                     self.connected |= 1 << u16::from(node);
-                    // Boot replies precede the first tick; they enter the
-                    // freshness clock at tick 0 so a node that answers
-                    // boot and then dies latches like any other.
-                    self.fresh.mark(node, 0, true);
+                    // Boot replies enter the freshness clock at the tick
+                    // the bring-up runs on (0 at boot, later after a link
+                    // cycle), so a node that answers it and then dies
+                    // latches like any other, and one that answers a late
+                    // bring-up is not already old.
+                    self.fresh.mark(node, self.tick, true);
                     if let Ok(d) = decode_frame(&frame) {
                         apply_payload(&d, &mut self.boot_state);
                         self.boot_state_pending = true;
@@ -386,6 +433,70 @@ impl SocketCanBus {
                 ),
             }
         }
+    }
+
+    /// Ask every poll target for the combined telemetry reply (cmd 37)
+    /// once, on the kt fetch's timing, and poll the ones that do not
+    /// answer the vendor way from here on. A drive on the vendor
+    /// firmware stays fully served, three slots a cycle instead of one.
+    fn probe_telemetry(&mut self, robot: &RobotConfig) {
+        self.probe_targets(robot, PollKind::Telemetry, |bus, node, target| {
+            let legacy = !bus.boot_state.nodes[usize::from(node)].combined_telemetry;
+            bus.poll.set_legacy(target, legacy);
+            if legacy {
+                log::info!(
+                    "node {node}: no combined telemetry reply (vendor firmware); polling \
+                     temperature, voltage and errors separately"
+                );
+            }
+        });
+    }
+
+    /// One request of `kind` to every poll target, retried on the kt
+    /// fetch's timing until the target answers it, then `settle` with
+    /// what the boot state holds.
+    fn probe_targets(
+        &mut self,
+        robot: &RobotConfig,
+        kind: PollKind,
+        mut settle: impl FnMut(&mut Self, NodeId, usize),
+    ) {
+        let f = robot.bus.kt_fetch;
+        let timeout = Duration::from_secs_f64(f.timeout_s);
+        let nodes = self.poll_nodes.clone();
+        for (target, node) in nodes.iter().enumerate() {
+            for _retry in 0..f.retries {
+                if let Err(e) = self.send(&encode_poll(*node, kind)) {
+                    log::warn!("{kind:?} probe: node {node}: {e}");
+                    break;
+                }
+                self.collect_for(timeout);
+                let n = &self.boot_state.nodes[usize::from(*node)];
+                let answered = match kind {
+                    PollKind::Telemetry => n.combined_telemetry,
+                    PollKind::DeviceInfo => n.device_info.is_some(),
+                    _ => true,
+                };
+                if answered {
+                    break;
+                }
+            }
+            settle(self, *node, target);
+        }
+    }
+
+    /// What the drive at `node` says it is built into, before the bus is
+    /// configured: its device info, requested on the kt fetch's timing.
+    /// `None` when nothing answers, or the drive reports no tool id (a
+    /// vendor firmware, or an unprovisioned one).
+    pub fn probe_tool_id(&mut self, node: NodeId, robot: &RobotConfig) -> Option<u8> {
+        self.poll_nodes = vec![node];
+        self.probe_targets(robot, PollKind::DeviceInfo, |_, _, _| {});
+        self.poll_nodes.clear();
+        self.boot_state.nodes[usize::from(node)]
+            .device_info
+            .map(|d| d.tool_id)
+            .filter(|&id| id != 0)
     }
 
     /// RTR-ping every node id, `rounds` times, and record who answers.
@@ -447,7 +558,7 @@ fn apply_payload(decoded: &DecodedFrame, state: &mut BusState) {
             speed_ticks_s,
             current_ma,
         } => {
-            state.nodes[n].position_ticks = Some(position_ticks);
+            state.nodes[n].record_position(position_ticks);
             state.nodes[n].speed_ticks_s = Some(speed_ticks_s);
             state.nodes[n].current_ma = Some(current_ma);
         }
@@ -455,20 +566,36 @@ fn apply_payload(decoded: &DecodedFrame, state: &mut BusState) {
             position_ticks,
             speed_ticks_s,
         } => {
-            state.nodes[n].position_ticks = Some(position_ticks);
+            state.nodes[n].record_position(position_ticks);
             state.nodes[n].speed_ticks_s = Some(speed_ticks_s);
         }
         Payload::Hall {
             position_ticks,
             state: hall,
         } => {
-            state.nodes[n].position_ticks = Some(position_ticks);
+            state.nodes[n].record_position(position_ticks);
             state.nodes[n].hall = Some(hall);
         }
         Payload::Temperature { deg_c } => state.nodes[n].temperature_c = Some(deg_c),
         Payload::Voltage { mv } => state.nodes[n].voltage_mv = Some(mv),
         Payload::IqCurrent { ma } => state.nodes[n].current_ma = Some(ma),
         Payload::Errors(flags) => state.nodes[n].error_flags = Some(flags),
+        Payload::Telemetry {
+            deg_c,
+            mv,
+            flags,
+            ma,
+        } => {
+            let s = &mut state.nodes[n];
+            s.temperature_c = Some(deg_c);
+            s.voltage_mv = Some(mv);
+            s.error_flags = Some(flags);
+            s.current_ma = Some(ma);
+            s.combined_telemetry = true;
+        }
+        Payload::Readback(r) => state.nodes[n].readback[r.kind().index()] = Some(r),
+        // Kept by the backend, not the shared state: see `SocketCanBus::captures`.
+        Payload::Capture { .. } | Payload::CaptureStatus { .. } => {}
         Payload::DeviceInfo(info) => state.nodes[n].device_info = Some(info),
         Payload::Kt { nm_per_a } => state.nodes[n].kt_nm_a = Some(nm_per_a),
         Payload::Gripper(reply) => {
@@ -481,6 +608,18 @@ fn apply_payload(decoded: &DecodedFrame, state: &mut BusState) {
 }
 
 impl DriverBus for SocketCanBus {
+    fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>) {
+        let node = self.gripper_node;
+        self.fresh.refit_gripper(node, self.tick);
+        // The configuration stored for the gripper node is the tool's drive:
+        // what a retune starts from and a reconnect resends, or none.
+        self.node_configs.retain(|c| c.node != node);
+        if let Some(d) = tool.and_then(|g| g.driver.as_ref()) {
+            self.node_configs
+                .push(NodeConfig::gripper(node, d, robot.bus.watchdog_action));
+        }
+    }
+
     fn begin_tick(&mut self, tick: u64) {
         debug_assert!(tick >= self.tick, "tick must be non-decreasing");
         self.tick = tick;
@@ -594,8 +733,42 @@ impl DriverBus for SocketCanBus {
             PollStep::Override(PollAction::ResendConfig { node }) => {
                 self.resend_node_config(node, 1)
             }
+            PollStep::Override(PollAction::ConfigFrame { node, kind }) => {
+                let c = self.node_config(node).ok_or(BusError::InvalidCommand {
+                    reason: "configuration poll for a node with no stored configuration",
+                })?;
+                self.send(&config_frame(kind, &c))
+            }
+            PollStep::Override(PollAction::ConfigRead { node, kind }) => {
+                let f = encode_readback_request(node, kind);
+                self.send(&f)
+            }
+            PollStep::Override(PollAction::CaptureRead {
+                node,
+                channel,
+                chunk,
+            }) => {
+                let f = encode_capture_read(node, channel, chunk);
+                self.send(&f)
+            }
             PollStep::Poll { target, kind } => {
                 let node = self.poll_nodes[target];
+                if kind == PollKind::Telemetry {
+                    // A drive that stopped answering the combined poll —
+                    // reflashed to vendor firmware while the runtime ran —
+                    // still answers the vendor's three, and its faults
+                    // only reach the error flags through them.
+                    let missed = &mut self.telemetry_unanswered[usize::from(node)];
+                    *missed = missed.saturating_add(1);
+                    if *missed > TELEMETRY_FALLBACK_POLLS {
+                        *missed = 0;
+                        self.poll.set_legacy(target, true);
+                        log::warn!(
+                            "node {node}: no combined telemetry reply; polling temperature, \
+                             voltage and errors separately"
+                        );
+                    }
+                }
                 let f = encode_poll(node, kind);
                 self.send(&f)
             }
@@ -609,7 +782,7 @@ impl DriverBus for SocketCanBus {
     fn boot_configure(
         &mut self,
         robot: &RobotConfig,
-        gripper: Option<&GripperConfig>,
+        gripper: Option<&ToolConfig>,
         repeats: u8,
     ) -> Result<(), BusError> {
         self.dt = robot.robot.tick_dt_s;
@@ -670,6 +843,7 @@ impl DriverBus for SocketCanBus {
         if robot.robot.kt_source == KtSource::Auto {
             self.fetch_kt(robot);
         }
+        self.probe_telemetry(robot);
         self.bus_scan(robot);
         self.seed_encoders(Duration::from_secs_f64(robot.bus.scan.wait_s));
 
@@ -699,6 +873,9 @@ impl DriverBus for SocketCanBus {
                 let f = config_frame(kind, &c);
                 self.send(&f)?;
             }
+            for f in c.extra_frames() {
+                self.send(&f)?;
+            }
         }
         Ok(())
     }
@@ -722,6 +899,59 @@ impl DriverBus for SocketCanBus {
     fn save_config(&mut self, node: NodeId) -> Result<(), BusError> {
         self.ensure_ready()?;
         self.send(&encode_save_config(node))
+    }
+
+    fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        self.send(&encode_gripper_id(node, tool_id))
+    }
+
+    fn set_ripple(
+        &mut self,
+        node: NodeId,
+        ripple: &[par6_config::RippleHarmonic],
+    ) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        if ripple.len() > usize::from(crate::spectral::codec::RIPPLE_SLOTS) {
+            return Err(BusError::InvalidCommand {
+                reason: "more ripple harmonics than a drive has slots",
+            });
+        }
+        let slots = crate::node_config::ripple_slots(ripple);
+        if let Some(c) = self.node_configs.iter_mut().find(|c| c.node == node) {
+            c.ripple = slots;
+        }
+        for (slot, (h, a, b)) in slots.iter().enumerate() {
+            self.send(&crate::spectral::codec::encode_ripple(
+                node, slot as u8, *h, *a, *b,
+            ))?;
+        }
+        Ok(())
+    }
+
+    fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        if let Some(c) = self.node_configs.iter_mut().find(|c| c.node == node) {
+            c.velocity_window = Some(window);
+        }
+        self.send(&crate::spectral::codec::encode_velocity_window(
+            node, window,
+        ))
+    }
+
+    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        self.send(&encode_capture_stream(node))
+    }
+
+    fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        self.captures[usize::from(node)].clear();
+        self.send(&encode_capture(node, divisor, wanted))
+    }
+
+    fn capture(&self, node: NodeId) -> Option<&CaptureBuffer> {
+        self.captures.get(usize::from(node))
     }
 
     fn send_limits(
@@ -777,6 +1007,24 @@ impl DriverBus for SocketCanBus {
             tx_errors: self.tx_errors,
             rx_frames: self.rx_frames,
             ..self.monitor.health()
+        }
+    }
+
+    /// The raw socket stays bound across the down/up; frames queued
+    /// while the link is down are dropped by the kernel, which is what
+    /// a boot scan that found nobody has to lose anyway.
+    fn recover_link(&mut self) -> bool {
+        let state = self.monitor.health().state;
+        log::warn!(
+            "CAN '{}': no node answered the boot scan (link {state:?}); cycling the interface once",
+            self.interface
+        );
+        match link::cycle(&self.link_cfg) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("CAN '{}': interface cycle failed: {e}", self.interface);
+                false
+            }
         }
     }
 }

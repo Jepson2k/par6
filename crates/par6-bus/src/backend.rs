@@ -2,11 +2,12 @@
 //! instantiates, so `--sim` and hardware share a single monomorphized RT
 //! core instead of duplicating the whole startup path per backend.
 
-use par6_config::{GripperConfig, RobotConfig};
+use par6_config::{RobotConfig, ToolConfig};
 
 use crate::bus::DriverBus;
 use crate::hw::SocketCanBus;
 use crate::sim::SimBus;
+use crate::types::CaptureBuffer;
 use crate::types::{
     BusError, BusState, DriveTune, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId,
     PollAction,
@@ -90,7 +91,7 @@ impl DriverBus for RuntimeBus {
     fn boot_configure(
         &mut self,
         robot: &RobotConfig,
-        gripper: Option<&GripperConfig>,
+        gripper: Option<&ToolConfig>,
         repeats: u8,
     ) -> Result<(), BusError> {
         dispatch!(self, boot_configure(robot, gripper, repeats))
@@ -110,6 +111,37 @@ impl DriverBus for RuntimeBus {
 
     fn save_config(&mut self, node: NodeId) -> Result<(), BusError> {
         dispatch!(self, save_config(node))
+    }
+
+    fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError> {
+        dispatch!(self, set_tool_id(node, tool_id))
+    }
+
+    fn set_ripple(
+        &mut self,
+        node: NodeId,
+        ripple: &[par6_config::RippleHarmonic],
+    ) -> Result<(), BusError> {
+        dispatch!(self, set_ripple(node, ripple))
+    }
+
+    fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError> {
+        dispatch!(self, set_velocity_window(node, window))
+    }
+
+    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
+        dispatch!(self, capture_stream(node))
+    }
+
+    fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {
+        dispatch!(self, capture_start(node, divisor, wanted))
+    }
+
+    fn capture(&self, node: NodeId) -> Option<&CaptureBuffer> {
+        match self {
+            Self::SocketCan(b) => b.capture(node),
+            Self::Sim(b) => b.capture(node),
+        }
     }
 
     fn send_limits(
@@ -155,5 +187,17 @@ impl DriverBus for RuntimeBus {
 
     fn link_health(&self) -> LinkHealth {
         dispatch!(self, link_health())
+    }
+
+    fn recover_link(&mut self) -> bool {
+        dispatch!(self, recover_link())
+    }
+
+    fn simulated(&self) -> bool {
+        self.is_sim()
+    }
+
+    fn fit_tool(&mut self, robot: &RobotConfig, tool: Option<&ToolConfig>) {
+        dispatch!(self, fit_tool(robot, tool))
     }
 }

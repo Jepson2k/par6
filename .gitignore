@@ -11,3 +11,6 @@ python/par6/*.so
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# One installation's own values, layered over the shipped config: never shipped.
+python/par6/_data/config/local.toml

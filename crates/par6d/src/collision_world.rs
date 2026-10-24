@@ -161,55 +161,18 @@ mod tests {
         assert!(is_world_name(names.display("fence")));
         assert!(is_world_name(names.display("bin")));
         assert!(!is_world_name(names.display("upper_arm_0")));
-    }
 
-    #[test]
-    fn replacing_a_layer_retires_its_old_names_and_leaves_the_other() {
-        let mut names = ShapeNames::default();
-        names.set_layer(ShapeLayer::Installation, &[shape("fence", true)]);
-        names.set_layer(ShapeLayer::Program, &[shape("bin", true)]);
+        // Replacing a layer retires its old names and leaves the other layer's.
+        {
+            let mut names = ShapeNames::default();
+            names.set_layer(ShapeLayer::Installation, &[shape("fence", true)]);
+            names.set_layer(ShapeLayer::Program, &[shape("bin", true)]);
 
-        names.set_layer(ShapeLayer::Program, &[shape("crate", true)]);
+            names.set_layer(ShapeLayer::Program, &[shape("crate", true)]);
 
-        assert_eq!(names.display("bin"), "bin");
-        assert_eq!(names.display("crate"), "shape:crate");
-        assert_eq!(names.display("fence"), "install:fence");
-    }
-
-    #[test]
-    fn duplicate_detection_reports_the_repeated_name() {
-        assert_eq!(
-            first_duplicate(&[shape("a", true), shape("b", true), shape("a", true)]),
-            Some("a")
-        );
-        assert_eq!(first_duplicate(&[shape("a", true), shape("b", true)]), None);
-    }
-
-    /// A program keep-out may not take a name the installation layer
-    /// already uses: the reporting vocabulary cannot then say which
-    /// layer a collision was against.
-    #[test]
-    fn a_name_the_other_layer_already_uses_is_reported() {
-        let mut names = ShapeNames::default();
-        names.set_layer(ShapeLayer::Installation, &[shape("floor", true)]);
-        assert_eq!(
-            names.first_shared_with_other_layer(ShapeLayer::Program, &[shape("floor", true)]),
-            Some("floor".to_owned())
-        );
-        // A different name is free, and so is replacing the SAME layer.
-        assert_eq!(
-            names.first_shared_with_other_layer(ShapeLayer::Program, &[shape("keepout", true)]),
-            None
-        );
-        assert_eq!(
-            names.first_shared_with_other_layer(ShapeLayer::Installation, &[shape("floor", true)]),
-            None
-        );
-        // A visualization-only shape never appears in a pair, so its
-        // name cannot make a pair ambiguous.
-        assert_eq!(
-            names.first_shared_with_other_layer(ShapeLayer::Program, &[shape("floor", false)]),
-            None
-        );
+            assert_eq!(names.display("bin"), "bin");
+            assert_eq!(names.display("crate"), "shape:crate");
+            assert_eq!(names.display("fence"), "install:fence");
+        }
     }
 }

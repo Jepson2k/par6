@@ -117,9 +117,10 @@ pub struct Collision {
     reporting_names: Vec<String>,
     raw_clearances: Vec<sys::ffi::par6_clearance>,
 
-    // Applied layers, kept so a layer replacement can rebuild the name
-    // table without re-reading the shim's synthetic world-geometry names.
-    layer_names: [Vec<String>; 2],
+    // Applied layers' colliding shapes, kept so a layer replacement can
+    // rebuild the name table without re-reading the shim's synthetic
+    // world-geometry names, and so a rebuilt world can adopt them.
+    layers: [Vec<Shape>; 2],
     robot_geoms: usize,
 }
 
@@ -200,7 +201,7 @@ impl Collision {
             names: Vec::new(),
             reporting_names: Vec::new(),
             raw_clearances: Vec::new(),
-            layer_names: [Vec::new(), Vec::new()],
+            layers: [Vec::new(), Vec::new()],
             robot_geoms,
         };
         this.rebuild_names()?;
@@ -288,14 +289,22 @@ impl Collision {
             Layer::Installation => 0,
             Layer::Program => 1,
         };
-        self.layer_names[slot] = shapes
-            .iter()
-            .filter(|s| s.collision)
-            .map(|s| s.name.clone())
-            .collect();
+        self.layers[slot] = shapes.iter().filter(|s| s.collision).cloned().collect();
         self.rebuild_names()?;
         self.scene_epoch += 1;
         Ok(self.scene_epoch)
+    }
+
+    /// Apply `from`'s keep-out layers and carry on its epoch: a world
+    /// rebuilt for other robot geometry (a tool change) enforces the same
+    /// keep-outs, and a readback never sees the epoch run backwards.
+    ///
+    /// Allocates; call it when the world changes, not per waypoint.
+    pub fn adopt_layers(&mut self, from: &Collision) -> Result<(), KinError> {
+        self.set_layer(Layer::Installation, &from.layers[0])?;
+        self.set_layer(Layer::Program, &from.layers[1])?;
+        self.scene_epoch = from.scene_epoch;
+        Ok(())
     }
 
     /// Test arm configuration `q` against the applied world.
@@ -433,8 +442,8 @@ impl Collision {
             self.names.push(self.model.geom_name(idx)?);
         }
         for slot in 0..2 {
-            for name in &self.layer_names[slot] {
-                self.names.push(name.clone());
+            for shape in &self.layers[slot] {
+                self.names.push(shape.name.clone());
             }
         }
         // The shim's documented layout is [robot…, installation…, program…];

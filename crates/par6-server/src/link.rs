@@ -120,7 +120,9 @@ fn bind_send_socket(cfg: &ServerConfig, unicast: bool) -> std::io::Result<UdpSoc
 }
 
 async fn probe(sock: &UdpSocket, cfg: &ServerConfig) -> bool {
-    let recv = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, cfg.status_port)).await {
+    // Probe on an ephemeral port so existing status subscribers cannot
+    // turn a reachable multicast interface into a unicast fallback.
+    let recv = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
         Ok(s) => s,
         Err(e) => {
             log::debug!("multicast probe: receiver bind failed: {e}");
@@ -131,9 +133,13 @@ async fn probe(sock: &UdpSocket, cfg: &ServerConfig) -> bool {
         log::debug!("multicast probe: group join failed: {e}");
         return false;
     }
+    let port = match recv.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(_) => return false,
+    };
     let token = probe_token(cfg.controller_id);
     if sock
-        .send_to(&token, (cfg.multicast_group, cfg.status_port))
+        .send_to(&token, (cfg.multicast_group, port))
         .await
         .is_err()
     {
@@ -165,36 +171,10 @@ mod tests {
         link.send(0, b"probe").await;
     }
 
-    /// `send()` itself resets the consecutive-error counter on success —
-    /// driven through real sends on the socket the link binds, so the
-    /// reset asserted here is the code's, not the test's.
-    #[tokio::test]
-    async fn a_successful_send_resets_the_consecutive_error_counter() {
-        let rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("rx");
-        let port = rx.local_addr().expect("addr").port();
-        let cfg = ServerConfig {
-            status_transport: StatusTransport::Unicast,
-            status_dest_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            ..ServerConfig::default()
-        };
-        let mut link = BroadcastLink::open(&cfg).await.expect("bind");
-
-        failing_send(&mut link).await;
-        failing_send(&mut link).await;
-        assert_eq!(link.errors, 2, "real send errors must count");
-
-        link.send(port, b"delivered").await;
-        let mut buf = [0u8; 32];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(2), rx.recv_from(&mut buf))
-            .await
-            .expect("delivery within budget")
-            .expect("recv");
-        assert_eq!(&buf[..n], b"delivered", "the send really went out");
-        assert_eq!(link.errors, 0, "a successful send resets the counter");
-    }
-
     /// The `auto` ladder keeps multicast when the group is genuinely
-    /// reachable on the CONFIGURED interface.
+    /// reachable on the CONFIGURED interface, and delivers both to
+    /// clients already listening at startup and to one that joins later
+    /// on another port.
     ///
     /// Regression: the send socket never set `IP_MULTICAST_IF`, so the
     /// probe left by whatever interface the routing table chose rather
@@ -203,57 +183,83 @@ mod tests {
     /// deployment silently ran on the unicast leg — the fallback working
     /// perfectly is exactly what hid it.
     #[tokio::test]
-    async fn auto_keeps_multicast_when_the_configured_interface_reaches_the_group() {
-        // The probe binds its receiver on `status_port`, so it needs a
-        // real one — and a free one, since these tests run in parallel.
-        let free_port = {
-            let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-                .await
-                .expect("probe port");
-            s.local_addr().expect("addr").port()
-        };
+    async fn auto_broadcasts_to_clients_already_listening_at_startup() {
         let cfg = ServerConfig {
             status_transport: StatusTransport::Auto,
             multicast_iface: Ipv4Addr::LOCALHOST,
             status_dest_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            status_port: free_port,
             ..ServerConfig::default()
         };
-        let link = BroadcastLink::open(&cfg).await.expect("bind");
-        assert!(
-            !link.unicast,
-            "the probe reached the group on {} but the ladder fell back to unicast",
-            cfg.multicast_iface
-        );
-
-        // And it delivers: a receiver joined on the same interface gets
-        // what the link sends to the group.
-        let rx = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+        let subscribe = |port| {
+            let sock = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .expect("socket");
+            sock.set_reuse_address(true).expect("reuse");
+            sock.set_nonblocking(true).expect("nonblocking");
+            sock.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())
+                .expect("bind subscriber");
+            sock.join_multicast_v4(&cfg.multicast_group, &cfg.multicast_iface)
+                .expect("join");
+            UdpSocket::from_std(std::net::UdpSocket::from(sock)).expect("subscriber")
+        };
+        let first = subscribe(0);
+        let port = first.local_addr().expect("address").port();
+        let second = subscribe(port);
+        let cfg = ServerConfig {
+            status_port: port,
+            ..cfg
+        };
+        let mut link = BroadcastLink::open(&cfg).await.expect("startup");
+        assert!(!link.unicast, "existing clients must not force unicast");
+        link.send(port, b"status for both").await;
+        for rx in [&first, &second] {
+            let mut buf = [0u8; 64];
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let (n, _) = rx.recv_from(&mut buf).await.expect("receive");
+                    if &buf[..n] == b"status for both" {
+                        break;
+                    }
+                }
+            })
             .await
-            .expect("rx");
-        let port = rx.local_addr().expect("addr").port();
-        rx.join_multicast_v4(cfg.multicast_group, cfg.multicast_iface)
+            .expect("each existing subscriber receives the broadcast");
+        }
+
+        let late = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
+            .await
+            .expect("late subscriber");
+        let late_port = late.local_addr().expect("addr").port();
+        late.join_multicast_v4(cfg.multicast_group, cfg.multicast_iface)
             .expect("join");
-        let mut link = link;
-        link.send(port, b"broadcast").await;
+        link.send(late_port, b"broadcast").await;
         let mut buf = [0u8; 32];
-        let (n, _) = tokio::time::timeout(Duration::from_secs(2), rx.recv_from(&mut buf))
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), late.recv_from(&mut buf))
             .await
             .expect("multicast delivery within budget")
             .expect("recv");
-        assert_eq!(&buf[..n], b"broadcast");
+        assert_eq!(
+            &buf[..n],
+            b"broadcast",
+            "a client joining later receives it"
+        );
     }
 
-    /// Three consecutive real send errors fail over to unicast, and the
-    /// failover is permanent: later sends succeed FOR REAL — delivered to
-    /// the unicast destination and resetting the error counter — and the
-    /// link still never returns to multicast.
+    /// Three CONSECUTIVE real send errors fail over to unicast — a success
+    /// in between starts the count again — and the failover is permanent:
+    /// later sends succeed FOR REAL, delivered to the unicast destination
+    /// and resetting the error counter, and the link still never returns
+    /// to multicast.
     #[tokio::test]
     async fn three_consecutive_send_errors_fail_over_permanently() {
         let rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("rx");
         let port = rx.local_addr().expect("addr").port();
         let cfg = ServerConfig {
             status_transport: StatusTransport::Multicast,
+            multicast_iface: Ipv4Addr::LOCALHOST,
             status_dest_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             ..ServerConfig::default()
         };
@@ -261,6 +267,16 @@ mod tests {
         assert!(!link.unicast);
 
         failing_send(&mut link).await;
+        failing_send(&mut link).await;
+        assert_eq!(link.errors, 2, "real send errors must count");
+        link.send(port, b"to the group").await;
+        assert_eq!(link.errors, 0, "a successful send resets the counter");
+        failing_send(&mut link).await;
+        assert!(
+            !link.unicast,
+            "three errors that were not consecutive must not fail over"
+        );
+
         failing_send(&mut link).await;
         assert!(!link.unicast, "two errors must not fail over");
         failing_send(&mut link).await;

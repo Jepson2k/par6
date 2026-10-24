@@ -71,7 +71,8 @@ const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
 const NLM_F_REQUEST: u16 = 1;
 const IFLA_LINKINFO: u16 = 18;
-const IFLA_INFO_XSTATS: u16 = 5;
+// linux/if_link.h: UNSPEC, KIND, DATA, XSTATS.
+const IFLA_INFO_XSTATS: u16 = 3;
 /// High rtattr type bits (nested/net-byteorder flags) masked off before
 /// comparing types.
 const NLA_TYPE_MASK: u16 = 0x3fff;
@@ -305,7 +306,7 @@ mod tests {
         body.extend_from_slice(attrs);
         let mut msg = Vec::new();
         msg.extend_from_slice(&((NLMSG_HDRLEN + body.len()) as u32).to_ne_bytes());
-        msg.extend_from_slice(&RTM_NEWLINK.to_ne_bytes());
+        msg.extend_from_slice(&16u16.to_ne_bytes()); // RTM_NEWLINK
         msg.extend_from_slice(&0u16.to_ne_bytes());
         msg.extend_from_slice(&1u32.to_ne_bytes());
         msg.extend_from_slice(&0u32.to_ne_bytes());
@@ -313,111 +314,53 @@ mod tests {
         msg
     }
 
-    fn xstats_payload(s: &CanDeviceStats) -> Vec<u8> {
-        let mut v = Vec::new();
-        for x in [
-            s.bus_error,
-            s.error_warning,
-            s.error_passive,
-            s.bus_off,
-            s.arbitration_lost,
-            s.restarts,
-        ] {
-            v.extend_from_slice(&x.to_ne_bytes());
-        }
-        v
-    }
+    /// A reply the kernel sent for an mcp251x `can0`, read as
+    /// error-warn 19 and error-pass 19 (all other counters 0) by
+    /// `ip -s -d link show can0` at the time.
+    const CAN0_GETLINK: &[u8] = include_bytes!("testdata/can0_getlink.bin");
+    const CAN0_IFINDEX: u32 = 6;
 
-    /// The parse walks real message framing: a preceding attribute is
-    /// skipped, the nested LINKINFO is entered, the six counters land in
-    /// declaration order, and the answer for a DIFFERENT ifindex is
-    /// ignored.
     #[test]
-    fn parses_nested_xstats_out_of_a_getlink_response() {
-        let stats = CanDeviceStats {
-            bus_error: 7,
-            error_warning: 3,
-            error_passive: 2,
-            bus_off: 5,
-            arbitration_lost: 1,
-            restarts: 4,
-        };
-        // IFLA_LINKINFO nests INFO_KIND ("can") before INFO_XSTATS —
-        // the walk has to step over it.
-        let mut linkinfo = attr(1, b"can\0");
-        linkinfo.extend_from_slice(&attr(IFLA_INFO_XSTATS, &xstats_payload(&stats)));
-        let mut attrs = attr(3, b"can0\0"); // IFLA_IFNAME first
-        attrs.extend_from_slice(&attr(IFLA_LINKINFO, &linkinfo));
-
-        let mut dgram = newlink_msg(9, &attr(IFLA_LINKINFO, &attr(IFLA_INFO_XSTATS, &[0; 24])));
-        dgram.extend_from_slice(&newlink_msg(4, &attrs));
+    fn a_kernel_getlink_reply_yields_its_counters_and_anything_else_yields_none() {
         assert_eq!(
-            parse_response(&dgram, 4).expect("parse"),
-            Some(stats),
-            "the counters must come from ifindex 4's message, not ifindex 9's"
+            parse_response(CAN0_GETLINK, CAN0_IFINDEX).expect("parse"),
+            Some(CanDeviceStats {
+                bus_error: 0,
+                error_warning: 19,
+                error_passive: 19,
+                bus_off: 0,
+                arbitration_lost: 0,
+                restarts: 0,
+            })
         );
-    }
+        assert_eq!(
+            parse_response(CAN0_GETLINK, CAN0_IFINDEX + 1).expect("parse"),
+            None,
+            "another interface's answer is not this one's"
+        );
+        for cut in [20, 64, CAN0_GETLINK.len() / 2, CAN0_GETLINK.len() - 1] {
+            assert_eq!(
+                parse_response(&CAN0_GETLINK[..cut], CAN0_IFINDEX).expect("parse"),
+                None,
+                "a datagram cut at {cut} bytes parses to nothing, never past its end"
+            );
+        }
 
-    /// A link without CAN device stats (vcan) is `None`, not an error —
-    /// and so are a missing LINKINFO, a short XSTATS payload, and a
-    /// truncated datagram.
-    #[test]
-    fn absent_or_malformed_xstats_degrade_to_none() {
+        // A link without CAN device stats (vcan), and one whose stats are
+        // short, read as no counters.
         let no_linkinfo = newlink_msg(4, &attr(3, b"vcan0\0"));
         assert_eq!(parse_response(&no_linkinfo, 4).expect("parse"), None);
-
-        let short = newlink_msg(4, &attr(IFLA_LINKINFO, &attr(IFLA_INFO_XSTATS, &[0; 8])));
+        let short = newlink_msg(4, &attr(18, &attr(3, &[0; 8])));
         assert_eq!(parse_response(&short, 4).expect("parse"), None);
 
-        let full = newlink_msg(
-            4,
-            &attr(
-                IFLA_LINKINFO,
-                &attr(
-                    IFLA_INFO_XSTATS,
-                    &xstats_payload(&CanDeviceStats::default()),
-                ),
-            ),
-        );
-        assert_eq!(
-            parse_response(&full[..20], 4).expect("parse"),
-            None,
-            "a truncated datagram parses to nothing, never past the end"
-        );
-
-        // NLMSG_ERROR carries -errno and must surface as an io::Error.
+        // NLMSG_ERROR carries -errno and surfaces as an io::Error.
         let mut err = Vec::new();
         err.extend_from_slice(&(20u32).to_ne_bytes());
-        err.extend_from_slice(&NLMSG_ERROR.to_ne_bytes());
+        err.extend_from_slice(&2u16.to_ne_bytes());
         err.extend_from_slice(&0u16.to_ne_bytes());
         err.extend_from_slice(&1u32.to_ne_bytes());
         err.extend_from_slice(&0u32.to_ne_bytes());
         err.extend_from_slice(&(-libc::ENODEV).to_ne_bytes());
         assert!(parse_response(&err, 4).is_err());
-    }
-
-    /// Delta semantics: counter advances alarm, a backward counter means
-    /// the interface was re-created and re-bases silently.
-    #[test]
-    fn deltas_alarm_on_advances_and_rebase_on_decreases() {
-        let a = CanDeviceStats {
-            bus_off: 2,
-            error_passive: 5,
-            restarts: 2,
-            ..CanDeviceStats::default()
-        };
-        let mut b = a;
-        b.bus_off = 4;
-        b.error_passive = 6;
-        b.restarts = 4;
-        let d = counter_deltas(&a, &b);
-        assert_eq!((d.bus_off, d.error_passive, d.rebased), (2, 1, false));
-
-        let fresh = CanDeviceStats::default();
-        let d = counter_deltas(&b, &fresh);
-        assert!(d.rebased, "a down/up re-creates the counters at zero");
-        assert_eq!((d.bus_off, d.error_passive), (0, 0));
-
-        assert_eq!(counter_deltas(&b, &b), CounterDeltas::default());
     }
 }

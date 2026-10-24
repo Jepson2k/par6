@@ -25,6 +25,36 @@ pub const MIN_JERK_FACTOR: f64 = 0.5;
 /// Safety factor on the lookahead stopping distance.
 const STOP_MARGIN: f64 = 1.5;
 
+/// The smallest share of the configured jog acceleration a jog runs at:
+/// the engine and the collision gate's projection of its stop both floor
+/// a client's fraction here, so the gate never projects a shorter stop than
+/// the engine then takes.
+pub const MIN_ACCEL_FRACTION: f64 = 0.01;
+
+/// One joint's jog ramp rates: the acceleration a ramp from rest to
+/// `v_full` over `accel_time_s` needs, capped at the joint's limit, and
+/// `jerk_factor` times that as the jerk \[rad/s², rad/s³\].
+pub fn ramp_rates(v_full: f64, a_limit: f64, accel_time_s: f64, jerk_factor: f64) -> (f64, f64) {
+    let a = (v_full / accel_time_s.max(MIN_ACCEL_TIME_S)).min(a_limit);
+    (a, a * jerk_factor.max(MIN_JERK_FACTOR))
+}
+
+/// How far a jog ramp moving at `speed` and accelerating at `a0` (both
+/// along its motion, non-negative) travels before it is at rest under
+/// `profile`, decelerating at most at `a` with jerk `jerk` \[rad\].
+pub fn stopping_distance(profile: JogProfile, speed: f64, a0: f64, a: f64, jerk: f64) -> f64 {
+    match profile {
+        JogProfile::Trapezoid => speed * speed / (2.0 * a),
+        JogProfile::Scurve => {
+            let v_peak = speed + a0 * a0 / (2.0 * jerk);
+            speed * a0 / jerk
+                + a0 * a0 * a0 / (3.0 * jerk * jerk)
+                + v_peak * v_peak / (2.0 * a)
+                + v_peak * a / (2.0 * jerk)
+        }
+    }
+}
+
 /// Direction of a jog command along a joint axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JogDirection {
@@ -205,8 +235,12 @@ impl JogEngine {
         }
         for (j, &qm) in q_meas.iter().enumerate() {
             let v_full = self.limits.velocity[j];
-            let a = (v_full / self.accel_time_s).min(self.limits.acceleration[j]);
-            let jerk = a * self.jerk_factor;
+            let (a, jerk) = ramp_rates(
+                v_full,
+                self.limits.acceleration[j],
+                self.accel_time_s,
+                self.jerk_factor,
+            );
 
             let mut v_t = self.active[j] * v_full;
 
@@ -243,16 +277,7 @@ impl JogEngine {
                 } else {
                     (speed, a0)
                 };
-                let stop = match self.profile {
-                    JogProfile::Trapezoid => speed * speed / (2.0 * a),
-                    JogProfile::Scurve => {
-                        let v_peak = speed + a0 * a0 / (2.0 * jerk);
-                        speed * a0 / jerk
-                            + a0 * a0 * a0 / (3.0 * jerk * jerk)
-                            + v_peak * v_peak / (2.0 * a)
-                            + v_peak * a / (2.0 * jerk)
-                    }
-                };
+                let stop = stopping_distance(self.profile, speed, a0, a, jerk);
                 if STOP_MARGIN * stop + speed * self.dt >= remaining {
                     self.blocked[j] = Some(JogDirection::from_sign(sgn));
                 }

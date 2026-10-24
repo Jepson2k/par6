@@ -18,7 +18,7 @@ import errno
 import fcntl
 import logging
 import os
-from collections.abc import Iterator
+from collections.abc import Generator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -37,7 +37,7 @@ class FlashBusy(RuntimeError):
 
 
 @contextmanager
-def flash_lock(path: Path = LOCK_PATH) -> Iterator[None]:
+def flash_lock(path: Path = LOCK_PATH) -> Generator[None]:
     """Exclusive right to flash on this machine, or refuse.
 
     Two flashers on one bus interleave their page streams and both fail,
@@ -94,7 +94,7 @@ def granted_bus(
     assertion: str = "parked",
     *,
     channel: str | None = None,
-) -> Iterator[Any]:
+) -> Generator[Any]:
     """Take the bus from a live par6d, yield an open socket, give it back.
 
     The runtime stays up throughout; it simply stops transmitting. On the

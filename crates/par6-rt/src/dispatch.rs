@@ -10,7 +10,6 @@
 //! |---|---|---|---|
 //! | BOOTING | — | 0 | 0 |
 //! | IDLE (homed ∧ enabled ∧ grav-on) | — | — | G(q) |
-//! | IDLE, drift lock armed | hold | 0 | G(q) + clamped integral | (PD pack: the drive's impedance hold)
 //! | IDLE otherwise | — | 0 | 0 |
 //! | ACTIVE_ERROR | — | 0 | 0 | (active zero-velocity hold)
 //! | SAFETY_STOP | — | — | 0 Nm | (fully limp)
@@ -82,26 +81,6 @@ pub fn law_idle(gravity_hold: bool, g: &[f64; MAX_JOINTS], out: &mut [JointSetpo
         }
     } else {
         out.fill(JointSetpoint::zero_velocity());
-    }
-}
-
-/// IDLE with the drift lock armed: the drive's impedance (PD) hold at
-/// the captured pose, gravity plus the lock's clamped integral as the
-/// feedforward — the same frame shape as a PD-packed jog, with the
-/// per-joint gains the config pushed at boot.
-pub fn law_freedrive(
-    hold: &[f64; MAX_JOINTS],
-    g: &[f64; MAX_JOINTS],
-    integral: &[f64; MAX_JOINTS],
-    out: &mut [JointSetpoint; MAX_JOINTS],
-) {
-    for i in 0..MAX_JOINTS {
-        out[i] = JointSetpoint {
-            pos_rad: Some(hold[i]),
-            vel_rad_s: Some(0.0),
-            torque_nm: Some(g[i] + integral[i]),
-            pack: Pack::Pd,
-        };
     }
 }
 
@@ -230,6 +209,12 @@ impl TorqueSlew {
     /// value the drives stopped holding.
     pub fn reset(&mut self) {
         self.applied = [0.0; MAX_JOINTS];
+    }
+
+    /// Take `applied` as the previous command: the next rate-limited
+    /// tick ramps from it.
+    pub fn seed(&mut self, applied: &[f64; MAX_JOINTS]) {
+        self.applied = *applied;
     }
 
     /// Rate-limit `want` toward the previous command and record the result.

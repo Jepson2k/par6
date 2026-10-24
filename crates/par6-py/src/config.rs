@@ -54,11 +54,14 @@ fn limit_mode(mode: &str) -> PyResult<LimitMode> {
     }
 }
 
-/// One loaded robot config bundle (robot TOML + its `grippers/*.toml`).
+/// One loaded robot config bundle (robot TOML + its `grippers/*.toml`),
+/// with the installation's local overlay layered over it as `par6d`
+/// layers it.
 #[pyclass(module = "par6._par6")]
 pub struct Config {
     bundle: ConfigBundle,
     path: PathBuf,
+    local: Option<PathBuf>,
 }
 
 #[pymethods]
@@ -72,13 +75,31 @@ impl Config {
             Some(p) => PathBuf::from(p),
             None => par6d::options::resolve_config_path(None).map_err(PyRuntimeError::new_err)?,
         };
-        let bundle = ConfigBundle::load(&path)
+        let (bundle, local) = par6d::options::load_config(&path, None, None)
             .map_err(|e| PyRuntimeError::new_err(format!("{}: {e}", path.display())))?;
-        Ok(Self { bundle, path })
+        Ok(Self {
+            bundle,
+            path,
+            local,
+        })
     }
 
     fn path(&self) -> String {
         self.path.display().to_string()
+    }
+
+    /// The robot TOML as the runtime runs it: the file, with the local
+    /// overlay merged in when there is one.
+    fn robot_toml(&self) -> PyResult<String> {
+        par6_config::effective_robot_toml(&self.path, self.local.as_deref())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+    }
+
+    /// Each tool file as the runtime runs it, `(file name, content)` in file
+    /// order: verbatim, or with the local overlay's entry merged in.
+    fn tool_tomls(&self) -> PyResult<Vec<(String, String)>> {
+        par6_config::effective_tool_tomls(&self.path, self.local.as_deref())
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
     }
 
     fn name(&self) -> String {
@@ -106,9 +127,9 @@ impl Config {
         self.bundle.robot.robot.park_pose_rad.clone()
     }
 
-    /// The fitted gripper's name as the robot TOML spells it.
-    fn active_gripper(&self) -> String {
-        self.bundle.robot.robot.active_gripper.clone()
+    /// The tool the runtime boots fitted with, as the robot TOML spells it.
+    fn active_tool(&self) -> String {
+        self.bundle.robot.robot.active_tool.clone()
     }
 
     /// `(min, max)` software travel per joint \[rad\] — what motion may use.
@@ -121,14 +142,14 @@ impl Config {
             .collect()
     }
 
-    /// `(min, max)` hardware travel per joint \[rad\] — what `teleport`
-    /// is refused outside of.
+    /// `(min, max)` travel per joint \[rad\] — what `teleport` is
+    /// refused outside of.
     fn hard_limits_rad(&self) -> Vec<(f64, f64)> {
         self.bundle
             .robot
             .joints
             .iter()
-            .map(|j| (j.limits.hard_min_rad, j.limits.hard_max_rad))
+            .map(|j| j.limits.travel_rad())
             .collect()
     }
 
@@ -247,7 +268,7 @@ impl Config {
     /// `ilim_ma`).
     fn grippers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let out = PyList::empty(py);
-        for g in &self.bundle.grippers {
+        for g in &self.bundle.tools {
             let d = PyDict::new(py);
             d.set_item("name", &g.name)?;
             d.set_item("key", g.name.trim().to_ascii_uppercase())?;
@@ -280,7 +301,7 @@ impl Config {
     fn variant<'py>(&self, py: Python<'py>, gripper_name: &str) -> PyResult<Bound<'py, PyDict>> {
         let urdf_variant = self
             .bundle
-            .grippers
+            .tools
             .iter()
             .find(|g| g.name.eq_ignore_ascii_case(gripper_name.trim()))
             .and_then(|g| g.urdf_variant.as_deref());

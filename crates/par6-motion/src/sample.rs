@@ -20,9 +20,6 @@ pub struct SampleMeta {
     /// Checkpoint label id; a CHANGE between consecutive samples is a
     /// checkpoint boundary (push completion for the previous label).
     pub checkpoint_id: u32,
-    /// True while this sample's segment blends into the next command:
-    /// at the boundary the completion policy must NOT settle.
-    pub blend_continues: bool,
     /// Final sample of the queued program; EXEC completion runs after it.
     pub is_last: bool,
 }

@@ -4,7 +4,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{invalid, ConfigError};
+use crate::{invalid, robot::JointConfig, ConfigError};
+
+/// Ramp-up and stall-confirmation allowance added to the full-range
+/// crossing time when deriving a seek budget.
+const SEEK_MARGIN: f64 = 1.25;
 
 /// Endstop detection strategy for one actuator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -160,7 +164,7 @@ pub struct MoveTo {
     pub joint: u8,
     /// Target position \[rad\].
     pub position_rad: f64,
-    /// Move duration \[s\] (timeout = duration + 2 s, warn-and-continue).
+    /// Move duration \[s\] (failure timeout = duration + 2 s).
     pub duration_s: f64,
 }
 
@@ -177,8 +181,8 @@ pub struct HomeGroup {
 }
 
 /// One step of the homing sequence. Runs `pre_moves`, then the `home`
-/// group in parallel, then `move_to` moves. Pre/post/move_to timeouts
-/// warn and continue; home-phase timeouts FAIL the sequence.
+/// group in parallel, then `move_to` moves. A timeout in any position or
+/// home phase fails the sequence; later phases cannot run without clearance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SequenceStep {
@@ -207,9 +211,37 @@ pub struct HomingConfig {
     /// Global trailing moves after the last step.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_moves: Vec<PreMove>,
+    /// Per-joint bound \[Nm\] on the mean holding-torque residual
+    /// `|tau_measured − G(q)|` over the final hold at the ready pose. A
+    /// joint above its bound fails the sequence: the reference it
+    /// latched puts the arm somewhere the gravity model says it cannot
+    /// be holding this load — the signature of a seek that stopped
+    /// short of the endstop. Empty disables the check; sized well above
+    /// the model's own error so only a gross reference error trips it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_check_nm: Vec<f64>,
 }
 
 impl JointHoming {
+    /// Seek budget \[s\] for one approach leg on `joint`.
+    ///
+    /// `timeout_s` alone is a fixed number that says nothing about how far
+    /// the joint may have to travel, so a joint left near the far end of
+    /// its range times out before reaching the endstop and homing becomes
+    /// a function of where the arm was parked. This arm did exactly that
+    /// on 2026-09-20: J1 swept 196 deg of its 338 deg range in the
+    /// configured 13 s and stopped short of the switch. The budget is
+    /// therefore at least one full-range crossing at the seek speed, with
+    /// `SEEK_MARGIN` covering the velocity ramp and stall confirmation;
+    /// `timeout_s` remains a floor for joints whose configured value is
+    /// already more generous.
+    pub fn seek_timeout_s(&self, joint: &JointConfig) -> f64 {
+        let ticks_per_rad =
+            f64::from(1u32 << joint.encoder_bits) / std::f64::consts::TAU * joint.gear_ratio;
+        let span_ticks = (joint.limits.hard_max_rad - joint.limits.hard_min_rad) * ticks_per_rad;
+        self.timeout_s
+            .max(span_ticks / self.speed_ticks_s * SEEK_MARGIN)
+    }
     pub(crate) fn validate(&self, field_prefix: &str) -> Result<(), ConfigError> {
         let f = |name: &str| format!("{field_prefix}.{name}");
         if self.speed_ticks_s <= 0.0 {
@@ -232,6 +264,23 @@ impl JointHoming {
         }
         if self.backoff_s < 0.0 {
             return Err(invalid(f("backoff_s"), "must be >= 0"));
+        }
+        // A second pass that stalls where it started is off the first by
+        // the whole backoff, so a tolerance that reaches it passes every
+        // second pass.
+        let backoff_ticks = self.speed_ticks_s * self.backoff_s;
+        if self.two_pass
+            && self.strategy == HomingStrategy::Stall
+            && f64::from(self.two_pass_max_diff_ticks) >= backoff_ticks
+        {
+            return Err(invalid(
+                f("two_pass_max_diff_ticks"),
+                format!(
+                    "must be below the backoff re-travel, speed_ticks_s x backoff_s = \
+                     {backoff_ticks:.0} ticks, or a second pass that stalls where it \
+                     started still passes"
+                ),
+            ));
         }
         if let Some(r) = &self.release {
             if self.strategy == HomingStrategy::Hall {
@@ -371,6 +420,27 @@ impl HomingConfig {
             ));
         }
         validate_moves(&self.post_moves, num_joints, "homing.post_moves")?;
+        if !self.reference_check_nm.is_empty() {
+            if self.reference_check_nm.len() != num_joints {
+                return Err(invalid(
+                    "homing.reference_check_nm",
+                    format!(
+                        "must be empty or one bound per joint ({num_joints} joints, {} entries)",
+                        self.reference_check_nm.len()
+                    ),
+                ));
+            }
+            if self
+                .reference_check_nm
+                .iter()
+                .any(|v| !v.is_finite() || *v <= 0.0)
+            {
+                return Err(invalid(
+                    "homing.reference_check_nm",
+                    "every bound must be a finite torque > 0 Nm",
+                ));
+            }
+        }
         Ok(())
     }
 }

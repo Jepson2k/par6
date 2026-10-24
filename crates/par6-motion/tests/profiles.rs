@@ -1,6 +1,6 @@
 //! Planned-move profile tests against the real PAR6 exec limits: limit
 //! adherence by finite differences, duration/speed parameterization,
-//! corner blending continuity, and input validation.
+//! and input validation.
 
 mod common;
 
@@ -38,82 +38,6 @@ fn peak_velocity(plan: &Plan) -> [f64; NUM_JOINTS] {
     peak
 }
 
-#[test]
-fn trapezoid_move_respects_limits_and_parameterization() {
-    let (plan, limits, dt) = plan_one(ProfileKind::Trapezoid, MoveParams::default());
-    let qs = positions_with_start(HOME, plan.samples());
-    assert_within_limits(
-        &qs,
-        dt,
-        &limits.velocity,
-        &limits.acceleration,
-        None,
-        "trap",
-    );
-    let last = plan.samples().last().unwrap();
-    assert!(max_err(&last.q, &TARGET) < 1e-9, "must land on the target");
-    assert!(last.qd.iter().all(|&v| v == 0.0), "must land at rest");
-
-    // Slowest-joint synchronization: every joint runs the same scalar
-    // profile scaled by its displacement, so qd_j / Δ_j matches across
-    // joints at every tick.
-    let mid = &plan.samples()[plan.len() / 2];
-    let ratios: Vec<f64> = (0..NUM_JOINTS)
-        .map(|j| mid.qd[j] / (TARGET[j] - HOME[j]))
-        .collect();
-    for r in &ratios {
-        assert!(
-            (r - ratios[0]).abs() <= 1e-9 * ratios[0].abs().max(1.0),
-            "joints must be synchronized on one path profile, ratios {ratios:?}"
-        );
-    }
-
-    // Duration-parameterized: stretching to 2× the minimum is honored.
-    let t0 = plan.duration_s();
-    let (stretched, limits, dt) = plan_one(
-        ProfileKind::Trapezoid,
-        MoveParams {
-            min_duration_s: Some(2.0 * t0),
-            ..MoveParams::default()
-        },
-    );
-    assert!(
-        (stretched.duration_s() - 2.0 * t0).abs() <= 2.0 * dt,
-        "requested {} s, planned {} s",
-        2.0 * t0,
-        stretched.duration_s()
-    );
-    let qs = positions_with_start(HOME, stretched.samples());
-    assert_within_limits(
-        &qs,
-        dt,
-        &limits.velocity,
-        &limits.acceleration,
-        None,
-        "trap stretched",
-    );
-    assert!(max_err(&stretched.samples().last().unwrap().q, &TARGET) < 1e-9);
-
-    // Speed-parameterized: half speed halves the velocity budget and takes
-    // longer.
-    let (half, limits, _) = plan_one(
-        ProfileKind::Trapezoid,
-        MoveParams {
-            speed_fraction: 0.5,
-            ..MoveParams::default()
-        },
-    );
-    let peak = peak_velocity(&half);
-    for (j, (&p, &v)) in peak.iter().zip(limits.velocity.iter()).enumerate() {
-        assert!(
-            p <= 0.5 * v + 1e-9,
-            "joint {j} peak {p} exceeds half budget {}",
-            0.5 * v
-        );
-    }
-    assert!(half.duration_s() > t0);
-}
-
 /// Peak |qdd| per joint over the stream.
 fn peak_acceleration(plan: &Plan) -> [f64; NUM_JOINTS] {
     let mut peak = [0.0_f64; NUM_JOINTS];
@@ -125,49 +49,212 @@ fn peak_acceleration(plan: &Plan) -> [f64; NUM_JOINTS] {
     peak
 }
 
-#[test]
-fn quintic_move_respects_limits_and_parameterization() {
-    let (plan, limits, dt) = plan_one(ProfileKind::Quintic, MoveParams::default());
-    let qs = positions_with_start(HOME, plan.samples());
-    assert_within_limits(
-        &qs,
-        dt,
-        &limits.velocity,
-        &limits.acceleration,
-        None,
-        "quintic",
-    );
-    let last = plan.samples().last().unwrap();
-    assert!(max_err(&last.q, &TARGET) < 1e-9, "must land on the target");
-    assert!(last.qd.iter().all(|&v| v == 0.0), "must land at rest");
+/// Jerk per joint read off the emitted acceleration, the move starting from
+/// rest. The final sample is forced to rest and would read as a spurious
+/// step, so it is left out.
+fn emitted_jerk(plan: &Plan, dt: f64) -> Vec<[f64; NUM_JOINTS]> {
+    let s = &plan.samples()[..plan.len() - 1];
+    let mut prev = [0.0; NUM_JOINTS];
+    s.iter()
+        .map(|x| {
+            let j = std::array::from_fn(|i| (x.qdd[i] - prev[i]) / dt);
+            prev = x.qdd;
+            j
+        })
+        .collect()
+}
 
-    // The property that distinguishes a quintic from a trapezoid: it
-    // STARTS at rest in acceleration too. One tick in, the trapezoid is
-    // already at its full ramp acceleration; the quintic has barely
-    // begun. The last sample is forced to rest and is excluded, so this
-    // reads the second-to-last for the same claim at the far end.
-    let peak = peak_acceleration(&plan);
-    let first = &plan.samples()[0];
-    let penult = &plan.samples()[plan.len() - 2];
-    for j in 0..NUM_JOINTS {
-        if (TARGET[j] - HOME[j]).abs() < 1e-9 {
-            continue;
-        }
+/// Every planned profile keeps every limit it holds (jerk too where it
+/// holds one), lands on the target at rest, honours a requested duration
+/// and a speed fraction, and — on a move too short to cruise — is as
+/// short as its binding limit allows. Trapezoid and polynomials run one
+/// scalar profile scaled per joint; the polynomials also start and end
+/// at rest in acceleration, and the septic in jerk as well.
+#[test]
+fn every_profile_respects_its_limits_and_parameterization() {
+    use ProfileKind::{Quintic, Ruckig, Septic, Trapezoid};
+    for profile in [Trapezoid, Ruckig, Quintic, Septic] {
+        let name = format!("{profile:?}");
+        let holds_jerk = matches!(profile, Ruckig | Septic);
+        let polynomial = matches!(profile, Quintic | Septic);
+        let jerk_bound = |l: &MotionLimits| holds_jerk.then_some(l.jerk);
+        let (plan, limits, dt) = plan_one(profile, MoveParams::default());
+        let qs = positions_with_start(HOME, plan.samples());
+        assert_within_limits(
+            &qs,
+            dt,
+            &limits.velocity,
+            &limits.acceleration,
+            jerk_bound(&limits).as_ref(),
+            &name,
+        );
+        let last = plan.samples().last().unwrap();
         assert!(
-            first.qdd[j].abs() < 0.05 * peak[j],
-            "joint {j} starts at {} rad/s^2 against a peak of {}: not a quintic",
-            first.qdd[j],
-            peak[j]
+            max_err(&last.q, &TARGET) < 1e-9,
+            "{name}: must land on the target"
         );
         assert!(
-            penult.qdd[j].abs() < 0.05 * peak[j],
-            "joint {j} ends at {} rad/s^2 against a peak of {}: not a quintic",
-            penult.qdd[j],
-            peak[j]
+            last.qd.iter().all(|&v| v.abs() < 1e-9),
+            "{name}: must land at rest"
+        );
+
+        // Slowest-joint synchronization: one scalar profile scaled by each
+        // joint's displacement, so qd_j / Δ_j matches across joints.
+        if profile != Ruckig {
+            let mid = &plan.samples()[plan.len() / 2];
+            let ratios: Vec<f64> = (0..NUM_JOINTS)
+                .map(|j| mid.qd[j] / (TARGET[j] - HOME[j]))
+                .collect();
+            for r in &ratios {
+                assert!(
+                    (r - ratios[0]).abs() <= 1e-9 * ratios[0].abs().max(1.0),
+                    "{name}: joints must be synchronized on one path profile, ratios {ratios:?}"
+                );
+            }
+        }
+
+        if polynomial {
+            // They START at rest in acceleration too: one tick in, a
+            // trapezoid is already at its full ramp acceleration; these
+            // have barely begun. The last sample is forced to rest and is
+            // excluded, so the far end reads the second-to-last.
+            let peak = peak_acceleration(&plan);
+            let first = &plan.samples()[0];
+            let penult = &plan.samples()[plan.len() - 2];
+            for j in 0..NUM_JOINTS {
+                if (TARGET[j] - HOME[j]).abs() < 1e-9 {
+                    continue;
+                }
+                assert!(
+                    first.qdd[j].abs() < 0.05 * peak[j],
+                    "{name}: joint {j} starts at {} rad/s^2 against a peak of {}",
+                    first.qdd[j],
+                    peak[j]
+                );
+                assert!(
+                    penult.qdd[j].abs() < 0.05 * peak[j],
+                    "{name}: joint {j} ends at {} rad/s^2 against a peak of {}",
+                    penult.qdd[j],
+                    peak[j]
+                );
+            }
+            // The septic's jerk starts and ends at rest as well; the
+            // quintic's steps straight to its peak on the first tick — the
+            // control that makes the septic's assertion discriminate.
+            let jerk = emitted_jerk(&plan, dt);
+            for j in 0..NUM_JOINTS {
+                if (TARGET[j] - HOME[j]).abs() < 1e-9 {
+                    continue;
+                }
+                let peak_j = jerk.iter().map(|x| x[j].abs()).fold(0.0, f64::max);
+                let (start, end) = (jerk[0][j].abs(), jerk[jerk.len() - 1][j].abs());
+                if profile == Septic {
+                    assert!(
+                        start < 0.1 * peak_j && end < 0.1 * peak_j,
+                        "{name}: joint {j} jerk {start} at the start and {end} at the end \
+                         against a peak of {peak_j}"
+                    );
+                } else {
+                    assert!(
+                        start > 0.9 * peak_j,
+                        "{name}: joint {j} jerk {start} on the first tick against a peak of \
+                         {peak_j} — the quintic should step to its peak"
+                    );
+                }
+            }
+        }
+
+        // Duration-parameterized: stretching to 2× the minimum is honored.
+        let t0 = plan.duration_s();
+        let (stretched, limits, dt) = plan_one(
+            profile,
+            MoveParams {
+                min_duration_s: Some(2.0 * t0),
+                ..MoveParams::default()
+            },
+        );
+        let stretch_tol = if profile == Ruckig { 3.0 } else { 2.0 } * dt;
+        assert!(
+            (stretched.duration_s() - 2.0 * t0).abs() <= stretch_tol,
+            "{name}: requested {} s, planned {} s",
+            2.0 * t0,
+            stretched.duration_s()
+        );
+        let qs = positions_with_start(HOME, stretched.samples());
+        assert_within_limits(
+            &qs,
+            dt,
+            &limits.velocity,
+            &limits.acceleration,
+            jerk_bound(&limits).as_ref(),
+            &format!("{name} stretched"),
+        );
+        assert!(max_err(&stretched.samples().last().unwrap().q, &TARGET) < 1e-9);
+
+        // Speed-parameterized: half speed halves the velocity budget.
+        let (half, limits, _) = plan_one(
+            profile,
+            MoveParams {
+                speed_fraction: 0.5,
+                ..MoveParams::default()
+            },
+        );
+        let peak = peak_velocity(&half);
+        for (j, (&p, &v)) in peak.iter().zip(limits.velocity.iter()).enumerate() {
+            assert!(
+                p <= 0.5 * v + 1e-9,
+                "{name}: joint {j} peak {p} exceeds half budget {}",
+                0.5 * v
+            );
+        }
+        assert!(half.duration_s() > t0, "{name}: half speed takes longer");
+
+        // Too short to cruise: acceleration (and jerk, where it is held)
+        // sets the duration, and the plan is as short as that allows — the
+        // binding joint reaches its limit.
+        let short = HOME.map(|q| q + 0.02);
+        let (limits, dt) = exec_limits();
+        let mut b = ProgramBuilder::new(HOME, limits, dt).unwrap();
+        b.move_j(
+            short,
+            MoveParams {
+                profile,
+                ..MoveParams::default()
+            },
+        )
+        .unwrap();
+        let brief = b.plan().unwrap();
+        let qs = positions_with_start(HOME, brief.samples());
+        assert_within_limits(
+            &qs,
+            dt,
+            &limits.velocity,
+            &limits.acceleration,
+            jerk_bound(&limits).as_ref(),
+            &format!("{name} short"),
+        );
+        let acc = peak_acceleration(&brief);
+        let jerk = emitted_jerk(&brief, dt);
+        let binding = (0..NUM_JOINTS)
+            .map(|j| {
+                let a = acc[j] / limits.acceleration[j];
+                let jk = jerk.iter().map(|x| x[j].abs()).fold(0.0, f64::max) / limits.jerk[j];
+                if holds_jerk {
+                    a.max(jk)
+                } else {
+                    a
+                }
+            })
+            .fold(0.0, f64::max);
+        assert!(
+            binding > 0.95,
+            "{name}: a short move reaches only {binding:.3} of its binding limit — \
+             it is slower than the limits require"
         );
     }
-    // ...and a trapezoid does not, which is what makes the assertion above
-    // discriminate rather than merely pass.
+
+    // ...and a trapezoid does not start at rest in acceleration, which is
+    // what makes the polynomials' assertion discriminate.
     let (trap, _, _) = plan_one(ProfileKind::Trapezoid, MoveParams::default());
     let trap_peak = peak_acceleration(&trap);
     let moving = (0..NUM_JOINTS)
@@ -177,302 +264,14 @@ fn quintic_move_respects_limits_and_parameterization() {
         trap.samples()[0].qdd[moving].abs() > 0.9 * trap_peak[moving],
         "the trapezoid should step straight to its ramp acceleration"
     );
-
-    // Slowest-joint synchronization: one scalar profile scaled by each
-    // joint's displacement, so qd_j / Δ_j matches across joints.
-    let mid = &plan.samples()[plan.len() / 2];
-    let ratios: Vec<f64> = (0..NUM_JOINTS)
-        .map(|j| mid.qd[j] / (TARGET[j] - HOME[j]))
-        .collect();
-    for r in &ratios {
-        assert!(
-            (r - ratios[0]).abs() <= 1e-9 * ratios[0].abs().max(1.0),
-            "joints must be synchronized on one path profile, ratios {ratios:?}"
-        );
-    }
-
-    // Duration-parameterized: stretching to 2× the minimum is honored.
-    let t0 = plan.duration_s();
-    let (stretched, limits, dt) = plan_one(
-        ProfileKind::Quintic,
-        MoveParams {
-            min_duration_s: Some(2.0 * t0),
-            ..MoveParams::default()
-        },
-    );
-    assert!(
-        (stretched.duration_s() - 2.0 * t0).abs() <= 2.0 * dt,
-        "requested {} s, planned {} s",
-        2.0 * t0,
-        stretched.duration_s()
-    );
-    let qs = positions_with_start(HOME, stretched.samples());
-    assert_within_limits(
-        &qs,
-        dt,
-        &limits.velocity,
-        &limits.acceleration,
-        None,
-        "quintic stretched",
-    );
-
-    // Speed-parameterized: half speed halves the velocity budget.
-    let (half, limits, _) = plan_one(
-        ProfileKind::Quintic,
-        MoveParams {
-            speed_fraction: 0.5,
-            ..MoveParams::default()
-        },
-    );
-    let peak = peak_velocity(&half);
-    for (j, (&p, &v)) in peak.iter().zip(limits.velocity.iter()).enumerate() {
-        assert!(
-            p <= 0.5 * v + 1e-9,
-            "joint {j} peak {p} exceeds half budget {}",
-            0.5 * v
-        );
-    }
-    assert!(half.duration_s() > t0);
-}
-
-#[test]
-fn quintic_refuses_to_blend() {
-    // Two complementary quintic halves sum to more than the profile's
-    // own peak, so a spliced corner would run over the velocity limit.
-    // The program is refused, not quietly stopped at the corner.
-    let (limits, dt) = exec_limits();
-    let mut b = ProgramBuilder::new(HOME, limits, dt).unwrap();
-    b.move_j(
-        TARGET,
-        MoveParams {
-            profile: ProfileKind::Quintic,
-            blend_with_next: true,
-            ..MoveParams::default()
-        },
-    )
-    .unwrap()
-    .move_j(
-        second_target(),
-        MoveParams {
-            profile: ProfileKind::Quintic,
-            ..MoveParams::default()
-        },
-    )
-    .unwrap();
-    assert!(matches!(
-        b.plan(),
-        Err(MotionError::ProfileCannotBlend {
-            profile: "quintic",
-            first: 0,
-            second: 1
-        })
-    ));
-    // The flag on a LAST move is documented as ignored, so a single
-    // quintic move carrying it still plans.
-    let mut b = ProgramBuilder::new(HOME, limits, dt).unwrap();
-    b.move_j(
-        TARGET,
-        MoveParams {
-            profile: ProfileKind::Quintic,
-            blend_with_next: true,
-            ..MoveParams::default()
-        },
-    )
-    .unwrap();
-    assert!(b.plan().is_ok());
-}
-
-#[test]
-fn ruckig_move_respects_limits_including_jerk() {
-    let (plan, limits, dt) = plan_one(ProfileKind::Ruckig, MoveParams::default());
-    let qs = positions_with_start(HOME, plan.samples());
-    assert_within_limits(
-        &qs,
-        dt,
-        &limits.velocity,
-        &limits.acceleration,
-        Some(&limits.jerk),
-        "ruckig",
-    );
-    let last = plan.samples().last().unwrap();
-    assert!(max_err(&last.q, &TARGET) < 1e-9, "must land on the target");
-    assert!(last.qd.iter().all(|&v| v.abs() < 1e-9), "must land at rest");
-
-    // Duration-parameterized via ruckig's minimum duration.
-    let t0 = plan.duration_s();
-    let (stretched, _, dt) = plan_one(
-        ProfileKind::Ruckig,
-        MoveParams {
-            min_duration_s: Some(2.0 * t0),
-            ..MoveParams::default()
-        },
-    );
-    assert!(
-        (stretched.duration_s() - 2.0 * t0).abs() <= 3.0 * dt,
-        "requested {} s, planned {} s",
-        2.0 * t0,
-        stretched.duration_s()
-    );
-
-    // Speed-parameterized.
-    let (half, limits, _) = plan_one(
-        ProfileKind::Ruckig,
-        MoveParams {
-            speed_fraction: 0.5,
-            ..MoveParams::default()
-        },
-    );
-    let peak = peak_velocity(&half);
-    for (j, (&p, &v)) in peak.iter().zip(limits.velocity.iter()).enumerate() {
-        assert!(
-            p <= 0.5 * v + 1e-9,
-            "joint {j} peak {p} exceeds half budget {}",
-            0.5 * v
-        );
-    }
-}
-
-/// Second target continuing every joint in its HOME→TARGET direction
-/// (clipped inside the soft windows) so a blended corner keeps cruising
-/// instead of reversing.
-fn second_target() -> [f64; NUM_JOINTS] {
-    [2.0, -0.2, 2.0, 2.0, 1.5, -0.5]
-}
-
-fn plan_two(profile: ProfileKind, blend: bool) -> (Plan, MotionLimits, f64) {
-    let (limits, dt) = exec_limits();
-    let mut b = ProgramBuilder::new(HOME, limits, dt).unwrap();
-    b.move_j(
-        TARGET,
-        MoveParams {
-            profile,
-            blend_with_next: blend,
-            ..MoveParams::default()
-        },
-    )
-    .unwrap()
-    .move_j(
-        second_target(),
-        MoveParams {
-            profile,
-            ..MoveParams::default()
-        },
-    )
-    .unwrap();
-    (b.plan().unwrap(), limits, dt)
-}
-
-/// Largest velocity utilization max_j |qd_j| / v_limit_j at one sample.
-fn vel_utilization(s: &par6_motion::Sample, limits: &MotionLimits) -> f64 {
-    (0..NUM_JOINTS)
-        .map(|j| s.qd[j].abs() / limits.velocity[j])
-        .fold(0.0, f64::max)
-}
-
-fn boundary_index(plan: &Plan) -> usize {
-    plan.samples()
-        .iter()
-        .position(|s| s.meta.command_index == 1)
-        .expect("second command must appear in the stream")
-}
-
-fn assert_blend_behavior(profile: ProfileKind) {
-    let (plan, limits, dt) = plan_two(profile, true);
-    let jerk = match profile {
-        ProfileKind::Ruckig => Some(&limits.jerk),
-        _ => None,
-    };
-    let qs = positions_with_start(HOME, plan.samples());
-    assert_within_limits(
-        &qs,
-        dt,
-        &limits.velocity,
-        &limits.acceleration,
-        jerk,
-        "blend",
-    );
-
-    // C1 continuity: the commanded velocity stream never slews faster than
-    // the acceleration limit, splice included, and stays consistent with
-    // the position stream.
-    let mut prev_qd = [0.0; NUM_JOINTS];
-    for (k, s) in plan.samples().iter().enumerate() {
-        for j in 0..NUM_JOINTS {
-            let dv = (s.qd[j] - prev_qd[j]).abs();
-            assert!(
-                dv <= limits.acceleration[j] * dt * (1.0 + 1e-6) + 1e-9,
-                "qd slew {dv} on joint {j} at tick {k} exceeds a*dt"
-            );
-            let fd = (qs[k + 1][j] - qs[k][j]) / dt;
-            let mid = 0.5 * (s.qd[j] + prev_qd[j]);
-            assert!(
-                (fd - mid).abs() <= limits.acceleration[j] * dt + 1e-6,
-                "qd inconsistent with positions on joint {j} at tick {k}: fd {fd} vs {mid}"
-            );
-        }
-        prev_qd = s.qd;
-    }
-
-    // The corner is taken at speed: the peak cruise utilization does not
-    // collapse at the command boundary.
-    let peak_util = plan
-        .samples()
-        .iter()
-        .map(|s| vel_utilization(s, &limits))
-        .fold(0.0, f64::max);
-    let b = boundary_index(&plan);
-    let boundary_util = vel_utilization(&plan.samples()[b], &limits);
-    assert!(
-        boundary_util > 0.25 * peak_util,
-        "blended corner nearly stopped: {boundary_util} vs peak {peak_util}"
-    );
-
-    // Metadata semantics.
-    for s in &plan.samples()[..b] {
-        assert!(
-            s.meta.blend_continues,
-            "blending segment must carry the flag"
-        );
-        assert_eq!(s.meta.command_index, 0);
-        assert_eq!(s.meta.checkpoint_id, 0);
-    }
-    for s in &plan.samples()[b..] {
-        assert!(!s.meta.blend_continues);
-        assert_eq!(s.meta.command_index, 1);
-        assert_eq!(s.meta.checkpoint_id, 1);
-    }
-    let last = plan.samples().last().unwrap();
-    assert!(last.meta.is_last);
-    assert!(max_err(&last.q, &second_target()) < 1e-9);
-
-    // Contrast: without blending the same program settles to rest at the
-    // boundary and carries no blend flag.
-    let (unblended, _, _) = plan_two(profile, false);
-    let b = boundary_index(&unblended);
-    let handoff = &unblended.samples()[b - 1];
-    assert!(
-        handoff.qd.iter().all(|&v| v.abs() < 1e-9),
-        "unblended boundary must be at rest, got {:?}",
-        handoff.qd
-    );
-    assert!(!handoff.meta.blend_continues);
-}
-
-#[test]
-fn corner_blending_is_velocity_continuous_trapezoid() {
-    assert_blend_behavior(ProfileKind::Trapezoid);
-}
-
-#[test]
-fn corner_blending_is_velocity_continuous_ruckig() {
-    assert_blend_behavior(ProfileKind::Ruckig);
 }
 
 /// `qdd` against the centered difference of the emitted `qd`. A
 /// jerk-limited profile has continuous acceleration and the two must
-/// agree everywhere; a trapezoid steps its acceleration between phases
-/// and the difference smears each step across two ticks, so there a
-/// mismatch is legal only where the profile actually steps. The last
+/// agree everywhere; a trapezoid holds its acceleration constant within
+/// each phase and steps it between them, and the difference smears each
+/// step across two ticks, so there a mismatch is legal only where the
+/// profile actually steps. The last
 /// two samples are excluded: the final sample is forced to land at
 /// rest, which the difference stencil reads as a spurious deceleration.
 fn assert_qdd_is_the_derivative_of_qd(
@@ -500,6 +299,20 @@ fn assert_qdd_is_the_derivative_of_qd(
         s.iter().any(|x| x.qdd.iter().any(|a| a.abs() > 1e-3)),
         "a move that starts and ends at rest must accelerate somewhere"
     );
+    if steps {
+        // Constant acceleration within each phase: it changes only where
+        // a phase begins or ends — four places at most.
+        for j in 0..NUM_JOINTS {
+            let changes = s[..s.len() - 1]
+                .windows(2)
+                .filter(|w| (w[1].qdd[j] - w[0].qdd[j]).abs() > 1e-9)
+                .count();
+            assert!(
+                changes <= 4,
+                "{case}: joint {j} acceleration changes {changes} times — it is not a trapezoid"
+            );
+        }
+    }
     for (j, &jscale) in jerk_scale.iter().enumerate() {
         for k in 1..s.len().saturating_sub(2) {
             let fd = (s[k + 1].qd[j] - s[k - 1].qd[j]) / (2.0 * dt);
@@ -529,85 +342,11 @@ fn emitted_acceleration_is_the_derivative_of_emitted_velocity() {
         ProfileKind::Trapezoid,
         ProfileKind::Ruckig,
         ProfileKind::Quintic,
+        ProfileKind::Septic,
     ] {
         let (plan, limits, dt) = plan_one(profile, MoveParams::default());
-        assert_qdd_is_the_derivative_of_qd(
-            &format!("{profile:?} single"),
-            profile,
-            &plan,
-            &limits,
-            dt,
-        );
-        if profile == ProfileKind::Quintic {
-            continue; // point-to-point: no blended form to check
-        }
-        let (plan, limits, dt) = plan_two(profile, true);
-        assert_qdd_is_the_derivative_of_qd(
-            &format!("{profile:?} blend"),
-            profile,
-            &plan,
-            &limits,
-            dt,
-        );
+        assert_qdd_is_the_derivative_of_qd(&format!("{profile:?}"), profile, &plan, &limits, dt);
     }
-}
-
-#[test]
-fn ruckig_waypoint_chain_passes_through_waypoints() {
-    let (limits, dt) = exec_limits();
-    let way1 = TARGET;
-    let way2: [f64; NUM_JOINTS] = [0.5, -1.0, 2.7, 0.5, 0.2, 2.0];
-    let end: [f64; NUM_JOINTS] = [-0.5, -2.0, 3.5, -0.5, -0.4, 3.0];
-    let mut b = ProgramBuilder::new(HOME, limits, dt).unwrap();
-    let blend = MoveParams {
-        profile: ProfileKind::Ruckig,
-        blend_with_next: true,
-        ..MoveParams::default()
-    };
-    b.move_j(way1, blend)
-        .unwrap()
-        .move_j(way2, blend)
-        .unwrap()
-        .move_j(
-            end,
-            MoveParams {
-                profile: ProfileKind::Ruckig,
-                ..MoveParams::default()
-            },
-        )
-        .unwrap();
-    let plan = b.plan().unwrap();
-    let qs = positions_with_start(HOME, plan.samples());
-    assert_within_limits(
-        &qs,
-        dt,
-        &limits.velocity,
-        &limits.acceleration,
-        Some(&limits.jerk),
-        "waypoint chain",
-    );
-    for (name, wp) in [("way1", way1), ("way2", way2)] {
-        let closest = plan
-            .samples()
-            .iter()
-            .map(|s| max_err(&s.q, &wp))
-            .fold(f64::INFINITY, f64::min);
-        assert!(
-            closest < 0.05,
-            "chain must pass through {name}, closest approach {closest} rad"
-        );
-    }
-    assert!(max_err(&plan.samples().last().unwrap().q, &end) < 1e-9);
-    // Three commands appear in order.
-    let cmds: Vec<u32> = plan
-        .samples()
-        .iter()
-        .map(|s| s.meta.command_index)
-        .collect();
-    assert!(cmds.windows(2).all(|w| w[0] <= w[1]));
-    assert_eq!(*cmds.last().unwrap(), 2);
-    assert_eq!(cmds[0], 0);
-    assert!(cmds.contains(&1));
 }
 
 #[test]
@@ -677,33 +416,6 @@ fn builder_rejects_invalid_programs() {
     assert!(matches!(
         b.plan(),
         Err(MotionError::InvalidInput { what: "moves", .. })
-    ));
-
-    // A blend chain must not mix profiles.
-    let mut b = ProgramBuilder::new(HOME, limits, dt).unwrap();
-    b.move_j(
-        TARGET,
-        MoveParams {
-            profile: ProfileKind::Trapezoid,
-            blend_with_next: true,
-            ..MoveParams::default()
-        },
-    )
-    .unwrap()
-    .move_j(
-        second_target(),
-        MoveParams {
-            profile: ProfileKind::Ruckig,
-            ..MoveParams::default()
-        },
-    )
-    .unwrap();
-    assert!(matches!(
-        b.plan(),
-        Err(MotionError::MixedProfileBlend {
-            first: 0,
-            second: 1
-        })
     ));
 
     // The ruckig profile needs finite jerk limits.

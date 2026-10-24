@@ -18,8 +18,8 @@ use par6_proto::command as cmd;
 use par6_proto::{Command, CompletionPolicy, NUM_JOINTS};
 
 use crate::convert::{
-    client_err, flashing_assertion, frame_of, query_result_dict, shape_from_py, status_dict,
-    tool_param_from_py, wire_error_tuple,
+    client_err, flashing_assertion, frame_of, query_result_dict, received_status_dict,
+    shape_from_py, tool_param_from_py, wire_error_tuple,
 };
 
 /// The model a payload identification measures against: the arm with no
@@ -248,16 +248,18 @@ impl CoreClient {
         self.client.status_seq_gaps()
     }
 
-    /// The latest STATUS frame as a dict, or `None` before the first one.
+    /// The latest STATUS frame and its client-local monotonic receipt time,
+    /// or `None` before the first one.
     fn latest_status(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
-        match self.client.latest_status() {
-            Some(s) => Ok(Some(status_dict(py, &s)?)),
+        match self.client.latest_received_status() {
+            Some(s) => Ok(Some(received_status_dict(py, &s)?)),
             None => Ok(None),
         }
     }
 
     /// Await a STATUS frame whose seq differs from `last_seq` (pass -1
     /// for "any frame"), up to `timeout` seconds; `None` on timeout.
+    /// `client_received_monotonic_s` includes time spent awaiting Python.
     fn status_after<'py>(
         &self,
         py: Python<'py>,
@@ -275,8 +277,8 @@ impl CoreClient {
             if !hit {
                 return Ok(None);
             }
-            match client.latest_status() {
-                Some(s) => Python::with_gil(|py| status_dict(py, &s).map(Some)),
+            match client.latest_received_status() {
+                Some(s) => Python::with_gil(|py| received_status_dict(py, &s).map(Some)),
                 None => Ok(None),
             }
         })
@@ -356,6 +358,21 @@ impl CoreClient {
         ack_future(
             py,
             async move { client.set_can_id(node, new_id, force).await },
+        )
+    }
+
+    #[pyo3(signature = (node, tool_id, force=false))]
+    fn set_tool_id<'py>(
+        &self,
+        py: Python<'py>,
+        node: u8,
+        tool_id: u8,
+        force: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        ack_future(
+            py,
+            async move { client.set_tool_id(node, tool_id, force).await },
         )
     }
 
@@ -548,8 +565,8 @@ impl CoreClient {
 
     /// Estimate what the arm is carrying — mass and centre of mass, never
     /// the inertia tensor, which static poses cannot excite — and,
-    /// optionally, tell the runtime. The whole protocol, including the
-    /// clearing and restoring of whatever was declared, is
+    /// optionally, tell the runtime. The position-hold measurement and
+    /// acknowledged declaration replacement are
     /// `par6d::calibrate::estimate`'s; this only carries paths and results.
     #[pyo3(signature = (config=None, assets=None, package_dir=None, spread=0.5, ridge=0.01, declare=false))]
     #[allow(clippy::too_many_arguments)]
@@ -565,8 +582,15 @@ impl CoreClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
         let cache = Arc::clone(&self.estimation);
-        let key = format!("{config:?}|{assets:?}|{package_dir:?}");
         future_into_py(py, async move {
+            // The tool the runtime has fitted now, which a select_tool may
+            // have changed since it booted: its mass is no payload.
+            let tool = match client.tools().await {
+                Ok(par6_proto::QueryResult::Tools { tool, .. }) if !tool.is_empty() => Some(tool),
+                Ok(_) => None,
+                Err(e) => return Err(PyRuntimeError::new_err(format!("tools: {e}"))),
+            };
+            let key = format!("{config:?}|{assets:?}|{package_dir:?}|{tool:?}");
             let mut slot = cache.lock().await;
             if !matches!(&*slot, Some((k, _)) if *k == key) {
                 // Off the async thread: this parses the URDF and builds the
@@ -577,6 +601,7 @@ impl CoreClient {
                         config.as_deref().map(std::path::Path::new),
                         assets.as_deref().map(std::path::Path::new),
                         package_dir.as_deref().map(std::path::Path::new),
+                        tool.as_deref(),
                     )
                 })
                 .await

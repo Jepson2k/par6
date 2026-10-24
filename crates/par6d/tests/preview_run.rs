@@ -83,6 +83,68 @@ fn physics_applies_program_configuration_and_reports_unsupported_operations() {
     assert!(run.commands.last().unwrap().rows > 0);
     assert_eq!(preview.payload(), initial_payload);
 
+    // The configuration reaches the run, not just the command list. Under
+    // COMMANDED a move ends with its trajectory; under SETTLED it waits for
+    // the arm, so the same move spans more rows.
+    let mut away = park_deg();
+    away[0] += 20.0;
+    let move_rows = |policy| {
+        let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+        let run = preview
+            .run(
+                &[
+                    Command::SetCompletionPolicy(SetCompletionPolicy { policy }),
+                    move_j_cmd(away, 9952, 0.5),
+                ],
+                RunLimits { max_seconds: 10.0 },
+            )
+            .unwrap();
+        assert_eq!(run.stop, StopReason::Completed, "{:?}", run.commands);
+        run.commands[1].rows
+    };
+    let (commanded, settled) = (
+        move_rows(CompletionPolicy::Commanded),
+        move_rows(CompletionPolicy::Settled),
+    );
+    assert!(
+        commanded < settled,
+        "the policy did not reach the run: {commanded} rows commanded, {settled} settled"
+    );
+    // A declared payload the plant does not carry is a load the
+    // controller lifts: the floating arm drifts where the undeclared one
+    // holds.
+    let held_after = |declare: bool| {
+        let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+        let mut program = vec![];
+        if declare {
+            program.push(Command::SetPayload(SetPayload {
+                mass: 1.5,
+                com: [0.0, 0.0, 0.05],
+                inertia: None,
+            }));
+        }
+        program.push(Command::Delay(Delay {
+            key: 9953,
+            seconds: 1.0,
+        }));
+        let run = preview
+            .run(&program, RunLimits { max_seconds: 3.0 })
+            .unwrap();
+        let last = run.rows - 1;
+        run.q_rad[last * run.joints..(last + 1) * run.joints].to_vec()
+    };
+    let (bare, loaded) = (held_after(false), held_after(true));
+    let moved = bare
+        .iter()
+        .zip(&loaded)
+        .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
+        .to_degrees();
+    assert!(
+        moved > 0.5,
+        "the declared payload did not reach the run's gravity model: the arm ends \
+         {moved:.3}° from where it ends undeclared"
+    );
+
     let unsupported = preview
         .run(
             &[Command::Reset, commands[4].clone()],
@@ -130,7 +192,11 @@ fn physics_refuses_stale_attachments_before_running_later_commands() {
                 Command::SetShapes(SetShapes { shapes: vec![part] })
             }
             _ => {
+                // The epoch is read after the arm loses its reference, so
+                // the attachment is fresh and only the homed gate can
+                // refuse it.
                 preview.set_homed(false);
+                part.attachment.as_mut().unwrap().epoch = preview.shapes().3;
                 Command::SetShapes(SetShapes { shapes: vec![part] })
             }
         };
@@ -301,7 +367,7 @@ fn execution_controls_reach_the_simulated_runtime() {
     let tool = par6_config::RobotConfig::load(&config)
         .expect("config")
         .robot
-        .active_gripper;
+        .active_tool;
     let held_tool = preview
         .run(
             &[
@@ -338,6 +404,24 @@ fn execution_controls_reach_the_simulated_runtime() {
         jaw.iter().all(|&j| j < 0.05),
         "a paused program closed the jaws: {jaw:?}"
     );
+
+    // A run starts unpaused whatever the session it was loaded from was doing.
+    {
+        use par6_proto::command::Pause;
+        let config = test_config();
+        let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+        assert!(preview.submit(Command::Pause(Pause { on: true })).valid());
+        let mut target = park_deg();
+        target[0] += 5.0;
+        let run = preview
+            .run(
+                &[move_j_cmd(target, 9970, 0.5)],
+                RunLimits { max_seconds: 5.0 },
+            )
+            .unwrap();
+        assert_eq!(run.stop, StopReason::Completed, "{:?}", run.commands);
+        assert!(run.commands[0].rows > 0, "the first move never ran");
+    }
 }
 
 /// The simulated run against the planner it replaces.
@@ -427,10 +511,24 @@ fn the_simulated_run_lands_where_the_plan_says_and_shows_the_tracking_error() {
     );
     // TOPPRA, the startup profile, runs the joints at their acceleration
     // limit with no jerk limit, which the plant follows a little less
-    // closely than a jerk-limited profile.
+    // closely than a jerk-limited profile. The lag grows with the
+    // acceleration asked of it: 0.06 rad at 9.6 rad/s², scaled to the
+    // configured EXEC limit of the two joints the moves drive.
+    let accel = par6_config::ConfigBundle::load(&config)
+        .expect("config")
+        .robot
+        .joints[..2]
+        .iter()
+        .map(|j| {
+            j.limits
+                .for_mode(par6_config::LimitMode::Exec)
+                .acceleration_rad_s2
+        })
+        .fold(0.0, f64::max);
+    let bound = (0.06 * accel / 9.6) as f32;
     assert!(
-        worst < 0.06,
-        "the arm is not following its commands: worst tracking error {worst} rad"
+        worst < bound,
+        "the arm is not following its commands: worst tracking error {worst} rad (bound {bound})"
     );
 }
 
@@ -443,6 +541,13 @@ fn the_simulated_run_lands_where_the_plan_says_and_shows_the_tracking_error() {
 /// welding it to the TCP — both would be claims physics could contradict.
 #[test]
 fn a_run_grasps_lifts_and_drops_a_world_object() {
+    // A light block and one ten times heavier: the drivetrains give under
+    // the extra load, and the grip and the lift must carry it all the same.
+    grasps_lifts_and_drops(0.05);
+    grasps_lifts_and_drops(0.5);
+}
+
+fn grasps_lifts_and_drops(mass: f64) {
     let config = test_config();
     let mut session = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     session.set_gripper_calibrated(true);
@@ -467,7 +572,7 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
             ShapeLayer::Program,
             &[
                 shape("stand", [0.04, 0.04, 0.01], 0.005, None),
-                shape("block", [0.036, 0.036, 0.06], 0.04, Some(0.05)),
+                shape("block", [0.036, 0.036, 0.06], 0.04, Some(mass)),
             ],
         )
         .expect("world applied");
@@ -478,7 +583,7 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
     let tool = par6_config::RobotConfig::load(&config)
         .expect("cfg")
         .robot
-        .active_gripper;
+        .active_tool;
     let tool_move = |key: u64, closed: f64| {
         Command::ToolAction(ToolAction {
             key,
@@ -520,7 +625,7 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
     assert!(
         !batch.objects.iter().any(|t| t.name == "stand"),
         "a massless shape is a fixture welded into the world, not a body \
-         with a pose to track: {:?}",
+             with a pose to track: {:?}",
         batch.objects.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
 
@@ -536,11 +641,11 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
     );
     assert!(
         raised > held + 0.05,
-        "friction against the closed jaws must carry the block up: {held} -> {raised}"
+        "friction against the closed jaws must carry the {mass} kg block up: {held} -> {raised}"
     );
     assert!(
         dropped < raised - 0.05,
-        "opening the jaws must drop it: held at {raised}, ended at {dropped}"
+        "opening the jaws must drop the {mass} kg block: held at {raised}, ended at {dropped}"
     );
 
     // The jaws report the hold themselves, and the contact solver has
@@ -564,7 +669,7 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
 /// report neither as a failure of the run.
 #[test]
 fn physics_replays_io_writes_and_runs_on_after_a_stop() {
-    use par6_proto::command::{Stop, WriteIo};
+    use par6_proto::command::{Pause, Stop, WriteIo};
     let config = test_config();
     let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
     let mut target = park_deg();
@@ -576,6 +681,7 @@ fn physics_replays_io_writes_and_runs_on_after_a_stop() {
             value: 1,
         }),
         move_j_cmd(target, 9960, 0.2),
+        Command::Pause(Pause { on: true }),
         Command::Stop(Stop { clear_queue: true }),
         move_j_cmd(park_deg(), 9961, 0.2),
     ];
@@ -589,11 +695,12 @@ fn physics_replays_io_writes_and_runs_on_after_a_stop() {
         "the move after the write never ran"
     );
     // Live, a stop with nothing queued behind it cancels nothing and the
-    // program goes on: the move after it runs and lands.
-    assert_eq!(run.commands[2].rows, 0);
-    assert!(run.commands[2].error.is_none(), "{:?}", run.commands[2]);
+    // program goes on; a clearing stop drops the pause standing before
+    // it, so the move after it runs and lands without a resume.
+    assert_eq!(run.commands[3].rows, 0);
+    assert!(run.commands[3].error.is_none(), "{:?}", run.commands[3]);
     assert!(
-        run.commands[3].rows > 0,
+        run.commands[4].rows > 0,
         "the move after the stop never ran"
     );
     let joints = run.joints;
@@ -605,24 +712,4 @@ fn physics_replays_io_writes_and_runs_on_after_a_stop() {
             "joint {j} ended at {got} rad, not {want}: the move after the stop did not land"
         );
     }
-}
-
-/// A run boots its engine unpaused whatever the session's pause: the
-/// program's own pause commands are what it replays.
-#[test]
-fn a_run_starts_unpaused_from_a_paused_session() {
-    use par6_proto::command::Pause;
-    let config = test_config();
-    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
-    assert!(preview.submit(Command::Pause(Pause { on: true })).valid());
-    let mut target = park_deg();
-    target[0] += 5.0;
-    let run = preview
-        .run(
-            &[move_j_cmd(target, 9970, 0.5)],
-            RunLimits { max_seconds: 5.0 },
-        )
-        .unwrap();
-    assert_eq!(run.stop, StopReason::Completed, "{:?}", run.commands);
-    assert!(run.commands[0].rows > 0, "the first move never ran");
 }

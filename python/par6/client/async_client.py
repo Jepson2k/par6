@@ -529,7 +529,7 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         Each row carries ``node``, ``configured`` (the config lists it),
         ``present`` (it answered a ping this boot), ``freshness`` (0
         unknown, 1 fresh, 2 stale, 3 lost — configured nodes only) and
-        the device identity ``hw_ver``/``sw_ver``/``serial`` when the
+        the device identity ``hw_ver``/``sw_ver``/``serial``/``tool_id`` when the
         runtime has swept it.  The reply waits for the scan to settle, so
         expect a few hundred milliseconds.  Returns None if unreachable.
 
@@ -599,6 +599,24 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         """
         core = await self._ensure_core()
         return await self._call(core.set_can_id(int(node), int(new_id), bool(force)))
+
+    async def set_tool_id(self, node: int, tool_id: int, *, force: bool = False) -> int:
+        """Commissioning: tell gripper drive *node* which tool it is built
+        into, and have it saved to the drive's NVM.
+
+        *tool_id* is the ``can_tool_id`` of a configured tool (0 clears it).
+        The drive reports it in its device info from then on, and the
+        runtime fits that tool at boot instead of ``active_tool``, so the
+        arm knows what is on it without being told.  Same gate and
+        ``force`` rule as :meth:`set_can_id`.
+
+        Category: Commissioning
+
+        Example:
+            rbt.set_tool_id(6, 13, force=True)
+        """
+        core = await self._ensure_core()
+        return await self._call(core.set_tool_id(int(node), int(tool_id), bool(force)))
 
     async def save_config(self, node: int, *, force: bool = False) -> int:
         """Commissioning: ask drive *node* to persist its running
@@ -1050,7 +1068,9 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
 
     async def stop(self, clear_queue: bool = True) -> int:
         """Stop all motion; with *clear_queue* (the default) also clear the
-        queue.  The controller stays enabled and holding position.
+        queue. The controller stays enabled. Idle support follows the gravity
+        compensation and freedrive settings; with gravity enabled it can use
+        torque-only support rather than a position hold.
 
         Category: Control
 
@@ -1128,18 +1148,16 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         runtime carries the result as a point mass, which is what most
         payloads are well enough described by.
 
-        Call it after closing on a part whose mass you do not know.  The
-        WRIST swings where the arm already stands — the payload's lever
-        arm about the wrist is what makes its first moment observable —
-        so nothing below moves, the pick is not disturbed, and the whole
-        thing takes seconds.
+        Measurement poses vary the wrist. Each is approached from both
+        directions with small shoulder, elbow and wrist moves (0.05 rad)
+        to reduce drivetrain friction bias. Position feedback remains
+        active throughout the final approach and sampling.
 
-        The runtime's payload is cleared first: the load is estimated
-        from the torque the *unloaded* model cannot account for, so a
-        payload already declared would be compensated away and come back
-        as nothing.  With *declare* (the default) the result is sent
-        straight back as the new payload, so the gravity model carries
-        the part from the next tick.
+        The current payload declaration stays in place while measuring.
+        With *declare*, a valid result replaces it after the routine
+        returns to the starting pose. A failed application restores the
+        previous declaration. Load-dependent gearbox friction can bias
+        the fit; a low residual alone does not validate its mass.
 
         *spread* is how far each wrist joint swings either way (rad);
         widen it when the wrist has room and the result reads noisy.
@@ -1560,12 +1578,11 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
     async def select_tool(self, tool_name: str, variant_key: str = "") -> int:
         """Set the active end-effector tool on the controller.
 
-        A runtime is built around ONE fitted gripper and refuses any other
-        key, so this selects the tool the box is already wearing — read the
-        available one from ``robot.tools`` rather than naming it literally.
-        No par6 tool declares variants, so ``variant_key`` selects no
-        geometry; it rides through to STATUS and clears the TCP offset when
-        it changes.
+        Any tool in ``robot.tools`` can be fitted; the runtime rebuilds its
+        kinematics, gravity and collision models around it, and an unknown
+        key is refused. No par6 tool declares variants, so ``variant_key``
+        selects no geometry; it rides through to STATUS and clears the TCP
+        offset when it changes.
 
         Category: Configuration
 
@@ -1578,9 +1595,9 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
             core.select_tool(key, variant_key if variant_key else None)
         )
         # Only a tool the runtime accepted is the active one: a refused
-        # selection (the runtime is fitted with a different tool) would
-        # otherwise leave ``client.tool`` and the tool_action key pointing
-        # at hardware that is not on the arm.
+        # selection (a key the runtime does not know) would otherwise leave
+        # ``client.tool`` and the tool_action key pointing at hardware that
+        # is not on the arm.
         if index is not None and index >= 0:
             self._active_tool_key = key
             self._active_variant_key = variant_key

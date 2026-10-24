@@ -30,14 +30,14 @@ use crate::state::LoopStats;
 /// these 500 order statistics, and a percentile needs its samples to
 /// mean anything. Held to a wall-clock span instead, a 50 ms tick would
 /// leave 40 samples and a "p99" that is really the window maximum.
-const WINDOW: usize = 500;
+pub const WINDOW: usize = 500;
 /// Percentiles are recomputed every this many ticks (vendor constant).
 ///
 /// Also a count — it buys the sort back over that many ticks. What it
 /// costs is resolution: `p99` cannot move faster than this, which is
 /// what [`sustain_resolution_s`] converts into the shortest critical
 /// sustain worth configuring.
-const RECOMPUTE_EVERY: u64 = 50;
+pub const RECOMPUTE_EVERY: u64 = 50;
 /// Ticks before the bands are evaluated at all (vendor constant; covers
 /// filling the window plus scheduler settling at boot).
 ///
@@ -45,7 +45,7 @@ const RECOMPUTE_EVERY: u64 = 50;
 /// holds samples, so this must outrun it and is a count for the same
 /// reason. Longer at a slow tick is the conservative direction — it
 /// delays judgement, it does not weaken it.
-const WARMUP_TICKS: u64 = 850;
+pub const WARMUP_TICKS: u64 = 850;
 /// EMA smoothing factor for the published mean period.
 const EMA_ALPHA: f64 = 0.05;
 
@@ -298,19 +298,28 @@ mod tests {
         for _ in 0..(WARMUP_TICKS - 1) {
             assert_eq!(t.record(dt * 1.2, false), LoopHealth::Ok, "warmup gates");
         }
-        // Past warmup with a fully bad window the sustain counter runs;
-        // 1.0 s of sustained critical-band p99 latches.
-        let sustain = (1.0f64 / dt).round() as u64;
-        let mut verdicts = Vec::new();
-        for _ in 0..sustain + RECOMPUTE_EVERY {
-            verdicts.push(t.record(dt * 1.2, false));
-        }
-        assert!(verdicts.contains(&LoopHealth::Critical), "sustained latch");
+        // Past warmup with a fully bad window the sustain counter runs:
+        // degraded until the configured sustain has elapsed, critical on
+        // exactly the tick it does.
+        let sustain = (TimingConfig::default().critical_sustain_s / dt).round() as usize;
+        let verdicts: Vec<LoopHealth> = (0..sustain).map(|_| t.record(dt * 1.2, false)).collect();
+        assert!(
+            verdicts[..sustain - 1]
+                .iter()
+                .all(|v| *v == LoopHealth::Degraded),
+            "critical before the sustain elapsed: {:?}",
+            verdicts.iter().position(|v| *v == LoopHealth::Critical)
+        );
+        assert_eq!(
+            verdicts[sustain - 1],
+            LoopHealth::Critical,
+            "latches at the sustain"
+        );
         // Degraded band: periods slightly high (7% over) — degraded but
         // never critical.
         let mut t = LoopTiming::new(dt, TimingConfig::default());
         let mut saw_degraded = false;
-        for _ in 0..(WARMUP_TICKS + 3 * sustain) {
+        for _ in 0..(WARMUP_TICKS + 3 * sustain as u64) {
             match t.record(dt * 1.07, false) {
                 LoopHealth::Critical => panic!("1.07·dt must not be critical"),
                 LoopHealth::Degraded => saw_degraded = true,

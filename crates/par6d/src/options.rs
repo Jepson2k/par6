@@ -35,6 +35,12 @@ pub struct Options {
     #[arg(long, value_name = "PATH", env = "PAR6_CONFIG")]
     pub config: Option<PathBuf>,
 
+    /// This installation's own values, layered over the robot TOML: its
+    /// calibration, the bench it stands on (default: `local.toml` beside
+    /// the robot TOML, when there is one).
+    #[arg(long, value_name = "PATH", env = par6_config::LOCAL_CONFIG_ENV)]
+    pub local_config: Option<PathBuf>,
+
     /// assets/par6_description tree with the PAR6 URDFs, used by the
     /// kinematics stack (default: the tree next to the config directory).
     #[arg(long, value_name = "DIR", env = "PAR6_ASSETS")]
@@ -136,6 +142,23 @@ pub fn clear_empty_env() {
     }
 }
 
+/// The robot config at `config_path` with its local overlay layered over it
+/// (`local` when given, else the default the overlay rules pick — see
+/// [`par6_config::local_overlay`]), fitted with `tool` when given; and the
+/// overlay that was applied.
+pub fn load_config(
+    config_path: &Path,
+    local: Option<&Path>,
+    tool: Option<&str>,
+) -> Result<(par6_config::ConfigBundle, Option<PathBuf>), par6_config::ConfigError> {
+    let local = par6_config::local_overlay(config_path, local)?;
+    let bundle = par6_config::ConfigBundle::load_with(config_path, local.as_deref(), tool)?;
+    Ok((bundle, local))
+}
+
+/// Where the deploy bundle installs the robot TOML on a control box.
+pub const INSTALLED_CONFIG: &str = "/etc/par6/PAR6.toml";
+
 /// Resolve the robot TOML path: the explicit choice when given, else the
 /// first existing default location. The error names every path tried.
 pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
@@ -162,7 +185,7 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
             candidates.push(dir.join("../../../config/PAR6.toml"));
         }
     }
-    candidates.push(PathBuf::from("/etc/par6/PAR6.toml"));
+    candidates.push(PathBuf::from(INSTALLED_CONFIG));
     for c in &candidates {
         if c.is_file() {
             return Ok(c.clone());
