@@ -825,14 +825,18 @@ arm's own link masses from the torque it holds at twenty poses (the links are
 gains because an uncompensated first harmonic looks exactly like a loop
 oscillation at speed and would fail every speed verdict after it.
 
-The gains stage is the StepFOC manual procedure, automated: Kpv, then Kiv,
-then Kpp, each walked up a fixed lattice (Kpv 0.001·1.25ⁿ with Kiv keeping its
-ratio to it, Kiv 0.0001·1.5ⁿ, Kpp 2.5·2ⁿ to 20) from the point nearest the
-configured value while a ramped velocity pulse (a position step for Kpp) stays
-stable, then backed off one point for Kpv. Every accepted point is confirmed on
-the normal profile over the joint's checked travel, both ways, and steps down a
+The gains stage is the StepFOC manual procedure, automated: Kpv (with Kiv at
+its lattice floor, as the guide tunes P before I), then Kiv, then Kpp, each
+walked up a fixed lattice (Kpv 0.001·1.25ⁿ, Kiv 0.0001·1.5ⁿ, Kpp 2.5·2ⁿ to 20)
+from the point nearest the configured value while a ramped velocity pulse (a
+position step for Kpp) stays stable. Every accepted point is confirmed on the
+normal profile over the joint's checked travel, both ways, and steps down a
 point if that sweep runs away, reverses its speed error six times across
-±15 deg/s, or fails to hold or settle; lag is reported, not judged. The set is
+±15 deg/s, or is not still afterwards or did not land; lag is reported, not
+judged. Kpv is then backed off one point from the point that passed the sweep:
+the pulse verdict at the knee does not repeat (J2 kpv 0.0284 read 2.7 and
+6.3 deg/s on consecutive runs) while the sweep's does, so the sweep decides
+where the margin is taken from. The set is
 then held at the arm-out pose and at each joint's minimum- and maximum-inertia
 identification poses to the measurement's own stillness rule; a joint that
 shakes on the way steps Kpv down, one that will not hold still steps Kpp then

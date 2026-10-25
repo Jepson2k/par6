@@ -108,12 +108,6 @@ const HOLDING_RMS_RAD_S: f64 = std::f64::consts::PI / 180.0;
 /// 1.7x and fails both wrist joints.
 const FOLLOWING_S: f64 = 0.006;
 
-/// Kollmorgen's velocity tuning guide recommends 1 s as an initial service
-/// interval when settling time is unknown. A finite measurement interval, not
-/// proof of indefinite stability.
-/// https://www.kollmorgen.com/en-us/developer-network/akd-online-tuning-guide
-const HOLD_OBSERVATION_S: f64 = 1.0;
-
 /// How long a drive may go without fresh motion feedback before the run treats
 /// it as lost. `[bus].stale_warn_s` is a self-clearing warning and the wrong
 /// knob for this. Measured over four runs (467k samples each): every joint is
@@ -463,17 +457,20 @@ impl GainAxis {
     fn set(self, g: &mut Gains, value: f64) {
         let value = f64::from(value as f32);
         match self {
-            Self::Kpv => {
-                // The integral corner (Kiv/Kpv) belongs to the Kiv search; a Kpv
-                // step keeps it so the loop's shape survives the walk. With Kiv
-                // left at the config's value, J3 hunted harder at every step
-                // down (2026-10-01).
-                let ratio = if g.kpv > 0.0 { g.kiv / g.kpv } else { 0.0 };
-                g.kpv = value;
-                g.kiv = f64::from((ratio * value) as f32);
-            }
+            Self::Kpv => g.kpv = value,
             Self::Kiv => g.kiv = value,
             Self::Kpp => g.kpp = value,
+        }
+    }
+    /// Step a tuned candidate down its lattice to `index`. A Kpv step keeps
+    /// the integral corner (Kiv/Kpv) the Kiv search found, so the loop's
+    /// shape survives: with Kiv left where it was, J3 hunted harder at every
+    /// step down (2026-10-01).
+    fn lower(self, g: &mut Gains, index: i32) {
+        let ratio = if g.kpv > 0.0 { g.kiv / g.kpv } else { 0.0 };
+        self.set(g, self.at(index));
+        if self == Self::Kpv {
+            g.kiv = f64::from((ratio * g.kpv) as f32);
         }
     }
     fn label(self) -> &'static str {
@@ -580,15 +577,15 @@ impl Sweep {
 }
 
 /// The verdict on one leg: a runaway or an oscillation fails it, as does a
-/// joint that will not hold still afterwards or did not land; a contact
-/// says nothing about the gains.
-fn sweep_verdict(m: &Measure, holding_limit: f64, tolerance: f64) -> Sweep {
+/// joint that is not still afterwards or did not land; a contact says
+/// nothing about the gains.
+fn sweep_verdict(m: &Measure, tolerance: f64) -> Sweep {
     match m.outcome {
         Outcome::Unstable | Outcome::Timeout => Sweep::Failed,
         Outcome::Blocked => Sweep::Stopped,
         Outcome::Complete => {
             if m.reversals >= SWEEP_REVERSALS
-                || m.hold_rms_rad_s > holding_limit
+                || !m.settle_s.is_finite()
                 || m.settled_error_rad > tolerance
             {
                 Sweep::Failed
@@ -777,7 +774,6 @@ enum Event {
     Phase(&'static str, usize),
     Tool(u8, bool),
     Configure(u64, usize, f64, i32),
-    Hold(u64, usize, &'static str, f64, f64),
     Move(u64, usize, Outcome, f64, i32, i32, Measure),
     Contact(u64, usize, i64, f64, f64, bool, bool),
     FeedbackGap(u64, usize, f64),
@@ -856,20 +852,15 @@ fn describe(event: &Event) -> Option<String> {
                 j + 1
             )
         }
-        Event::Hold(tick, j, why, position_rms, speed_rms) => format!(
-            "tick={tick} J{} HOLD {why} position_rms={:.5}deg speed_rms={:.5}deg/s",
-            j + 1,
-            position_rms.to_degrees(),
-            speed_rms.to_degrees()
-        ),
         Event::Move(tick, j, outcome, elapsed, from, to, m) => format!(
             "tick={tick} J{} MOVE {outcome:?} {elapsed:.3}s {from}->{to} \
              position_rms={:.5}deg peak_error={:.5}deg settled={:.5}deg \
-             speed_rms={:.5}deg/s peak_command={:.5}deg/s excess={:.4}",
+             settle={:.2}s speed_rms={:.5}deg/s peak_command={:.5}deg/s excess={:.4}",
             j + 1,
             m.rms_position().to_degrees(),
             m.peak_error_rad.to_degrees(),
             m.settled_error_rad.to_degrees(),
+            m.settle_s,
             m.rms_speed().to_degrees(),
             m.peak_command_rad_s.to_degrees(),
             m.excess
@@ -938,9 +929,9 @@ fn describe(event: &Event) -> Option<String> {
             "tick={tick} J{} GAINS pose motion speed_rms={:.3}deg/s peak_position_error={:.3}deg reversals={reversals}",
             j + 1, speed.to_degrees(), position.to_degrees()
         ),
-        Event::Sweep(tick, j, g, reversals, hold, lag_ms, verdict) => format!(
-            "tick={tick} J{} GAINS sweep kpv={:.6} kiv={:.8} kpp={:.5} reversals={reversals} hold_rms={:.3}deg/s lag={lag_ms:.1}ms {verdict}",
-            j + 1, g.kpv, g.kiv, g.kpp, hold.to_degrees()
+        Event::Sweep(tick, j, g, reversals, settle_s, lag_ms, verdict) => format!(
+            "tick={tick} J{} GAINS sweep kpv={:.6} kiv={:.8} kpp={:.5} reversals={reversals} settle={settle_s:.2}s lag={lag_ms:.1}ms {verdict}",
+            j + 1, g.kpv, g.kiv, g.kpp
         ),
         Event::RippleFit(tick, j, h) => format!(
             "tick={tick} J{} RIPPLE fit {}",
@@ -1093,7 +1084,9 @@ struct Measure {
     /// `SWEEP_BAND_RAD_S` to beyond the other.
     reversals: u32,
     settled_error_rad: f64,
-    hold_rms_rad_s: f64,
+    /// From the end of the move until the joint was still \[s\]; infinite
+    /// when it never was within the settle budget.
+    settle_s: f64,
     /// How far this move missed the acceptance limits, as a fraction of them.
     /// Zero passes. One scale, no offset: an earlier design carried
     /// `1.0 + violation` in one place and the raw value in another, and a
@@ -1118,7 +1111,7 @@ impl Measure {
     /// diagnostic: on 2026-09-21 J4 carried 1.19 deg of following error at
     /// 97 deg/s, four times what a healthy joint carries per unit speed, and
     /// passed on speed RMS alone.
-    fn score(&mut self, positional: bool, moving_limit: f64, holding_limit: f64, tolerance: f64) {
+    fn score(&mut self, positional: bool, moving_limit: f64, tolerance: f64) {
         let over = |value: f64, limit: f64| {
             if limit > 0.0 {
                 value / limit - 1.0
@@ -1127,7 +1120,9 @@ impl Measure {
             }
         };
         let mut excess = over(self.rms_speed(), moving_limit);
-        excess = excess.max(over(self.hold_rms_rad_s, holding_limit));
+        if !self.settle_s.is_finite() {
+            excess = f64::INFINITY;
+        }
         if positional {
             excess = excess.max(over(
                 self.peak_error_rad,
@@ -2089,93 +2084,10 @@ impl Arm {
         }
     }
 
+    /// Every joint still, by the measurements' own rule, before a stage
+    /// trusts the hold it starts from.
     fn check_startup_hold(&mut self) -> Result<()> {
-        self.check_hold("startup")
-    }
-
-    fn check_hold(&mut self, why: &'static str) -> Result<()> {
-        let held = self.measure_hold(why)?;
-        for (j, (offset, speed)) in held.iter().enumerate() {
-            if *offset > self.tolerance() || *speed > self.holding_limit(j) {
-                return Err(format!(
-                    "J{} will not hold still at {why}: {:.4}deg, {:.4}deg/s",
-                    j + 1,
-                    offset.to_degrees(),
-                    speed.to_degrees()
-                )
-                .into());
-            }
-        }
-        Ok(())
-    }
-
-    /// Position RMS and speed RMS of every joint over the observation window.
-    fn measure_hold(&mut self, why: &'static str) -> Result<[(f64, f64); N]> {
-        let mut rings: [Ring; N] = std::array::from_fn(|_| Ring::default());
-        let mut sums = [(0.0_f64, 0.0_f64, 0u32); N];
-        let mut generation = self.generation;
-        let window = self.ticks(SPEED_WINDOW_S);
-        // A joint holding on trial gains has no guard but this one: the
-        // shared guard stands aside for it and the motion's own guard ended
-        // with the motion. A runaway here ends the hold at once as a failed
-        // hold, and the trial's own backoff takes it from there.
-        let trial = self.gain_joint.filter(|&j| self.sane_gains[j].is_some());
-        let mut loud = 0u32;
-        let mut ran_away = None;
-        'hold: for _ in 0..self.ticks(HOLD_OBSERVATION_S) {
-            self.frame(None)?;
-            for j in 0..N {
-                if generation[j] == self.generation[j] {
-                    continue;
-                }
-                generation[j] = self.generation[j];
-                if trial == Some(j) {
-                    let reported = self.state.nodes[self.node(j)].speed_ticks_s.unwrap_or(0);
-                    loud = if (f64::from(reported) * self.per_tick(j)).abs() > RUNAWAY_RAD_S {
-                        loud + 1
-                    } else {
-                        0
-                    };
-                    if loud >= RUNAWAY_TICKS {
-                        self.emit(Event::GainsNote(
-                            self.tick,
-                            j,
-                            "ran away while holding on trial gains; the hold is failed",
-                        ));
-                        ran_away = Some(j);
-                        break 'hold;
-                    }
-                }
-                let p = self.pos(j)?;
-                let per_tick = self.per_tick(j);
-                let offset = (f64::from(p) - f64::from(self.hold[j])) * per_tick;
-                let Some(speed) = rings[j].push(self.tick, p, window, self.dt) else {
-                    continue;
-                };
-                let speed = speed * per_tick;
-                sums[j].0 += offset * offset;
-                sums[j].1 += speed * speed;
-                sums[j].2 += 1;
-            }
-        }
-        if ran_away.is_none() {
-            if let Some(j) = sums.iter().position(|(_, _, n)| *n == 0) {
-                return Err(
-                    format!("J{} supplied no complete encoder window at {why}", j + 1).into(),
-                );
-            }
-        }
-        let out: [(f64, f64); N] = std::array::from_fn(|j| {
-            if ran_away == Some(j) {
-                return (f64::INFINITY, f64::INFINITY);
-            }
-            let n = f64::from(sums[j].2.max(1));
-            ((sums[j].0 / n).sqrt(), (sums[j].1 / n).sqrt())
-        });
-        for (j, (offset, speed)) in out.iter().enumerate() {
-            self.emit(Event::Hold(self.tick, j, why, *offset, *speed));
-        }
-        Ok(out)
+        self.wait_still([true; N], STICTION_STILL_TIMEOUT_S)
     }
 
     // ------------------------------------------------------------ motion
@@ -2200,8 +2112,8 @@ impl Arm {
     }
 
     /// Run one commanded position move on one joint under its EXEC limits.
-    fn run_motion(&mut self, j: usize, target: i32, seconds: f64, score: bool) -> Result<Measure> {
-        self.run_motion_capped(j, target, seconds, score, self.exec_caps(j))
+    fn run_motion(&mut self, j: usize, target: i32, seconds: f64) -> Result<Measure> {
+        self.run_motion_capped(j, target, seconds, self.exec_caps(j))
     }
 
     /// Run one commanded position move on one joint and measure how it went.
@@ -2216,7 +2128,6 @@ impl Arm {
         j: usize,
         target: i32,
         seconds: f64,
-        score: bool,
         caps: Caps,
     ) -> Result<Measure> {
         let start = self.pos(j)?;
@@ -2424,14 +2335,21 @@ impl Arm {
         if toward_stop {
             self.retune(j, operating)?;
         }
-        let held = self.measure_hold("after move")?;
-        out.hold_rms_rad_s = held[j].1;
-        // Where the joint is once it has held, not where it landed: a joint
-        // that drifts through the hold has not settled.
+        // The move is over when the joint is still by the measurements' own
+        // rule, within the configured settle budget. A fixed 1 s hold
+        // observation used to follow instead; over two runs (2026-10-24) the
+        // joint was already still before it began on 539 of 552 moves, so it
+        // measured nothing the stillness window does not, and the arm stood
+        // through it 355 s a run.
+        let settle_from = self.tick;
+        let budget = self.bundle.robot.motion.settle_timeout_s;
+        out.settle_s = match self.stillness(std::array::from_fn(|k| k == j), budget)? {
+            None => (self.tick - settle_from) as f64 * self.dt,
+            Some(_) => f64::INFINITY,
+        };
+        // Where the joint is once it is still, not where it landed: a joint
+        // that drifts after the move has not settled.
         out.settled_error_rad = ((f64::from(self.pos(j)?) - f64::from(target)) * per_tick).abs();
-        if score {
-            out.score(true, MOVING_RMS_RAD_S, self.holding_limit(j), tolerance);
-        }
         self.emit(Event::Move(
             self.tick,
             j,
@@ -2638,7 +2556,7 @@ impl Arm {
                 let target = self
                     .pos(j)?
                     .saturating_add((speed_ticks_s * duration_s) as i32);
-                self.run_motion(j, target, duration_s * SEPTIC_PEAK_VEL, false)?;
+                self.run_motion(j, target, duration_s * SEPTIC_PEAK_VEL)?;
             }
             PreMove::Position {
                 joint,
@@ -2682,7 +2600,7 @@ impl Arm {
             return Err(format!("J{} is not referenced", j + 1).into());
         }
         let target = self.conv[j].motor_ticks(radians);
-        let result = self.run_motion(j, target, seconds.max(self.dt), false)?;
+        let result = self.run_motion(j, target, seconds.max(self.dt))?;
         if result.outcome != Outcome::Complete {
             return Err(format!("J{} did not reach the requested position", j + 1).into());
         }
@@ -3004,7 +2922,7 @@ impl Arm {
         // Still first: the previous breakaway's return was still settling
         // when J3's ramp began, and the sliding test read that as a
         // breakaway at the balance current.
-        self.wait_still(std::array::from_fn(|k| k == j))?;
+        self.wait_still(std::array::from_fn(|k| k == j), STICTION_STILL_TIMEOUT_S)?;
         let window = self.ticks(STICTION_WINDOW_S);
         let start = self.pos(j)?;
         // The ramp starts from the current the drive is holding with, not
@@ -3077,7 +2995,7 @@ impl Arm {
     /// the base degrees away, which is no distance to jump in one frame.
     fn return_to(&mut self, j: usize, start: i32) -> Result<()> {
         self.adopt(j)?;
-        let result = self.run_motion(j, start, RETURN_S, false)?;
+        let result = self.run_motion(j, start, RETURN_S)?;
         if result.outcome != Outcome::Complete {
             return Err(format!("J{} did not return to where it started", j + 1).into());
         }
@@ -3147,7 +3065,7 @@ impl Arm {
     /// whole chirp.
     fn belt(&mut self, j: usize, span: (f64, f64)) -> Result<bool> {
         self.emit(Event::Phase("belt chirp", j));
-        self.wait_still(std::array::from_fn(|k| k == j))?;
+        self.wait_still(std::array::from_fn(|k| k == j), STICTION_STILL_TIMEOUT_S)?;
         let start = self.pos(j)?;
         let at = self.conv[j].joint_rad(start);
         let clear = (at - span.0).min(span.1 - at);
@@ -3273,13 +3191,13 @@ impl Arm {
             return Ok(None);
         };
         let far = start + (out * sweep_s).round() as i32;
-        if self.run_motion(j, far, RETURN_S, false)?.outcome != Outcome::Complete {
+        if self.run_motion(j, far, RETURN_S)?.outcome != Outcome::Complete {
             return Err(format!("J{} did not reach the ripple sweep's far end", j + 1).into());
         }
         let back = self
             .capture_step(j, -out, RIPPLE_CAPTURE_DIVISOR, span)?
             .ok_or_else(|| format!("J{} stopped answering captures", j + 1))?;
-        if self.run_motion(j, start, RETURN_S, false)?.outcome != Outcome::Complete {
+        if self.run_motion(j, start, RETURN_S)?.outcome != Outcome::Complete {
             return Err(format!("J{} did not return from the ripple sweep", j + 1).into());
         }
         let skip = (RIPPLE_SETTLE_S * LOOP_HZ / f64::from(RIPPLE_CAPTURE_DIVISOR)) as usize;
@@ -3496,16 +3414,12 @@ impl Arm {
             }
             // The measurements' own stillness rule, so a joint that hunts at
             // the pose is caught here and not at a gravity hold minutes in.
-            if let Some(j) = self.stillness(judged)? {
+            if let Some(j) = self.stillness(judged, STICTION_STILL_TIMEOUT_S)? {
                 self.emit(Event::GainsNote(
                     self.tick,
                     j,
                     "did not reach stillness at a calibration pose",
                 ));
-                fault = Some((j, PoseFault::Hold));
-                break 'poses;
-            }
-            if let Some(j) = self.hold_fault("calibration-pose qualification", judged)? {
                 fault = Some((j, PoseFault::Hold));
                 break 'poses;
             }
@@ -3536,8 +3450,13 @@ impl Arm {
             }
             return Ok(fault);
         }
-        let fault = self.hold_fault("return from calibration-pose qualification", judged)?;
+        let fault = self.stillness(judged, STICTION_STILL_TIMEOUT_S)?;
         if let Some(j) = fault {
+            self.emit(Event::GainsNote(
+                self.tick,
+                j,
+                "did not reach stillness back at ready",
+            ));
             self.gain_configure(j, self.bundle.robot.joints[j].gains)?;
         }
         Ok(fault.map(|j| (j, PoseFault::Hold)))
@@ -3573,25 +3492,6 @@ impl Arm {
         }
     }
 
-    /// The first joint that will not hold still now, by the same rule
-    /// `check_hold` fails on. A joint not being judged has nothing to fall
-    /// back to, so its failure to hold is the run's, not the candidate's.
-    fn hold_fault(&mut self, why: &'static str, judged: [bool; N]) -> Result<Option<usize>> {
-        let held = self.measure_hold(why)?;
-        let fault =
-            (0..N).find(|&j| held[j].0 > self.tolerance() || held[j].1 > self.holding_limit(j));
-        match fault {
-            Some(j) if !judged[j] => Err(format!(
-                "J{} will not hold still at {why}: {:.4}deg, {:.4}deg/s",
-                j + 1,
-                held[j].0.to_degrees(),
-                held[j].1.to_degrees()
-            )
-            .into()),
-            other => Ok(other),
-        }
-    }
-
     /// The stage's test motion for the session's joint at the pose it holds:
     /// the speed of its pulses and constant-velocity checks \[rad/s\], the
     /// position step \[motor ticks\] and the pulse's ramp \[s\]. `None` when
@@ -3624,11 +3524,15 @@ impl Arm {
         Some((speed, offset, ramp))
     }
 
-    /// StepFOC's order on one joint: Kpv, Kiv, then Kpp, each searched along
-    /// its lattice with the stage's pulse or step, confirmed over the checked
-    /// travel at the normal profile before the next axis is searched, and
-    /// the complete candidate qualified last. Kpv keeps the guide's 20%
-    /// backoff from its last stable lattice point.
+    /// StepFOC's order on one joint: Kpv (with Kiv at its floor), Kiv, then
+    /// Kpp, each searched along its lattice with the stage's pulse or step,
+    /// confirmed over the checked travel at the normal profile before the
+    /// next axis is searched, and the complete candidate qualified last. Kpv
+    /// keeps the guide's 20% backoff, taken from the lattice point that
+    /// passed the normal profile:
+    /// the pulse verdict at the knee is not repeatable (J2 kpv 0.0284 read
+    /// 2.7 and 6.3 deg/s on consecutive runs, 2026-10-24) while the sweep's
+    /// was, so the sweep decides where the margin is measured from.
     fn stepfoc_gains(&mut self, session: &GainSession) -> Result<Option<Tuned>> {
         let j = session.joint;
         let Some((speed, offset, ramp)) = self.gain_motion_plan(session) else {
@@ -3658,6 +3562,17 @@ impl Arm {
         let mut candidate = before;
         let mut indices = [0; 3];
         for (k, (axis, command, backoff)) in axes.into_iter().enumerate() {
+            // The guide tunes the proportional gain before the integral one.
+            // A PI loop's knee moves with its integral gain, so a walk that
+            // carried the configured Kiv along would find a Kpv that depends
+            // on the config it started from: Kiv sits at its lattice floor
+            // until Kpv is settled, then is searched from the configured
+            // value at that Kpv.
+            match axis {
+                GainAxis::Kpv => GainAxis::Kiv.set(&mut candidate, GainAxis::Kiv.at(0)),
+                GainAxis::Kiv => GainAxis::Kiv.set(&mut candidate, before.kiv),
+                GainAxis::Kpp => {}
+            }
             let Some((found, index)) = self.gain_search(session, candidate, axis, command)? else {
                 self.emit(Event::GainsNote(
                     self.tick,
@@ -3670,8 +3585,7 @@ impl Arm {
                 ));
                 return Ok(None);
             };
-            let Some((confirmed, index)) =
-                self.gain_sweep_down(session, found, axis, (index - backoff).max(0))?
+            let Some((mut confirmed, index)) = self.gain_sweep_down(session, found, axis, index)?
             else {
                 self.emit(Event::GainsNote(
                     self.tick,
@@ -3690,6 +3604,8 @@ impl Arm {
                 ));
                 return Ok(None);
             };
+            let index = (index - backoff).max(0);
+            axis.set(&mut confirmed, axis.at(index));
             candidate = confirmed;
             indices[k] = index;
         }
@@ -3817,7 +3733,7 @@ impl Arm {
                         return Ok(None);
                     }
                     kpv_index -= 1;
-                    GainAxis::Kpv.set(&mut gains, GainAxis::Kpv.at(kpv_index));
+                    GainAxis::Kpv.lower(&mut gains, kpv_index);
                     self.emit(Event::GainsNote(
                         self.tick,
                         j,
@@ -3941,8 +3857,8 @@ impl Arm {
             self.gain_configure(j, gains)?;
             for target in [high, low] {
                 self.gain_used[j] += 1;
-                let measured = self.run_motion(j, target, self.dt, false)?;
-                let verdict = sweep_verdict(&measured, self.holding_limit(j), self.tolerance());
+                let measured = self.run_motion(j, target, self.dt)?;
+                let verdict = sweep_verdict(&measured, self.tolerance());
                 let lag_ms = if measured.peak_command_rad_s > 0.0 {
                     1000.0 * measured.peak_error_rad / measured.peak_command_rad_s
                 } else {
@@ -3953,7 +3869,7 @@ impl Arm {
                     j,
                     gains,
                     measured.reversals,
-                    measured.hold_rms_rad_s,
+                    measured.settle_s,
                     lag_ms,
                     verdict.label(),
                 ));
@@ -4742,11 +4658,11 @@ impl Arm {
         for (target, scored) in moves {
             let ticks = self.conv[j].motor_ticks(target);
             if !scored {
-                self.run_motion(j, ticks, self.dt, false)?;
+                self.run_motion(j, ticks, self.dt)?;
                 continue;
             }
-            let mut m = self.run_motion_capped(j, ticks, self.dt, false, caps)?;
-            m.score(true, f64::INFINITY, self.holding_limit(j), self.tolerance());
+            let mut m = self.run_motion_capped(j, ticks, self.dt, caps)?;
+            m.score(true, f64::INFINITY, self.tolerance());
             if m.peak_command_rad_s > 0.0 {
                 ripple = ripple.max(m.rms_speed() / m.peak_command_rad_s);
             }
@@ -4764,11 +4680,11 @@ impl Arm {
             };
             if let Some(why) = why {
                 self.emit(Event::LimitsStep(self.tick, j, caps, Some(why)));
-                self.run_motion(j, self.conv[j].motor_ticks(home), self.dt, false)?;
+                self.run_motion(j, self.conv[j].motor_ticks(home), self.dt)?;
                 return Ok(None);
             }
         }
-        self.run_motion(j, self.conv[j].motor_ticks(home), self.dt, false)?;
+        self.run_motion(j, self.conv[j].motor_ticks(home), self.dt)?;
         self.emit(Event::LimitsStep(self.tick, j, caps, None));
         let long = span.1 - span.0;
         let t_speed = SEPTIC_PEAK_VEL * long / caps.velocity;
@@ -5103,33 +5019,52 @@ impl Arm {
     }
 
     /// Require a complete stillness window of fresh encoder observations.
-    /// A timeout invalidates the measurement; elapsed time is not settling.
-    fn wait_still(&mut self, chosen: [bool; N]) -> Result<()> {
-        match self.stillness(chosen)? {
+    /// A timeout invalidates what was about to be measured; elapsed time is
+    /// not settling.
+    fn wait_still(&mut self, chosen: [bool; N], timeout_s: f64) -> Result<()> {
+        match self.stillness(chosen, timeout_s)? {
             None => Ok(()),
-            Some(joint) => Err(format!(
-                "J{} did not settle within {STICTION_STILL_TIMEOUT_S}s; measurement rejected",
-                joint + 1
-            )
-            .into()),
+            Some(joint) => {
+                Err(format!("J{} did not reach stillness within {timeout_s}s", joint + 1).into())
+            }
         }
     }
 
     /// The first chosen joint that did not reach a full window of stillness
-    /// within `STICTION_STILL_TIMEOUT_S`, or `None` when all did.
-    fn stillness(&mut self, chosen: [bool; N]) -> Result<Option<usize>> {
+    /// within `timeout_s`, or `None` when all did. A joint holding on trial
+    /// gains has no guard but this one, so its runaway ends the wait at once
+    /// as that joint's failure; the trial's own backoff takes it from there.
+    fn stillness(&mut self, chosen: [bool; N], timeout_s: f64) -> Result<Option<usize>> {
         let window = self.ticks(STICTION_WINDOW_S);
         let mut seen: [VecDeque<(u64, i32)>; N] =
             std::array::from_fn(|_| VecDeque::with_capacity(window as usize + 2));
         let mut generation = self.generation;
         let mut still = chosen.map(|selected| !selected);
-        for _ in 0..self.ticks(STICTION_STILL_TIMEOUT_S) {
+        let trial = self.gain_joint.filter(|&j| self.sane_gains[j].is_some());
+        let mut loud = 0u32;
+        for _ in 0..self.ticks(timeout_s) {
             self.frame(None)?;
             for j in 0..N {
                 if !chosen[j] || generation[j] == self.generation[j] {
                     continue;
                 }
                 generation[j] = self.generation[j];
+                if trial == Some(j) {
+                    let reported = self.state.nodes[self.node(j)].speed_ticks_s.unwrap_or(0);
+                    loud = if (f64::from(reported) * self.per_tick(j)).abs() > RUNAWAY_RAD_S {
+                        loud + 1
+                    } else {
+                        0
+                    };
+                    if loud >= RUNAWAY_TICKS {
+                        self.emit(Event::GainsNote(
+                            self.tick,
+                            j,
+                            "ran away while holding on trial gains; the hold is failed",
+                        ));
+                        return Ok(Some(j));
+                    }
+                }
                 seen[j].push_back((self.tick, self.pos(j)?));
                 while seen[j]
                     .get(1)
@@ -5161,7 +5096,7 @@ impl Arm {
     /// not drift while measuring: a joint that wanders is holding something
     /// other than what the pose says.
     fn holding_current(&mut self) -> Result<[f64; N]> {
-        self.wait_still([true; N])?;
+        self.wait_still([true; N], STICTION_STILL_TIMEOUT_S)?;
         let tolerance = self.tolerance();
         let held: [f64; N] = std::array::from_fn(|k| self.conv[k].joint_rad(self.hold[k]));
         let mut sum = [0.0; N];
@@ -5447,7 +5382,7 @@ impl Arm {
             self.emit(Event::Phase("return to where the run found it", j));
             self.operating(j)?;
             let seconds = (SEPTIC_PEAK_VEL * distance / per_s).max(0.3);
-            let m = self.run_motion(j, found, seconds, false)?;
+            let m = self.run_motion(j, found, seconds)?;
             return if m.outcome == Outcome::Complete {
                 Ok(())
             } else {
@@ -6664,7 +6599,7 @@ fn run(args: Args) -> Result<()> {
                                 );
                                 continue;
                             }
-                            axis.set(&mut next, axis.at(index - 1));
+                            axis.lower(&mut next, index - 1);
                             stepped[j] += 1;
                             found[j] = Some(Tuned {
                                 after: next,
