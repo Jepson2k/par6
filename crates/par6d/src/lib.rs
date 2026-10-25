@@ -37,6 +37,7 @@ pub mod logging;
 pub mod options;
 mod planner;
 pub mod preview;
+pub mod ripple;
 pub mod vitals;
 
 pub use bridge::{held_jog_travel, stream_stopping_travel};

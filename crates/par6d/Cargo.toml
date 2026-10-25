@@ -33,6 +33,9 @@ file-rotate = "0.8"
 jiff = { version = "0.2", default-features = false, features = ["std"] }
 sha2 = { workspace = true }
 libc = "0.2"
+socketcan = { workspace = true }
+toml = { workspace = true }
+toml_edit = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }
