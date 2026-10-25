@@ -322,7 +322,7 @@ impl Rig {
     pub fn ready(&mut self) {
         self.boot_to_idle();
         self.core.set_homed(true);
-        self.cmd(RtCommand::Enable);
+        self.cmd(RtCommand::Enable(0));
     }
 
     /// The most recent per-joint frame set on the bus.
@@ -506,7 +506,7 @@ impl SimCore {
             s = sim.tick();
         }
         assert_eq!(s.mode, Mode::Idle, "the sim core boots to IDLE");
-        sim.cmd(RtCommand::Enable);
+        sim.cmd(RtCommand::Enable(0));
         sim.core
             .bus_mut()
             .teleport_joint_rad(&q[..bundle.robot.joints.len()])

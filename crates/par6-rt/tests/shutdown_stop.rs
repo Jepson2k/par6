@@ -201,7 +201,7 @@ fn an_unhomed_errored_or_unconfigured_arm_does_not_retreat() {
     for _ in 0..100 {
         unhomed.tick();
     }
-    unhomed.cmd(RtCommand::Enable);
+    unhomed.cmd(RtCommand::Enable(0));
     let mut errored = SimCore::landed_at(&b, &away_from_rest(&b));
     errored.cmd(RtCommand::SetSoftEstop(true));
     let off = shipped(false);

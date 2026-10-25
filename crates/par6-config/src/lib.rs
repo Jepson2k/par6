@@ -424,7 +424,7 @@ mod tests {
     /// asserting the shipped config names it: which tool is bolted on is the
     /// operator's to change, and a test that pins `active_tool` turns a
     /// tool swap into a suite failure.
-    const DRIVEN_TOOL: &str = "MSG_small_motor_200mm_rail";
+    const DRIVEN_TOOL: &str = "MSG_SM_200mm";
 
     fn select_tool(name: &str) -> impl Fn(&str, &str) -> String + '_ {
         move |file, text| {

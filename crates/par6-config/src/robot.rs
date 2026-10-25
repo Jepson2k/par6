@@ -585,11 +585,11 @@ pub struct TimingConfig {
     pub critical_factor: f64,
     /// How long the hard band must hold before latching \[s\].
     pub critical_sustain_s: f64,
-    /// CPU the RT thread pins to on hardware; negative disables pinning.
-    /// Ignored under `--sim`, which always runs unpinned and unprivileged.
+    /// CPU the RT thread pins to; negative disables pinning. Under
+    /// `--sim` the thread pins only once its SCHED_FIFO request took.
     pub cpu: i64,
-    /// SCHED_FIFO priority the RT thread requests on hardware (1..=99);
-    /// 0 disables the request. Ignored under `--sim`.
+    /// SCHED_FIFO priority the RT thread requests (1..=99); 0 disables
+    /// the request.
     pub fifo_priority: u8,
 }
 
@@ -619,8 +619,7 @@ impl TimingConfig {
         degraded_factor: 1.5,
         critical_factor: 4.0,
         critical_sustain_s: 5.0,
-        // Scheduling knobs are hardware-only; the sim path never reads
-        // them, so the vendor defaults ride along unchanged.
+        // The simulator asks for the same priority and core as the arm.
         cpu: 3,
         fifo_priority: 99,
     };

@@ -40,7 +40,7 @@ fn the_idle_pre_move_drops_the_driver_twice_then_polls_its_encoder() {
         true,
     );
     rig.boot_to_idle();
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
     let start = rig.snap().tick;
     rig.cmd(RtCommand::SetMode(Mode::Homing));
     let s = rig.tick_until(1000, |s| !s.homing.active);
@@ -99,7 +99,7 @@ fn an_idled_joint_hangs_limp_under_load_while_a_waiting_one_holds() {
         let node = b.robot.joints[0].node_id;
         let mut sim = SimCore::new(&b, Box::new(ZeroGravity));
         sim.tick_until_idle();
-        sim.cmd(RtCommand::Enable);
+        sim.cmd(RtCommand::Enable(0));
         // Inside the normal current budget, past what friction holds.
         sim.core.bus_mut().set_joint_load_ma(node, 1500.0);
         for _ in 0..(0.5 / sim.dt) as u32 {

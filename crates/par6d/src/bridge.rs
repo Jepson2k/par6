@@ -1638,11 +1638,77 @@ struct EnableRequest {
     deadline: Instant,
     /// When the last `Enable` went out (retry spacing).
     last_sent: Option<Instant>,
-    /// The core's `enable_seq` sampled just BEFORE that send. The first
-    /// snapshot whose `enable_seq` is past it has processed an Enable
-    /// belonging to this request, so its `state` is the request's answer
-    /// — not a leftover reading from before it.
-    sent_at_seq: Option<u64>,
+    /// Identity echoed only by a successful enable for this reset.
+    id: u64,
+}
+
+/// Correlates each reset with its own RT enable, including across delayed
+/// snapshots and resets that supersede an earlier request.
+#[derive(Default)]
+struct EnableControl {
+    next_id: u64,
+    request: Option<EnableRequest>,
+    outcome: Option<Result<(), WireError>>,
+}
+
+impl EnableControl {
+    fn set_enabled(&mut self, link: &CoreLink, enabled: bool, now: Instant) {
+        if enabled {
+            link.send(RtCommand::SetSoftEstop(false));
+            link.send(RtCommand::ClearErrors);
+            self.next_id = self
+                .next_id
+                .checked_add(1)
+                .expect("enable identity exhausted");
+            self.outcome = None;
+            self.request = Some(EnableRequest {
+                deadline: now + ENABLE_RETRY_WINDOW,
+                last_sent: None,
+                id: self.next_id,
+            });
+        } else {
+            link.send(RtCommand::SetSoftEstop(true));
+            // An e-stop also supersedes success the server has not collected.
+            if self.request.take().is_some() || self.outcome.is_some() {
+                self.outcome = Some(Err(make_error(
+                    ErrorCode::SysEstopActive,
+                    UNATTRIBUTED,
+                    &[],
+                )));
+            }
+        }
+    }
+
+    fn poll(&mut self, link: &CoreLink, snap: &StateSnapshot, dt: f64, now: Instant) {
+        let Some(req) = &mut self.request else {
+            return;
+        };
+        // A processed-command count sampled before sending can include an
+        // earlier enable whose snapshot was delayed. Only our identity proves
+        // that this reset's clear sequence and enable have both finished.
+        if snap.enabled_request_id == req.id && snap.state == ArmState::Enabled {
+            self.request = None;
+            self.outcome = Some(Ok(()));
+        } else if now >= req.deadline {
+            log::warn!("enable retry window expired; controller still DISABLED");
+            self.request = None;
+            self.outcome = Some(Err(make_error(
+                ErrorCode::SysControllerDisabled,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    "The RT core refused to enable: the e-stop line is engaged \
+                     or a hard error is latched.",
+                )],
+            )));
+        } else if req
+            .last_sent
+            .is_none_or(|t| now.duration_since(t) >= housekeeping_period(dt) * ENABLE_RETRY_TICKS)
+        {
+            req.last_sent = Some(now);
+            link.send(RtCommand::Enable(req.id));
+        }
+    }
 }
 
 /// A FLASHING enter/exit in flight: resolved when the published mode
@@ -1661,9 +1727,7 @@ struct FlashingRequest {
 #[derive(Default)]
 pub(crate) struct SharedState {
     stream: Option<ActiveStream>,
-    enable: Option<EnableRequest>,
-    /// Resolved enable outcome, waiting to be collected by the server.
-    enable_outcome: Option<Result<(), WireError>>,
+    enable: EnableControl,
     flashing: Option<FlashingRequest>,
     /// Resolved FLASHING outcome, waiting to be collected by the server.
     flashing_outcome: Option<Result<(), WireError>>,
@@ -2592,37 +2656,15 @@ impl RtCommands for RtBridge {
     }
 
     fn set_enabled(&mut self, enabled: bool) {
-        let mut sh = self.shared.lock().unwrap();
-        if enabled {
-            // Clear the soft e-stop flag and run the RT clear sequence;
-            // Enable only succeeds after the clear settle window, so
-            // housekeeping retries it until the core answers.
-            self.link.send(RtCommand::SetSoftEstop(false));
-            self.link.send(RtCommand::ClearErrors);
-            // A verdict nobody collected belongs to the request it came
-            // from; this one gets its own answer, never an inherited one.
-            sh.enable_outcome = None;
-            sh.enable = Some(EnableRequest {
-                deadline: Instant::now() + ENABLE_RETRY_WINDOW,
-                last_sent: None,
-                sent_at_seq: None,
-            });
-        } else {
-            self.link.send(RtCommand::SetSoftEstop(true));
-            if sh.enable.take().is_some() {
-                // An enable that an e-stop overtook did not happen, and
-                // whoever is waiting on it must be told so.
-                sh.enable_outcome = Some(Err(make_error(
-                    ErrorCode::SysEstopActive,
-                    UNATTRIBUTED,
-                    &[],
-                )));
-            }
-        }
+        self.shared
+            .lock()
+            .unwrap()
+            .enable
+            .set_enabled(&self.link, enabled, Instant::now());
     }
 
     fn take_enable_outcome(&mut self) -> Option<Result<(), WireError>> {
-        self.shared.lock().unwrap().enable_outcome.take()
+        self.shared.lock().unwrap().enable.outcome.take()
     }
 
     fn enter_flashing(&mut self) {
@@ -3994,35 +4036,7 @@ pub(crate) fn housekeeping_loop(
                     _ => {}
                 }
             }
-            if let Some(req) = &mut sh.enable {
-                // `enable_seq` counts every Enable the core PROCESSED,
-                // granted or refused, so a reading past our baseline
-                // makes the `state` in the same snapshot this request's
-                // answer rather than whatever an earlier one left behind.
-                let answered = req.sent_at_seq.is_some_and(|s| snap.enable_seq > s);
-                if answered && snap.state == ArmState::Enabled {
-                    sh.enable = None;
-                    sh.enable_outcome = Some(Ok(()));
-                } else if now >= req.deadline {
-                    log::warn!("enable retry window expired; controller still DISABLED");
-                    sh.enable = None;
-                    sh.enable_outcome = Some(Err(make_error(
-                        ErrorCode::SysControllerDisabled,
-                        UNATTRIBUTED,
-                        &[(
-                            "detail",
-                            "The RT core refused to enable: the e-stop line is engaged \
-                             or a hard error is latched.",
-                        )],
-                    )));
-                } else if req.last_sent.is_none_or(|t| {
-                    now.duration_since(t) >= housekeeping_period(dt) * ENABLE_RETRY_TICKS
-                }) {
-                    req.sent_at_seq = Some(snap.enable_seq);
-                    req.last_sent = Some(now);
-                    link.send(RtCommand::Enable);
-                }
-            }
+            sh.enable.poll(&link, &snap, dt, now);
             if let Some(req) = &sh.flashing {
                 // An exit lands wherever the RT settles: a still-latched
                 // hard error re-drives a FLASHING exit to ACTIVE_ERROR, and
@@ -4408,6 +4422,175 @@ fn world_cart_twist(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use par6_bus::sim::scene::Tool;
+    use par6_rt::adapters::MotionJog;
+    use par6_rt::hooks::ClampStream;
+    use par6_rt::{
+        sample_ring, CompletionPolicy, NoFk, RtHooks, SharedDigitalIo, SharedFlashMarker,
+        SharedLineGpio, SpecSettle, ZeroGravity,
+    };
+
+    struct EnableRig {
+        core: RtCore<SimBus>,
+        snapshots: SnapshotReader<StateSnapshot>,
+        link: CoreLink,
+        estop_line: Arc<AtomicBool>,
+        dt: f64,
+        now: Instant,
+    }
+
+    impl EnableRig {
+        fn new(dt: f64) -> Self {
+            let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+            let mut bundle = ConfigBundle::load(&root.join("config/PAR6.toml")).unwrap();
+            bundle.robot.robot.tick_dt_s = dt;
+            let robot = &bundle.robot;
+            let scene = Scene {
+                assets: root.join("assets/par6_description"),
+                tool: bundle
+                    .active_tool()
+                    .and_then(|g| g.urdf_variant.as_deref())
+                    .and_then(Tool::from_urdf_variant)
+                    .unwrap_or(Tool::Flange),
+            };
+            let (tx, rx) = mpsc::channel();
+            let (ops, _ops_rx) = mpsc::channel();
+            let (_producer, samples) = sample_ring(64);
+            let (estop, estop_line) = SharedLineGpio::new(true);
+            let (flash, _flag) = SharedFlashMarker::new();
+            let (io, _lines) = SharedDigitalIo::new(robot.io.inputs.len(), robot.io.outputs.len());
+            let hooks = RtHooks {
+                gravity: Box::new(ZeroGravity),
+                jog: Box::new(MotionJog::from_config(robot).expect("jog engine")),
+                stream: Box::new(ClampStream::new(robot)),
+                stream_shaped: Box::new(ClampStream::new(robot)),
+                settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
+                estop: Box::new(estop),
+                io: Box::new(io),
+                flash: Box::new(flash),
+                commands: Box::new(rx),
+                fk: Box::new(NoFk),
+                samples,
+            };
+            let (core, handles) = RtCore::new(&bundle, SimBus::new(scene), hooks).unwrap();
+            let mut rig = Self {
+                core,
+                snapshots: handles.snapshots,
+                link: CoreLink::new(tx, ops, Arc::new(AtomicBool::new(false))),
+                estop_line,
+                dt,
+                now: Instant::now(),
+            };
+            for _ in 0..(0.5 / dt).round() as usize {
+                if rig.tick().mode == Mode::Idle {
+                    return rig;
+                }
+            }
+            panic!("sim core did not boot");
+        }
+
+        fn tick(&mut self) -> StateSnapshot {
+            self.now += Duration::from_secs_f64(self.dt);
+            self.core.tick(self.dt, false);
+            self.snapshots.latest()
+        }
+
+        fn finish_reset(&mut self, enable: &mut EnableControl) -> StateSnapshot {
+            for _ in 0..(0.5 / self.dt).round() as usize {
+                let snap = self.tick();
+                enable.poll(&self.link, &snap, self.dt, self.now);
+                if let Some(result) = enable.outcome.take() {
+                    result.expect("reset must succeed");
+                    assert_eq!(snap.state, ArmState::Enabled);
+                    assert!(!snap.error_active, "reset left a hard latch");
+                    return snap;
+                }
+            }
+            panic!("reset never completed");
+        }
+    }
+
+    #[test]
+    fn reset_waits_for_its_own_enable_and_clear_before_home() {
+        for dt in [0.004, 0.02] {
+            let mut rig = EnableRig::new(dt);
+            let mut enable = EnableControl::default();
+            let mut stale = rig.snapshots.latest();
+            enable.set_enabled(&rig.link, true, rig.now);
+            // Let the startup enable finish on the RT, but withhold its final
+            // snapshot from housekeeping until after estop and reset arrive.
+            let mut startup = None;
+            for _ in 0..(0.5 / dt).round() as usize {
+                stale = rig.snapshots.latest();
+                enable.poll(&rig.link, &stale, dt, rig.now);
+                let snap = rig.tick();
+                if snap.state == ArmState::Enabled {
+                    startup = Some(snap);
+                    break;
+                }
+            }
+            let startup = startup.expect("startup enable");
+            enable.set_enabled(&rig.link, false, rig.now);
+            enable.set_enabled(&rig.link, true, rig.now);
+            enable.poll(&rig.link, &stale, dt, rig.now);
+            enable.poll(&rig.link, &startup, dt, rig.now);
+            assert!(
+                enable.outcome.is_none(),
+                "an earlier enable must not acknowledge reset before any RT ticks"
+            );
+            let latched = rig.tick();
+            assert!(latched.error_active, "the queued estop must latch");
+            enable.poll(&rig.link, &latched, dt, rig.now);
+            assert!(enable.outcome.is_none(), "reset must wait for clear settle");
+            rig.finish_reset(&mut enable);
+
+            // Reset while already enabled must also wait for its clear window,
+            // even though a refused early enable leaves the state ENABLED.
+            enable.set_enabled(&rig.link, true, rig.now);
+            let before = rig.snapshots.latest();
+            enable.poll(&rig.link, &before, dt, rig.now);
+            let settle_ticks = (par6_rt::errors::CLEAR_SETTLE_S / dt).round() as usize;
+            for _ in 0..settle_ticks {
+                let snap = rig.tick();
+                enable.poll(&rig.link, &snap, dt, rig.now);
+                assert!(
+                    enable.outcome.is_none(),
+                    "reset acknowledged during clear settle"
+                );
+            }
+            let ready = rig.finish_reset(&mut enable);
+            assert!(par6_server::gating::check_gate(
+                par6_proto::CmdType::Home,
+                &par6_server::gating::GateContext {
+                    estop_latched: false,
+                    enabled: ready.state == ArmState::Enabled,
+                    homed: ready.homed,
+                    simulator: true,
+                }
+            )
+            .is_none());
+            // The planner's home mode requests follow confirmation with no
+            // intervening ticks or settling delay.
+            rig.link.send(RtCommand::SetMode(Mode::Idle));
+            rig.link.send(RtCommand::SetMode(Mode::Homing));
+            rig.tick();
+            assert_eq!(rig.tick().mode, Mode::Homing);
+
+            // A held physical e-stop must still fail, using virtual time for
+            // the existing enable deadline as well as the RT settle window.
+            rig.estop_line.store(false, Ordering::Relaxed);
+            enable.set_enabled(&rig.link, true, rig.now);
+            for _ in 0..=((ENABLE_RETRY_WINDOW.as_secs_f64() / dt).ceil() as usize) {
+                let snap = rig.tick();
+                enable.poll(&rig.link, &snap, dt, rig.now);
+                if enable.outcome.is_some() {
+                    break;
+                }
+            }
+            let error = enable.outcome.take().expect("reset deadline").unwrap_err();
+            assert_eq!(error.code, ErrorCode::SysControllerDisabled as u16);
+        }
+    }
 
     /// The jog watchdog deadline is what STOPS a jog, and it is computed
     /// from a wire float with `Duration`/`Instant` arithmetic that panics

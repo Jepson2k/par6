@@ -3,7 +3,7 @@
 //! Threads owned by one [`Daemon`]:
 //!
 //! 1. **RT thread** — `RtCore<RuntimeBus>::run()` (absolute-deadline pacing;
-//!    SCHED_FIFO/pinning skipped in sim mode). Between `run()` sessions
+//!    SCHED_FIFO and pinning from `[timing]`, `--sim` included). Between `run()` sessions
 //!    it applies queued [`CoreOp`](crate::bridge) closures (teleport
 //!    re-seed, settle-policy swap, loop-stats reset).
 //! 2. **Snapshot tee** — fans the single RT snapshot reader out to the
@@ -426,23 +426,15 @@ impl Daemon {
         let backend = if opts.sim { "sim" } else { "SocketCAN" };
         log::info!("command plane on {command_addr} ({backend} backend)");
 
-        let run_opts = if opts.sim {
-            // Sim runs unprivileged and in CI: no pinning, no SCHED_FIFO.
-            RunOptions {
-                cpu: None,
-                fifo_priority: None,
-                tick_profile: opts.tick_profile,
-            }
-        } else {
-            // Hardware: SCHED_FIFO on the configured core (setup failure
-            // is logged DEGRADED, not fatal; the outcome is published
-            // through LOOP_STATS).
-            let timing = robot.loop_timing();
-            RunOptions {
-                cpu: usize::try_from(timing.cpu).ok(),
-                fifo_priority: (timing.fifo_priority > 0).then_some(timing.fifo_priority),
-                tick_profile: opts.tick_profile,
-            }
+        // SCHED_FIFO on the configured core, the simulator's too: a
+        // refusal is logged DEGRADED, not fatal, and the outcome is
+        // published through LOOP_STATS.
+        let timing = robot.loop_timing();
+        let run_opts = RunOptions {
+            cpu: usize::try_from(timing.cpu).ok(),
+            fifo_priority: (timing.fifo_priority > 0).then_some(timing.fifo_priority),
+            tick_profile: opts.tick_profile,
+            shared_host: opts.sim,
         };
         {
             let (rt_break, shutdown) = (rt_break.clone(), shutdown.clone());

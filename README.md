@@ -783,7 +783,7 @@ file defines is refused.
 
 ```toml
 [robot]
-active_tool = "MSG_small_motor_200mm_rail"
+active_tool = "MSG_SM_200mm"
 
 [[joints]]
 name = "joint2"
@@ -798,7 +798,7 @@ params = [6.0, 6.0, 0.2]
 pose = [0.0, 0.0, -0.11, 0.0, 0.0, 0.0]
 
 [[tools]]
-name = "MSG_small_motor_200mm_rail"
+name = "MSG_SM_200mm"
 [tools.driver]
 ilim_ma = 900.0
 ```
@@ -1063,7 +1063,9 @@ ExecStart=
 ExecStart=/usr/local/bin/par6d --sim
 ```
 
-`--sim` runs unprivileged with no SCHED_FIFO and no CPU pin.
+`--sim` asks for the same `SCHED_FIFO` priority and core. Where the box refuses
+`SCHED_FIFO` it warns and runs unpinned at ordinary priority, since a thread
+held to one core at ordinary priority cannot move off it when that core is busy.
 
 ### 4. Post-install check
 

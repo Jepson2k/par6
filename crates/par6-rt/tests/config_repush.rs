@@ -69,7 +69,7 @@ fn every_config_shot_pushes_each_node_its_redundancy_at_boot_and_after_flashing(
         each_node_got(&mut rig, &format!("the boot shot at tick {shot}"));
     }
 
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
     rig.cmd(RtCommand::Disable);
     rig.cmd(RtCommand::AssertParked);
     rig.cmd(RtCommand::SetMode(Mode::Flashing));

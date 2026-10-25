@@ -25,6 +25,10 @@ pub struct RunOptions {
     /// Run the per-phase tick profiler (a clock read per phase; off by
     /// default, the tick then costs nothing extra).
     pub tick_profile: bool,
+    /// The thread shares its host with ordinary work (the simulator): a
+    /// refused SCHED_FIFO is a warning rather than an error, and the
+    /// thread is pinned and its memory locked only once SCHED_FIFO took.
+    pub shared_host: bool,
 }
 
 impl Default for RunOptions {
@@ -33,6 +37,7 @@ impl Default for RunOptions {
             cpu: Some(3),
             fifo_priority: Some(99),
             tick_profile: false,
+            shared_host: false,
         }
     }
 }
@@ -44,10 +49,13 @@ impl<B: DriverBus> RtCore<B> {
     /// missed deadline counts as an overrun and re-bases the schedule
     /// (no catch-up burst).
     pub fn run(&mut self, opts: &RunOptions, shutdown: &AtomicBool) {
-        let (fifo, pinned) = setup_realtime(opts);
-        // Idempotent across re-entries (op application breaks re-call
-        // `run`): the latest attempt's outcome is the published one.
-        self.record_rt_sched(fifo, pinned);
+        // Once per thread: op application breaks out of this loop and calls
+        // `run` again on the same thread, which keeps its priority and its
+        // core, and locking every page again would stall the loop that long.
+        if !self.rt_sched_recorded() {
+            let (fifo, pinned) = setup_realtime(opts);
+            self.record_rt_sched(fifo, pinned);
+        }
         let dt = self.tick_dt_s();
         let dt_ns = (dt * 1e9).round() as u64;
         // Anchor the schedule at the FIRST tick, which runs immediately:
@@ -158,20 +166,43 @@ fn setup_realtime(opts: &RunOptions) -> (bool, bool) {
         // more than the number the config named, so ask for that instead
         // and say so.
         let prio = permitted_priority(asked, rtprio_ceiling());
-        if prio > 0 {
+        if prio == 0 {
+            refused(
+                opts.shared_host,
+                format_args!(
+                    "RT thread DEGRADED: this process may not use SCHED_FIFO at all \
+                     (RLIMIT_RTPRIO is 0); the control loop runs at ordinary priority. \
+                     Grant it with a limits.d entry or CAP_SYS_NICE."
+                ),
+            );
+        } else {
+            if prio < asked {
+                log::warn!(
+                    "RT thread: SCHED_FIFO {asked} is above this process's ceiling of \
+                     {prio} (RLIMIT_RTPRIO); asking for {prio} instead. Lower \
+                     [timing].fifo_priority to {prio} or raise the limit."
+                );
+            }
             match set_fifo_priority(prio) {
                 Ok(()) => {
                     fifo = true;
                     log::info!("RT thread: SCHED_FIFO priority {prio}");
                 }
-                Err(e) => log::error!(
-                    "RT thread DEGRADED: SCHED_FIFO {prio} refused ({e}); the control \
-                     loop runs at ordinary priority"
+                Err(e) => refused(
+                    opts.shared_host,
+                    format_args!(
+                        "RT thread DEGRADED: SCHED_FIFO {prio} refused ({e}); the control \
+                         loop runs at ordinary priority"
+                    ),
                 ),
             }
         }
     }
-    if opts.fifo_priority.is_some() {
+    // At ordinary priority a thread held to one core cannot move off it
+    // when that core is busy, so on a shared host it is left to the
+    // scheduler.
+    let dedicated = fifo || !opts.shared_host;
+    if opts.fifo_priority.is_some() && dedicated {
         // A page fault in the tick is a latency spike of unbounded size,
         // and once the box has swap a cold page can also be a disk read.
         match lock_memory() {
@@ -179,7 +210,7 @@ fn setup_realtime(opts: &RunOptions) -> (bool, bool) {
             Err(e) => log::warn!("RT thread DEGRADED: mlockall failed ({e}); continuing"),
         }
     }
-    if let Some(cpu) = opts.cpu {
+    if let Some(cpu) = opts.cpu.filter(|_| dedicated) {
         match pin_to_cpu(cpu) {
             Ok(()) => {
                 pinned = true;
@@ -189,6 +220,16 @@ fn setup_realtime(opts: &RunOptions) -> (bool, bool) {
         }
     }
     (fifo, pinned)
+}
+
+/// A real-time setup the host refused: an error on hardware, where the
+/// arm then runs degraded; a warning for a thread on a shared host.
+fn refused(shared_host: bool, message: std::fmt::Arguments<'_>) {
+    if shared_host {
+        log::warn!("{message}");
+    } else {
+        log::error!("{message}");
+    }
 }
 
 /// The SCHED_FIFO priority to actually ask for, given what the config
@@ -202,22 +243,7 @@ fn setup_realtime(opts: &RunOptions) -> (bool, bool) {
 /// number the config named.
 pub fn permitted_priority(asked: u8, ceiling: Option<u8>) -> u8 {
     match ceiling {
-        Some(0) => {
-            log::error!(
-                "RT thread DEGRADED: this process may not use SCHED_FIFO at all \
-                 (RLIMIT_RTPRIO is 0); the control loop runs at ordinary priority. \
-                 Grant it with a limits.d entry or CAP_SYS_NICE."
-            );
-            0
-        }
-        Some(ceiling) if ceiling < asked => {
-            log::warn!(
-                "RT thread: SCHED_FIFO {asked} is above this process's ceiling of \
-                 {ceiling} (RLIMIT_RTPRIO); asking for {ceiling} instead. Lower \
-                 [timing].fifo_priority to {ceiling} or raise the limit."
-            );
-            ceiling
-        }
+        Some(ceiling) if ceiling < asked => ceiling,
         _ => asked,
     }
 }

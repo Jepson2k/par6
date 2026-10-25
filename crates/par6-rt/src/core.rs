@@ -570,9 +570,11 @@ pub struct RtCore<B: DriverBus> {
     // Consecutive-failure streaks drive the disconnect latch below.
     bus_tx_failures: u32,
     /// Scheduling setup outcome recorded by the run loop (SCHED_FIFO
-    /// applied, CPU pinned) — published through `LoopStats`.
+    /// applied, CPU pinned) — published through `LoopStats` — and whether
+    /// the setup has run at all.
     rt_fifo: bool,
     rt_pinned: bool,
+    rt_sched_recorded: bool,
     /// Per-node self-heal one-shot (indexed by error index): armed while
     /// the node is fresh, fired once when it goes stale/lost, re-armed on
     /// recovery.
@@ -599,7 +601,7 @@ pub struct RtCore<B: DriverBus> {
     // State-machine variables: mode, state, homed, errors.
     mode: Mode,
     state: ArmState,
-    enable_seq: u64,
+    enabled_request_id: u64,
     homed: bool,
     soft_estop: bool,
     hw_estop: bool,
@@ -849,6 +851,7 @@ impl<B: DriverBus> RtCore<B> {
             bus_tx_failures: 0,
             rt_fifo: false,
             rt_pinned: false,
+            rt_sched_recorded: false,
             self_heal_armed: [true; crate::NUM_NODES],
             bus_rx_failures: 0,
             config_resend_failures: 0,
@@ -866,7 +869,7 @@ impl<B: DriverBus> RtCore<B> {
             tx_fault_latch_ticks: robot.ticks(robot.bus.lost_s).max(1),
             mode: Mode::Booting,
             state: ArmState::Disabled,
-            enable_seq: 0,
+            enabled_request_id: 0,
             homed: false,
             soft_estop: false,
             hw_estop: false,
@@ -1235,6 +1238,12 @@ impl<B: DriverBus> RtCore<B> {
     pub fn record_rt_sched(&mut self, fifo: bool, pinned: bool) {
         self.rt_fifo = fifo;
         self.rt_pinned = pinned;
+        self.rt_sched_recorded = true;
+    }
+
+    /// Whether the run loop has set its thread's scheduling up yet.
+    pub fn rt_sched_recorded(&self) -> bool {
+        self.rt_sched_recorded
     }
 
     /// Shutdown phase 1: force the standing halt. Any working mode drops
@@ -1747,10 +1756,7 @@ impl<B: DriverBus> RtCore<B> {
                     log::warn!("mode request {target:?} refused: {e:?}");
                 }
             }
-            RtCommand::Enable => {
-                // Counted whether granted or refused: the counter is what
-                // ties the published `state` to THIS request.
-                self.enable_seq += 1;
+            RtCommand::Enable(request_id) => {
                 if self.mode == Mode::Booting {
                     // ENABLED before the bus selfcheck lets the command
                     // plane accept motion the transition table then
@@ -1759,8 +1765,11 @@ impl<B: DriverBus> RtCore<B> {
                     log::warn!("enable refused: the core is still BOOTING");
                 } else if self.estop_condition() || self.errors.any_hard() {
                     log::warn!("enable refused: e-stop or errors active");
+                } else if self.errors.clearing() {
+                    log::debug!("enable deferred: error clear still settling");
                 } else {
                     self.state = ArmState::Enabled;
+                    self.enabled_request_id = request_id;
                 }
             }
             RtCommand::Disable => self.state = ArmState::Disabled,
@@ -3000,7 +3009,7 @@ impl<B: DriverBus> RtCore<B> {
         s.tick = self.tick;
         s.mode = self.mode;
         s.state = self.state;
-        s.enable_seq = self.enable_seq;
+        s.enabled_request_id = self.enabled_request_id;
         s.homed = self.homed;
         s.q = self.q;
         s.qd = self.qd;

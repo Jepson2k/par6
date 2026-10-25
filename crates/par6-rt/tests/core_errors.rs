@@ -137,7 +137,7 @@ fn estop_lifecycle_debounce_latch_reaction_clear_and_relatch() {
     rig.tick_n(DEBOUNCE_READS + 1);
     rig.cmd(RtCommand::ClearErrors);
     rig.tick_n(w.settle);
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
     assert_eq!(rig.snap().state, ArmState::Enabled);
 
     // The software e-stop latches under its own key, and dropping the
@@ -357,7 +357,7 @@ fn clearing_a_still_dead_node_re_latches_and_still_resends_its_config() {
     // Which is what keeps the arm off the wall: enable and HOMING stay
     // refused while a joint is off the bus (HOMING is not behind the
     // homed gate, so this latch is the only thing holding it).
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
     rig.cmd(RtCommand::SetMode(Mode::Homing));
     let s = rig.snap();
     assert_eq!(s.state, ArmState::Disabled, "enable refused");

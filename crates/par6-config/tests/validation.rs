@@ -229,7 +229,7 @@ fn a_local_overlay_layers_one_installations_values_over_the_shipped_file() {
 #[test]
 fn a_local_overlay_layers_one_tools_values_over_its_file() {
     use par6_config::ConfigBundle;
-    const TOOL: &str = "MSG_small_motor_150mm_rail";
+    const TOOL: &str = "MSG_SM_150mm";
     let shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
     let dir = std::env::temp_dir().join(format!("par6-config-tool-overlay-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("scratch dir");

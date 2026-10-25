@@ -2049,7 +2049,7 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
     enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
     let i = c.ok_index(&Command::SelectTool(SelectTool {
         key: 7103,
-        tool_name: "MSG_medium_motor_150mm_rail".to_owned(),
+        tool_name: "MSG_MM_150mm".to_owned(),
         variant_key: None,
     }));
     let (ok, detail) = c.wait_complete(i);

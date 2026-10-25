@@ -1,19 +1,18 @@
-# MSG gripper, small motor, 150 mm rail.
-# Values transcribed from vendor grippers/MSG_small_motor_150mm_rail.xml.
+# MSG_LM_150mm — CAN-driven motor gripper.
+# Values transcribed from vendor grippers/MSG_large_motor_150mm_rail.xml.
 # Vendor TODO markers carried over: kt, kinematics d/mass/com unverified.
 # Motor size names the mechanical build, not the drive: the vendor gives
 # every small/medium/large variant identical kt, current/velocity limits,
 # gains and pinion radius. Only stroke and the tool link change.
 
-name = "MSG_small_motor_150mm_rail"
+name = "MSG_LM_150mm"
 urdf_variant = "msg"
 # What this tool's drive reports in its device info (`par6 tool-id` writes it).
-can_tool_id = 12
+can_tool_id = 32
 
 [driver]
 driver_type = "stepfoc"
-stroke_mm = 106.0 # vendor value, and it disagrees with the rail name —
-                  # only MSG_large_motor_150mm_rail declares 150.
+stroke_mm = 150.0
 kt_nm_a = 0.111
 ilim_ma = 1700.0
 # 0 = the bus (~24 V), as on the arm joints.
@@ -52,10 +51,12 @@ home_offset_rad = -2.070
 # com on the tool axis, and this file is one of the three that do not.
 # Transcribed as written — picking a majority would guess at the arm's
 # gravity feedforward.
+# It also carries the same inertia as MSG_SM_150mm with Iyz
+# and Ixz the other way round.
 [kinematics]
-d_m = -0.1409
-a_m = -0.02835
+d_m = -0.11745
+a_m = 0.0
 alpha_rad = 3.141592653589793
-mass_kg = 0.37
+mass_kg = 0.37621
 com_m = [0.03362, 0.00122, -0.06832]
-inertia_kg_m2 = [5.39212e-4, 3.03879e-4, 6.43418e-4, 5.28904e-6, 1.12004e-6, -2.121042e-5]
+inertia_kg_m2 = [5.39212e-4, 3.03879e-4, 6.43418e-4, 5.28904e-6, -2.121042e-5, 1.12004e-6]

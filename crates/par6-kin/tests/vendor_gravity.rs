@@ -36,8 +36,7 @@ struct Fixture {
     cases: Vec<Case>,
 }
 
-/// Keyed by the vendor gripper file each entry was read from, which is
-/// also the name of the config file that must carry the same values.
+/// Keyed by the vendor gripper file each entry was read from.
 #[derive(Deserialize)]
 struct Tools {
     #[serde(rename = "MSG_small_motor_150mm_rail")]
@@ -160,7 +159,7 @@ fn the_shipped_tool_compositions_are_the_vendors_too() {
             t.inertia_kg_m2,
         )
     };
-    let msg_small_150 = shipped_tool("MSG_small_motor_150mm_rail");
+    let msg_small_150 = shipped_tool("MSG_SM_150mm");
     let ssg48 = shipped_tool("SSG48");
     assert_eq!(msg_small_150, fx.tools.msg_small_150);
     assert_eq!(ssg48, fx.tools.ssg48);
@@ -170,7 +169,7 @@ fn the_shipped_tool_compositions_are_the_vendors_too() {
 
     let mut worst = [
         ("flange variant", 0.0f64),
-        ("arm + MSG_small_motor_150mm_rail tool", 0.0),
+        ("arm + MSG_SM_150mm tool", 0.0),
         ("arm + SSG48 tool", 0.0),
     ];
     for c in &fx.cases {

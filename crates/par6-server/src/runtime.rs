@@ -379,8 +379,9 @@ pub trait RtCommands: Send {
     fn set_exec_speed(&mut self, scale: f64);
 
     /// Take the outcome of the last `set_enabled(true)` request, once the
-    /// RT has actually answered it: `Some(Ok(()))` when the core came up
-    /// ENABLED, `Some(Err(..))` when it refused or was superseded, `None`
+    /// RT has actually answered that request after error clearing settled:
+    /// `Some(Ok(()))` when the core came up ENABLED, `Some(Err(..))` when
+    /// it refused or was superseded, `None`
     /// while the request is still outstanding or there is none.
     ///
     /// The server holds the `reset` reply until this resolves — waldoctl

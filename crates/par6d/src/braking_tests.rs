@@ -72,7 +72,7 @@ impl Rig {
             dt,
         };
         rig.until("boot", |s| s.mode == Mode::Idle);
-        rig.commands.send(RtCommand::Enable).unwrap();
+        rig.commands.send(RtCommand::Enable(0)).unwrap();
         rig.until("enable", |s| s.state == ArmState::Enabled);
         rig.core.bus_mut().teleport_joint_rad(&q).expect("teleport");
         rig.core.adopt_landed_pose(&rig.bundle.robot, &q);

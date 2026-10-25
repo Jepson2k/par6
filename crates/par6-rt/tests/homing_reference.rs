@@ -118,7 +118,7 @@ fn home_and_measure(
         tx.send(RtCommand::RetuneNode { node, tune }).unwrap();
         core.tick(dt, false);
     }
-    tx.send(RtCommand::Enable).unwrap();
+    tx.send(RtCommand::Enable(0)).unwrap();
     core.tick(dt, false);
     tx.send(RtCommand::SetMode(Mode::Homing)).unwrap();
     core.tick(dt, false);

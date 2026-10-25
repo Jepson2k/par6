@@ -224,7 +224,7 @@ class TestToolTransforms:
         lim = robot.joints.limits.position.rad
         q = np.array([rng.uniform(lo, hi) for lo, hi in lim])
         out = np.zeros(6)
-        for key in ("FLANGE", "MSG_SMALL_MOTOR_150MM_RAIL", "SSG48"):
+        for key in ("FLANGE", "MSG_SM_150MM", "SSG48"):
             # Both frames off the SAME tree: the trees are separate CAD
             # exports and their arm chains are written to different
             # precisions, so a cross-tree comparison drifts by microns for
@@ -243,7 +243,7 @@ class TestToolTransforms:
         # micron the trees' differing chain precision costs, not to 1e-9.
         robot.set_active_tool("FLANGE")
         p_flange = robot.fk(q, out)[:3].copy()
-        for key, reach in (("MSG_SMALL_MOTOR_150MM_RAIL", 0.14), ("SSG48", 0.16)):
+        for key, reach in (("MSG_SM_150MM", 0.14), ("SSG48", 0.16)):
             robot.set_active_tool(key)
             p_tool = robot.fk(q, out)[:3].copy()
             assert np.linalg.norm(p_tool - p_flange) == pytest.approx(reach, abs=1e-5)
@@ -265,7 +265,7 @@ class TestToolTransforms:
         rz_pi[:3, :3] = np.diag([-1.0, -1.0, 1.0])
         grippers = {g["key"]: g for g in config().grippers()}
         for key, jaw in (
-            ("MSG_SMALL_MOTOR_150MM_RAIL", "joint_jaw1"),
+            ("MSG_SM_150MM", "joint_jaw1"),
             ("SSG48", "jaw1_JOINT"),
         ):
             kin = grippers[key]["kinematics"]
@@ -279,9 +279,7 @@ class TestToolTransforms:
     @requires_par6d
     @pytest.mark.e2e
     @pytest.mark.timeout(180)
-    @pytest.mark.parametrize(
-        "fitted_tool", ["Flange", "MSG_small_motor_150mm_rail", "SSG48"]
-    )
+    @pytest.mark.parametrize("fitted_tool", ["Flange", "MSG_SM_150mm", "SSG48"])
     async def test_tcp_agrees_with_a_live_daemon(
         self, tmp_path: Path, fitted_tool: str
     ) -> None:
@@ -358,7 +356,7 @@ class TestToolTransforms:
         enforces them at the TCP."""
         motion = config().motion()
         ramp = config().jog_defaults()["accel_time_s"]
-        for key in ("FLANGE", "MSG_SMALL_MOTOR_150MM_RAIL", "SSG48"):
+        for key in ("FLANGE", "MSG_SM_150MM", "SSG48"):
             robot.set_active_tool(key)
             limits = robot.cartesian_limits
             assert limits.velocity.linear == pytest.approx(
@@ -376,7 +374,7 @@ class TestToolTransforms:
         robot.set_active_tool("FLANGE")
 
     def test_urdf_tree_follows_active_tool(self, robot: Robot) -> None:
-        robot.set_active_tool("MSG_SMALL_MOTOR_150MM_RAIL")
+        robot.set_active_tool("MSG_SM_150MM")
         assert "par6_msg_gripper" in robot.urdf_path
         assert Path(robot.urdf_path).is_file()
         assert (
@@ -387,6 +385,76 @@ class TestToolTransforms:
 
 
 class TestCollision:
+    def test_clearances_report_nearest_world_points_per_keepout(
+        self, robot: Robot
+    ) -> None:
+        from waldoctl.shapes import Box
+
+        robot.set_active_tool("FLANGE")
+        world = robot._world
+        assert world is not None
+        q = np.zeros(robot.joints.count)
+        world.set_layer("installation", [])
+        try:
+            robot.apply_shapes([])
+            assert robot.clearances(q) == []
+            for z in (0.75, 0.48):
+                robot.apply_shapes(
+                    [Box(name="overhead", x=0.3, y=0.3, z=0.3, pose=(0, 0, z, 0, 0, 0))]
+                )
+                entries = robot.clearances(q)
+                assert len(entries) == 1
+                entry = entries[0]
+                assert entry.obstacle == "shape:overhead"
+                assert entry.distance == pytest.approx(
+                    world.world_distance(q.tolist()), abs=1e-9
+                )
+                assert np.linalg.norm(
+                    np.subtract(entry.part_point, entry.obstacle_point)
+                ) == pytest.approx(abs(entry.distance), abs=1e-6)
+                local = np.asarray(entry.obstacle_point) - [0, 0, z]
+                assert np.all(np.abs(local) <= 0.15 + 1e-6)
+                assert np.any(np.abs(np.abs(local) - 0.15) < 1e-6)
+                if z == 0.75:
+                    assert entry.distance > 0
+                else:
+                    assert entry.distance < 0
+                    pairs = robot.colliding_pairs(q)
+                    assert (entry.part, entry.obstacle) in pairs or (
+                        entry.obstacle,
+                        entry.part,
+                    ) in pairs
+
+            robot.apply_shapes(
+                [
+                    Box(name="farther", x=0.3, y=0.3, z=0.3, pose=(0, 0, 1.5, 0, 0, 0)),
+                    Box(
+                        name="overhead", x=0.3, y=0.3, z=0.3, pose=(0, 0, 0.48, 0, 0, 0)
+                    ),
+                ]
+            )
+            world.set_layer("installation", config().installation_shapes())
+            entries = robot.clearances(q)
+            assert {entry.obstacle for entry in entries} == {
+                "shape:farther",
+                "shape:overhead",
+                "install:floor",
+            }
+            distances = [entry.distance for entry in entries]
+            assert distances == sorted(distances)
+            assert distances[0] == pytest.approx(
+                world.world_distance(q.tolist()), abs=1e-9
+            )
+            robot.apply_shapes([])
+            assert [entry.obstacle for entry in robot.clearances(q)] == [
+                "install:floor"
+            ]
+            world.set_layer("installation", [])
+            assert robot.clearances(q) == []
+        finally:
+            robot.apply_shapes([])
+            world.set_layer("installation", config().installation_shapes())
+
     def test_keepouts_are_reported_in_the_runtimes_vocabulary(
         self, robot: Robot
     ) -> None:
@@ -534,7 +602,7 @@ class TestPackagedData:
         from par6.robot import Robot
 
         bot = Robot()
-        for key in ("FLANGE", "MSG_SMALL_MOTOR_150MM_RAIL", "SSG48"):
+        for key in ("FLANGE", "MSG_SM_150MM", "SSG48"):
             bot.set_active_tool(key)
             urdf = Path(bot.urdf_path)
             text = urdf.read_text()

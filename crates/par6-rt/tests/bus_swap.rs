@@ -33,7 +33,7 @@ fn a_swapped_bus_re_runs_the_boot_sequence_and_drops_the_old_arms_state() {
         // BOOTING, with fresh readings from every node.
         rig.tick_n(40);
         rig.core.set_homed(true);
-        rig.send(RtCommand::Enable);
+        rig.send(RtCommand::Enable(0));
         rig.tick_n(4);
         let before = rig.snap();
         assert_eq!(before.mode, Mode::Idle, "the first bus finished booting");

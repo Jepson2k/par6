@@ -193,7 +193,7 @@ impl SimDriver {
 
         // The core requests IDLE itself once its boot selfcheck passes.
         d.tick_until(IDLE_BUDGET_S, "reached IDLE", |s| s.mode == Mode::Idle)?;
-        d.send(RtCommand::Enable);
+        d.send(RtCommand::Enable(0));
         d.tick_until(ENABLE_BUDGET_S, "enabled", |s| s.state == ArmState::Enabled)?;
         d.land(bundle, &q0);
         // A tool action is refused against an uncalibrated gripper, and a

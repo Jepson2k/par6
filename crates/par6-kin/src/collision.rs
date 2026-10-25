@@ -19,6 +19,7 @@
 //! flange and 19 us for a gripper variant; with a box keep-out, 25 us
 //! either way; with a per-shape margin, 26 us and 34 us.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::MAX_SHAPE_PARAMS;
@@ -50,6 +51,18 @@ pub fn link_of(geom: &str) -> &str {
 /// truncated (the verdict stays correct — `collision_active` is still true,
 /// and the wire carries a bounded pair list either way).
 pub const MAX_REPORTED_PAIRS: usize = 64;
+
+/// Nearest arm/tool geometry to one keep-out. Names use the runtime's
+/// reporting vocabulary; distance and witness points are in world metres.
+#[derive(Clone, Debug)]
+pub struct Clearance {
+    pub part: String,
+    pub obstacle: String,
+    /// Signed raw-geometry distance (negative = penetration).
+    pub distance: f64,
+    pub part_point: [f64; 3],
+    pub obstacle_point: [f64; 3],
+}
 
 /// A configuration's collision verdict.
 ///
@@ -101,6 +114,8 @@ pub struct Collision {
     raw_pairs: Vec<i32>,
     pairs: Vec<(usize, usize)>,
     names: Vec<String>,
+    reporting_names: Vec<String>,
+    raw_clearances: Vec<sys::ffi::par6_clearance>,
 
     // Applied layers' colliding shapes, kept so a layer replacement can
     // rebuild the name table without re-reading the shim's synthetic
@@ -184,6 +199,8 @@ impl Collision {
             raw_pairs: vec![0; 2 * MAX_REPORTED_PAIRS],
             pairs: Vec::with_capacity(MAX_REPORTED_PAIRS),
             names: Vec::new(),
+            reporting_names: Vec::new(),
+            raw_clearances: Vec::new(),
             layers: [Vec::new(), Vec::new()],
             robot_geoms,
         };
@@ -357,6 +374,39 @@ impl Collision {
         Ok(self.model.world_distance(&self.q_full)?)
     }
 
+    /// Nearest arm/tool pair per keep-out, sorted by signed distance.
+    /// Self pairs and allowed contacts are excluded. Empty with no keep-outs.
+    /// Passive jaw joints stay at zero, as in [`Self::min_distance`].
+    ///
+    /// Margins do not shift these values. Mesh penetration uses coal's
+    /// patch-local depth, matching [`Self::world_distance`]. Allocates owned
+    /// results for scene queries; keep this off the RT tick path.
+    pub fn clearances(&mut self, q: &[f64; NQ]) -> Result<Vec<Clearance>, KinError> {
+        self.q_full[..NQ].copy_from_slice(q);
+        let count = self
+            .model
+            .world_clearances_into(&self.q_full, &mut self.raw_clearances)?;
+        let mut nearest: BTreeMap<i32, &sys::ffi::par6_clearance> = BTreeMap::new();
+        for pair in &self.raw_clearances[..count] {
+            let best = nearest.entry(pair.obstacle).or_insert(pair);
+            if pair.distance < best.distance {
+                *best = pair;
+            }
+        }
+        let mut clearances: Vec<_> = nearest
+            .into_values()
+            .map(|pair| Clearance {
+                part: self.reporting_names[pair.part as usize].clone(),
+                obstacle: self.reporting_names[pair.obstacle as usize].clone(),
+                distance: pair.distance,
+                part_point: pair.part_point,
+                obstacle_point: pair.obstacle_point,
+            })
+            .collect();
+        clearances.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+        Ok(clearances)
+    }
+
     /// Whether the straight joint-space segment `from → to` stays clear,
     /// sampled at `steps` interior points plus both endpoints.
     ///
@@ -405,6 +455,18 @@ impl Collision {
             "shim geometry layout drift: {} names for {total} geometries",
             self.names.len()
         );
+        self.reporting_names.clear();
+        for idx in 0..total {
+            let name = self.model.geom_name(idx)?;
+            self.reporting_names
+                .push(if idx < self.robot_geoms && !name.contains(':') {
+                    link_of(&name).to_owned()
+                } else {
+                    name
+                });
+        }
+        self.raw_clearances
+            .resize(self.model.pair_count(), sys::ffi::par6_clearance::default());
         Ok(())
     }
 }

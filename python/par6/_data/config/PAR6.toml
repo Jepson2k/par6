@@ -26,7 +26,7 @@ park_pose_rad = [0.0, -1.5708, 3.1416, 0.0, 0.0, 3.1416]
 # passive "Flange" is one. Arm identification runs bare, against that
 # flange, with the gripper physically off: set this to Flange and remove it
 # together -- the run reads the bus and refuses if the two disagree.
-active_tool = "MSG_small_motor_150mm_rail"
+active_tool = "MSG_SM_150mm"
 kt_source = "auto"
 
 # ---------------------------------------------------------------- joint 1 (J0)

@@ -74,7 +74,7 @@ fn idle_gravity_hold_is_torque_only_and_gated() {
 
     // homed ∧ enabled ∧ grav-on ⇒ torque-only hold, mA = trunc(g·trim·factor).
     rig.core.set_homed(true);
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
     rig.tick();
     assert!(rig.snap().gravity_comp, "applied once the arm is enabled");
     let trimmed: [f64; MAX_JOINTS] = std::array::from_fn(|i| g[i] * robot.gravity_scale[i]);
@@ -153,7 +153,7 @@ fn boot_adopts_each_drivers_own_kt_and_falls_back_per_joint() {
     rig.boot_to_idle();
 
     rig.core.set_homed(true);
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
     rig.tick();
     let expect: [i16; MAX_JOINTS] = std::array::from_fn(|i| {
         let j = &robot.joints[i];
@@ -219,7 +219,7 @@ fn gate_matrix_enforces_transitions_enable_homed_and_park() {
     // reference: refused unhomed, with the NOT_HOMED warning. JOG does
     // not — an arm can need jogging clear of an obstruction before it can
     // be homed at all — and HOMING is not homed-gated either.
-    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::Enable(0));
     for target in [Mode::Exec, Mode::Stream] {
         rig.cmd(RtCommand::SetMode(target));
         rig.tick();
@@ -246,7 +246,7 @@ fn gate_matrix_enforces_transitions_enable_homed_and_park() {
     // One external command per tick: Enable and Jog queued together —
     // after one tick only Enable has been consumed.
     rig.core.set_homed(true);
-    rig.send(RtCommand::Enable);
+    rig.send(RtCommand::Enable(0));
     rig.send(RtCommand::SetMode(Mode::Jog));
     rig.tick();
     let s = rig.snap();

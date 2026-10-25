@@ -585,6 +585,32 @@ fn world_distance_reads_world_pairs_only_and_tracks_approach() {
         );
     }
 
+    assert!(matches!(
+        col.world_clearances_into(&q, &mut []),
+        Err(Error::Status(ffi::PAR6_ERR_BUFFER_TOO_SMALL))
+    ));
+    let mut out = vec![ffi::par6_clearance::default(); col.pair_count()];
+    assert!(matches!(
+        col.world_clearances_into(&q[..5], &mut out),
+        Err(Error::Dimension { .. })
+    ));
+    for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let mut bad = q;
+        bad[0] = invalid;
+        assert!(matches!(
+            col.world_clearances_into(&bad, &mut out),
+            Err(Error::Status(ffi::PAR6_ERR_INVALID_ARG))
+        ));
+    }
+    let count = col.world_clearances_into(&q, &mut out).unwrap();
+    // Every arm part but the base, which is fixed to the world as the box is.
+    assert_eq!(count, col.robot_geom_count() - 1);
+    let nearest = out[..count]
+        .iter()
+        .map(|p| p.distance)
+        .fold(f64::INFINITY, f64::min);
+    assert!((nearest - col.world_distance(&q).unwrap()).abs() < 1e-9);
+
     // A self contact never masks the world reading: folded onto itself,
     // with the box well clear above, the arm still reads the box's gap.
     let folded = [0.0, -2.4, 6.5, 0.0, 1.6, 0.0];
