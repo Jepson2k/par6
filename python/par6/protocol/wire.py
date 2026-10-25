@@ -153,6 +153,9 @@ class StatusBuffer:
     bits it currently asserts, empty for a healthy drive."""
     loop_health: dict = field(default_factory=dict)
     """Control-loop health: ``p99_period_s`` and ``overruns``."""
+    motion_profile: str | None = None
+    """Motion profile the planner times moves with; None before the first
+    frame."""
     # Aliases into the two enable arrays the filler mutates in place.
     cart_en: dict[str, np.ndarray] = field(init=False, repr=False, compare=False)
 
@@ -254,3 +257,4 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
     buf.torques_ext[:] = d["torques_ext"]
     buf.drive_health = dict(d["drive_health"])
     buf.loop_health = dict(d["loop_health"])
+    buf.motion_profile = d["motion_profile"]
