@@ -1600,7 +1600,10 @@ impl Arm {
             let guarded = check
                 && !self.blind
                 && !self.restoring
-                && !self.homing
+                // Every referenced joint, in every stage: the homing sequence's
+                // own legs run at EXEC speed too, and one of them oscillated
+                // unwatched for its whole window on 2026-10-25 while the guard
+                // stood down for the stage.
                 && self.homed[j]
                 // Gain trials and calm() have their own guard and bounded
                 // backoff path; a joint-by-joint park answers for its joint.
