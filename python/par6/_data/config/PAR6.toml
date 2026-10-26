@@ -115,12 +115,6 @@ velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 5000
 encoder_bits = 14
 gear_ratio = 25.0
-# The vendor is internally inconsistent about J1's reduction: 20 in its
-# dynamics table (robots/PAR6.py -> robotics/dynamics.py) vs 25 in the
-# motor config. The wire conversion keeps 25; the sim dynamics follow
-# the table J1 was modeled with. Switch to 25 if real movement proves
-# the table stale.
-dynamics_gear_ratio = 20.0
 gear_efficiency = 0.90
 dir = 0
 sector_master_position_ticks = 5707
@@ -405,11 +399,18 @@ two_pass_max_diff_ticks = 500
 home_offset_rad = 2.96279
 home_offset_gripper_dependent = false
 
+# The shoulder and elbow seek on a light contact current and brake on a
+# strong one: from a high pose gravity drives them into their stops harder
+# than the contact current can hold back, and the current they touch with
+# decides the reference (the vendor's elbow homed within 0.04 deg touching at
+# ~400 mA, 0.23-0.36 deg off at 750-850 mA). The vendor's 250 mA stopped this
+# arm short of its stops (2026-09-18).
 [[homing.joints]] # J1
 strategy = "stall"
 speed_ticks_s = 6000.0
 direction = 1
-current_ma = 250.0
+current_ma = 450.0
+brake_current_ma = 800.0
 timeout_s = 10.0
 backoff_s = 1.5
 two_pass = true
@@ -426,7 +427,8 @@ sample_pct = 0.8
 strategy = "stall"
 speed_ticks_s = 6000.0
 direction = 0
-current_ma = 250.0
+current_ma = 450.0
+brake_current_ma = 800.0
 timeout_s = 10.0
 backoff_s = 1.5
 two_pass = true

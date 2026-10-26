@@ -1284,6 +1284,8 @@ struct Arm {
     /// against, or the one a move stopped on. Samples within
     /// `ENDSTOP_EXCLUSION_RAD` of it are not scored.
     endstop_guard: [Option<i32>; N],
+    /// Where each joint latched its home reference this run \[ticks\].
+    latched: [Option<i32>; N],
     /// While the gains stage trials a joint: the last gains that tracked,
     /// restored within a tick if the trial runs away.
     sane_gains: [Option<Gains>; N],
@@ -1404,6 +1406,7 @@ impl Arm {
             position_rx_ns: [0; N],
             friction_fit_uncertain: [false; N],
             endstop_guard: [None; N],
+            latched: [None; N],
             sane_gains: [None; N],
             gain_used: [0; N],
             gain_watch: false,
@@ -2468,6 +2471,7 @@ impl Arm {
                     // stop it was referenced against sits.
                     let contact = self.home_joint(j)?;
                     self.endstop_guard[j] = Some(contact);
+                    self.latched[j] = Some(contact);
                     self.homed[j] = true;
                 }
             }
@@ -2510,7 +2514,8 @@ impl Arm {
             cfg.velocity_limit_ticks_s,
             cfg.ilim_ma,
             self.dt,
-        );
+        )
+        .with_latch_check(jh, cfg);
         let offset = self
             .bundle
             .effective_home_offset(j)
@@ -2521,9 +2526,24 @@ impl Arm {
         // the reference latches -- the orchestrator's `apply_phase_limits`
         // rule, which is this much when there is no step machinery above it.
         self.configure(j, params.current_ma)?;
+        let mut limit = homer.current_limit(&params);
         let mut reference = None;
         while homer.running() {
             let (cmd, event) = homer.tick(&params, &mut self.state.nodes[self.node(j)]);
+            // Brake strong, touch light: the limit follows the FSM's
+            // braking without stopping the approach for a full configure.
+            let wanted = homer.current_limit(&params);
+            if homer.running() && reference.is_none() && wanted != limit {
+                limit = wanted;
+                self.retune(j, f64::from(limit))?;
+                self.bus.queue_poll_override(
+                    PollAction::ConfigFrame {
+                        node: params.node,
+                        kind: ConfigKind::Limits,
+                    },
+                    3,
+                );
+            }
             self.frame(Some((j, cmd)))?;
             match event {
                 Some(HomerEvent::Reference { latched_ticks }) => {
@@ -2539,7 +2559,10 @@ impl Arm {
                     reference = Some(latched_ticks);
                 }
                 Some(HomerEvent::Failed) => {
-                    return Err(format!("J{} homing failed", j + 1).into());
+                    let why = homer
+                        .failure()
+                        .map_or_else(String::new, |why| format!(": {why}"));
+                    return Err(format!("J{} homing failed{why}", j + 1).into());
                 }
                 None => {}
             }
@@ -5470,8 +5493,7 @@ fn joint_inertia(kin: &mut par6_kin::Kin, bundle: &ConfigBundle, q: [f64; N]) ->
         kin.dyn_feedforward(&q, &zero, &qdd, &mut tau)
             .map_err(|e| format!("J{} inertia: {e}", j + 1))?;
         let cfg = &bundle.robot.joints[j];
-        let g = cfg.dynamics_gear_ratio.unwrap_or(cfg.gear_ratio);
-        out[j] = tau[j] + g * g * bundle.robot.sim.motor_jm_kg_m2[j];
+        out[j] = tau[j] + cfg.gear_ratio * cfg.gear_ratio * bundle.robot.sim.motor_jm_kg_m2[j];
     }
     Ok(out)
 }
@@ -6079,6 +6101,18 @@ fn compact(value: f64, decimals: usize) -> String {
     }
     let text = format!("{value:.decimals$}");
     text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// `original` with each joint's latch written where it has one: the spot
+/// homing checks that joint's reference against from now on.
+fn record_latches(original: &str, latches: &[Option<u32>; N]) -> Result<String> {
+    let mut overlay = par6_config::LocalOverlay::parse(original)?;
+    for (j, latch) in latches.iter().enumerate() {
+        if let Some(latch) = latch {
+            overlay.set_homing_joint(j, "endstop_latch_ticks", i64::from(*latch))?;
+        }
+    }
+    Ok(overlay.to_string())
 }
 
 /// The measured values as the installation's local overlay: `original`
@@ -6845,6 +6879,19 @@ fn run(args: Args) -> Result<()> {
             .map(|(i, d)| d + config_correction.get(i).copied().unwrap_or(0.0))
             .collect()
     });
+    // Where each joint latched, written where it moved: the check homing
+    // makes against it from now on. A joint homing against the tool latches
+    // where the tool puts it, so it has none.
+    let latches: [Option<u32>; N] = std::array::from_fn(|j| {
+        let (joint, jh) = (
+            &arm.bundle.robot.joints[j],
+            &arm.bundle.robot.homing.joints[j],
+        );
+        let counts = 1i64 << joint.encoder_bits;
+        let latch = u32::try_from(i64::from(arm.latched[j]?).rem_euclid(counts)).ok()?;
+        (!jh.home_offset_gripper_dependent && jh.endstop_latch_ticks != Some(latch))
+            .then_some(latch)
+    });
     arm.events.take();
     drop(arm);
     let recorded = recorder.join().map_err(|_| "recording thread failed")?;
@@ -6910,21 +6957,24 @@ fn run(args: Args) -> Result<()> {
     // What was measured is the record, whatever ended the run: the candidate
     // and the run's marker are written here, and the history read from them,
     // before the verdict can return. `--apply` stays gated below on both.
-    let candidate = patch_config(
-        &original,
-        correction.as_deref(),
-        friction.as_ref(),
-        &sim,
-        ripples.as_ref(),
-        tuned.as_ref(),
-        limits.as_ref(),
-    )
-    .and_then(|patched| {
-        let written = directory.join(par6_config::LOCAL_CONFIG_NAME);
-        fs::write(&written, &patched)?;
-        ConfigBundle::load_with(&config, Some(&written), args.tool.as_deref())?;
-        Ok(patched)
-    });
+    let candidate = record_latches(&original, &latches)
+        .and_then(|latched| {
+            patch_config(
+                &latched,
+                correction.as_deref(),
+                friction.as_ref(),
+                &sim,
+                ripples.as_ref(),
+                tuned.as_ref(),
+                limits.as_ref(),
+            )
+        })
+        .and_then(|patched| {
+            let written = directory.join(par6_config::LOCAL_CONFIG_NAME);
+            fs::write(&written, &patched)?;
+            ConfigBundle::load_with(&config, Some(&written), args.tool.as_deref())?;
+            Ok(patched)
+        });
     match &candidate {
         Ok(_) => {
             let effective = par6_config::effective_robot_toml(

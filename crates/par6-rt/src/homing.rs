@@ -16,21 +16,23 @@
 //!   including trailing moves, fails and stops once it outlasts the sum of
 //!   its parts' own bounds.
 //! - the per-joint FSM: approach (stall = windowed displacement plateau
-//!   AND current-ratio window, both required; hall = trigger/edge with
+//!   AND current-ratio window, both required, on the brake limit while
+//!   the drive brakes against its travel; hall = trigger/edge with
 //!   the pre-clear guard, on cmd-32 bits dropped at every approach entry
 //!   so only a reply this approach asked for can be a hit) → dwell →
 //!   backoff (speed ramped at both ends) → pause → second pass at the
-//!   rehome speed → optional release (current-only, ramped in from the
-//!   stall push and back out to zero, latched at the sample percentage of
-//!   its hold); a hall hit latches at the trigger and brakes to a stop →
-//!   settle
-//!   (position-never-valid = FAILURE, two-pass mismatch = FAILURE, then
-//!   the home reference is applied and normal limits restored) →
-//!   optional post-move.
+//!   rehome speed (two-pass mismatch at its stall = FAILURE) → optional
+//!   release (current-only, ramped in from the stall push and back out to
+//!   zero, latched at the sample percentage of its hold; sliding off the
+//!   stall = FAILURE); a hall hit latches at the trigger and brakes to a
+//!   stop → settle (position-never-valid = FAILURE, then the home
+//!   reference is applied and normal limits restored) → optional
+//!   post-move.
 //!
 //! Current limits: waiting joints retain normal holding authority. Active
-//! unreferenced nudges and homing phases use the configured seeking limit;
-//! referenced joints use their normal limit. Limit transitions send four
+//! unreferenced nudges and homing phases use the configured seeking limit
+//! (the brake limit while an approach brakes); referenced joints use their
+//! normal limit. Limit transitions send four
 //! frames, and exit resends each node's stored configuration. The effective
 //! per-node limit is published every tick.
 //!
@@ -93,13 +95,24 @@ const CURRENT_WINDOW_FRACTION: f64 = 0.6;
 /// `REHOME_SPEED_FACTOR`, so a fixed pass-1 threshold would call a joint
 /// still travelling at 83 % of the commanded speed stalled).
 const STALL_DISP_FACTOR: f64 = 0.08 * 0.25;
+/// Braking current against the approach's travel that raises the limit to
+/// `brake_current_ma`, and the level it must ease below before the limit
+/// drops back \[mA\]. The vendor's measurements on the PAR6 elbow
+/// (2026-10-14): from a high pose gravity needs 450-550 mA to hold it back;
+/// it contacts its stop while lifting at about +280 mA, so the limit is
+/// back at the light contact current before it touches. That current
+/// decides the reference: contact at ~400 mA homed within 0.04 deg, at
+/// 750-850 mA 0.23-0.36 deg off.
+const BRAKE_ON_MA: f64 = 300.0;
+const BRAKE_OFF_MA: f64 = 150.0;
+/// How far from this arm's recorded latch a joint may latch, at the joint
+/// \[rad\]: 1 deg, the vendor's tolerance for the same check. This arm's
+/// latches repeated within 0.1 deg over three selfcal runs (2026-10-24/25);
+/// a false stall the vendor caught was 4.8 deg short, a skipped belt half a
+/// motor turn.
+const LATCH_TOL_RAD: f64 = 1.0 * std::f64::consts::PI / 180.0;
 /// In-position tolerance for position moves \[ticks\].
 const POS_TOL_TICKS: i64 = 50;
-/// Gripper firmware calibrate timeout \[s\].
-const CAL_TIMEOUT_S: f64 = 10.0;
-/// Gripper firmware calibrate minimum wait \[s\] (the calibrated bit may
-/// still be set from a previous run).
-const CAL_MIN_WAIT_S: f64 = 2.0;
 /// Limits-frame repeats around homing.
 const LIMIT_REPEATS: u8 = 4;
 /// HALL pack trigger value (vendor homing constant).
@@ -139,6 +152,7 @@ pub struct HomerParams {
     /// Signed approach speed \[motor ticks/s\].
     pub speed: f64,
     pub current_ma: f64,
+    pub brake_ma: Option<f64>,
     pub timeout_ticks: u32,
     pub backoff_ticks: u32,
     pub two_pass: bool,
@@ -164,6 +178,27 @@ pub struct HomerParams {
     pub normal_vel_limit: f32,
     pub normal_ilim: f32,
     pub dt: f64,
+    /// This arm's latch to check the reference against.
+    pub latch: Option<LatchCheck>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct LatchCheck {
+    /// The recorded latch within one motor turn \[ticks\].
+    pub ticks: i64,
+    /// Encoder counts per motor turn.
+    pub counts: i64,
+    /// Motor ticks per joint radian.
+    pub ticks_per_rad: f64,
+}
+
+impl LatchCheck {
+    /// How far `latched` sits from the recorded latch, at the joint \[rad\].
+    pub fn off_rad(&self, latched: i32) -> f64 {
+        let half = self.counts / 2;
+        let off = (i64::from(latched) - self.ticks + half).rem_euclid(self.counts) - half;
+        off as f64 / self.ticks_per_rad
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -196,6 +231,7 @@ impl HomerParams {
             strategy: jh.strategy,
             speed: dir_sign * jh.speed_ticks_s,
             current_ma: jh.current_ma,
+            brake_ma: jh.brake_current_ma,
             timeout_ticks: ticks(seek_timeout_s).max(1),
             backoff_ticks: ticks(jh.backoff_s),
             two_pass: jh.two_pass && jh.strategy == HomingStrategy::Stall,
@@ -232,7 +268,20 @@ impl HomerParams {
             normal_vel_limit: normal_vel_limit as f32,
             normal_ilim: normal_ilim as f32,
             dt,
+            latch: None,
         }
+    }
+
+    /// Check the reference against the arm's recorded latch, when the
+    /// config carries one.
+    pub fn with_latch_check(mut self, jh: &JointHoming, joint: &par6_config::JointConfig) -> Self {
+        let counts = 1i64 << joint.encoder_bits;
+        self.latch = jh.endstop_latch_ticks.map(|ticks| LatchCheck {
+            ticks: i64::from(ticks).rem_euclid(counts),
+            counts,
+            ticks_per_rad: counts as f64 / std::f64::consts::TAU * joint.gear_ratio.abs(),
+        });
+        self
     }
 }
 
@@ -269,9 +318,49 @@ pub enum HomerEvent {
     /// The reference position was latched at settle; the orchestrator
     /// applies it and restores limits.
     Reference { latched_ticks: i32 },
-    /// The FSM failed (timeout / two-pass mismatch / never-valid
-    /// position).
+    /// The FSM failed; [`Homer::failure`] says why.
     Failed,
+}
+
+/// Why a joint's homing failed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HomerFailure {
+    /// No stop within the joint's seek budget.
+    Timeout,
+    /// The two passes stalled this far apart \[ticks\].
+    TwoPass { diff_ticks: i64 },
+    /// The joint slid this far off its stall in the release \[ticks\].
+    Slid { ticks: i64 },
+    /// No valid position to latch.
+    NoPosition,
+    /// The latch sits this far from the arm's recorded one \[rad\].
+    Latch { off_rad: f64 },
+    /// The post-home target was not reached.
+    PostMove,
+}
+
+impl std::fmt::Display for HomerFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::Timeout => write!(f, "no stop within its seek time"),
+            Self::TwoPass { diff_ticks } => {
+                write!(f, "its two passes stalled {diff_ticks} ticks apart")
+            }
+            Self::Slid { ticks } => write!(
+                f,
+                "it slid {ticks} ticks off its stall in the release: a false stall, not its stop"
+            ),
+            Self::NoPosition => write!(f, "its position never read valid at the stop"),
+            Self::Latch { off_rad } => write!(
+                f,
+                "it latched {:+.2} deg from where this arm latches (endstop_latch_ticks): a \
+                 false stall, a skipped belt or a slipping coupling; after a deliberate change, \
+                 remove the value and the next par6-selfcal --apply records the new spot",
+                off_rad.to_degrees()
+            ),
+            Self::PostMove => write!(f, "its post-home target was not reached"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -309,6 +398,10 @@ pub struct Homer {
     post_elapsed: u32,
     /// Measured current at the stall hit: where the release ramp starts.
     hit_current: f64,
+    /// The approach is braking against its own travel and runs on
+    /// `brake_ma` (see [`BRAKE_ON_MA`]).
+    braking: bool,
+    failure: Option<HomerFailure>,
 }
 
 impl Homer {
@@ -334,11 +427,14 @@ impl Homer {
             post_dur_ticks: 0,
             post_elapsed: 0,
             hit_current: 0.0,
+            braking: false,
+            failure: None,
         }
     }
 
     pub fn start(&mut self) {
         self.phase = HPhase::Approach;
+        self.failure = None;
         self.elapsed = 0;
         self.pass = 1;
         self.pass_hits = [0; 2];
@@ -353,6 +449,7 @@ impl Homer {
     }
 
     fn reset_detectors(&mut self) {
+        self.braking = false;
         self.ref_pos = None;
         self.still = 0;
         self.cur_ring.fill(false);
@@ -365,11 +462,41 @@ impl Homer {
         !matches!(self.phase, HPhase::Finished | HPhase::Failed)
     }
 
+    /// The current limit this joint's homing needs on its drive now \[mA\]:
+    /// the brake limit while the approach brakes, the homing current
+    /// otherwise.
+    pub fn current_limit(&self, p: &HomerParams) -> f32 {
+        match p.brake_ma {
+            Some(brake) if self.braking => brake as f32,
+            _ => p.current_ma as f32,
+        }
+    }
+
+    /// Brake strong, touch light: the drive's current against the
+    /// approach's travel decides which limit it runs on.
+    fn track_braking(&mut self, p: &HomerParams, node: &NodeState, speed: f64) {
+        let (Some(_), Some(current)) = (p.brake_ma, node.current_ma) else {
+            return;
+        };
+        let push = f64::from(current) * speed.signum();
+        if !self.braking && push < -BRAKE_ON_MA {
+            self.braking = true;
+        } else if self.braking && push > -BRAKE_OFF_MA {
+            self.braking = false;
+        }
+    }
+
     /// Fail in the current phase, recording it for [`Self::public_phase`].
-    fn fail(&mut self) -> (JointCommand, Option<HomerEvent>) {
+    fn fail(&mut self, why: HomerFailure) -> (JointCommand, Option<HomerEvent>) {
         self.failed_in = self.phase;
         self.phase = HPhase::Failed;
+        self.failure = Some(why);
         (JointCommand::idle(), Some(HomerEvent::Failed))
+    }
+
+    /// Why the last run failed; `None` while it has not.
+    pub fn failure(&self) -> Option<HomerFailure> {
+        self.failure
     }
 
     /// The published phase; `Failed` reports the phase the FSM failed in.
@@ -457,7 +584,7 @@ impl Homer {
             HPhase::Approach => {
                 self.elapsed += 1;
                 if self.spent.saturating_add(self.elapsed) > p.timeout_ticks {
-                    return self.fail();
+                    return self.fail(HomerFailure::Timeout);
                 }
                 if self.elapsed == 1 {
                     // `hall` is written only by a cmd-32 reply and nothing
@@ -471,10 +598,13 @@ impl Homer {
                 }
                 let speed = self.approach_speed(p);
                 let (cmd, hit) = match p.strategy {
-                    HomingStrategy::Stall => (
-                        JointCommand::velocity(trunc_to_wire(speed), 0),
-                        self.detect_stall(p, node, speed),
-                    ),
+                    HomingStrategy::Stall => {
+                        self.track_braking(p, node, speed);
+                        (
+                            JointCommand::velocity(trunc_to_wire(speed), 0),
+                            self.detect_stall(p, node, speed),
+                        )
+                    }
                     HomingStrategy::Hall => (
                         JointCommand::hall(trunc_to_wire(speed), HALL_TRIGGER_VALUE),
                         node.hall.map(|h| !h.trigger || h.edge).unwrap_or(false),
@@ -502,6 +632,7 @@ impl Homer {
                 }
                 let hit_pos = i64::from(node.position_ticks.unwrap_or(0));
                 self.elapsed = 0;
+                self.braking = false;
                 match p.strategy {
                     HomingStrategy::Hall => {
                         // Position latched AT trigger; hall skips two-pass
@@ -513,6 +644,19 @@ impl Homer {
                         self.pass_hits[usize::from(self.pass - 1)] = hit_pos;
                         self.hit_current = f64::from(node.current_ma.unwrap_or(0));
                         let final_hit = !(self.pass == 1 && p.two_pass);
+                        // Judged at the second stall, before a release: two
+                        // stalls apart are a joint that cannot hold itself
+                        // at its homing current, and the release's lower
+                        // current would only let it fall further first.
+                        if final_hit && p.two_pass {
+                            let diff_ticks = (self.pass_hits[1] - self.pass_hits[0]).abs();
+                            if diff_ticks > p.max_diff_ticks {
+                                // Published as the verdict on the stalls it
+                                // is, not as an approach that found no stop.
+                                self.phase = HPhase::Settle;
+                                return self.fail(HomerFailure::TwoPass { diff_ticks });
+                            }
+                        }
                         self.phase = if !final_hit {
                             HPhase::Dwell
                         } else if p.release.is_some() {
@@ -553,7 +697,7 @@ impl Homer {
             HPhase::Preclear => {
                 self.elapsed += 1;
                 if self.spent.saturating_add(self.elapsed) > p.timeout_ticks {
-                    return self.fail();
+                    return self.fail(HomerFailure::Timeout);
                 }
                 // Reverse WITH the hall pack: each tick's cmd-32 reply
                 // carries the live band state, and only an off-band
@@ -606,6 +750,16 @@ impl Homer {
             HPhase::Release => {
                 self.elapsed += 1;
                 let r = p.release.expect("release phase without a plan");
+                // A joint resting on its stop relaxes a little; one that
+                // slides further than twice its two-pass tolerance is not on
+                // a stop at all but a false stall short of it. The vendor
+                // logged normal releases of 12-2144 ticks and failing ones
+                // up to 21684 (2026-10-14).
+                let stall = self.pass_hits[usize::from(self.pass - 1)];
+                let slid = node.position_ticks.map_or(0, |pos| i64::from(pos) - stall);
+                if slid.abs() > 2 * p.max_diff_ticks {
+                    return self.fail(HomerFailure::Slid { ticks: slid });
+                }
                 let (ramp, e) = (p.ramp_ticks, self.elapsed);
                 let target = f64::from(r.current_ma);
                 // Ramp in from the stall push, hold for the configured
@@ -641,18 +795,13 @@ impl Homer {
                     match self.latched {
                         None if self.elapsed < 2 * p.settle_ticks => {}
                         None => {
-                            return self.fail();
+                            return self.fail(HomerFailure::NoPosition);
                         }
                         Some(latched) => {
-                            if p.two_pass {
-                                let diff = (self.pass_hits[1] - self.pass_hits[0]).abs();
-                                if diff > p.max_diff_ticks {
-                                    log::warn!(
-                                        "homing node {}: two-pass diff {diff} > {}",
-                                        p.node,
-                                        p.max_diff_ticks
-                                    );
-                                    return self.fail();
+                            if let Some(check) = p.latch {
+                                let off_rad = check.off_rad(latched);
+                                if off_rad.abs() > LATCH_TOL_RAD {
+                                    return self.fail(HomerFailure::Latch { off_rad });
                                 }
                             }
                             self.phase = if p.post.is_some() {
@@ -718,8 +867,7 @@ impl Homer {
                 if self.post_elapsed >= self.post_dur_ticks && self.post_streak >= p.in_pos_streak {
                     self.phase = HPhase::Finished;
                 } else if self.elapsed > self.post_dur_ticks.saturating_add(p.pre_post_timeout) {
-                    log::warn!("homing node {}: post-home target not reached", p.node);
-                    return self.fail();
+                    return self.fail(HomerFailure::PostMove);
                 }
                 (cmd, None)
             }
@@ -874,7 +1022,9 @@ pub struct HomingSystem {
     step_idx: usize,
     part: Part,
     statuses: [HomingJointStatus; NUM_NODES],
-    seeking_limits: [bool; NUM_NODES],
+    /// The seeking limit each drive runs on now \[mA\]; `None` = its
+    /// normal limit.
+    seeking_limits: [Option<f32>; NUM_NODES],
     last_fw_cmd: Option<FirmwareGripperCommand>,
     cal: Option<CalRun>,
     cal_failed: bool,
@@ -901,7 +1051,8 @@ impl HomingSystem {
                 joint.velocity_limit_ticks_s,
                 joint.ilim_ma,
                 dt,
-            );
+            )
+            .with_latch_check(jh, joint);
             // The post move's span is sized at its start (peak tangent
             // 1.5·d/span at the post-home speed), from at most the whole range.
             if let Some(post) = &jh.post_home {
@@ -952,15 +1103,15 @@ impl HomingSystem {
             gripper_node: robot.bus.gripper_node,
             has_can_gripper: gripper_driver.is_some(),
             gripper_gear_r_m: gripper_driver.map(|d| d.gear_r_m).unwrap_or(0.0),
-            cal_timeout: ticks(CAL_TIMEOUT_S).max(1),
-            cal_min_wait: ticks(CAL_MIN_WAIT_S),
+            cal_timeout: 1,
+            cal_min_wait: 0,
             active: false,
             elapsed_ticks: 0,
             sequence_timeout_ticks: 1,
             step_idx: 0,
             part: Part::Pre,
             statuses: [HomingJointStatus::Idle; NUM_NODES],
-            seeking_limits: [false; NUM_NODES],
+            seeking_limits: [None; NUM_NODES],
             last_fw_cmd: None,
             cal: None,
             cal_failed: false,
@@ -973,8 +1124,18 @@ impl HomingSystem {
             },
             check_left: 0,
         };
+        system.set_calibration_timings(gripper_driver);
         system.sequence_timeout_ticks = system.sequence_budget_ticks();
         system
+    }
+
+    /// The firmware calibration's bounds come from the tool's own timings,
+    /// the same ones a calibration outside homing is judged by.
+    fn set_calibration_timings(&mut self, driver: Option<&par6_config::GripperDriverConfig>) {
+        let t = driver.map_or_else(par6_config::SettleTimings::default, |d| d.settle);
+        let ticks = |s: f64| (s / self.dt).round() as u32;
+        self.cal_timeout = ticks(t.calibrate_timeout_s).max(1);
+        self.cal_min_wait = ticks(t.calibrate_min_wait_s);
     }
 
     /// The longest a healthy run of the planned sequence can take: each
@@ -1101,7 +1262,7 @@ impl HomingSystem {
             h.phase = HPhase::Finished;
         }
         self.reset_step_states(0);
-        self.seeking_limits.fill(false);
+        self.seeking_limits.fill(None);
         for p in self.params.iter().chain(self.gripper_params.iter()) {
             let _ = bus.send_limits(p.node, p.normal_vel_limit, p.normal_ilim, LIMIT_REPEATS);
         }
@@ -1124,6 +1285,7 @@ impl HomingSystem {
         let driver = gripper.and_then(|g| g.driver.as_ref());
         self.has_can_gripper = driver.is_some();
         self.gripper_gear_r_m = driver.map_or(0.0, |d| d.gear_r_m);
+        self.set_calibration_timings(driver);
         self.gripper_params = gripper.and_then(|g| {
             let (d, h) = (g.driver.as_ref()?, g.homing.as_ref()?);
             Some(HomerParams::from_config(
@@ -1183,14 +1345,11 @@ impl HomingSystem {
             .enumerate()
         {
             seeking[i] &= self.statuses[i] != HomingJointStatus::Done;
-            if seeking[i] != self.seeking_limits[i] {
-                let limit = if seeking[i] {
-                    p.current_ma as f32
-                } else {
-                    p.normal_ilim
-                };
+            let want = seeking[i].then(|| self.homers[i].current_limit(p));
+            if want != self.seeking_limits[i] {
+                let limit = want.unwrap_or(p.normal_ilim);
                 let _ = bus.send_limits(p.node, p.normal_vel_limit, limit, LIMIT_REPEATS);
-                self.seeking_limits[i] = seeking[i];
+                self.seeking_limits[i] = want;
             }
         }
     }
@@ -1236,19 +1395,15 @@ impl HomingSystem {
     pub fn status(&self) -> HomingStatus {
         let mut eff = [0.0f32; NUM_NODES];
         for (i, e) in eff.iter_mut().enumerate().take(MAX_JOINTS) {
-            let homing_now = self.active && self.seeking_limits[i];
-            *e = if homing_now {
-                self.params[i].current_ma as f32
-            } else {
-                self.params[i].normal_ilim
+            *e = match self.seeking_limits[i] {
+                Some(limit) if self.active => limit,
+                _ => self.params[i].normal_ilim,
             };
         }
         if let Some(gp) = &self.gripper_params {
-            let homing_now = self.active && self.seeking_limits[GRIPPER_SLOT];
-            eff[GRIPPER_SLOT] = if homing_now {
-                gp.current_ma as f32
-            } else {
-                gp.normal_ilim
+            eff[GRIPPER_SLOT] = match self.seeking_limits[GRIPPER_SLOT] {
+                Some(limit) if self.active => limit,
+                _ => gp.normal_ilim,
             };
         }
         // Phase is meaningful only once that actuator's FSM has been
@@ -1450,7 +1605,7 @@ impl HomingSystem {
             );
             for (homer, status) in self.homers.iter_mut().zip(self.statuses.iter_mut()) {
                 if *status == HomingJointStatus::Running {
-                    homer.fail();
+                    homer.fail(HomerFailure::Timeout);
                     *status = HomingJointStatus::Failed;
                 }
             }
@@ -1713,13 +1868,16 @@ impl HomingSystem {
                     conv[j].set_home(latched_ticks, self.eff_offset[j]);
                     let _ =
                         bus.send_limits(p.node, p.normal_vel_limit, p.normal_ilim, LIMIT_REPEATS);
-                    self.seeking_limits[j] = false;
+                    self.seeking_limits[j] = None;
                     self.statuses[j] = HomingJointStatus::Done;
                     if let Some(post) = &p.post {
                         self.homers[j].post_target_ticks = conv[j].motor_ticks(post.position_rad);
                     }
                 }
                 Some(HomerEvent::Failed) => {
+                    if let Some(why) = self.homers[j].failure() {
+                        log::warn!("homing J{}: {why}", j + 1);
+                    }
                     self.statuses[j] = HomingJointStatus::Failed;
                     failed = true;
                 }
@@ -1747,10 +1905,13 @@ impl HomingSystem {
                                     gp.normal_ilim,
                                     LIMIT_REPEATS,
                                 );
-                                self.seeking_limits[GRIPPER_SLOT] = false;
+                                self.seeking_limits[GRIPPER_SLOT] = None;
                                 self.statuses[GRIPPER_SLOT] = HomingJointStatus::Done;
                             }
                             Some(HomerEvent::Failed) => {
+                                if let Some(why) = self.homers[GRIPPER_SLOT].failure() {
+                                    log::warn!("homing the gripper: {why}");
+                                }
                                 self.statuses[GRIPPER_SLOT] = HomingJointStatus::Failed;
                                 failed = true;
                             }

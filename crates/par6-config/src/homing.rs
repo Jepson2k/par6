@@ -64,6 +64,12 @@ pub struct JointHoming {
     /// Current threshold \[mA\] — above this (with stall) = endstop hit.
     /// Also the per-node current limit applied for the duration of homing.
     pub current_ma: f64,
+    /// Current limit \[mA\] while the approach brakes against its own
+    /// travel (gravity pulling the joint toward its stop); `current_ma`
+    /// again once the braking eases, so the contact itself stays at
+    /// `current_ma`. Omit for a joint gravity never drives into its stop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub brake_current_ma: Option<f64>,
     /// Approach timeout \[s\]; exceeding it FAILS the joint (and the
     /// sequence).
     pub timeout_s: f64,
@@ -90,6 +96,14 @@ pub struct JointHoming {
     /// against the gripper body).
     #[serde(default)]
     pub home_offset_gripper_dependent: bool,
+    /// Where this arm's motor latches at its stop, within one motor turn
+    /// \[encoder ticks\]: fixed by how the motor was mounted, repeating
+    /// within a few ticks, so a latch elsewhere is a false stall, a skipped
+    /// belt or a slipping coupling and fails homing. `par6-selfcal --apply`
+    /// writes it into the arm's local overlay; omit it to skip the check.
+    /// Not on a joint that homes against the tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub endstop_latch_ticks: Option<u32>,
 }
 
 /// Gripper homing flavor referenced by a sequence step.
@@ -258,6 +272,26 @@ impl JointHoming {
         }
         if self.current_ma <= 0.0 {
             return Err(invalid(f("current_ma"), "must be > 0"));
+        }
+        if let Some(brake) = self.brake_current_ma {
+            if self.strategy == HomingStrategy::Hall {
+                return Err(invalid(
+                    f("brake_current_ma"),
+                    "hall joints seek without a stall — remove it",
+                ));
+            }
+            if brake.is_nan() || brake <= self.current_ma {
+                return Err(invalid(
+                    f("brake_current_ma"),
+                    "must be above current_ma, the limit it replaces while braking",
+                ));
+            }
+        }
+        if self.endstop_latch_ticks.is_some() && self.home_offset_gripper_dependent {
+            return Err(invalid(
+                f("endstop_latch_ticks"),
+                "a joint that homes against the tool latches where the tool puts it — remove it",
+            ));
         }
         if self.timeout_s <= 0.0 {
             return Err(invalid(f("timeout_s"), "must be > 0"));

@@ -2,8 +2,9 @@
 //! bus, the mid-homing hard-error abort,
 //! the home reference the hall FSM latches against the sim's own sensor,
 //! the failure signatures (two-pass mismatch, position-never-valid,
-//! approach timeout), the stall false-positive guards (startup inrush,
-//! current-window duty, pass-2 travel), and the release phase's sign/duration/sample
+//! approach timeout, a slide off the stall, a latch off the arm's own), the
+//! stall false-positive guards (startup inrush, current-window duty, pass-2
+//! travel), the brake limit, and the release phase's sign/duration/sample
 //! contract — the scripted cases at the HomingSystem seam. The latched
 //! reference itself is checked against plant ground truth in
 //! homing_reference.rs.
@@ -784,6 +785,15 @@ fn a_free_running_approach_fails_after_one_full_range_crossing() {
 /// of its ticks, the latched reference, and the outcome.
 type CurrentRuns = Vec<(Vec<i16>, Vec<i32>)>;
 fn run_release_scenario(bundle: &ConfigBundle) -> (CurrentRuns, i64, SeqStatus) {
+    run_release_scenario_at(bundle, 3.0).0
+}
+
+/// [`run_release_scenario`] with the release moving the joint
+/// `release_step` ticks per tick, and the homing system it ended in.
+fn run_release_scenario_at(
+    bundle: &ConfigBundle,
+    release_step: f64,
+) -> ((CurrentRuns, i64, SeqStatus), HomingHarness) {
     let jh = &bundle.robot.homing.joints[1];
     let eff = bundle
         .effective_home_offset(1)
@@ -792,8 +802,6 @@ fn run_release_scenario(bundle: &ConfigBundle) -> (CurrentRuns, i64, SeqStatus) 
     let n1 = usize::from(bundle.robot.joints[1].node_id);
 
     const TRACKING: f64 = 0.8;
-    /// Windup relax/wind rate under release current \[ticks per tick\].
-    const RELEASE_STEP: f64 = 3.0;
     let master = bundle.robot.joints[1].sector_master_position_ticks;
     let mut pos = f64::from(master);
     let stop = pos - 3000.0; // J1 approaches with negative motor speed
@@ -819,7 +827,7 @@ fn run_release_scenario(bundle: &ConfigBundle) -> (CurrentRuns, i64, SeqStatus) 
             run.1.push(exposed);
             // Sign-sensitive plant: the current's sign decides whether
             // the gearbox relaxes (away from the stop) or winds tighter.
-            pos += RELEASE_STEP * f64::from(c.signum());
+            pos += release_step * f64::from(c.signum());
         } else {
             in_run = false;
             let v = cmd.vel.unwrap_or(0);
@@ -838,7 +846,116 @@ fn run_release_scenario(bundle: &ConfigBundle) -> (CurrentRuns, i64, SeqStatus) 
         }
     }
     let latched = i64::from(h.conv[1].motor_ticks(eff));
-    (runs, latched, outcome)
+    ((runs, latched, outcome), h)
+}
+
+/// A stall short of the stop holds through both passes, then gives way to
+/// the release's lower current: a joint that slides further than twice its
+/// two-pass tolerance is not resting on a stop and fails in the release,
+/// before the release has run out, while one that relaxes less homes.
+#[test]
+fn a_joint_sliding_off_its_stall_in_the_release_fails_there() {
+    let bundle = single_joint_bundle(1);
+    let jh = &bundle.robot.homing.joints[1];
+    let r = jh.release.expect("J1 ships a release plan");
+    let dt = bundle.robot.robot.tick_dt_s;
+    let limit = 2.0 * f64::from(jh.two_pass_max_diff_ticks);
+    let hold_ticks = r.duration_s / dt;
+
+    // Ramps and hold together relax it well inside the limit.
+    let ((_, _, outcome), _) = run_release_scenario_at(&bundle, 0.6 * limit / hold_ticks);
+    assert_eq!(
+        outcome,
+        SeqStatus::Complete,
+        "a joint relaxing on its stop homes"
+    );
+
+    let ((runs, _, outcome), h) = run_release_scenario_at(&bundle, 3.0 * limit / hold_ticks);
+    assert_eq!(
+        outcome,
+        SeqStatus::Failed,
+        "a joint sliding off its stall fails"
+    );
+    assert_eq!(h.sys.statuses()[1], HomingJointStatus::Failed);
+    assert_eq!(h.sys.status().phase[1], HomingPhase::Release);
+    let released = runs.last().expect("the release ran").0.len() as f64;
+    assert!(
+        released < hold_ticks,
+        "it fails as it slides, not after its {hold_ticks} release ticks: {released}"
+    );
+}
+
+/// Brake strong, touch light: while the drive brakes against the
+/// approach's travel the limit is the brake limit, and it is the contact
+/// limit again once the braking eases, so the stop is touched at it.
+#[test]
+fn an_approach_brakes_on_its_brake_limit_and_touches_on_its_contact_limit() {
+    let bundle = single_joint_bundle(1);
+    let jh = &bundle.robot.homing.joints[1];
+    let brake = jh
+        .brake_current_ma
+        .expect("the shoulder ships a brake limit");
+    let mut h = HomingHarness::new(&bundle);
+    let node = bundle.robot.joints[1].node_id;
+    let n1 = usize::from(node);
+    let master = bundle.robot.joints[1].sector_master_position_ticks;
+    let mut pos = f64::from(master);
+    let stop = pos - 20_000.0; // J1 approaches with negative motor speed
+    h.state.nodes[n1].position_ticks = Some(master);
+    h.state.nodes[n1].current_ma = Some(0);
+    let mut outcome = SeqStatus::Running;
+    for t in 1..30_000u64 {
+        let status = h.tick(t);
+        let cmd = h.cmds[1];
+        if let Some(v) = cmd.vel.filter(|_| cmd.pos.is_none()) {
+            pos = (pos + f64::from(v) * h.dt).max(stop);
+            let seated = pos <= stop + 0.5 && v < 0;
+            // Gravity drives the first half of the travel: the drive holds
+            // it back against the motion, then the load eases.
+            let braking = !seated && v < 0 && pos > stop + 10_000.0;
+            h.state.nodes[n1].current_ma = Some(if seated {
+                -(jh.current_ma as i16)
+            } else if braking {
+                600
+            } else {
+                -100
+            });
+            h.state.nodes[n1].speed_ticks_s = Some(v);
+        }
+        h.state.nodes[n1].position_ticks = Some(pos as i32);
+        if status != SeqStatus::Running {
+            outcome = status;
+            break;
+        }
+    }
+    assert_eq!(outcome, SeqStatus::Complete);
+    let mut limits: Vec<f32> = h
+        .bus
+        .tx_log
+        .iter()
+        .filter_map(|(_, r)| match r {
+            TxRecord::Limits {
+                node: n,
+                current_limit_ma,
+                ..
+            } if *n == node => Some(*current_limit_ma),
+            _ => None,
+        })
+        .collect();
+    limits.dedup();
+    let normal = bundle.robot.joints[1].ilim_ma as f32;
+    assert_eq!(
+        limits,
+        [
+            normal,
+            jh.current_ma as f32,
+            brake as f32,
+            jh.current_ma as f32,
+            normal
+        ],
+        "normal until it seeks, the contact limit, the brake limit while braking, the \
+         contact limit to the stop, then normal once referenced"
+    );
 }
 
 #[test]
@@ -1216,8 +1333,15 @@ fn tick_uncalibrated(rig: &mut common::Rig, n: u32) {
 
 #[test]
 fn a_gripper_calibration_timeout_clears_without_a_restart() {
+    let bundle = gripper_cal_bundle();
+    let timeout_s = bundle
+        .active_tool()
+        .and_then(|t| t.driver.as_ref())
+        .expect("a CAN gripper")
+        .settle
+        .calibrate_timeout_s;
     let mut rig = common::Rig::build_bundle(
-        gripper_cal_bundle(),
+        bundle,
         CompletionPolicy::Settled,
         Box::new(ZeroGravity),
         true,
@@ -1232,9 +1356,9 @@ fn a_gripper_calibration_timeout_clears_without_a_restart() {
     assert_eq!(rig.snap().mode, Mode::Homing);
 
     // cmd 62 goes out, the calibrated bit never comes back: after the
-    // 10 s calibrate timeout, the sequence fails and the
+    // tool's calibrate timeout, the sequence fails and the
     // hard key latches on the next error pass.
-    let timeout_ticks = (10.0 / rig.dt).round() as u32;
+    let timeout_ticks = (timeout_s / rig.dt).round() as u32;
     tick_uncalibrated(&mut rig, timeout_ticks + 40);
     let s = rig.snap();
     assert_eq!(s.mode, Mode::ActiveError, "the calibration failure reacts");
@@ -1548,5 +1672,44 @@ fn two_passes_that_disagree_fail_the_joint_and_restore_its_limits() {
             "the drive is back on its normal current limit"
         ),
         other => panic!("no limits read back: {other:?}"),
+    }
+}
+
+/// A motor latches at its stop where its mounting puts it within one turn,
+/// so a reference more than 1 deg from this arm's recorded latch fails the
+/// joint; one a whole motor turn away is the same spot.
+#[test]
+fn a_latch_away_from_the_arms_recorded_one_fails_the_joint() {
+    let mut bundle = single_joint_bundle(0);
+    let start = short_of_j0_stop(&bundle, 0.3);
+    let (outcome, h) = home_j0(&bundle, start, |_, _, _| 0.0);
+    assert_eq!(outcome, SeqStatus::Complete);
+    let joint = &bundle.robot.joints[0];
+    let offset = bundle
+        .effective_home_offset(0)
+        .unwrap_or(bundle.robot.homing.joints[0].home_offset_rad);
+    let latched = i64::from(h.conv[0].motor_ticks(offset));
+    let counts = 1i64 << joint.encoder_bits;
+    let per_deg = counts as f64 * joint.gear_ratio / 360.0;
+    for (recorded_deg, turns, homes) in [
+        (0.5, 0, true),
+        (0.0, 1, true),
+        (-1.5, 0, false),
+        (1.5, 0, false),
+    ] {
+        let recorded = latched + (recorded_deg * per_deg).round() as i64 + turns * counts;
+        bundle.robot.homing.joints[0].endstop_latch_ticks =
+            Some(u32::try_from(recorded.rem_euclid(counts)).unwrap());
+        let (outcome, h) = home_j0(&bundle, start, |_, _, _| 0.0);
+        if homes {
+            assert_eq!(
+                outcome,
+                SeqStatus::Complete,
+                "{recorded_deg} deg, {turns} turns"
+            );
+        } else {
+            assert_eq!(outcome, SeqStatus::Failed, "{recorded_deg} deg off");
+            assert_eq!(h.sys.status().phase[0], HomingPhase::Settle);
+        }
     }
 }

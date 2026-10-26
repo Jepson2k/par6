@@ -1239,7 +1239,14 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
   `reset()` does not return until the RT has actually answered, because "the enable was
   queued" is not "the arm will move".
 - **Homing references the arm.** Planned motion is refused before it; jogging is not, so
-  an arm can be driven clear of an obstruction before it is referenced. A completed
+  an arm can be driven clear of an obstruction before it is referenced. The shoulder and
+  elbow seek on a light contact current and raise their limit to `brake_current_ma` only
+  while gravity drives them into their stops, since the contact current decides the
+  reference. A joint fails homing at once when its two passes stall apart, when it slides
+  off its stall during the release (a false stall), or when it latches more than 1 deg from
+  this arm's `endstop_latch_ticks`, which `par6-selfcal --apply` records in the local
+  overlay: a motor's latch within one turn is fixed by how it was mounted, so a latch
+  elsewhere is a false stall, a skipped belt or a slipping coupling. A completed
   sequence is still refused when the ready-pose holding torque contradicts the gravity
   model by more than `homing.reference_check_nm` (a stall seek that latched short of its
   endstop); the joint reports `HOMING_FAILED` in its `Finished` phase. A boot scan that

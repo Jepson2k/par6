@@ -246,12 +246,6 @@ pub struct JointConfig {
     pub encoder_bits: u8,
     /// Gear ratio motor→joint.
     pub gear_ratio: f64,
-    /// Gear ratio the SIM dynamics reflections use (rotor inertia,
-    /// motor friction); omitted = `gear_ratio`. Exists because the
-    /// vendor's dynamics table and motor config can disagree (J1: 20 in
-    /// the dynamics table vs 25 in the motor config).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dynamics_gear_ratio: Option<f64>,
     /// Gear efficiency (0–1], used in the torque→current conversion.
     pub gear_efficiency: f64,
     /// 0 = joint positive rotation matches the kinematic model, 1 = inverted.
@@ -1498,16 +1492,6 @@ impl RobotConfig {
                     "sim.motor_jm_kg_m2",
                     format!("entry {i}: must be > 0 on a joint with a drivetrain stiffness"),
                 ));
-            }
-        }
-        for (i, j) in self.joints.iter().enumerate() {
-            if let Some(g) = j.dynamics_gear_ratio {
-                if !is_positive(g) {
-                    return Err(invalid(
-                        "joints.dynamics_gear_ratio",
-                        format!("joint {i}: must be > 0"),
-                    ));
-                }
             }
         }
         Ok(())

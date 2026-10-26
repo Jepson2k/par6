@@ -22,9 +22,6 @@ pub(crate) struct JointMap {
     /// teleport clamp); `None` on a continuous joint.
     pub endstops: Option<(f64, f64)>,
     pub gear_ratio: f64,
-    /// Gear ratio the drivetrain reflections use (`dynamics_gear_ratio`,
-    /// falling back to `gear_ratio` — the vendor's J1 tables disagree).
-    pub dyn_gear: f64,
     pub encoder_max_counts: i32,
 }
 
@@ -47,7 +44,6 @@ impl JointMap {
             ),
             endstops: j.limits.endstops(),
             gear_ratio: j.gear_ratio,
-            dyn_gear: j.dynamics_gear_ratio.unwrap_or(j.gear_ratio),
             encoder_max_counts,
         }
     }

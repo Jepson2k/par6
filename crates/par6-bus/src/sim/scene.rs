@@ -125,7 +125,7 @@ impl JointTuning {
         coulomb_nm: f64,
         transmission: (f64, f64),
     ) -> Self {
-        let g = map.dyn_gear;
+        let g = map.gear_ratio;
         let armature = g * g * motor_jm_kg_m2;
         let (stiffness, ratio) = transmission;
         Self {

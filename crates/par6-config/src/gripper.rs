@@ -33,8 +33,12 @@ pub struct SettleTimings {
     pub move_timeout_s: f64,
     /// Ceiling on the calibration sweep.
     pub calibrate_timeout_s: f64,
-    /// The sweep reports `calibrated` from its previous run before the
-    /// new one starts, so a calibration is not believed before this.
+    /// The sweep reports `calibrated` from its previous run throughout
+    /// the new one, so a calibration is not believed before this. It has
+    /// to cover a whole sweep: a command sent into an unfinished one
+    /// abandons it while the firmware keeps counting its timeout (the
+    /// vendor's twelfth homing in a row failed that way; their 150 mm MSG
+    /// took ~4.5 s from where homing leaves the jaws, 2026-10-09).
     pub calibrate_min_wait_s: f64,
 }
 
@@ -45,7 +49,7 @@ impl Default for SettleTimings {
             detect_debounce_s: 0.02,
             move_timeout_s: 5.0,
             calibrate_timeout_s: 12.0,
-            calibrate_min_wait_s: 2.0,
+            calibrate_min_wait_s: 5.5,
         }
     }
 }
@@ -265,6 +269,12 @@ impl ToolConfig {
                 return Err(invalid(
                     "homing.home_offset_gripper_dependent",
                     "gripper-dependent overrides apply to ARM joints, not the gripper itself",
+                ));
+            }
+            if h.endstop_latch_ticks.is_some() {
+                return Err(invalid(
+                    "homing.endstop_latch_ticks",
+                    "the latch check is an arm joint's, not the gripper's",
                 ));
             }
         }

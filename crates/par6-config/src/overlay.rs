@@ -390,6 +390,32 @@ impl LocalOverlay {
         Ok(())
     }
 
+    /// Set `key` in joint `index`'s `[[homing.joints]]` entry. Those merge
+    /// by position, so the entries before it are added empty where the
+    /// overlay has none, leaving those joints as shipped.
+    pub fn set_homing_joint(
+        &mut self,
+        index: usize,
+        key: &str,
+        value: impl Into<toml_edit::Value>,
+    ) -> Result<(), ConfigError> {
+        let entries = table_at(self.doc.as_table_mut(), &["homing"])?
+            .entry("joints")
+            .or_insert(toml_edit::Item::ArrayOfTables(Default::default()))
+            .as_array_of_tables_mut()
+            .ok_or_else(|| {
+                invalid(
+                    "homing.joints",
+                    "the overlay's homing joints are not [[homing.joints]] entries",
+                )
+            })?;
+        while entries.len() <= index {
+            entries.push(toml_edit::Table::new());
+        }
+        entries.get_mut(index).expect("padded")[key] = toml_edit::value(value);
+        Ok(())
+    }
+
     /// Drop `key` from the `[[joints]]` entry named `joint`, so the shipped
     /// value stands again.
     pub fn remove_joint_key(&mut self, joint: &str, key: &str) -> Result<(), ConfigError> {
@@ -558,7 +584,8 @@ mod tests {
     #[test]
     fn an_overlay_is_edited_in_place_and_merges_as_written() {
         let text = "# This arm.\n\n\
-                    [[joints]]\nname = \"joint2\"\n[joints.gains]\n# tuned by hand\nkiv = 0.0005\n";
+                    [[joints]]\nname = \"joint2\"\n[joints.gains]\n# tuned by hand\nkiv = 0.0005\n\
+                    [homing]\n[[homing.joints]] # J0\ncurrent_ma = 9.0\n";
         let mut overlay = LocalOverlay::parse(text).unwrap();
         overlay
             .set_array(&["sim"], "viscous_nm_s", &[0.1, 0.2])
@@ -573,23 +600,35 @@ mod tests {
         let ripple: toml_edit::Array = [1.0, 2.0].into_iter().collect();
         overlay.set_joint("joint5", &[], "ripple", ripple).unwrap();
         overlay.remove_joint_key("joint5", "ripple").unwrap();
+        overlay
+            .set_homing_joint(2, "endstop_latch_ticks", 11743)
+            .unwrap();
         let written = overlay.to_string();
         assert!(
-            written.contains("# This arm.") && written.contains("# tuned by hand"),
+            written.contains("# This arm.")
+                && written.contains("# tuned by hand")
+                && written.contains("# J0"),
             "comments survive the edit:\n{written}"
         );
 
         let mut base = table(
             "gravity_scale = [1.0, 1.0]\n[sim]\nviscous_nm_s = [0.0, 0.0]\ncoulomb_nm = [0.5]\n\
              [[joints]]\nname = \"joint2\"\n[joints.gains]\nkpv = 0.01\nkiv = 0.001\nkpp = 3.0\n\
-             [[joints]]\nname = \"joint5\"\n[joints.limits.exec]\nvelocity_rad_s = 1.0\n",
+             [[joints]]\nname = \"joint5\"\n[joints.limits.exec]\nvelocity_rad_s = 1.0\n\
+             [homing]\n[[homing.joints]]\ncurrent_ma = 1.0\n[[homing.joints]]\ncurrent_ma = 2.0\n\
+             [[homing.joints]]\ncurrent_ma = 3.0\n",
         );
         merge(&mut base, table(&written), "").unwrap();
         let want = table(
             "gravity_scale = [1.0]\n[sim]\nviscous_nm_s = [0.1, 0.2]\ncoulomb_nm = [0.5]\n\
              [[joints]]\nname = \"joint2\"\n[joints.gains]\nkpv = 0.02\nkiv = 0.0005\nkpp = 3.0\n\
-             [[joints]]\nname = \"joint5\"\n[joints.limits.exec]\nvelocity_rad_s = 7.7\n",
+             [[joints]]\nname = \"joint5\"\n[joints.limits.exec]\nvelocity_rad_s = 7.7\n\
+             [homing]\n[[homing.joints]]\ncurrent_ma = 9.0\n[[homing.joints]]\ncurrent_ma = 2.0\n\
+             [[homing.joints]]\ncurrent_ma = 3.0\nendstop_latch_ticks = 11743\n",
         );
-        assert_eq!(base, want);
+        assert_eq!(
+            base, want,
+            "a homing joint written past the overlay's entries pads them"
+        );
     }
 }

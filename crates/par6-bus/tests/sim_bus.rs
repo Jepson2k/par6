@@ -337,8 +337,8 @@ fn run_stall_approach(
 fn stall_endstop_signatures_and_release_preload() {
     let robot = par6();
     let dt = robot.robot.tick_dt_s;
-    // J1: stall strategy, direction 1 (negative motor drive), 250 mA
-    // homing current, release +150 mA for 1 s sampling at 80%.
+    // J1: stall strategy, direction 1 (negative motor drive), release
+    // +150 mA for 1 s sampling at 80%.
     let j = 1usize;
     let jc = &robot.joints[j];
     let h = &robot.homing.joints[j];
@@ -406,10 +406,11 @@ fn stall_endstop_signatures_and_release_preload() {
     }
     let sampled = sampled.expect("release sample point inside the phase");
     // At this pose the release current unloads contact without lifting
-    // the arm from the stop: displacement is bounded by contact penetration.
+    // the arm from the stop: displacement is bounded by contact penetration,
+    // which the stall push sets (about 0.2 ticks per mA on this plant).
     let relaxed = f64::from(sampled - rest) * -sign;
     assert!(
-        (0.0..=50.0).contains(&relaxed),
+        (0.0..=0.2 * h.current_ma).contains(&relaxed),
         "release moved the reported position {relaxed} ticks (toward-stop positive)"
     );
     // The current frame drives the current it carries.
