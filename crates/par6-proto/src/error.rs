@@ -57,6 +57,8 @@ wire_enum! {
         CommValidationError = 43,
         /// A chunked transfer timed out before completing.
         CommChunkTimeout = 44,
+        /// A client's heartbeats stopped while its own motion ran.
+        CommClientLost = 45,
 
         /// Motion command while the controller is DISABLED.
         SysControllerDisabled = 50,
@@ -283,6 +285,12 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
             cause: "Transfer {transfer_id} received {received}/{total} chunks before the timeout.",
             effect: "Partial transfer discarded; the command was not executed.",
             remedy: "Retry the command; check for datagram loss on the link.",
+        },
+        E::CommClientLost => ErrorTemplate {
+            title: "Client lost",
+            cause: "Client {addr} sent no heartbeat for {timeout_s} s while its motion was running.",
+            effect: "Motion stopped and the queue was cleared.",
+            remedy: "Check the client process and its network link, then send the program again.",
         },
         E::SysControllerDisabled => ErrorTemplate {
             title: "Controller disabled",

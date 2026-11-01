@@ -365,6 +365,10 @@ struct Core<R: RtCommands> {
     /// more behind.
     teleport_homed: bool,
     active_stream: Option<CmdType>,
+    /// Who sent the setpoints the active stream is running on.
+    stream_owner: Option<SocketAddr>,
+    /// When each client that sends heartbeats was last heard from.
+    leases: HashMap<SocketAddr, Instant>,
     /// Datagrams a preemption drain took off the socket without being
     /// entitled to discard them; dispatched by the run loop, in order.
     deferred: VecDeque<(Vec<u8>, SocketAddr)>,
@@ -481,6 +485,8 @@ impl<R: RtCommands> Core<R> {
             estop_latched: false,
             teleport_homed: false,
             active_stream: None,
+            stream_owner: None,
+            leases: HashMap::new(),
             deferred: VecDeque::new(),
             drainbuf: vec![0u8; 65535],
             reset_waiters: Waiters::new(MAX_RESET_WAITERS, "reset"),
@@ -669,7 +675,57 @@ impl<R: RtCommands> Core<R> {
         self.settle_flashing().await;
         self.settle_bus().await;
         self.expire_chunks().await;
+        self.stop_lost_clients().await;
         self.pump().await;
+    }
+
+    /// A client that sends heartbeats and then falls silent while motion
+    /// of its own runs has crashed or lost its link, and nobody is left
+    /// to stop that motion: it stops here, the queue with it, as a
+    /// clearing `stop` would. A homing it queued runs on, as it would
+    /// for a client that closed: abandoning one halfway leaves the arm
+    /// unreferenced.
+    async fn stop_lost_clients(&mut self) {
+        let now = Instant::now();
+        let timeout = self.cfg.client_timeout;
+        let lost: Vec<SocketAddr> = self
+            .leases
+            .iter()
+            .filter(|(_, seen)| now.duration_since(**seen) > timeout)
+            .map(|(addr, _)| *addr)
+            .collect();
+        for addr in lost {
+            self.leases.remove(&addr);
+            if !self.runs_motion_of(addr) {
+                continue;
+            }
+            log::warn!(target: COMMAND_LOG, "client {addr} lost: stopping its motion");
+            self.cancel_all_motion("a lost client").await;
+            self.clear_pause();
+            self.standing_error = Some(make_error(
+                ErrorCode::CommClientLost,
+                UNATTRIBUTED,
+                &[
+                    ("addr", &addr.to_string()),
+                    ("timeout_s", &format!("{:.2}", timeout.as_secs_f64())),
+                ],
+            ));
+        }
+    }
+
+    /// Whether motion `addr` sent is streaming, executing or queued.
+    fn runs_motion_of(&self, addr: SocketAddr) -> bool {
+        let streaming = self.active_stream.is_some() && self.stream_owner == Some(addr);
+        let executing = self.executing.as_ref().is_some_and(|ex| {
+            (ex.addr == addr && ex.tag != CmdType::Home)
+                || ex.blended.iter().any(|(_, a)| *a == addr)
+        });
+        let queued = self
+            .pending
+            .iter()
+            .any(|p| p.addr == addr && p.cmd.tag() != CmdType::Home);
+        let tool_stop = self.tool_stops.iter().any(|t| t.addr == addr);
+        streaming || executing || queued || tool_stop
     }
 
     /// The RT's own latch, on its edges: latched (with the catalog's
@@ -1331,9 +1387,20 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_faf(&mut self, req_id: u32, cmd: Command, addr: SocketAddr) {
         let tag = cmd.tag();
-        if tag == CmdType::ResetLoopStats {
-            self.runtime.rt.reset_loop_stats();
-            return;
+        match tag {
+            CmdType::ResetLoopStats => {
+                self.runtime.rt.reset_loop_stats();
+                return;
+            }
+            CmdType::Heartbeat => {
+                self.leases.insert(addr, Instant::now());
+                return;
+            }
+            CmdType::Detach => {
+                self.leases.remove(&addr);
+                return;
+            }
+            _ => {}
         }
         if let Some(error) = self
             .check_gate(tag)
@@ -1355,6 +1422,7 @@ impl<R: RtCommands> Core<R> {
                 // Same type: update the active command in place — no new
                 // index, no cancel, no drain.
                 let outcome = self.runtime.rt.stream(&cmd);
+                self.stream_owner = Some(addr);
                 if outcome.is_err() {
                     // A refused update stops the stream it was updating:
                     // the client asked for a direction the gate blocks,
@@ -1389,8 +1457,10 @@ impl<R: RtCommands> Core<R> {
                 // the stream's own, latched as a refused update is.
                 if outcome.is_ok() {
                     self.active_stream = Some(tag);
+                    self.stream_owner = Some(addr);
                 } else if self.runtime.rt.refusal_in_progress() {
                     self.active_stream = Some(tag);
+                    self.stream_owner = Some(addr);
                     refused_in_place = true;
                 }
                 self.complete_cancelled("a streaming preemption", dropped)
@@ -3512,6 +3582,8 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::JogL => "jog_l",
         T::Teleport => "teleport",
         T::ResetLoopStats => "reset_loop_stats",
+        T::Heartbeat => "heartbeat",
+        T::Detach => "detach",
         T::Home => "home",
         T::MoveJ => "move_j",
         T::MoveJPose => "move_j",

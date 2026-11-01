@@ -36,6 +36,10 @@ pub enum KtSource {
     Config,
 }
 
+/// Longest `[protocol] client_timeout_s` \[s\]: past it a crashed client's
+/// motion runs on for longer than anyone would wait to see it stop.
+pub const MAX_CLIENT_TIMEOUT_S: f64 = 10.0;
+
 /// The drive watchdog timeouts a config may set \[ms\] (the vendor's
 /// range). Below 80 the bursts that hold one joint's frames back for
 /// ~40 ms trip it; above a second a dead link leaves the arm on its last
@@ -406,6 +410,10 @@ pub struct ProtocolConfig {
     /// what they carry stops being a uniform sampling of the arm, which
     /// is what anything recording STATUS as a time series depends on.
     pub status_rate_hz: u32,
+    /// How long a client that sends heartbeats may fall silent, while
+    /// motion it queued or streams is still running, before that motion
+    /// is stopped \[s\]. At least two heartbeats.
+    pub client_timeout_s: f64,
 }
 
 /// Jog profile shape.
@@ -1408,6 +1416,13 @@ impl RobotConfig {
         }
         if p.status_rate_hz == 0 {
             return Err(invalid("protocol.status_rate_hz", "must be > 0"));
+        }
+        let beats = 2.0 * par6_proto::HEARTBEAT_PERIOD_S;
+        if !(p.client_timeout_s >= beats && p.client_timeout_s <= MAX_CLIENT_TIMEOUT_S) {
+            return Err(invalid(
+                "protocol.client_timeout_s",
+                format!("must be {beats}..={MAX_CLIENT_TIMEOUT_S} s"),
+            ));
         }
         let rate = self.tick_rate_hz();
         let per = rate / f64::from(p.status_rate_hz);

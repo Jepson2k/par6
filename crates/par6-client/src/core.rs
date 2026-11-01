@@ -264,9 +264,10 @@ impl Client {
 
         let reply_task = tokio::spawn(reply_rx(inner.clone()));
         let status_task = tokio::spawn(status_rx(inner.clone(), status_sock));
+        let heartbeat_task = tokio::spawn(heartbeat(inner.clone()));
         Ok(Client {
             inner,
-            tasks: Arc::new(Mutex::new(vec![reply_task, status_task])),
+            tasks: Arc::new(Mutex::new(vec![reply_task, status_task, heartbeat_task])),
         })
     }
 
@@ -274,6 +275,12 @@ impl Client {
     pub fn close(&self) {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return;
+        }
+        // Without it the runtime reads the heartbeats stopping as a crash
+        // and stops whatever this client left queued. Best effort: a full
+        // socket buffer at close is what the lost-client stop is for.
+        if let Ok(data) = encode_bare(&self.inner, &Command::Detach) {
+            let _ = self.inner.sock.try_send(&data);
         }
         for task in self.tasks.lock().unwrap().iter() {
             task.abort();
@@ -878,6 +885,34 @@ fn note_skew(inner: &Inner, daemon: Option<u8>, readable: bool) {
          stop arriving entirely",
         par6_proto::PROTO_VERSION
     );
+}
+
+/// A command with no reply to wait for, encoded off the client handle.
+fn encode_bare(inner: &Inner, cmd: &Command) -> Result<Vec<u8>, par6_proto::DecodeError> {
+    let mut req_id = inner.req_id.fetch_add(1, Ordering::Relaxed);
+    if req_id == 0 {
+        req_id = inner.req_id.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut buf = Vec::new();
+    encode_command(cmd, req_id, &mut buf)?;
+    Ok(buf)
+}
+
+/// HEARTBEAT from connect to close, on its own task so a caller blocked
+/// in anything else — a long wait, a paused script — still reads as
+/// alive.
+async fn heartbeat(inner: Arc<Inner>) {
+    let Ok(data) = encode_bare(&inner, &Command::Heartbeat) else {
+        return;
+    };
+    let mut beat = tokio::time::interval(Duration::from_secs_f64(par6_proto::HEARTBEAT_PERIOD_S));
+    beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    while !inner.closed.load(Ordering::SeqCst) {
+        beat.tick().await;
+        if let Err(e) = inner.sock.send(&data).await {
+            log::debug!("heartbeat not sent: {e}");
+        }
+    }
 }
 
 async fn status_rx(inner: Arc<Inner>, sock: UdpSocket) {

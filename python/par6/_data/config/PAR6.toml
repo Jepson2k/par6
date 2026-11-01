@@ -569,6 +569,10 @@ status_multicast_group = "239.255.0.71"
 # work. Must divide the tick rate exactly, or the broadcast beats against
 # the once-per-tick snapshot it samples instead of tracking it.
 status_rate_hz = 50
+# A client whose heartbeats stop this long while motion it queued or streams
+# is running has crashed or lost its link: that motion is stopped. A client
+# that closes on purpose says so first, and what it queued runs on.
+client_timeout_s = 1.0
 
 # ============================================================ digital I/O lines
 # The control box's general-purpose lines, by BCM offset on the 40-pin header.

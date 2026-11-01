@@ -3977,3 +3977,121 @@ async fn a_stop_completes_a_tool_head_the_planner_is_still_starting() {
         .count();
     assert_eq!(offers, 1, "a cancelled head was offered again");
 }
+
+fn halt_count(h: &Harness) -> usize {
+    h.rt_events()
+        .iter()
+        .filter(|e| **e == RtEvent::Halt)
+        .count()
+}
+
+/// Over several client timeouts nothing halts the RT and `index` is still
+/// the command executing. `beating` keeps the client's heartbeat going.
+async fn still_running(h: &Harness, c: &mut Client, index: u64, beating: bool, timeout: Duration) {
+    let halted = halt_count(h);
+    let until = tokio::time::Instant::now() + timeout * 4;
+    while tokio::time::Instant::now() < until {
+        if beating {
+            c.send(&Command::Heartbeat).await;
+        }
+        tokio::time::sleep(timeout / 4).await;
+    }
+    assert_eq!(halt_count(h), halted, "command {index} was stopped");
+    match c.query(&Command::Queue).await {
+        QueryResult::Queue {
+            executing_index, ..
+        } => assert_eq!(executing_index, index as i64),
+        other => panic!("unexpected {other:?}"),
+    }
+    c.ok(&Command::Stop(Stop { clear_queue: true })).await;
+}
+
+/// A client that sends heartbeats and then falls silent while its motion
+/// runs has crashed or lost its link, and nothing else will stop that
+/// motion: it stops with the queue behind it, and COMM_CLIENT_LOST stands.
+/// A client still beating, one that detached first, one that never sent a
+/// heartbeat and a homing all run on.
+#[tokio::test]
+async fn a_lost_client_stops_its_own_motion_and_nothing_else() {
+    const TIMEOUT: Duration = Duration::from_millis(100);
+    let mut h = start(|cfg| cfg.client_timeout = TIMEOUT).await;
+    h.publish(|_| {});
+
+    let mut legacy = Client::new(&h).await;
+    let i = legacy.ok_index(&move_j(501)).await;
+    h.wait_started(i).await;
+    still_running(&h, &mut legacy, i, false, TIMEOUT).await;
+
+    let mut alive = Client::new(&h).await;
+    alive.send(&Command::Heartbeat).await;
+    let i = alive.ok_index(&move_j(502)).await;
+    h.wait_started(i).await;
+    still_running(&h, &mut alive, i, true, TIMEOUT).await;
+
+    let mut detached = Client::new(&h).await;
+    detached.send(&Command::Heartbeat).await;
+    let i = detached.ok_index(&move_j(503)).await;
+    h.wait_started(i).await;
+    detached.send(&Command::Detach).await;
+    still_running(&h, &mut detached, i, false, TIMEOUT).await;
+
+    let mut homing = Client::new(&h).await;
+    homing.send(&Command::Heartbeat).await;
+    let i = homing
+        .ok_index(&Command::Home(par6_proto::command::Home {
+            key: 504,
+            calibrate: false,
+        }))
+        .await;
+    h.wait_started(i).await;
+    still_running(&h, &mut homing, i, false, TIMEOUT).await;
+
+    let mut lost = Client::new(&h).await;
+    lost.send(&Command::Heartbeat).await;
+    let i = lost.ok_index(&move_j(505)).await;
+    let queued = lost.ok_index(&move_j(506)).await;
+    h.wait_started(i).await;
+    let halted = halt_count(&h);
+    h.wait_rt(|ev| ev.iter().filter(|e| **e == RtEvent::Halt).count() > halted)
+        .await;
+    for index in [i, queued] {
+        let (ok, detail) = lost.wait_complete(index).await;
+        assert!(!ok, "command {index} was cancelled");
+        assert_eq!(
+            detail.map(|e| e.code),
+            Some(ErrorCode::MotnCancelled as u16)
+        );
+    }
+    match legacy.query(&Command::Error).await {
+        QueryResult::Error { error: Some(e) } => {
+            assert_eq!(e.code, ErrorCode::CommClientLost as u16);
+        }
+        other => panic!("COMM_CLIENT_LOST standing expected, got {other:?}"),
+    }
+    match legacy.query(&Command::Queue).await {
+        QueryResult::Queue {
+            queue,
+            executing_index,
+            ..
+        } => {
+            assert!(queue.is_empty());
+            assert_eq!(executing_index, -1);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // A jog streams until its own duration runs out: a 60 s one from a
+    // client that died is stopped on the same rule.
+    let mut jogger = Client::new(&h).await;
+    jogger.send(&Command::Heartbeat).await;
+    jogger.send(&jog_j()).await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogJ)))
+        .await;
+    let cancels = h
+        .rt_events()
+        .iter()
+        .filter(|e| **e == RtEvent::CancelStream)
+        .count();
+    h.wait_rt(|ev| ev.iter().filter(|e| **e == RtEvent::CancelStream).count() > cancels)
+        .await;
+}

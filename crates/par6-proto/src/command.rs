@@ -881,6 +881,8 @@ pub enum Command {
     JogL(JogL),
     Teleport(Teleport),
     ResetLoopStats,
+    Heartbeat,
+    Detach,
     // QUEUED
     Home(Home),
     MoveJ(MoveJ),
@@ -956,6 +958,8 @@ impl Command {
             C::JogL(_) => CmdType::JogL,
             C::Teleport(_) => CmdType::Teleport,
             C::ResetLoopStats => CmdType::ResetLoopStats,
+            C::Heartbeat => CmdType::Heartbeat,
+            C::Detach => CmdType::Detach,
             C::Home(_) => CmdType::Home,
             C::MoveJ(_) => CmdType::MoveJ,
             C::MoveJPose(_) => CmdType::MoveJPose,
@@ -1031,7 +1035,9 @@ impl Command {
             | C::ConfigBundle
             | C::BusScan
             | C::StatusRate
-            | C::ResetLoopStats => Ok(()),
+            | C::ResetLoopStats
+            | C::Heartbeat
+            | C::Detach => Ok(()),
             C::SetCanId(p) => {
                 check(
                     p.node <= 15,
@@ -1385,7 +1391,13 @@ fn waypoints(what: &'static str, wps: &[[f64; 6]]) -> Result<(), DecodeError> {
 fn arity(tag: CmdType) -> usize {
     use CmdType as T;
     match tag {
-        T::Reset | T::Estop | T::ResetState | T::ResetLoopStats | T::ExitFlashing => 2,
+        T::Reset
+        | T::Estop
+        | T::ResetState
+        | T::ResetLoopStats
+        | T::Heartbeat
+        | T::Detach
+        | T::ExitFlashing => 2,
         T::Ping
         | T::Status
         | T::Angles
@@ -1506,6 +1518,8 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         | C::Estop
         | C::ResetState
         | C::ResetLoopStats
+        | C::Heartbeat
+        | C::Detach
         | C::ExitFlashing
         | C::Ping
         | C::Status
@@ -2147,6 +2161,8 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             },
         }),
         T::ResetLoopStats => Command::ResetLoopStats,
+        T::Heartbeat => Command::Heartbeat,
+        T::Detach => Command::Detach,
         T::Home => Command::Home(Home {
             key: r.uint()?,
             calibrate: r.bool()?,

@@ -21,6 +21,7 @@ import signal
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 
 import numpy as np
@@ -2213,3 +2214,70 @@ async def test_estimate_payload_runs_from_a_program_and_only_declares_what_it_fo
             assert carried.com == pytest.approx(declared.com, rel=1e-6)
 
         assert await client.set_payload(0.0) == 1
+
+
+async def _poll(predicate, budget_s: float) -> bool:
+    deadline = time.monotonic() + budget_s
+    while time.monotonic() < deadline:
+        if await predicate():
+            return True
+        await asyncio.sleep(0.05)
+    return False
+
+
+@pytest.mark.timeout(120)
+async def test_a_killed_client_stops_its_motion_and_a_closed_one_leaves_it_running(
+    daemon: LiveDaemon,
+):
+    """A script killed mid-move leaves nobody to stop the arm: the runtime
+    reads its heartbeats stopping and stops the motion itself. A script that
+    closes on purpose with motion still queued is leaving it to run."""
+    endpoint = (
+        f"host='127.0.0.1', port={daemon.command_port}, "
+        f"status_transport='UNICAST', status_port={daemon.status_port}, "
+        "status_unicast_host='127.0.0.1'"
+    )
+    target = [10.0, -80.0, 190.0, 0.0, 0.0, 180.0]
+
+    def script(ending: str) -> tuple[subprocess.Popen, int]:
+        """A script that queues one long move and then runs *ending*, with
+        the index of that move."""
+        source = (
+            "import time\n"
+            "from par6 import RobotClient\n"
+            f"rbt = RobotClient({endpoint})\n"
+            f"print(rbt.move_j({target}, duration=30.0, wait=False), flush=True)\n"
+            f"{ending}\n"
+        )
+        proc = subprocess.Popen(
+            [sys.executable, "-c", source], stdout=subprocess.PIPE, text=True
+        )
+        assert proc.stdout is not None
+        return proc, int(proc.stdout.readline())
+
+    timeout_s = tomllib.loads(daemon.config.read_text())["protocol"]["client_timeout_s"]
+    async with daemon.client() as client:
+        assert await client.wait_ready(timeout=STEP_BUDGET_S)
+        await settle_at(client, park_deg())
+
+        async def executing(index: int) -> bool:
+            state = await client.queue_state()
+            return state is not None and state.executing_index == index
+
+        closed, index = script("rbt.close()")
+        assert closed.wait(timeout=STEP_BUDGET_S) == 0
+        assert await _poll(lambda: executing(index), STEP_BUDGET_S)
+        assert not await _poll(lambda: executing(-1), 3 * timeout_s), (
+            "a script that closed on purpose had its move stopped"
+        )
+        await client.stop()
+
+        killed, index = script("time.sleep(60)")
+        assert await _poll(lambda: executing(index), STEP_BUDGET_S)
+        killed.send_signal(signal.SIGKILL)
+        killed.wait(timeout=STEP_BUDGET_S)
+        assert await _poll(lambda: executing(-1), timeout_s + 2.0), (
+            "the move of a killed script ran on"
+        )
+        error = await client.error()
+        assert error is not None and error.code == ErrorCode.COMM_CLIENT_LOST, error

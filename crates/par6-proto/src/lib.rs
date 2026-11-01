@@ -60,7 +60,10 @@ pub use status::{
 };
 
 /// Protocol version carried in the STATUS header.
-pub const PROTO_VERSION: u8 = 6;
+pub const PROTO_VERSION: u8 = 7;
+/// How often a client sends HEARTBEAT \[s\]. A server's lost-client
+/// timeout covers several, so one dropped datagram is not a lost client.
+pub const HEARTBEAT_PERIOD_S: f64 = 0.25;
 /// Number of arm joints.
 pub const NUM_JOINTS: usize = 6;
 /// Elements in a flattened 4×4 row-major pose.

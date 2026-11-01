@@ -60,6 +60,9 @@ pub struct ServerConfig {
     pub dedup_window: usize,
     /// Chunked-transfer inactivity timeout (`COMM_CHUNK_TIMEOUT`).
     pub chunk_timeout: Duration,
+    /// Heartbeat silence after which a client's own running motion is
+    /// stopped (`COMM_CLIENT_LOST`).
+    pub client_timeout: Duration,
     /// Cadence of the internal housekeeping tick (planner outcome
     /// polling, queue pumping, chunk expiry).
     pub poll_interval: Duration,
@@ -201,6 +204,7 @@ impl Default for ServerConfig {
             queue_capacity: 256,
             dedup_window: 256,
             chunk_timeout: Duration::from_secs(2),
+            client_timeout: Duration::from_secs(1),
             poll_interval: Duration::from_millis(2),
             // parol6's blend buffer holds up to PAROL6_MAX_BLEND_LOOKAHEAD
             // (100) commands and flushes after 100 ms of queue silence
@@ -269,6 +273,7 @@ impl ServerConfig {
             multicast_group: group,
             status_port: p.status_port,
             status_rate_hz: p.status_rate_hz,
+            client_timeout: Duration::from_secs_f64(p.client_timeout_s),
             ..Self::default()
         }
     }

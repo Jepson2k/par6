@@ -215,6 +215,13 @@ wire_enum! {
         Teleport = 85,
         /// Reset loop timing statistics. Truly unacked (v2 fix).
         ResetLoopStats = 86,
+        /// Client liveness, every [`crate::HEARTBEAT_PERIOD_S`]. The first
+        /// one opts the sender in: from then on, falling silent while its
+        /// own motion runs stops that motion.
+        Heartbeat = 87,
+        /// The sender is closing on purpose: what it queued runs on, and
+        /// its silence from here on is not a lost client.
+        Detach = 88,
 
         // -- QUEUED: ack carries the command index; COMPLETE push follows --
         /// Run the homing sequence.
@@ -500,9 +507,14 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::StatusRate
         | C::CommandCompletion => CommandClass::Query,
 
-        C::ServoJ | C::ServoJPose | C::ServoL | C::JogJ | C::JogL | C::ResetLoopStats => {
-            CommandClass::FireAndForget
-        }
+        C::ServoJ
+        | C::ServoJPose
+        | C::ServoL
+        | C::JogJ
+        | C::JogL
+        | C::ResetLoopStats
+        | C::Heartbeat
+        | C::Detach => CommandClass::FireAndForget,
 
         C::Home
         | C::MoveJ
