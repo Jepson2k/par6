@@ -1,5 +1,5 @@
 {
- "provenance": "Per-joint gravity torque G(q) [Nm] derived from the vendor runtime's own dynamics table (Source Robotics rcb-runtime: robots/PAR6.py masses/COMs, grippers/*.xml tool entries; numeric facts only) by an independent static-torque computation over the vendor DH chain \u2014 NOT from any URDF, so a URDF whose inertials drift from the real arm fails against these numbers. The URDF joint coordinates were re-based onto the vendor motor convention (issue #24), so vendor theta IS URDF q and the torques apply verbatim; the original extraction derived the pre-rebase relation theta = S*q + O with S = [-1,1,-1,-1,1,-1], O = [0,-pi/2,pi,0,0,0] geometrically, disambiguated against the CAD COMs, and this fixture's q/tau columns were mapped through it (q' = S*q + O, tau' = S*tau) when the URDF was re-based. Generator cross-checked against the torque values printed in the vendor's own model file comments (2.720815741 Nm at their standby pose).",
+ "provenance": "Per-joint gravity torque G(q) [Nm] derived from the vendor runtime's own dynamics table (Source Robotics rcb-runtime: robots/PAR6.py masses/COMs, grippers/*.xml tool entries; numeric facts only) by an independent static-torque computation over the vendor DH chain \u2014 NOT from any URDF, so a URDF whose inertials drift from the real arm fails against these numbers. The URDF joint coordinates were re-based onto the vendor motor convention (issue #24), so vendor theta IS URDF q and the torques apply verbatim; the original extraction derived the pre-rebase relation theta = S*q + O with S = [-1,1,-1,-1,1,-1], O = [0,-pi/2,pi,0,0,0] geometrically, disambiguated against the CAD COMs, and this fixture's q/tau columns were mapped through it (q' = S*q + O, tau' = S*tau) when the URDF was re-based. Generator cross-checked against the torque values printed in the vendor's own model file comments (2.720815741 Nm at their standby pose). The Flange tool's COM is the CAD value (our SolidWorks export, par6_flange.csv, which Source-Robotics/robot_descriptions v2.13.0 shares), not grippers/Flange.xml's DH tool origin; tau_flange_variant carries the point-mass difference.",
  "gravity_m_s2": 9.81,
  "tools": {
   "Flange": {
@@ -8,9 +8,9 @@
    "alpha_rad": 3.141592653589793,
    "mass_kg": 0.0555,
    "com_m": [
-    0.0,
-    0.0,
-    0.0
+    -6.28287e-05,
+    -6.96476e-05,
+    -0.0080465
    ],
    "inertia_kg_m2": [
     0,
@@ -80,11 +80,11 @@
    ],
    "tau_flange_variant": [
     0.0,
-    3.704971905237,
-    0.559421966786,
-    3.62272e-07,
-    -4.7188e-08,
-    -0.0
+    3.705006096266,
+    0.559387775757,
+    3.62411e-07,
+    -3.4238217e-05,
+    1.39e-10
    ],
    "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
@@ -122,11 +122,11 @@
    ],
    "tau_flange_variant": [
     0.0,
-    5.76312776417,
-    -1.606560121409,
-    0.060871730597,
-    -0.00179948813,
-    -0.0
+    5.762243438942,
+    -1.605675796181,
+    0.060419579329,
+    -0.001152792784,
+    1.2832082e-05
    ],
    "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
@@ -164,11 +164,11 @@
    ],
    "tau_flange_variant": [
     0.0,
-    0.635025502317,
-    -0.013385949053,
-    0.029917821236,
-    -0.003896933312,
-    0.0
+    0.633663954618,
+    -0.012024401354,
+    0.029906318306,
+    -0.002535385613,
+    -1.150293e-05
    ],
    "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
@@ -206,11 +206,11 @@
    ],
    "tau_flange_variant": [
     0.0,
-    5.370275054023,
-    -1.815625695548,
-    0.0714442479,
-    -0.008150222843,
-    0.0
+    5.366627204264,
+    -1.811977845789,
+    0.072940296401,
+    -0.005392666327,
+    3.2207185e-05
    ],
    "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
@@ -248,11 +248,11 @@
    ],
    "tau_flange_variant": [
     0.0,
-    5.426762367224,
-    -1.663828253628,
-    0.057717180017,
-    0.001981263673,
-    0.0
+    5.426784968755,
+    -1.663850855159,
+    0.053934013567,
+    0.001317803161,
+    2.8625031e-05
    ],
    "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
@@ -290,11 +290,11 @@
    ],
    "tau_flange_variant": [
     0.0,
-    4.710512664164,
-    -1.890714566743,
-    -0.00501814164,
-    0.002399253554,
-    -0.0
+    4.706748930891,
+    -1.88695083347,
+    -0.005868551088,
+    0.001602366776,
+    4.4015768e-05
    ],
    "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
@@ -332,11 +332,11 @@
    ],
    "tau_flange_variant": [
     0.0,
-    5.065419068893,
-    -1.098013701775,
-    0.074046514493,
-    -0.004713288315,
-    -0.0
+    5.0634476364,
+    -1.096042269282,
+    0.07345525563,
+    -0.003061117412,
+    1.3494361e-05
    ],
    "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
@@ -374,11 +374,11 @@
    ],
    "tau_flange_variant": [
     0.0,
-    3.191568563097,
-    1.069162839009,
-    -0.024506569162,
-    -0.000398800932,
-    0.0
+    3.191722283946,
+    1.06900911816,
+    -0.024355144618,
+    -0.000299600467,
+    -5.59196e-06
    ],
    "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
@@ -416,11 +416,11 @@
    ],
    "tau_flange_variant": [
     0.0,
-    1.438518689724,
-    0.371736164647,
-    -0.04412558794,
-    0.010745023187,
-    0.0
+    1.442132076877,
+    0.368122777494,
+    -0.043505989787,
+    0.007073272283,
+    4.4544682e-05
    ],
    "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,
@@ -458,11 +458,11 @@
    ],
    "tau_flange_variant": [
     0.0,
-    4.793809999745,
-    -0.549920087322,
-    0.002363046421,
-    -0.00734766697,
-    -0.0
+    4.792294764618,
+    -0.548404852195,
+    0.002285918247,
+    -0.004808535807,
+    -1.8880254e-05
    ],
    "tau_arm_msg_small_motor_150mm_rail_tool": [
     0.0,

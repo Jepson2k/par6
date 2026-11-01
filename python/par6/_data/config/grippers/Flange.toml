@@ -1,5 +1,6 @@
 # Bare flange — passive tool: no CAN driver, no homing, kinematics only.
-# Values transcribed from vendor grippers/Flange.xml (vendor CAN_gripper = 0).
+# Values transcribed from vendor grippers/Flange.xml (vendor CAN_gripper = 0),
+# except com_m: the CAD value (par6_flange.urdf), 8 mm behind the face.
 
 name = "Flange"
 urdf_variant = "flange"
@@ -14,5 +15,5 @@ d_m = -0.0571
 a_m = 0.0
 alpha_rad = 3.141592653589793
 mass_kg = 0.0555
-com_m = [0.0, 0.0, 0.0]
+com_m = [-6.28287e-05, -6.96476e-05, -0.0080465]
 inertia_kg_m2 = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]

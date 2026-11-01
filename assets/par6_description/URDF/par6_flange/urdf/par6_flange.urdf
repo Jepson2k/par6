@@ -347,9 +347,9 @@
   <link
     name="gripper">
     <inertial>
-      <!-- mass/COM from the vendor Flange tool entry (rcb-runtime grippers/Flange.xml); rotational inertia kept from the SolidWorks export (the vendor carries none, gravity never reads it, and the sim plant's forward dynamics needs a nonsingular wrist inertia) -->
+      <!-- mass from the vendor Flange tool entry (rcb-runtime grippers/Flange.xml), which puts the COM at the face; COM and inertia from the SolidWorks export, as in the vendor CAD (robot_descriptions v2.13.0) -->
       <origin
-        xyz="0 0 -0.0571"
+        xyz="-6.28287090892465E-05 6.96476392843537E-05 -0.0490534784184994"
         rpy="0 0 0" />
       <mass
         value="0.0555" />
