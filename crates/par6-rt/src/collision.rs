@@ -40,8 +40,13 @@ const SETTLE_S: f64 = 0.5;
 const BASELINE_TAU_S: f64 = 0.1;
 /// How long a joint stays over a threshold before it counts \[s\].
 const SUSTAIN_S: f64 = 0.012;
-/// A joint is clear again below this fraction of its contact threshold.
+/// A joint is clear again below this fraction of its contact threshold,
+/// held for [`CLEAR_HOLD_S`].
 const REARM_FRACTION: f64 = 0.5;
+/// How long a joint stays under the rearm level before its warnings clear
+/// \[s\]: an estimate ringing about its threshold would otherwise raise
+/// and clear them every few ticks, and every edge is a log write.
+const CLEAR_HOLD_S: f64 = 0.25;
 
 /// The external torque the model does not explain.
 #[derive(Debug, Clone)]
@@ -158,6 +163,8 @@ pub struct CollisionMonitor {
     settle_left: u32,
     over_contact: [u32; MAX_JOINTS],
     over_collision: [u32; MAX_JOINTS],
+    clear_hold_ticks: u32,
+    under: [u32; MAX_JOINTS],
     contact: [bool; MAX_JOINTS],
     collision: [bool; MAX_JOINTS],
 }
@@ -180,6 +187,8 @@ impl CollisionMonitor {
             settle_left: 0,
             over_contact: [0; MAX_JOINTS],
             over_collision: [0; MAX_JOINTS],
+            clear_hold_ticks: robot.ticks(CLEAR_HOLD_S).max(1),
+            under: [0; MAX_JOINTS],
             contact: [false; MAX_JOINTS],
             collision: [false; MAX_JOINTS],
         }
@@ -237,7 +246,12 @@ impl CollisionMonitor {
                 } else {
                     self.collision_nm[j]
                 };
-            if d < clear_below {
+            self.under[j] = if d < clear_below {
+                self.under[j].saturating_add(1)
+            } else {
+                0
+            };
+            if self.under[j] >= self.clear_hold_ticks {
                 self.contact[j] = false;
                 self.collision[j] = false;
             }
@@ -245,7 +259,7 @@ impl CollisionMonitor {
     }
 
     /// Whether joint `j` is in contact: over its contact threshold, and not
-    /// yet back under half of it.
+    /// yet back under half of it for [`CLEAR_HOLD_S`].
     pub fn contact(&self, j: usize) -> bool {
         self.contact[j]
     }
@@ -263,6 +277,7 @@ impl CollisionMonitor {
     fn clear(&mut self) {
         self.over_contact = [0; MAX_JOINTS];
         self.over_collision = [0; MAX_JOINTS];
+        self.under = [0; MAX_JOINTS];
         self.contact = [false; MAX_JOINTS];
         self.collision = [false; MAX_JOINTS];
     }

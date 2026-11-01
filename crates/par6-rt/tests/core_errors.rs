@@ -678,7 +678,8 @@ fn jog_j0(rig: &mut Rig, pct: f64) {
 /// already there at rest is the pose's, not a contact; one that arrives
 /// mid-motion is contact past its threshold and a collision past the
 /// next, which stops the arm in `stop` mode and only warns in `warn`.
-/// Back under half the contact threshold, the warnings clear.
+/// Back under half the contact threshold for long enough, the warnings
+/// clear, and not before.
 #[test]
 fn collisions_are_judged_against_the_baseline_at_rest_and_react_per_mode() {
     use par6_config::CollisionMode;
@@ -729,8 +730,20 @@ fn collisions_are_judged_against_the_baseline_at_rest_and_react_per_mode() {
     let s = rig.snap();
     assert!(!s.error_active);
     assert_eq!(s.mode, Mode::Jog);
+    // A load coming and going faster than the clear hold keeps the
+    // warning standing rather than raising and clearing it each time.
+    for k in 0..20 {
+        load_j2(&mut rig, if k % 2 == 0 { 0.0 } else { 3.0 });
+        for _ in 0..secs(&rig, 0.05) {
+            rig.tick();
+            assert!(
+                has_error(&mut rig, ErrorCode::Contact, Some(2)),
+                "the contact warning cleared {k} toggles in"
+            );
+        }
+    }
     load_j2(&mut rig, 0.0);
-    rig.tick_n(secs(&rig, 0.2));
+    rig.tick_n(secs(&rig, 0.5));
     assert!(!has_error(&mut rig, ErrorCode::CollisionWarning, Some(2)));
     assert!(!has_error(&mut rig, ErrorCode::Contact, Some(2)));
 
