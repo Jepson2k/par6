@@ -412,8 +412,13 @@ pub struct ProtocolConfig {
     pub status_rate_hz: u32,
     /// How long a client that sends heartbeats may fall silent, while
     /// motion it queued or streams is still running, before that motion
-    /// is stopped \[s\]. At least two heartbeats.
+    /// is stopped \[s\]. At least two heartbeats. Omitted = 1 s.
+    #[serde(default = "default_client_timeout_s")]
     pub client_timeout_s: f64,
+}
+
+fn default_client_timeout_s() -> f64 {
+    1.0
 }
 
 /// Jog profile shape.

@@ -44,16 +44,30 @@ where
     F: Future<Output = Result<Option<u64>, ClientError>>,
 {
     let mut bytes = [0; 2048];
-    // Both futures register their readiness with the executor, so the
-    // current-thread runtime's I/O driver gets to run.
-    let n = tokio::select! {
-        biased;
-        received = sink.recv(&mut bytes) => received.expect("UDP receive"),
-        result = request => panic!("Unacknowledged request ended before receive: {result:?}"),
-    };
-    let (_, command) = par6_proto::decode_command(&bytes[..n]).unwrap();
-    assert!(matches!(command, Command::MoveJ(_)));
-    bytes[..n].to_vec()
+    let mut request = request;
+    loop {
+        // Both futures register their readiness with the executor, so the
+        // current-thread runtime's I/O driver gets to run.
+        let n = tokio::select! {
+            biased;
+            received = sink.recv(&mut bytes) => received.expect("UDP receive"),
+            result = request.as_mut() => {
+                panic!("Unacknowledged request ended before receive: {result:?}")
+            }
+        };
+        let (_, command) = par6_proto::decode_command(&bytes[..n]).unwrap();
+        if is_liveness(&command) {
+            continue;
+        }
+        assert!(matches!(command, Command::MoveJ(_)));
+        return bytes[..n].to_vec();
+    }
+}
+
+/// The client's own heartbeat and detach, which ride the same socket as
+/// every command.
+fn is_liveness(command: &Command) -> bool {
+    matches!(command, Command::Heartbeat | Command::Detach)
 }
 
 async fn poll_once<F: Future>(mut future: Pin<&mut F>) -> Poll<F::Output> {
@@ -73,9 +87,14 @@ async fn advance_past_timer(duration: Duration) {
 
 fn assert_no_datagram(sink: &UdpSocket) {
     let mut bytes = [0; 2048];
-    match sink.try_recv(&mut bytes) {
-        Err(error) if error.kind() == ErrorKind::WouldBlock => {}
-        result => panic!("Closed or dropped request sent another datagram: {result:?}"),
+    loop {
+        match sink.try_recv(&mut bytes) {
+            Err(error) if error.kind() == ErrorKind::WouldBlock => return,
+            Ok(n)
+                if par6_proto::decode_command(&bytes[..n])
+                    .is_ok_and(|(_, command)| is_liveness(&command)) => {}
+            result => panic!("Closed or dropped request sent another datagram: {result:?}"),
+        }
     }
 }
 
