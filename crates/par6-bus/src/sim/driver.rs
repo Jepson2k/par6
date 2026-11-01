@@ -94,6 +94,9 @@ pub enum FaultKind {
     Current,
     /// Motor-side e-stop (b0).
     Estop,
+    /// A watchdog trip still latched: what every drive carries after a
+    /// silence past its timeout, the end of the previous run included.
+    Watchdog,
 }
 
 /// What the driver's control loop asks of the plant for one step.
@@ -830,6 +833,10 @@ impl VirtualDriver {
             FaultKind::Velocity => self.flags.velocity = true,
             FaultKind::Current => self.flags.current = true,
             FaultKind::Estop => self.flags.estop = true,
+            FaultKind::Watchdog => {
+                self.mode = Mode::Idle;
+                self.flags.watchdog = true;
+            }
         }
         self.flags.error = true;
     }

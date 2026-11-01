@@ -2885,10 +2885,10 @@ impl RtBridge {
     /// the sim now holds — which is the one direction where keeping it
     /// is true.
     ///
-    /// What this does NOT do is stop the physical arm. The drivers keep
-    /// whatever they were last commanded until their own watchdogs fire
-    /// (`bus.watchdog_action`), so on hardware this is a way to stop
-    /// LOOKING at the arm, not a way to park it.
+    /// What this does NOT do is park the physical arm. The drivers keep
+    /// whatever they were last commanded until their own watchdogs trip
+    /// (`watchdog_timeout_ms`) and brake, so on hardware this is a way to
+    /// stop LOOKING at the arm, not a way to park it.
     fn swap_to_sim(&mut self) -> Result<(), WireError> {
         self.end_stream_for_swap();
         let sim = SimBus::new(self.scene.clone());

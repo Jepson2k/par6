@@ -281,3 +281,27 @@ fn a_local_overlay_layers_one_tools_values_over_its_file() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Below 80 ms a drive's watchdog trips on the bursts that hold its frames
+/// back; past a second a dead link leaves the arm on its last command that
+/// long.
+#[test]
+fn the_drive_watchdog_stays_within_the_vendor_range() {
+    for ms in [0, 79, 1001, 5000] {
+        let field = refused_field(
+            load_with(
+                "watchdog_timeout_ms = 100",
+                &format!("watchdog_timeout_ms = {ms}"),
+            ),
+            &format!("a {ms} ms drive watchdog"),
+        );
+        assert_eq!(field, "joints[0].watchdog_timeout_ms");
+    }
+    for ms in [80, 1000] {
+        load_with(
+            "watchdog_timeout_ms = 100",
+            &format!("watchdog_timeout_ms = {ms}"),
+        )
+        .unwrap_or_else(|e| panic!("a {ms} ms drive watchdog is in range: {e}"));
+    }
+}

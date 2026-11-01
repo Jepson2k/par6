@@ -38,7 +38,7 @@ use par6_bus::{
 use par6_config::{ConfigBundle, ControlMode, KtSource, LimitMode, MAX_IO_LINES};
 
 use crate::dispatch::{self, CommandMirror, JointSetpoint};
-use crate::errors::ErrorManager;
+use crate::errors::{ErrorManager, CLEAR_SETTLE_S};
 use crate::exec::{ExecPlayback, ExecTick};
 use crate::gpio::{Debouncer, DigitalIo, EstopGpio, EstopMonitor};
 use crate::gravity::GravityModel;
@@ -109,6 +109,12 @@ pub const BOOT_SELFCHECK_S: f64 = 0.032;
 const LINK_RECOVERY_SETTLE_S: f64 = 0.5;
 /// Clear_Error frame repeats per faulted node during the clear sequence.
 const CLEAR_ERROR_REPEATS: u8 = 3;
+/// Ticks from a bus coming up to the clear of every drive. A Clear_Error
+/// does not feed a drive's watchdog and a command does not clear a trip,
+/// so the clear has to land after one tick of commands has restarted
+/// every timer; a drive still tripped from the silence before it would
+/// trip again.
+const BOOT_CLEAR_TICKS: u64 = 2;
 /// EXEC link watchdog: heartbeat silence while samples pending that
 /// latches `EXEC_LINK_LOST` \[s\].
 pub const EXEC_HEARTBEAT_TIMEOUT_S: f64 = 0.5;
@@ -497,6 +503,13 @@ pub struct RtCore<B: DriverBus> {
     /// Tick the ACTIVE bus was brought up at; the boot one-shots are
     /// measured from here so a live backend swap re-runs them.
     bus_booted_at: u64,
+    /// The tick the clear of every drive goes out on.
+    drive_clear_at: Option<u64>,
+    /// First tick a drive-reported fault latches again. Every drive comes
+    /// up with its watchdog tripped by the silence before the loop ran
+    /// (the previous run's exit, the boot probes), and that trip is the
+    /// clear's to remove, not an error to latch.
+    drive_faults_from: u64,
     /// Tick the 50/150/300 config-shot schedule counts from: the bus
     /// boot, or the last FLASHING exit (which must not reset
     /// `bus_booted_at` — the selfcheck already ran).
@@ -788,6 +801,8 @@ impl<B: DriverBus> RtCore<B> {
             conv,
             sector_done: [false; MAX_JOINTS],
             bus_booted_at: 0,
+            drive_clear_at: Some(BOOT_CLEAR_TICKS),
+            drive_faults_from: BOOT_CLEAR_TICKS + u64::from(robot.ticks(CLEAR_SETTLE_S).max(1)) + 1,
             config_repush_armed_at: 0,
             boot: BootConfig {
                 robot: robot.clone(),
@@ -1081,6 +1096,7 @@ impl<B: DriverBus> RtCore<B> {
         self.sector_done = [false; MAX_JOINTS];
         self.filters_seeded = false;
         self.bus_booted_at = self.tick;
+        self.arm_drive_clear();
         self.config_repush_armed_at = self.tick;
         self.link_recovered = false;
         self.tool_hold = false;
@@ -1560,6 +1576,10 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     fn boot_oneshots(&mut self) {
+        if self.drive_clear_at == Some(self.tick) {
+            self.drive_clear_at = None;
+            self.clear_every_drive();
+        }
         // Ticks since this BUS came up, not since the process did: a
         // backend swapped in at tick 90 000 needs the same selfcheck and
         // the same config re-sends a backend opened at boot got.
@@ -1578,6 +1598,7 @@ impl<B: DriverBus> RtCore<B> {
             ) {
                 log::error!("the bus bring-up after the link cycle failed: {e}");
             }
+            self.arm_drive_clear();
             self.rescan_configured = true;
             self.rescan_at = Some(self.tick + 1);
             return;
@@ -1639,6 +1660,32 @@ impl<B: DriverBus> RtCore<B> {
             self.config_repush();
         }
         self.drain_config_resends();
+    }
+
+    /// Schedule the clear of every drive and hold drive-reported faults
+    /// until its settle has passed.
+    fn arm_drive_clear(&mut self) {
+        let at = self.tick + BOOT_CLEAR_TICKS;
+        self.drive_clear_at = Some(at);
+        self.drive_faults_from = at + u64::from(self.boot.robot.ticks(CLEAR_SETTLE_S).max(1)) + 1;
+    }
+
+    /// Clear_Error to every drive, faulted or not: a drive whose fault the
+    /// latch never saw is still tripped.
+    fn clear_every_drive(&mut self) {
+        for i in 0..MAX_JOINTS {
+            let _ = self
+                .bus
+                .send_clear_error(self.node_of[i], CLEAR_ERROR_REPEATS);
+        }
+        if self.has_can_gripper {
+            let _ = self
+                .bus
+                .send_clear_error(self.gripper_node, CLEAR_ERROR_REPEATS);
+        }
+        for node in &mut self.bus_state.nodes {
+            node.error_flags = None;
+        }
     }
 
     /// One full stored-config shot: `bus.boot_config_repeats` passes to
@@ -2136,9 +2183,12 @@ impl<B: DriverBus> RtCore<B> {
                 // ... which also masks every real power-cycle or reflash
                 // that happened during it from the reconnect path, so
                 // the exit pushes the stored config itself — one pass
-                // now, then the re-armed 50/150/300 shots.
+                // now, then the re-armed 50/150/300 shots. The silence
+                // tripped every drive's watchdog on purpose; that trip
+                // is cleared the way a boot's is.
                 self.config_repush();
                 self.config_repush_armed_at = self.tick;
+                self.arm_drive_clear();
                 if self.flash.flashed() {
                     log::info!("firmware was flashed: homing invalidated");
                     self.homed = false;
@@ -2458,10 +2508,13 @@ impl<B: DriverBus> RtCore<B> {
             }
             // Per-type motor fault flags, trusted only while the node's
             // per-frame live fault bit is set (live-bit gating).
-            for i in 0..MAX_JOINTS {
-                self.motor_flag_check(self.node_of[i], i as u8);
+            let drive_faults = self.tick >= self.drive_faults_from;
+            if drive_faults {
+                for i in 0..MAX_JOINTS {
+                    self.motor_flag_check(self.node_of[i], i as u8);
+                }
             }
-            if self.has_can_gripper {
+            if self.has_can_gripper && drive_faults {
                 self.motor_flag_check(self.gripper_node, GRIPPER_ERR_IDX);
                 let g = &self.bus_state.gripper;
                 if g.live_error_bit {

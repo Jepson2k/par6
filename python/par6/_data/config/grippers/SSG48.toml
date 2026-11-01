@@ -15,7 +15,7 @@ kt_nm_a = 0.3
 ilim_ma = 1700.0
 voltage_limit_mv = 0
 velocity_limit_ticks_s = 80000.0
-watchdog_timeout_ms = 5000
+watchdog_timeout_ms = 100
 gear_r_m = 0.006
 
 [driver.gains]

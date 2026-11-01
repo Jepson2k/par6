@@ -318,14 +318,19 @@ fn the_sequence_deadline_leaves_every_step_its_own_budget() {
     assert_eq!(s.homing.per_joint[5], HomingJointStatus::Failed);
     assert_eq!(s.mode, Mode::Idle);
     assert!(!s.homed, "a timed-out sequence establishes no reference");
+    // Judged on travel, not one speed sample: a joint at rest still reads
+    // a count of jitter now and then.
     for _ in 0..(0.5 / dt).round() as usize {
         core.tick(dt, false);
     }
-    let s = handles.snapshots.latest();
+    let rested_at = handles.snapshots.latest().q[5];
+    for _ in 0..(0.5 / dt).round() as usize {
+        core.tick(dt, false);
+    }
+    let travel = handles.snapshots.latest().q[5] - rested_at;
     assert!(
-        s.qd[5].abs() < 0.01,
-        "the seeking joint must actually stop: {}",
-        s.qd[5]
+        travel.abs() < 1e-3,
+        "the seeking joint must actually stop: {travel} rad in 0.5 s"
     );
 }
 

@@ -1217,7 +1217,8 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
   removing power would drop the arm.
 - **A normal shutdown puts the arm down**: `par6d` retreats to its safe park, the shoulder
   and elbow onto their homing endstops, then goes limp (`[shutdown] safe_park`).
-- **A dead daemon or CAN link drops the arm.** Each drive's own watchdog idles it; the
+- **A dead daemon or CAN link drops the arm.** Each drive's own watchdog trips 100 ms
+  after its last command and brakes it by shorting its phases, so the arm sinks; the
   firmware has no hold action. This is the accepted exception.
 - **`par6-selfcal` parks and releases** on a failure and at the end of a run: the area is
   known clear and nothing is held, and a run may be on a bad tune that oscillates loudly

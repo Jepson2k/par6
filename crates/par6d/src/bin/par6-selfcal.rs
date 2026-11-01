@@ -436,8 +436,6 @@ const SWEEP_REVERSALS: u32 = 6;
 const POSE_BACKOFF_STEPS: u8 = 2;
 /// Passes over the calibration poses before the qualification is given up.
 const POSE_ATTEMPTS: usize = 8;
-/// How long the CAN transmit queue may stay full before the bus is given up.
-const TX_FULL_S: f64 = 1.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum GainAxis {
@@ -1301,6 +1299,9 @@ struct Arm {
     runaway_joint: Option<usize>,
     /// Consecutive ticks the CAN transmit queue refused the frames.
     tx_full: u64,
+    /// The gripper slot's frame every tick: a fitted CAN gripper's drive
+    /// is fed by it, where polls alone leave it past its watchdog.
+    gripper_idle: GripperCommand,
     /// What the run last announced, and how long each announcement held the
     /// arm still during the current stop, so the idle report names what the
     /// stop was spent on rather than what ended it.
@@ -1387,6 +1388,12 @@ impl Arm {
         for j in &bundle.robot.joints {
             bus.send_clear_error(j.node_id, 3)?;
         }
+        let gripper_idle = if tool.is_some_and(|t| t.driver.is_some()) {
+            bus.send_clear_error(bundle.robot.bus.gripper_node, 3)?;
+            GripperCommand::FirmwarePoll
+        } else {
+            GripperCommand::NoGripper
+        };
         let robot = &bundle.robot;
         Ok(Self {
             conv: std::array::from_fn(|j| JointConversion::from_config(&robot.joints[j])),
@@ -1422,6 +1429,7 @@ impl Arm {
             idle_total_s: 0.0,
             idle_longest: (0.0, "startup", 0),
             tx_full: 0,
+            gripper_idle,
             ready: None,
             visited: Vec::new(),
             recoveries: 0,
@@ -1503,6 +1511,22 @@ impl Arm {
     }
     fn ticks(&self, seconds: f64) -> u64 {
         (seconds / self.dt).round().max(1.0) as u64
+    }
+    /// The shortest drive watchdog on the bus \[ms\].
+    fn watchdog_ms(&self) -> u32 {
+        let gripper = self
+            .bundle
+            .active_tool()
+            .and_then(|t| t.driver.as_ref())
+            .map(|d| d.watchdog_timeout_ms);
+        self.bundle
+            .robot
+            .joints
+            .iter()
+            .map(|j| j.watchdog_timeout_ms)
+            .chain(gripper)
+            .min()
+            .unwrap_or(0)
     }
     fn node(&self, j: usize) -> usize {
         self.bundle.robot.joints[j].node_id as usize
@@ -1656,13 +1680,15 @@ impl Arm {
         self.watch_idle();
         // A transmit queue that fills is a bus that stopped carrying frames
         // for a moment -- on 2026-10-01 for long enough to end a run and fail
-        // its parking. The drives hold their last target meanwhile, so the
-        // tick is skipped and the next one tries again, up to `TX_FULL_S`.
+        // its parking. The drives hold their last target until their own
+        // watchdog trips, so the tick is skipped and the next one tries
+        // again, until then.
+        let gripper = self.gripper_idle;
         let sent = self
             .bus
             .poll_step()
             .and_then(|()| self.bus.send_joint_commands(&commands))
-            .and_then(|()| self.bus.send_gripper(&GripperCommand::NoGripper));
+            .and_then(|()| self.bus.send_gripper(&gripper));
         match sent {
             Ok(()) => self.tx_full = 0,
             Err(BusError::TxQueueFull) => {
@@ -1673,10 +1699,11 @@ impl Arm {
                         0,
                     ));
                 }
-                if self.tx_full > self.ticks(TX_FULL_S) {
+                let watchdog_ms = self.watchdog_ms();
+                if self.tx_full > self.ticks(f64::from(watchdog_ms) / 1000.0) {
                     return Err(format!(
-                        "the CAN transmit queue stayed full for {TX_FULL_S} s; the bus is not \
-                         carrying frames"
+                        "the CAN transmit queue stayed full past the drives' {watchdog_ms} ms \
+                         watchdog; the bus is not carrying frames"
                     )
                     .into());
                 }

@@ -4,11 +4,12 @@
 
 mod common;
 
-use common::Rig;
+use common::{Rig, SimCore};
+use par6_bus::sim::FaultKind;
 use par6_bus::{ErrorFlags, Reply, TxRecord};
 use par6_rt::errors::CLEAR_SETTLE_S;
 use par6_rt::timing::{RECOMPUTE_EVERY, WARMUP_TICKS, WINDOW};
-use par6_rt::{ArmState, ErrorCode, Mode, RtCommand, StreamSetpoint, DEBOUNCE_READS};
+use par6_rt::{ArmState, ErrorCode, Mode, RtCommand, StreamSetpoint, ZeroGravity, DEBOUNCE_READS};
 
 /// The core's windows at the rig's tick, from the config seconds.
 struct Windows {
@@ -165,6 +166,8 @@ fn estop_lifecycle_debounce_latch_reaction_clear_and_relatch() {
 fn per_type_flags_are_trusted_only_with_the_live_fault_bit() {
     let mut rig = Rig::new();
     rig.ready();
+    // Past the boot clear's settle, where drive-reported faults latch.
+    rig.tick_n(windows(&rig).settle);
     let flags = ErrorFlags {
         error: true,
         current: true,
@@ -677,4 +680,47 @@ fn torque_envelope_latches_only_when_configured_and_sustained() {
     assert!(s.error_active);
     assert_eq!(s.state, ArmState::Disabled);
     assert_eq!(s.mode, Mode::ActiveError);
+}
+
+/// A restart finds every drive still tripped by the silence since the last
+/// run's exit. The core clears them itself and boots enableable with no
+/// reset from anyone, and a fault a drive reports once that clear has
+/// settled latches as it always did.
+#[test]
+fn drives_left_tripped_by_the_last_run_boot_clean_without_a_reset() {
+    let bundle = common::bundle();
+    let mut sim = SimCore::new(&bundle, Box::new(ZeroGravity));
+    let nodes: Vec<u8> = bundle.robot.joints.iter().map(|j| j.node_id).collect();
+    for node in &nodes {
+        sim.core.bus_mut().inject_fault(*node, FaultKind::Watchdog);
+    }
+    let dt = sim.dt;
+    let ticks = |s: f64| (s / dt).round() as u32;
+
+    sim.tick_until_idle();
+    let mut s = sim.cmd(RtCommand::Enable);
+    // Past the clear's settle and several full round-robin poll cycles, so
+    // every drive's error register has been read since.
+    for _ in 0..ticks(1.0) {
+        s = sim.tick();
+        assert!(
+            s.errors.as_slice().is_empty(),
+            "a trip left by the last run latched: {:?}",
+            s.errors.as_slice()
+        );
+    }
+    assert_eq!(s.mode, Mode::Idle);
+    assert_eq!(s.state, ArmState::Enabled, "the boot enable went through");
+
+    sim.core
+        .bus_mut()
+        .inject_fault(nodes[2], FaultKind::Temperature);
+    let latched = (0..ticks(1.0)).any(|_| {
+        sim.tick()
+            .errors
+            .as_slice()
+            .iter()
+            .any(|e| e.code == ErrorCode::Temperature && e.joint == Some(2))
+    });
+    assert!(latched, "a fault after the boot clear still latches");
 }

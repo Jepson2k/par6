@@ -72,7 +72,8 @@ pub struct GripperDriverConfig {
     pub voltage_limit_mv: u32,
     /// Motor velocity limit \[ticks/s\].
     pub velocity_limit_ticks_s: f64,
-    /// Driver watchdog timeout \[ms\].
+    /// Driver watchdog timeout \[ms\], within
+    /// [`crate::robot::WATCHDOG_TIMEOUT_MS`].
     pub watchdog_timeout_ms: u32,
     /// Pinion pitch radius \[m\] (vendor `Gear_r`). Converts between
     /// linear jaw motion and motor rotation:
@@ -227,8 +228,8 @@ impl ToolConfig {
                     return Err(invalid(name, "must be > 0"));
                 }
             }
-            if d.watchdog_timeout_ms == 0 {
-                return Err(invalid("driver.watchdog_timeout_ms", "must be > 0"));
+            if !crate::robot::WATCHDOG_TIMEOUT_MS.contains(&d.watchdog_timeout_ms) {
+                return Err(invalid("driver.watchdog_timeout_ms", "must be 80..=1000"));
             }
             for (v, name) in [
                 (d.settle.command_grace_s, "driver.settle.command_grace_s"),

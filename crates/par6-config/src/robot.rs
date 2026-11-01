@@ -36,11 +36,18 @@ pub enum KtSource {
     Config,
 }
 
-/// What the driver-side watchdog does when it fires.
+/// The drive watchdog timeouts a config may set \[ms\] (the vendor's
+/// range). Below 80 the bursts that hold one joint's frames back for
+/// ~40 ms trip it; above a second a dead link leaves the arm on its last
+/// command that long.
+pub const WATCHDOG_TIMEOUT_MS: std::ops::RangeInclusive<u32> = 80..=1000;
+
+/// The action byte sent with the drive watchdog timeout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchdogAction {
-    /// Drop to Idle (cmd 12 behavior) — the vendor setting.
+    /// The vendor setting. The firmware stores the byte and acts on none:
+    /// a trip latches Watchdog and brakes the motor whatever it says.
     Idle,
 }
 
@@ -239,8 +246,9 @@ pub struct JointConfig {
     pub phase_inductance_mh: Option<f64>,
     /// Motor velocity limit \[encoder ticks/s\] (cmd 20).
     pub velocity_limit_ticks_s: f64,
-    /// Driver watchdog timeout \[ms\] (cmd 15, wire unit is ms). Fires
-    /// into [`WatchdogAction`] configured in `[bus]`.
+    /// Driver watchdog timeout \[ms\] (cmd 15, wire unit is ms), within
+    /// [`WATCHDOG_TIMEOUT_MS`]: a drive that hears no command for this
+    /// long latches Watchdog and brakes.
     pub watchdog_timeout_ms: u32,
     /// Encoder resolution in bits (14 → 16384 counts).
     pub encoder_bits: u8,
@@ -1225,8 +1233,8 @@ impl RobotConfig {
                 return Err(invalid(f("ripple"), "amplitude beyond ilim_ma"));
             }
         }
-        if j.watchdog_timeout_ms == 0 {
-            return Err(invalid(f("watchdog_timeout_ms"), "must be > 0"));
+        if !WATCHDOG_TIMEOUT_MS.contains(&j.watchdog_timeout_ms) {
+            return Err(invalid(f("watchdog_timeout_ms"), "must be 80..=1000"));
         }
         let l = &j.limits;
         if l.hard_min_rad >= l.hard_max_rad {
