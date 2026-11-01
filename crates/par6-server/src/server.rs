@@ -2733,6 +2733,11 @@ impl<R: RtCommands> Core<R> {
             proto_version: PROTO_VERSION,
             controller_id: self.cfg.controller_id,
             session_id: self.session_id,
+            torques_observed: {
+                let mut out = [0.0; par6_proto::NUM_JOINTS];
+                out.copy_from_slice(&self.snap.tau_observed[..par6_proto::NUM_JOINTS]);
+                out
+            },
             seq: self.status_seq,
             mono_time_ns: self.mono_ns(),
             link_ok: u8::from(self.link_ok()),

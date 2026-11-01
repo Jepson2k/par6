@@ -145,6 +145,12 @@ class StatusBuffer:
     )
     """External joint torque estimate [Nm]: filtered measured torque
     minus the model's gravity torque."""
+    torques_observed: np.ndarray = field(
+        default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64)
+    )
+    """The collision observer's external torque estimate [Nm]: measured
+    minus model with inertia and friction taken out too; ``torques_ext``
+    where the observer is off."""
     drive_health: dict = field(default_factory=dict)
     """Per-drive readings and faults: ``temperatures_c`` and ``currents_ma``
     (per node, arm joints first, ``NaN`` where a node has not answered
@@ -252,5 +258,6 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
             fresh.append((HomingJointState(state), HomingPhase(phase)))
     joints[:] = fresh
     buf.torques_ext[:] = d["torques_ext"]
+    buf.torques_observed[:] = d["torques_observed"]
     buf.drive_health = dict(d["drive_health"])
     buf.loop_health = dict(d["loop_health"])

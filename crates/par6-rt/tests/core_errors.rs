@@ -9,7 +9,9 @@ use par6_bus::sim::FaultKind;
 use par6_bus::{ErrorFlags, Reply, TxRecord};
 use par6_rt::errors::CLEAR_SETTLE_S;
 use par6_rt::timing::{RECOMPUTE_EVERY, WARMUP_TICKS, WINDOW};
-use par6_rt::{ArmState, ErrorCode, Mode, RtCommand, StreamSetpoint, ZeroGravity, DEBOUNCE_READS};
+use par6_rt::{
+    ArmState, ErrorCode, Mode, RtCommand, StreamSetpoint, ZeroGravity, DEBOUNCE_READS, MAX_JOINTS,
+};
 
 /// The core's windows at the rig's tick, from the config seconds.
 struct Windows {
@@ -612,74 +614,136 @@ fn a_stale_node_gets_one_self_heal_resend_per_episode() {
     );
 }
 
-#[test]
-fn torque_envelope_latches_only_when_configured_and_sustained() {
-    use par6_bus::spectral::convert::torque_to_ma_factor;
-    use par6_rt::CompletionPolicy;
+/// A massless arm: no gravity, no inertia, so the observer's estimate is
+/// the measured torque itself — the one-line oracle that lets the
+/// monitor's verdicts be driven by injected current alone.
+struct Massless;
 
-    // ~10 Nm of "external" torque on J2: ZeroGravity makes the whole
-    // measured torque external, so the injected current maps straight to
-    // tau_ext through the config torque factor.
-    let inject_ma = |b: &par6_config::ConfigBundle| {
-        let j = &b.robot.joints[2];
-        (10.0 * torque_to_ma_factor(j.gear_ratio, j.gear_efficiency, j.kt_nm_a, j.dir)) as i16
-    };
+impl par6_rt::GravityModel for Massless {
+    fn gravity(&mut self, _q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
+        out.fill(0.0);
+    }
 
-    // Shipped default: margin 0 disables the envelope. The same sustained
-    // torque that latches below must do nothing here.
-    let mut rig = Rig::new();
-    rig.ready();
-    rig.current_ma[2] = inject_ma(&common::bundle());
-    rig.tick_n(100);
-    let s = rig.snap();
-    assert!(
-        !has_error(&mut rig, ErrorCode::TorqueEnvelope, Some(2)),
-        "margin 0 must disable the envelope"
-    );
-    assert!(!s.error_active);
+    fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
 
-    // Margin configured: 2 Nm over a 0.1 s window (25 ticks at 4 ms).
+    fn momentum(
+        &mut self,
+        _q: &[f64; MAX_JOINTS],
+        _qd: &[f64; MAX_JOINTS],
+        p: &mut [f64; MAX_JOINTS],
+        ctv: &mut [f64; MAX_JOINTS],
+    ) -> bool {
+        p.fill(0.0);
+        ctv.fill(0.0);
+        true
+    }
+}
+
+/// A referenced, enabled arm in JOG with `[collision]` set to `mode` and
+/// J2 (index 2) checked at 1 Nm contact / 2 Nm collision, every other
+/// joint unchecked.
+fn collision_rig(mode: par6_config::CollisionMode) -> Rig {
     let mut b = common::bundle();
-    b.robot.limits.tau_ext_margin_nm = 2.0;
-    b.robot.limits.tau_ext_window_s = 0.1;
-    let window_ticks = (0.1_f64 / b.robot.robot.tick_dt_s).round() as u32;
-    let cur = inject_ma(&b);
+    b.robot.collision.mode = mode;
+    b.robot.collision.contact_nm = vec![0.0, 0.0, 1.0, 0.0, 0.0, 0.0];
+    b.robot.collision.collision_nm = vec![0.0, 0.0, 2.0, 0.0, 0.0, 0.0];
     let mut rig = Rig::build_bundle(
         b,
-        CompletionPolicy::Settled,
-        Box::new(par6_rt::ZeroGravity),
+        par6_rt::CompletionPolicy::Settled,
+        Box::new(Massless),
         true,
     );
     rig.ready();
+    rig.cmd(RtCommand::SetMode(Mode::Jog));
+    assert_eq!(rig.snap().mode, Mode::Jog);
+    rig
+}
 
-    // A transient shorter than the window stays green: the counter never
-    // reaches the window before the load disappears and resets it.
-    rig.current_ma[2] = cur;
-    rig.tick_n(window_ticks / 2);
-    assert!(
-        !has_error(&mut rig, ErrorCode::TorqueEnvelope, Some(2)),
-        "a transient inside the window must not latch"
-    );
-    rig.current_ma[2] = 0;
-    rig.tick_n(60); // filter decays, counter resets
-    assert!(
-        !has_error(&mut rig, ErrorCode::TorqueEnvelope, Some(2)),
-        "a released transient must never latch"
-    );
-    assert!(!rig.snap().error_active);
+/// Joint 2's drive reporting `nm` of torque.
+fn load_j2(rig: &mut Rig, nm: f64) {
+    use par6_bus::spectral::convert::torque_to_ma_factor;
+    let j = &common::bundle().robot.joints[2];
+    rig.current_ma[2] =
+        (nm * torque_to_ma_factor(j.gear_ratio, j.gear_efficiency, j.kt_nm_a, j.dir)) as i16;
+}
 
-    // Sustained past the window: hard latch on the joint, controller
-    // DISABLED, ACTIVE_ERROR reaction — the full hard-fault path.
-    rig.current_ma[2] = cur;
-    rig.tick_n(window_ticks + 20);
+fn jog_j0(rig: &mut Rig, pct: f64) {
+    let mut speeds = [0.0; MAX_JOINTS];
+    speeds[0] = pct;
+    rig.cmd(RtCommand::Jog { speeds, accel: 1.0 });
+}
+
+/// What the monitor judges: the external-torque estimate's change since
+/// the arm last stood still, only while it is commanded to move. A load
+/// already there at rest is the pose's, not a contact; one that arrives
+/// mid-motion is contact past its threshold and a collision past the
+/// next, which stops the arm in `stop` mode and only warns in `warn`.
+/// Back under half the contact threshold, the warnings clear.
+#[test]
+fn collisions_are_judged_against_the_baseline_at_rest_and_react_per_mode() {
+    use par6_config::CollisionMode;
+    let secs = |rig: &Rig, s: f64| (s / rig.dt).round() as u32;
+
+    // A load standing at rest is absorbed: the jog that follows starts
+    // from it, and nothing is in contact.
+    let mut rig = collision_rig(CollisionMode::Stop);
+    load_j2(&mut rig, 3.0);
+    rig.tick_n(secs(&rig, 1.0));
+    jog_j0(&mut rig, 0.5);
+    rig.tick_n(secs(&rig, 0.5));
+    assert!(
+        !rig.snap().error_active,
+        "{:?}",
+        rig.snap().errors.as_slice()
+    );
+    assert!(!has_error(&mut rig, ErrorCode::Contact, Some(2)));
+
+    // Mid-motion: past contact only, a warning; past collision, the latch.
+    let mut rig = collision_rig(CollisionMode::Stop);
+    rig.tick_n(secs(&rig, 0.2));
+    jog_j0(&mut rig, 0.5);
+    rig.tick_n(secs(&rig, 0.1));
+    load_j2(&mut rig, 1.5);
+    rig.tick_n(secs(&rig, 0.2));
+    assert!(has_error(&mut rig, ErrorCode::Contact, Some(2)));
+    assert!(
+        !rig.snap().error_active,
+        "contact alone does not stop the arm"
+    );
+    load_j2(&mut rig, 3.0);
+    rig.tick_n(secs(&rig, 0.2));
+    assert!(has_error(&mut rig, ErrorCode::Collision, Some(2)));
     let s = rig.snap();
-    assert!(
-        has_error(&mut rig, ErrorCode::TorqueEnvelope, Some(2)),
-        "sustained over-margin torque must latch"
-    );
-    assert!(s.error_active);
-    assert_eq!(s.state, ArmState::Disabled);
-    assert_eq!(s.mode, Mode::ActiveError);
+    assert_eq!((s.mode, s.state), (Mode::ActiveError, ArmState::Disabled));
+
+    // Warn mode: the same collision is a warning, the jog runs on, and the
+    // warnings clear once the load is gone.
+    let mut rig = collision_rig(CollisionMode::Warn);
+    rig.tick_n(secs(&rig, 0.2));
+    jog_j0(&mut rig, 0.5);
+    rig.tick_n(secs(&rig, 0.1));
+    load_j2(&mut rig, 3.0);
+    rig.tick_n(secs(&rig, 0.2));
+    assert!(has_error(&mut rig, ErrorCode::CollisionWarning, Some(2)));
+    assert!(has_error(&mut rig, ErrorCode::Contact, Some(2)));
+    let s = rig.snap();
+    assert!(!s.error_active);
+    assert_eq!(s.mode, Mode::Jog);
+    load_j2(&mut rig, 0.0);
+    rig.tick_n(secs(&rig, 0.2));
+    assert!(!has_error(&mut rig, ErrorCode::CollisionWarning, Some(2)));
+    assert!(!has_error(&mut rig, ErrorCode::Contact, Some(2)));
+
+    // Off: no observer, so the published estimate is the static one and
+    // nothing is judged.
+    let mut rig = collision_rig(CollisionMode::Off);
+    rig.tick_n(secs(&rig, 0.2));
+    jog_j0(&mut rig, 0.5);
+    load_j2(&mut rig, 3.0);
+    rig.tick_n(secs(&rig, 0.3));
+    let s = rig.snap();
+    assert!(s.errors.as_slice().is_empty(), "{:?}", s.errors.as_slice());
+    assert!((s.tau_ext[2] - s.tau_filtered[2]).abs() < 1e-9);
 }
 
 /// A restart finds every drive still tripped by the silence since the last

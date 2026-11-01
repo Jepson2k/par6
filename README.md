@@ -1215,6 +1215,15 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
   operator resets. Holding under power is a protective stop (IEC 60204-1 category 2); an
   emergency stop is category 0 or 1 by that standard, but the PAR6 has no brakes, and
   removing power would drop the arm.
+- **A collision holds the arm too** with `[collision] mode = "stop"`: a momentum observer
+  estimates the torque on each joint that gravity, inertia and friction do not explain,
+  and a moving joint whose estimate leaves where it stood still by more than its
+  `collision_nm` latches. The shipped mode is `warn`, which only reports contact and
+  collisions, until the thresholds are measured on the arm.
+- **A client that crashes or loses its link stops its own motion**: one that sends
+  heartbeats and then falls silent for `[protocol] client_timeout_s` while motion it sent
+  is still running gets that motion stopped and the queue cleared. A client that closes on
+  purpose leaves what it queued to run.
 - **A normal shutdown puts the arm down**: `par6d` retreats to its safe park, the shoulder
   and elbow onto their homing endstops, then goes limp (`[shutdown] safe_park`).
 - **A dead daemon or CAN link drops the arm.** Each drive's own watchdog trips 100 ms

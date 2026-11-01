@@ -103,9 +103,15 @@ pub enum ErrorCode {
     /// Motor-bus controller error-passive (warning, self-clears when
     /// the error counters recover).
     LinkErrorPassive,
-    /// Per-joint: external-torque estimate beyond the configured
-    /// envelope margin for the configured window (hard latch).
-    TorqueEnvelope,
+    /// Per-joint: a collision, in `[collision] mode = "stop"` (hard
+    /// latch).
+    Collision,
+    /// Per-joint: a collision, in `mode = "warn"` (warning, clears once
+    /// the joint is back under half its contact threshold or at rest).
+    CollisionWarning,
+    /// Per-joint: contact, the estimate past the contact threshold
+    /// (warning, clears as a collision warning does).
+    Contact,
 }
 
 impl ErrorCode {
@@ -119,6 +125,8 @@ impl ErrorCode {
                 | ErrorCode::NotHomed
                 | ErrorCode::LoopDegraded
                 | ErrorCode::LinkErrorPassive
+                | ErrorCode::CollisionWarning
+                | ErrorCode::Contact
         )
     }
 }
@@ -502,6 +510,10 @@ pub struct StateSnapshot {
     /// External torque estimate \[Nm\]: filtered measured torque minus
     /// the model's gravity torque.
     pub tau_ext: [f64; MAX_JOINTS],
+    /// The collision observer's external torque estimate \[Nm\]: measured
+    /// minus model with inertia and friction taken out too; `tau_ext`
+    /// while the observer is off.
+    pub tau_observed: [f64; MAX_JOINTS],
     /// Per-node motor telemetry: arm joints 0..MAX_JOINTS, gripper last.
     pub nodes: [NodeState; NUM_NODES],
     /// Per-node data-age classification, same order — the backend's own
@@ -596,6 +608,7 @@ impl Default for StateSnapshot {
             tcp_target: [0.0; 6],
             gravity_torque_nm: [0.0; MAX_JOINTS],
             tau_ext: [0.0; MAX_JOINTS],
+            tau_observed: [0.0; MAX_JOINTS],
             nodes: [NodeState::default(); NUM_NODES],
             node_freshness: [Freshness::Unknown; NUM_NODES],
             gripper: GripperState::default(),

@@ -331,14 +331,16 @@ impl ForwardKin for KinFk {
 /// G(q) behind the RT [`GravityModel`] seam. A model failure must not
 /// kill the RT thread: hold the last good value (gravity is a
 /// feedforward, not a safety path).
-pub(crate) struct KinGravity {
+pub struct KinGravity {
     kin: Kin,
     scratch: [f64; MAX_JOINTS],
     last_good: [f64; MAX_JOINTS],
 }
 
 impl KinGravity {
-    pub(crate) fn new(kin: Kin) -> Self {
+    /// The seam over `kin`, as the daemon builds it from
+    /// [`load_gravity_kin`].
+    pub fn new(kin: Kin) -> Self {
         Self {
             kin,
             scratch: [0.0; MAX_JOINTS],
@@ -361,6 +363,18 @@ impl GravityModel for KinGravity {
         if let Err(e) = self.kin.set_tool(mass, com, inertia) {
             log::error!("gravity payload update refused: {e}");
         }
+    }
+
+    /// A model failure here turns the observer off for the tick rather
+    /// than holding a stale value: an estimate built on it would be wrong.
+    fn momentum(
+        &mut self,
+        q: &[f64; MAX_JOINTS],
+        qd: &[f64; MAX_JOINTS],
+        p: &mut [f64; MAX_JOINTS],
+        ctv: &mut [f64; MAX_JOINTS],
+    ) -> bool {
+        self.kin.momentum(q, qd, p, ctv).is_ok()
     }
 }
 

@@ -187,6 +187,7 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     homing.set_item("joints", s.homing.joints.clone())?;
     d.set_item("homing", homing)?;
     d.set_item("torques_ext", s.torques_ext.to_vec())?;
+    d.set_item("torques_observed", s.torques_observed.to_vec())?;
     d.set_item("paused", s.paused)?;
     let dh = PyDict::new(py);
     dh.set_item("temperatures_c", s.drive_health.temperatures_c.clone())?;

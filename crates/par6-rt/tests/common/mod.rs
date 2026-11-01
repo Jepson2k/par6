@@ -87,6 +87,17 @@ impl GravityModel for ConstGravity {
     /// that silently drops a declared payload holds the arm against a
     /// load it does not know about.
     fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
+
+    /// A constant torque has no inertia to observe with.
+    fn momentum(
+        &mut self,
+        _q: &[f64; MAX_JOINTS],
+        _qd: &[f64; MAX_JOINTS],
+        _p: &mut [f64; MAX_JOINTS],
+        _ctv: &mut [f64; MAX_JOINTS],
+    ) -> bool {
+        false
+    }
 }
 
 pub struct Rig {
@@ -436,6 +447,18 @@ impl GravityModel for PlantGravity {
 
     /// The plant carries no declared payload, so neither does its model.
     fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
+
+    /// The plant answers gravity only; the collision observer is
+    /// par6d's, over the real model.
+    fn momentum(
+        &mut self,
+        _q: &[f64; MAX_JOINTS],
+        _qd: &[f64; MAX_JOINTS],
+        _p: &mut [f64; MAX_JOINTS],
+        _ctv: &mut [f64; MAX_JOINTS],
+    ) -> bool {
+        false
+    }
 }
 
 /// An RT core on the simulator with the hooks par6d installs, its command

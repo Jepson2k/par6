@@ -615,8 +615,9 @@ control_mode = "pid"
 # through each joint's dynamics gear ratio as G^2*jm, and the friction
 # each joint shows its drive, joint side, as par6-selfcal measured it on a
 # reference arm: the simulator's model of a PAR6, not any one arm's
-# calibration, which --apply writes to that arm's local overlay. Friction
-# is the damping the drives' velocity loops
+# calibration, which --apply writes to that arm's local overlay. The
+# collision observer takes the same rotor inertia and friction out of what
+# the drives deliver. Friction is the damping the drives' velocity loops
 # live on: with one motor-side guess for every joint, an eighth of what
 # the base has, the simulated base limit-cycled at its current limit
 # whenever the arm was held extended, where the arm itself holds still.
@@ -703,14 +704,20 @@ path_rot_weight_m_per_rad = 0.15   # w: rotation weight in the multi-segment pat
 singularity_cond_max = 1000.0      # near-singularity warning when a path sample's jacobian condition exceeds this ...
 singularity_sigma_min = 0.0001     # ... or its smallest singular value drops under this
 
-[limits]
-# External-torque envelope: hard fault when a joint's external-torque
-# estimate (measured minus the gravity model, minus the active motion's
-# feed-forward) stays beyond the margin for the window. 0 disables —
-# the shipped default, because the estimate is only as good as the
-# torque constants and the gravity model; calibrate before opting in.
-tau_ext_margin_nm = 0.0
-tau_ext_window_s = 0.1
+[collision]
+# A momentum observer estimates the torque on each joint that gravity,
+# inertia (rotors included) and the [sim] friction do not explain; while a
+# jog, stream or program moves the arm, a joint whose estimate moves past a
+# threshold from where it stood still is in contact or has collided.
+# warn = both are warnings and the arm keeps moving; stop = a collision
+# latches a hard error and the arm holds; off = no observer.
+mode = "warn"
+# The vendor's thresholds (rcb-runtime PAR6.xml, J2 in this config's 0.90
+# efficiency scale) until this arm's are measured: twice the estimate's
+# 99th percentile with nothing touching the arm, and the larger of twice its
+# peak and 1.5 times that. 0 = unchecked.
+contact_nm = [0.60, 2.82, 1.49, 0.49, 0.30, 0.34]
+collision_nm = [0.90, 4.24, 2.23, 0.74, 0.44, 0.51]
 
 # ============================================= installation keep-outs (issue #19)
 # Standing collision restrictions of THIS installation — cage walls, the

@@ -127,6 +127,13 @@ int32_t par6_kin_ik_solve(par6_kin *h, const double *q_seed,
                           const double *target_pose16, double *out_q,
                           int32_t max_iters, double tol, double damping);
 
+/* The momentum observer's model terms at (q, v): the generalized
+ * momentum out_p = M(q) v and out_ctv = C(q, v)^T v, with C Pinocchio's
+ * Christoffel-consistent Coriolis matrix (dM/dt = C + C^T). q/v: nq
+ * doubles each; out_p/out_ctv: nq doubles. Allocation-free after create. */
+par6_status par6_kin_momentum(par6_kin *h, const double *q, const double *v,
+                              double *out_p, double *out_ctv);
+
 /* Forward dynamics: joint accelerations ddq = ABA(q, v, tau), including
  * the tool inertia when given at create. q/v/tau: nq doubles each;
  * out_a: nq doubles. Allocation-free after create. */
@@ -445,9 +452,11 @@ par6_status par6_kin_set_tool(par6_kin *h, double mass, const double *com3,
  *     fails to link it.
  * v10: par6_kin_set_tool added (reversible runtime payload attach at the
  *     end-effector frame). Purely additive; a stale v9 library fails to
- *     link it. */
+ *     link it.
+ * v13: par6_kin_momentum added (M(q) v and C(q, v)^T v for the collision
+ *     observer). Purely additive; a stale v12 library fails to link it. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 12
+#define PAR6_SHIM_ABI_VERSION 13
 
 /* The byte layout of the value structs that cross this boundary, so the
  * Rust mirrors can check they read the same bytes: each struct's size,

@@ -139,6 +139,15 @@ extern "C" {
         out_tau: *mut f64,
     ) -> par6_status;
 
+    /// `M(q)·v` and `C(q,v)ᵀ·v`: the momentum observer's model terms.
+    pub fn par6_kin_momentum(
+        h: *mut par6_kin,
+        q: *const f64,
+        v: *const f64,
+        out_p: *mut f64,
+        out_ctv: *mut f64,
+    ) -> par6_status;
+
     /// DLS IK that refuses a step which would increase the residual.
     pub fn par6_kin_ik_solve(
         h: *mut par6_kin,

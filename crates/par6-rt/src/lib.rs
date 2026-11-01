@@ -42,6 +42,7 @@
 //!   latch list, homing/exec/jog/stream status, loop stats).
 
 pub mod adapters;
+pub mod collision;
 pub mod core;
 pub mod dispatch;
 pub mod errors;

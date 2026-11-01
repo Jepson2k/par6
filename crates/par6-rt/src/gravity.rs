@@ -32,6 +32,21 @@ pub trait GravityModel: Send {
     /// so here, in one line, deliberately.
     fn set_payload(&mut self, mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>);
 
+    /// The collision observer's model terms at `q` with `qd` \[Nm\]: the
+    /// generalized momentum `M(q)·q̇` into `p` and `C(q,q̇)ᵀ·q̇` into
+    /// `ctv`, payload included. `false` = no dynamics, and the observer
+    /// stays off.
+    ///
+    /// No default body, for the reason `set_payload` has none: a model
+    /// that inherited one would leave collision detection silently off.
+    fn momentum(
+        &mut self,
+        q: &[f64; MAX_JOINTS],
+        qd: &[f64; MAX_JOINTS],
+        p: &mut [f64; MAX_JOINTS],
+        ctv: &mut [f64; MAX_JOINTS],
+    ) -> bool;
+
     /// Whether `gravity` describes the arm at all. Checks that compare
     /// measured holding torque against G(q) (the post-homing reference
     /// check) are meaningless against a placeholder and skip themselves.
@@ -56,4 +71,15 @@ impl GravityModel for ZeroGravity {
     /// Nothing to carry it: this model compensates no gravity at all, so
     /// a payload changes nothing rather than being quietly lost.
     fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
+
+    /// No dynamics to observe with.
+    fn momentum(
+        &mut self,
+        _q: &[f64; MAX_JOINTS],
+        _qd: &[f64; MAX_JOINTS],
+        _p: &mut [f64; MAX_JOINTS],
+        _ctv: &mut [f64; MAX_JOINTS],
+    ) -> bool {
+        false
+    }
 }

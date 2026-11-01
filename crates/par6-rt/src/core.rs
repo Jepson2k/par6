@@ -35,8 +35,9 @@ use par6_bus::{
     BusError, BusState, DriverBus, Fault, Freshness, GripperCommand, JointCommand, NodeId, Pack,
     PollAction,
 };
-use par6_config::{ConfigBundle, ControlMode, KtSource, LimitMode, MAX_IO_LINES};
+use par6_config::{CollisionMode, ConfigBundle, ControlMode, KtSource, LimitMode, MAX_IO_LINES};
 
+use crate::collision::{CollisionMonitor, MomentumObserver};
 use crate::dispatch::{self, CommandMirror, JointSetpoint};
 use crate::errors::{ErrorManager, CLEAR_SETTLE_S};
 use crate::exec::{ExecPlayback, ExecTick};
@@ -630,17 +631,19 @@ pub struct RtCore<B: DriverBus> {
     q_filt: [f64; MAX_JOINTS],
     qd_filt: [f64; MAX_JOINTS],
     tau_filt: [f64; MAX_JOINTS],
-    /// External torque estimate \[Nm\]: filtered measured torque minus
-    /// the model's gravity torque. What a hand pushing the arm looks
-    /// like in the torque domain.
+    /// External torque estimate \[Nm\], measured minus model: the
+    /// collision observer's while it runs, else [`Self::tau_static`]. What
+    /// a hand pushing the arm looks like in the torque domain.
     tau_ext: [f64; MAX_JOINTS],
+    /// Filtered measured torque minus the model's gravity torque: the
+    /// estimate at rest, which the post-homing reference check sums.
+    tau_static: [f64; MAX_JOINTS],
     filters_seeded: bool,
-    /// `[limits] tau_ext_margin_nm`; 0 disables the envelope.
-    tau_env_margin_nm: f64,
-    /// Ticks a joint must stay beyond the margin before latching.
-    tau_env_window_ticks: u32,
-    /// Per-joint consecutive over-margin tick counters.
-    tau_env_over: [u32; MAX_JOINTS],
+    observer: MomentumObserver,
+    collision: CollisionMonitor,
+    /// The observer's model terms this tick: `M(q)·q̇` and `C(q,q̇)ᵀ·q̇`.
+    momentum: [f64; MAX_JOINTS],
+    coriolis: [f64; MAX_JOINTS],
 
     // Per-tick compute buffers.
     g: [f64; MAX_JOINTS],
@@ -896,10 +899,12 @@ impl<B: DriverBus> RtCore<B> {
             qd_filt: [0.0; MAX_JOINTS],
             tau_filt: [0.0; MAX_JOINTS],
             tau_ext: [0.0; MAX_JOINTS],
+            tau_static: [0.0; MAX_JOINTS],
             filters_seeded: false,
-            tau_env_margin_nm: robot.limits.tau_ext_margin_nm,
-            tau_env_window_ticks: robot.ticks(robot.limits.tau_ext_window_s).max(1),
-            tau_env_over: [0; MAX_JOINTS],
+            observer: MomentumObserver::new(robot),
+            collision: CollisionMonitor::new(robot),
+            momentum: [0.0; MAX_JOINTS],
+            coriolis: [0.0; MAX_JOINTS],
             g: [0.0; MAX_JOINTS],
             setpoints: [JointSetpoint::zero_velocity(); MAX_JOINTS],
             cmds: [JointCommand::idle(); MAX_JOINTS],
@@ -1173,6 +1178,37 @@ impl<B: DriverBus> RtCore<B> {
         self.torque_slew.seed(&applied);
     }
 
+    /// The collision observer's tick. It needs referenced angles for the
+    /// model to describe the arm; without them, or without dynamics,
+    /// `tau_ext` is the static estimate.
+    fn observe(&mut self, period_s: f64) {
+        let wanted = self.collision.mode() != CollisionMode::Off
+            && self.homed
+            && self.gravity.describes_arm();
+        if wanted
+            && self.gravity.momentum(
+                &self.q,
+                &self.qd_filt,
+                &mut self.momentum,
+                &mut self.coriolis,
+            )
+        {
+            self.observer.step(
+                &self.momentum,
+                &self.coriolis,
+                &self.g,
+                &self.tau,
+                &self.qd_filt,
+                period_s,
+            );
+        } else {
+            self.observer.reset();
+        }
+        if !self.observer.estimate(&mut self.tau_ext) {
+            self.tau_ext = self.tau_static;
+        }
+    }
+
     /// The gravity feedforward at the current `q`, scaled per joint.
     fn refresh_gravity(&mut self) {
         self.gravity.gravity(&self.q, &mut self.g);
@@ -1222,6 +1258,7 @@ impl<B: DriverBus> RtCore<B> {
         let (mass, com, inertia) = self.payload;
         gravity.set_payload(mass, com, inertia);
         self.gravity = gravity;
+        self.observer.reset();
     }
 
     /// Swap the forward-kinematics model — the `select_tool`
@@ -1440,12 +1477,13 @@ impl<B: DriverBus> RtCore<B> {
         // Gravity: computed every tick, published always.
         self.refresh_gravity();
 
-        // External torque: what the measured (filtered) torque carries
-        // beyond the model's gravity — a contact, a payload the model
-        // does not know, a hand on the arm.
+        // External torque: what the measured torque carries beyond the
+        // model — a contact, a payload the model does not know, a hand on
+        // the arm.
         for i in 0..MAX_JOINTS {
-            self.tau_ext[i] = self.tau_filt[i] - self.g[i];
+            self.tau_static[i] = self.tau_filt[i] - self.g[i];
         }
+        self.observe(period_s);
         lap(&mut mark, &mut laps, 5);
 
         // Phase 7: error checks and reactions.
@@ -1919,6 +1957,8 @@ impl<B: DriverBus> RtCore<B> {
             RtCommand::SetPayload { mass, com, inertia } => {
                 self.payload = (mass, com, inertia);
                 self.gravity.set_payload(mass, com, inertia);
+                // The momentum it integrated was another arm's.
+                self.observer.reset();
             }
             RtCommand::WriteIo { port, value } => self.set_io_output(port, value),
             RtCommand::SetCanId { node, new_id } => match self.bus.set_can_id(node, new_id) {
@@ -2433,40 +2473,28 @@ impl<B: DriverBus> RtCore<B> {
             link.state == par6_bus::LinkState::ErrorPassive,
         );
 
-        // External-torque envelope: a joint whose external-torque
-        // estimate stays beyond the margin for the window latches hard —
-        // unexpected contact or an unmodeled payload. Enforced only
-        // where the estimate is meaningful: homed (the gravity model
-        // needs referenced angles), enabled, and in a mode whose drives
-        // actively bear the load — a limp or protective-hold arm reads
-        // `-g(q)` as "external" torque and would re-latch forever. The
-        // EXEC feed-forward is subtracted so planned acceleration does
-        // not count against the margin (one tick stale, matching the
-        // measurement's own lag). Only IDLE and the working modes are
-        // policed: the protective laws, BOOTING and FLASHING command no
-        // torque of their own, so there is nothing to compare against.
-        if self.tau_env_margin_nm > 0.0 {
-            let enforce = self.homed
-                && self.state == ArmState::Enabled
-                && matches!(
-                    self.mode,
-                    Mode::Idle | Mode::Jog | Mode::Stream | Mode::Exec
-                );
-            for i in 0..MAX_JOINTS {
-                let ff = if self.mode == Mode::Exec {
-                    self.scratch_tau[i]
-                } else {
-                    0.0
-                };
-                if enforce && (self.tau_ext[i] - ff).abs() > self.tau_env_margin_nm {
-                    self.tau_env_over[i] = self.tau_env_over[i].saturating_add(1);
-                    if self.tau_env_over[i] >= self.tau_env_window_ticks {
-                        self.errors.latch(ErrorCode::TorqueEnvelope, Some(i as u8));
-                    }
-                } else {
-                    self.tau_env_over[i] = 0;
-                }
+        // Collision: the observer's estimate against each joint's
+        // thresholds while the arm is commanded to move, judged only where
+        // the estimate means something — referenced, enabled, the drives
+        // tracking a motion of the core's own, the observer settled. The
+        // commanded speed is last tick's, as the measurement is.
+        let active = self.homed
+            && self.state == ArmState::Enabled
+            && matches!(self.mode, Mode::Jog | Mode::Stream | Mode::Exec)
+            && self.observer.settled();
+        let moving = CollisionMonitor::moving(&self.qd_target);
+        self.collision.step(active, moving, &self.tau_ext);
+        let stop = self.collision.mode() == CollisionMode::Stop;
+        for i in 0..MAX_JOINTS {
+            let joint = Some(i as u8);
+            let collided = self.collision.collision(i);
+            if stop && collided {
+                self.errors.latch(ErrorCode::Collision, joint);
             }
+            self.errors
+                .condition(ErrorCode::CollisionWarning, joint, !stop && collided);
+            self.errors
+                .condition(ErrorCode::Contact, joint, self.collision.contact(i));
         }
 
         if !self.bus.is_silent() {
@@ -2704,7 +2732,7 @@ impl<B: DriverBus> RtCore<B> {
             let _ = self.bus.poll_step();
             match status {
                 SeqStatus::Checking => {
-                    for (sum, ext) in self.ref_check_sum.iter_mut().zip(self.tau_ext) {
+                    for (sum, ext) in self.ref_check_sum.iter_mut().zip(self.tau_static) {
                         *sum += ext;
                     }
                     self.ref_check_n += 1;
@@ -3061,7 +3089,8 @@ impl<B: DriverBus> RtCore<B> {
         s.q_filtered = self.q_filt;
         s.qd_filtered = self.qd_filt;
         s.tau_filtered = self.tau_filt;
-        s.tau_ext = self.tau_ext;
+        s.tau_ext = self.tau_static;
+        s.tau_observed = self.tau_ext;
         s.q_commanded = self.mirror.q;
         s.qd_commanded = self.mirror.qd;
         s.tau_commanded = self.mirror.tau;

@@ -423,6 +423,30 @@ impl Kin {
         Ok(())
     }
 
+    /// The momentum observer's model terms for the arm joints: the
+    /// generalized momentum `M(q)·q̇` into `p` and `C(q,q̇)ᵀ·q̇` into
+    /// `ctv` \[Nm\], over the arm and the attached tool and payload. Jaw
+    /// joints ride at zero position and velocity.
+    pub fn momentum(
+        &mut self,
+        q: &[f64; NQ],
+        qd: &[f64; NQ],
+        p: &mut [f64; NQ],
+        ctv: &mut [f64; NQ],
+    ) -> Result<(), KinError> {
+        self.set_q(q);
+        self.v_full[..NQ].copy_from_slice(qd);
+        self.model.momentum_into(
+            &self.q_full,
+            &self.v_full,
+            &mut self.tau_full,
+            &mut self.g_full,
+        )?;
+        p.copy_from_slice(&self.tau_full[..NQ]);
+        ctv.copy_from_slice(&self.g_full[..NQ]);
+        Ok(())
+    }
+
     /// Closed-form IK for `target` (same frame and layout as [`Kin::fk`]
     /// output), taking the solution branch nearest `seed`. The result is
     /// proven through the FK before it is reported: `out_q` is written

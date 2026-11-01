@@ -48,9 +48,9 @@ pub fn rt_standing_error(snap: &StateSnapshot) -> Option<WireError> {
         make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[])
     } else if has(RtCode::BusOff) {
         make_error(ErrorCode::SysBusOff, UNATTRIBUTED, &[])
-    } else if let Some(e) = errs.iter().find(|e| e.code == RtCode::TorqueEnvelope) {
+    } else if let Some(e) = errs.iter().find(|e| e.code == RtCode::Collision) {
         make_error(
-            ErrorCode::SysTorqueEnvelope,
+            ErrorCode::SysCollision,
             UNATTRIBUTED,
             &[("joint", &e.joint.unwrap_or(0).to_string())],
         )
@@ -140,6 +140,12 @@ pub fn wire_warning(e: &par6_rt::ErrorEntry, snap: &StateSnapshot) -> Option<Wir
         RtCode::LoopDegraded => make_error(ErrorCode::SysLoopDegraded, UNATTRIBUTED, &[]),
         RtCode::NotHomed => make_error(ErrorCode::MotnNotHomed, UNATTRIBUTED, &[]),
         RtCode::LinkErrorPassive => make_error(ErrorCode::SysLinkErrorPassive, UNATTRIBUTED, &[]),
+        RtCode::Contact => make_error(ErrorCode::SysContact, UNATTRIBUTED, &[("joint", &joint)]),
+        RtCode::CollisionWarning => make_error(
+            ErrorCode::SysCollisionWarning,
+            UNATTRIBUTED,
+            &[("joint", &joint)],
+        ),
         RtCode::HomingFailed => {
             let phase = e
                 .joint
@@ -195,9 +201,9 @@ mod tests {
             (RtCode::SwEstop, None, ErrorCode::SysEstopActive, ""),
             (RtCode::BusOff, None, ErrorCode::SysBusOff, ""),
             (
-                RtCode::TorqueEnvelope,
+                RtCode::Collision,
                 Some(2),
-                ErrorCode::SysTorqueEnvelope,
+                ErrorCode::SysCollision,
                 "Joint 2",
             ),
             (

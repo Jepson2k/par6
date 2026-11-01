@@ -92,11 +92,17 @@ wire_enum! {
         /// A joint's external-torque estimate stayed beyond the
         /// configured envelope margin (hard latch — unexpected contact
         /// or an unmodeled payload).
-        SysTorqueEnvelope = 63,
+        SysCollision = 63,
         /// The streaming rate limiter failed to produce setpoints for a
         /// sustained interval (hard latch — the stream was silently
         /// holding, not tracking).
         SysStreamFault = 64,
+        /// A joint's external torque passed its contact threshold
+        /// (warning, self-clears).
+        SysContact = 65,
+        /// A joint's external torque passed its collision threshold with
+        /// `[collision] mode = "warn"` (warning, self-clears).
+        SysCollisionWarning = 66,
     }
 }
 
@@ -370,11 +376,23 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
             effect: "Warning only; clears when the error counters recover.",
             remedy: "Check bus wiring and termination before it goes bus-off.",
         },
-        E::SysTorqueEnvelope => ErrorTemplate {
-            title: "Torque envelope exceeded",
-            cause: "Joint {joint}'s external torque stayed beyond the configured margin.",
+        E::SysCollision => ErrorTemplate {
+            title: "Collision",
+            cause: "Joint {joint}'s external torque passed its collision threshold while the arm moved.",
             effect: "Controller DISABLED; error latched.",
-            remedy: "Remove the obstruction or update the payload model, then send reset.",
+            remedy: "Clear the obstruction, or declare the payload the arm carries, then send reset.",
+        },
+        E::SysContact => ErrorTemplate {
+            title: "Contact",
+            cause: "Joint {joint}'s external torque passed its contact threshold while the arm moved.",
+            effect: "Warning only; clears once the joint is back under half its threshold.",
+            remedy: "Check what the arm is touching, or the payload it carries.",
+        },
+        E::SysCollisionWarning => ErrorTemplate {
+            title: "Collision (warn mode)",
+            cause: "Joint {joint}'s external torque passed its collision threshold while the arm moved.",
+            effect: "Warning only: [collision] mode is warn, so the arm kept moving.",
+            remedy: "Clear the obstruction; set mode = \"stop\" once the thresholds are measured.",
         },
         E::MotnHomingFailed => ErrorTemplate {
             title: "Homing failed",

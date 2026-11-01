@@ -790,29 +790,37 @@ impl Default for MotionConfig {
     }
 }
 
-/// `[limits]`: safety-envelope enforcement thresholds.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct LimitsSection {
-    /// External-torque envelope margin \[Nm\]: hard fault when a joint's
-    /// external torque estimate (measured minus model, minus the active
-    /// motion's feed-forward) stays beyond this for the window below.
-    /// 0 disables the envelope — the shipped default, because the
-    /// estimate is only as good as the torque constants and the gravity
-    /// model; hardware opts in with a calibrated margin.
-    pub tau_ext_margin_nm: f64,
-    /// How long a joint must stay beyond the margin before the fault
-    /// latches \[s\] — rides out measurement transients and filter lag.
-    pub tau_ext_window_s: f64,
+/// What a collision does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CollisionMode {
+    /// No observer, no verdicts.
+    #[default]
+    Off,
+    /// Contact and collision are warnings; the arm keeps moving.
+    Warn,
+    /// A collision latches a hard error and the arm holds.
+    Stop,
 }
 
-impl Default for LimitsSection {
-    fn default() -> Self {
-        Self {
-            tau_ext_margin_nm: 0.0,
-            tau_ext_window_s: 0.1,
-        }
-    }
+/// Largest contact or collision threshold \[Nm\]: past it a joint's
+/// drive saturates before the estimate gets there, and the joint is
+/// unchecked in all but name.
+pub const MAX_COLLISION_NM: f64 = 50.0;
+
+/// `[collision]`: per-joint thresholds on the momentum observer's
+/// external-torque estimate, judged while a jog, stream or program moves
+/// the arm. 0 leaves a joint unchecked.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct CollisionConfig {
+    /// What a collision does. Omitted = off.
+    pub mode: CollisionMode,
+    /// Per joint: the change in external torque since the arm last stood
+    /// still that counts as contact \[Nm\].
+    pub contact_nm: Vec<f64>,
+    /// Per joint: the change that counts as a collision \[Nm\].
+    pub collision_nm: Vec<f64>,
 }
 
 /// The shutdown retreat: a slow drive to a rest pose before the drives
@@ -982,10 +990,9 @@ pub struct RobotConfig {
     /// fills this in with [`TimingConfig::SIM`] when it is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<TimingConfig>,
-    /// Safety-envelope enforcement thresholds. Omitted = everything
-    /// disabled.
+    /// Collision detection. Omitted = off.
     #[serde(default)]
-    pub limits: LimitsSection,
+    pub collision: CollisionConfig,
     /// Shutdown retreat. Omitted = the retreat to the park pose.
     #[serde(default)]
     pub shutdown: ShutdownConfig,
@@ -1164,7 +1171,7 @@ impl RobotConfig {
         self.validate_protocol()?;
         self.validate_defaults()?;
         self.validate_timing()?;
-        self.validate_limits()?;
+        self.validate_collision()?;
         self.validate_motion()?;
         self.validate_shutdown()?;
         self.validate_sim()?;
@@ -1671,16 +1678,37 @@ impl RobotConfig {
         Ok(())
     }
 
-    fn validate_limits(&self) -> Result<(), ConfigError> {
-        let l = &self.limits;
-        if l.tau_ext_margin_nm < 0.0 || !l.tau_ext_margin_nm.is_finite() {
-            return Err(invalid(
-                "limits.tau_ext_margin_nm",
-                "must be >= 0 (0 disables the envelope)",
-            ));
+    fn validate_collision(&self) -> Result<(), ConfigError> {
+        let c = &self.collision;
+        if c.mode == CollisionMode::Off {
+            return Ok(());
         }
-        if !is_positive(l.tau_ext_window_s) || !l.tau_ext_window_s.is_finite() {
-            return Err(invalid("limits.tau_ext_window_s", "must be > 0"));
+        for (values, name) in [
+            (&c.contact_nm, "collision.contact_nm"),
+            (&c.collision_nm, "collision.collision_nm"),
+        ] {
+            if values.len() != self.joints.len() {
+                return Err(invalid(name, "needs one value per joint"));
+            }
+            if !values
+                .iter()
+                .all(|v| v.is_finite() && (0.0..=MAX_COLLISION_NM).contains(v))
+            {
+                return Err(invalid(
+                    name,
+                    format!("must be 0..={MAX_COLLISION_NM} Nm (0 = unchecked)"),
+                ));
+            }
+        }
+        if c.contact_nm
+            .iter()
+            .zip(&c.collision_nm)
+            .any(|(contact, collision)| *contact > 0.0 && *collision > 0.0 && collision < contact)
+        {
+            return Err(invalid(
+                "collision.collision_nm",
+                "must not be below the joint's contact_nm",
+            ));
         }
         Ok(())
     }

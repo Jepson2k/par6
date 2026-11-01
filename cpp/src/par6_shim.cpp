@@ -9,6 +9,7 @@
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
 #include <pinocchio/algorithm/aba.hpp>
+#include <pinocchio/algorithm/crba.hpp>
 #include <pinocchio/algorithm/regressor.hpp>
 #include <pinocchio/algorithm/rnea.hpp>
 #include <pinocchio/spatial/explog.hpp>
@@ -328,6 +329,28 @@ par6_status par6_kin_inverse_dynamics(par6_kin *h, const double *q,
         h->a_in = Eigen::Map<const Eigen::VectorXd>(a, h->model.nv);
         pinocchio::rnea(h->model, h->data, h->q, h->v_in, h->a_in);
         Eigen::Map<Eigen::VectorXd>(out_tau, h->model.nv) = h->data.tau;
+        return PAR6_OK;
+    } catch (const std::exception &) {
+        return PAR6_ERR_EXCEPTION;
+    }
+}
+
+par6_status par6_kin_momentum(par6_kin *h, const double *q, const double *v,
+                              double *out_p, double *out_ctv) {
+    if (h == nullptr || q == nullptr || v == nullptr || out_p == nullptr ||
+        out_ctv == nullptr) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    try {
+        h->q = Eigen::Map<const Eigen::VectorXd>(q, h->model.nq);
+        h->v_in = Eigen::Map<const Eigen::VectorXd>(v, h->model.nv);
+        // CRBA fills the upper triangle only.
+        pinocchio::crba(h->model, h->data, h->q);
+        Eigen::Map<Eigen::VectorXd>(out_p, h->model.nv).noalias() =
+            h->data.M.selfadjointView<Eigen::Upper>() * h->v_in;
+        pinocchio::computeCoriolisMatrix(h->model, h->data, h->q, h->v_in);
+        Eigen::Map<Eigen::VectorXd>(out_ctv, h->model.nv).noalias() =
+            h->data.C.transpose() * h->v_in;
         return PAR6_OK;
     } catch (const std::exception &) {
         return PAR6_ERR_EXCEPTION;

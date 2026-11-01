@@ -349,6 +349,31 @@ impl Model {
         Self::check_status(status)
     }
 
+    /// The generalized momentum `M(q)·v` into `p` and `C(q,v)ᵀ·v` into
+    /// `ctv`, with `C` the Coriolis matrix for which `Ṁ = C + Cᵀ`.
+    pub fn momentum_into(
+        &mut self,
+        q: &[f64],
+        v: &[f64],
+        p: &mut [f64],
+        ctv: &mut [f64],
+    ) -> Result<(), Error> {
+        self.check_len(q, self.nq)?;
+        self.check_len(v, self.nq)?;
+        self.check_len(p, self.nq)?;
+        self.check_len(ctv, self.nq)?;
+        let status = unsafe {
+            ffi::par6_kin_momentum(
+                self.raw.as_ptr(),
+                q.as_ptr(),
+                v.as_ptr(),
+                p.as_mut_ptr(),
+                ctv.as_mut_ptr(),
+            )
+        };
+        Self::check_status(status)
+    }
+
     /// Convenience allocating variant of [`Model::gravity_into`].
     pub fn gravity(&mut self, q: &[f64]) -> Result<Vec<f64>, Error> {
         let mut out = vec![0.0; self.nq];

@@ -99,6 +99,7 @@ fn populated() -> Status {
             overruns: 8,
         },
         session_id: u64::MAX - 1,
+        torques_observed: [0.7, -0.8, 0.9, -1.0, 1.1, -1.2],
     }
 }
 
@@ -162,12 +163,15 @@ fn every_status_slot_survives_encode_and_decode() {
 #[test]
 fn session_metadata_requires_an_unsigned_integer_and_complete_field() {
     let mut encoder = StatusEncoder::new();
-    let mut prefix = encoder.encode(&Status::default()).to_vec();
-    prefix.pop();
+    let full = encoder.encode(&Status::default()).to_vec();
+    // The observed torques follow it: a six-element array of f64.
+    let observed = full[full.len() - (1 + 6 * 9)..].to_vec();
+    let prefix = full[..full.len() - observed.len() - 1].to_vec();
     assert!(decode_status(&prefix).is_err());
     for invalid in [vec![0xc0], vec![0xc3], vec![0xff], vec![0xa1, b'1']] {
         let mut packet = prefix.clone();
         packet.extend_from_slice(&invalid);
+        packet.extend_from_slice(&observed);
         assert!(decode_status(&packet).is_err());
     }
 }
