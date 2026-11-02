@@ -657,4 +657,9 @@ def test_the_client_describes_the_config_the_daemon_runs(
     finally:
         _cfg.config.cache_clear()
     monkeypatch.delenv("PAR6_CONFIG")
-    assert "isolated_in_1" in _cfg.io_line_names()[0]
+    try:
+        assert "isolated_in_1" in _cfg.io_line_names()[0]
+    finally:
+        # Read without PAR6_CONFIG, the cached config is whatever this host
+        # has installed: the next test would describe that arm, not its own.
+        _cfg.config.cache_clear()
