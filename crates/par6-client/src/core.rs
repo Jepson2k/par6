@@ -178,6 +178,9 @@ pub(crate) struct Inner {
     /// for its own run has to know what to put back.
     pub(crate) completion_policy: Mutex<Option<par6_proto::CompletionPolicy>>,
     closed: AtomicBool,
+    /// Held across each heartbeat send and the detach, so no heartbeat
+    /// can follow the detach and re-arm the lease it just dropped.
+    liveness: Mutex<()>,
 }
 
 // An async request can be dropped at any await, before its normal return.
@@ -260,6 +263,7 @@ impl Client {
             drop_complete_pushes: AtomicBool::new(false),
             completion_policy: Mutex::new(None),
             closed: AtomicBool::new(false),
+            liveness: Mutex::new(()),
         });
 
         let reply_task = tokio::spawn(reply_rx(inner.clone()));
@@ -280,6 +284,7 @@ impl Client {
         // and stops whatever this client left queued. Best effort: a full
         // socket buffer at close is what the lost-client stop is for.
         if let Ok(data) = encode_bare(&self.inner, &Command::Detach) {
+            let _gate = self.inner.liveness.lock().unwrap();
             let _ = self.inner.sock.try_send(&data);
         }
         for task in self.tasks.lock().unwrap().iter() {
@@ -907,9 +912,13 @@ async fn heartbeat(inner: Arc<Inner>) {
     };
     let mut beat = tokio::time::interval(Duration::from_secs_f64(par6_proto::HEARTBEAT_PERIOD_S));
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    while !inner.closed.load(Ordering::SeqCst) {
+    loop {
         beat.tick().await;
-        if let Err(e) = inner.sock.send(&data).await {
+        let _gate = inner.liveness.lock().unwrap();
+        if inner.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Err(e) = inner.sock.try_send(&data) {
             log::debug!("heartbeat not sent: {e}");
         }
     }
