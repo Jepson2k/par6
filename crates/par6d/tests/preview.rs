@@ -1305,6 +1305,71 @@ fn each_profile_plans_its_own_minimum_time_shape() {
     }
 }
 
+/// The startup profile is the jerk-limited RUCKIG, and a duration-based
+/// `move_j` under it is timed by TOPPRA: asked for less than the optimum
+/// it takes TOPPRA's acceleration-bound minimum (2·√(d/a)), not RUCKIG's
+/// jerk-bound one (∛(32·d/j)); asked for more, it takes what it was
+/// asked; with no duration it takes RUCKIG's.
+#[test]
+fn a_timed_move_under_the_startup_profile_is_toppra_timed() {
+    let mut preview =
+        Preview::new(Some(&test_config()), Some(&assets()), None).expect("the preview boots");
+    preview.set_homed(true);
+    let start = wrist_clear_deg();
+    preview.teleport_rad(to_rad(&start));
+    let robot = par6_config::RobotConfig::load(&test_config()).expect("config");
+    let dt = robot.robot.tick_dt_s;
+    let l = robot.joints[0]
+        .limits
+        .for_mode(par6_config::LimitMode::Exec);
+    let (v, a, j) = (
+        l.velocity_rad_s,
+        l.acceleration_rad_s2,
+        l.jerk_rad_s3.expect("exec jerk"),
+    );
+    let d: f64 = 0.5;
+    let toppra = 2.0 * (d / a).sqrt();
+    let ruckig = (32.0 * d / j).cbrt();
+    // The regime the formulas describe, and one that tells the two apart.
+    assert!((a * d).sqrt() < v, "the move must not reach cruise");
+    assert!(
+        j * ruckig / 4.0 < a,
+        "the jerk-limited move must not reach the acceleration limit"
+    );
+    assert!(toppra * 1.03 + dt < ruckig, "{toppra} s vs {ruckig} s");
+    let mut away = start;
+    away[0] += d.to_degrees();
+    let submit = |preview: &mut Preview, key, angles, duration: Option<f64>| {
+        let r = preview.submit(Command::MoveJ(MoveJ {
+            key,
+            angles,
+            duration,
+            speed: duration.is_none().then_some(1.0),
+            accel: None,
+            blend_radius: None,
+            rel: false,
+        }));
+        assert!(r.error.is_none(), "{:?}", r.error);
+        r.duration_s
+    };
+
+    let took = submit(&mut preview, 6101, away, Some(0.1));
+    assert!(
+        (took - toppra).abs() <= 0.03 * toppra + dt,
+        "asked for 0.1 s, the move took {took:.4} s; TOPPRA's optimum is {toppra:.4} s"
+    );
+    let took = submit(&mut preview, 6102, start, Some(2.0));
+    assert!(
+        (took - 2.0).abs() <= dt + 1e-6,
+        "asked for 2 s, the move took {took:.4} s"
+    );
+    let took = submit(&mut preview, 6103, away, None);
+    assert!(
+        took >= ruckig - 1e-6 && took <= ruckig + dt + 1e-6,
+        "with no duration the move took {took:.4} s; RUCKIG's shape takes {ruckig:.4} s"
+    );
+}
+
 /// `LINEAR` is a profile this runtime plans with, and it is what its
 /// name says: a constant-velocity joint path with ramps at the
 /// acceleration limit, so a script written for parol6's default profile

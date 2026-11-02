@@ -132,7 +132,13 @@ pub(crate) const COLLISION_STEP_RAD: f64 = 0.02;
 /// these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Profile {
-    /// Jerk-limited point-to-point (rsruckig).
+    /// Jerk-limited point-to-point (rsruckig). The default: the EXEC
+    /// torque feedforward is `M(q)·q̈`, and a profile that steps its
+    /// acceleration steps that torque, which rang J1's drivetrain into
+    /// chatter at 18 rad/s²; ramped over a jerk limit the same
+    /// acceleration was clean. A duration-based `move_j` under it is
+    /// timed by [`Profile::Toppra`]: a timed move is a path stretched to
+    /// a clock, which is that parameterization.
     Ruckig,
     /// Trapezoid on the path coordinate; no jerk limiting.
     Trapezoid,
@@ -143,7 +149,7 @@ pub(crate) enum Profile {
     /// jerk at both ends, jerk-limited, point-to-point only.
     Septic,
     /// Time-optimal path parameterization (toppra-cpp): the velocity and
-    /// acceleration limits bind, nothing else. The default.
+    /// acceleration limits bind, nothing else.
     Toppra,
     /// Constant velocity along a degree-1 joint path, with ramps at the
     /// acceleration limit at either end: parol6's LINEAR, which is the
@@ -153,8 +159,8 @@ pub(crate) enum Profile {
 
 /// Every profile by its wire name, the default first.
 const PROFILES: [(&str, Profile); 6] = [
-    ("TOPPRA", Profile::Toppra),
     ("RUCKIG", Profile::Ruckig),
+    ("TOPPRA", Profile::Toppra),
     ("TRAPEZOID", Profile::Trapezoid),
     ("QUINTIC", Profile::Quintic),
     ("SEPTIC", Profile::Septic),
@@ -981,7 +987,11 @@ impl Par6Planner {
         speed: Option<f64>,
         accel: Option<f64>,
     ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
-        let kind = match self.profile {
+        let profile = match (self.profile, duration) {
+            (Profile::Ruckig, Some(_)) => Profile::Toppra,
+            (profile, _) => profile,
+        };
+        let kind = match profile {
             Profile::Ruckig => ProfileKind::Ruckig,
             Profile::Trapezoid | Profile::Linear => ProfileKind::Trapezoid,
             Profile::Quintic => ProfileKind::Quintic,

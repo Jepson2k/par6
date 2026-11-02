@@ -509,11 +509,11 @@ fn the_simulated_run_lands_where_the_plan_says_and_shows_the_tracking_error() {
         worst > 1e-5,
         "q and q_commanded are the same column: the plant is not being simulated"
     );
-    // TOPPRA, the startup profile, runs the joints at their acceleration
-    // limit with no jerk limit, which the plant follows a little less
-    // closely than a jerk-limited profile. The lag grows with the
-    // acceleration asked of it: 0.06 rad at 9.6 rad/s², scaled to the
-    // configured EXEC limit of the two joints the moves drive.
+    // The lag grows with the acceleration asked of it: 0.06 rad at
+    // 9.6 rad/s² under TOPPRA's bang-bang acceleration (which the plant
+    // follows a little less closely than the jerk-limited startup
+    // profile), scaled to the configured EXEC limit of the two joints
+    // the moves drive.
     let accel = par6_config::ConfigBundle::load(&config)
         .expect("config")
         .robot

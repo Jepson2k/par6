@@ -407,8 +407,9 @@ class Robot(_RobotABC):
         own registry, so the advertisement cannot drift from what
         ``select_profile`` accepts.
 
-        ``TOPPRA`` (the runtime's startup default) time-optimally
-        parameterizes the path, ``RUCKIG`` is jerk-limited point-to-point,
+        ``RUCKIG`` (the runtime's startup default) is jerk-limited
+        point-to-point, ``TOPPRA`` time-optimally parameterizes the path
+        (and times a duration-based ``move_j`` under the default),
         ``TRAPEZOID`` and ``LINEAR`` run the path at constant velocity with
         ramps at the acceleration limit, ``QUINTIC`` is a point-to-point
         polynomial with zero end acceleration, and ``SEPTIC`` with zero end
