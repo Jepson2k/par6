@@ -609,8 +609,7 @@ async def test_advertised_motion_profiles_are_the_ones_the_runtime_plans_with(
     Every advertised profile is driven through ``select_profile`` and read
     back from the PROFILE query, so none is advertised that the command
     plane refuses; a name outside the list is refused, so the list is not
-    vacuously true. ``reset_state`` puts the default back: TOPPRA, as on
-    parol6.
+    vacuously true. ``reset_state`` puts the default back: RUCKIG.
     """
     advertised = Robot().motion_profiles
     async with daemon.client() as client:
@@ -624,7 +623,7 @@ async def test_advertised_motion_profiles_are_the_ones_the_runtime_plans_with(
 
         await client.select_profile("LINEAR")
         await client.reset_state()
-        assert await client.profile() == "TOPPRA"
+        assert await client.profile() == "RUCKIG"
 
 
 @pytest.mark.timeout(120)

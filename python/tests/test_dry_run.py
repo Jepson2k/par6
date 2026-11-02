@@ -750,7 +750,7 @@ class TestCartesianMotion:
         # first preview: the runtime's own startup profile
         # (par6d::planner::DEFAULT_PROFILE). A mirror that disagreed with
         # the engine timed every pre-sync preview with the wrong profile.
-        assert client.profile() == "TOPPRA"
+        assert client.profile() == "RUCKIG"
 
         # STATUS builds its pose from the 4x4 the engine returns; pose()
         # reads the engine's own xyzrpy. The two must describe one arm.

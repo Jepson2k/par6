@@ -1313,37 +1313,61 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     // exactly the time its longer plan cost. The shape survives both.
     // Over a move too short to reach cruise, a jerk limit is visible
     // directly: ruckig spends the whole probe ramping and never gets
-    // near the speed an unlimited-jerk profile reaches. Analytically the
-    // unlimited-jerk peaks over this probe are more than 3.5× the
-    // jerk-limited ones; the plant's lag on a move that short eats into
-    // the fast ones, so 1.4× keeps the check on the profile family, and
-    // which shape each profile plans is pinned in `preview.rs`.
+    // near the speed an unlimited-jerk profile reaches. Each profile's
+    // minimum-time shape predicts its peak from the EXEC limits (the
+    // shapes themselves are pinned in `preview.rs`); the plant's lag on
+    // a move this short eats a few percent off the fast ones, so a
+    // selection is proved by 85% of the ratio the shapes predict.
+    let d = PROFILE_PROBE_DEG.to_radians();
+    let l = par6_config::RobotConfig::load(&common::shipped_config())
+        .expect("PAR6 config")
+        .joints[0]
+        .limits
+        .for_mode(par6_config::LimitMode::Exec);
+    let (v, a, j) = (
+        l.velocity_rad_s,
+        l.acceleration_rad_s2,
+        l.jerk_rad_s3.expect("exec jerk"),
+    );
+    let t_ruckig = (32.0 * d / j).cbrt();
+    assert!(
+        (a * d).sqrt() < v && j * t_ruckig / 4.0 < a,
+        "the probe must stay under cruise and, jerk-limited, under the acceleration limit"
+    );
+    let predicted = |profile: &str| match profile {
+        "TRAPEZOID" => (a * d).sqrt(),
+        "QUINTIC" => 1.875 * d / (5.7735 * d / a).sqrt(),
+        "SEPTIC" => 2.1875 * d / (52.5 * d / j).cbrt(),
+        "RUCKIG" => j * t_ruckig * t_ruckig / 16.0,
+        other => panic!("no prediction for {other}"),
+    };
+    let outruns = |fast: (&str, f64), slow: (&str, f64)| {
+        let floor = 0.85 * predicted(fast.0) / predicted(slow.0);
+        assert!(
+            slow.1 * floor < fast.1,
+            "the {} selection did not reach the planner: peak speed {} {:.3} vs \
+             {} {:.3} rad/s, under the {floor:.2}x the shapes predict",
+            fast.0,
+            fast.0,
+            fast.1,
+            slow.0,
+            slow.1
+        );
+    };
     c.ok(&Command::SetCompletionPolicy(SetCompletionPolicy {
         policy: CompletionPolicy::Settled,
     }));
     let trapezoid = peak_speed_under(&rig, &mut c, "TRAPEZOID", 5100);
     let ruckig = peak_speed_under(&rig, &mut c, "RUCKIG", 5101);
-    assert!(
-        ruckig * 1.4 < trapezoid,
-        "the selected profile did not change the trajectory: peak speed \
-         TRAPEZOID {trapezoid:.3} vs RUCKIG {ruckig:.3} rad/s"
-    );
+    outruns(("TRAPEZOID", trapezoid), ("RUCKIG", ruckig));
     // Same proof for QUINTIC: unlimited jerk, so it too outruns the
     // jerk-limited profile over the probe.
     let quintic = peak_speed_under(&rig, &mut c, "QUINTIC", 5103);
-    assert!(
-        ruckig * 1.4 < quintic,
-        "the QUINTIC selection did not reach the planner: peak speed \
-         QUINTIC {quintic:.3} vs RUCKIG {ruckig:.3} rad/s"
-    );
+    outruns(("QUINTIC", quintic), ("RUCKIG", ruckig));
     // SEPTIC holds the jerk limit the quintic ignores, so over the same
     // probe it is held under the quintic just as ruckig is.
     let septic = peak_speed_under(&rig, &mut c, "SEPTIC", 5104);
-    assert!(
-        septic * 1.4 < quintic,
-        "the SEPTIC selection did not reach the planner: peak speed \
-         SEPTIC {septic:.3} vs QUINTIC {quintic:.3} rad/s"
-    );
+    outruns(("QUINTIC", quintic), ("SEPTIC", septic));
     let toppra = peak_speed_under(&rig, &mut c, "TOPPRA", 5102);
     assert!(
         toppra > ruckig,
