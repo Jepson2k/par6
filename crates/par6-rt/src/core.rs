@@ -596,8 +596,16 @@ pub struct RtCore<B: DriverBus> {
     config_resend_failures: u32,
     /// The residual of the last strict-settle fault (`ExecSettleTimeout`).
     settle_residual_rad: f64,
-    /// Nodes whose last config re-send was refused, retried one per tick.
+    /// Nodes still owed a stored-config push: a shot's nodes, pushed one
+    /// per tick, and refused pushes, retried from `config_resend_retry_at`.
     config_resend_pending: u16,
+    /// No push before this tick. A refusal means the kernel's TX queue is
+    /// full; a retry on the next tick lands on the same full queue and
+    /// keeps it full, which refuses the joint commands too (a node with a
+    /// ripple table re-pushed every tick held the arm's queue full for
+    /// good). One retry per lost window: a link that has not drained by
+    /// then latches CAN_LOST on its TX streak anyway.
+    config_resend_retry_at: u64,
     /// Ticks after arming at which the full stored-config shots run
     /// (`bus.config_resend_offsets_s`).
     config_resend_ticks: Vec<u64>,
@@ -872,6 +880,7 @@ impl<B: DriverBus> RtCore<B> {
             config_resend_failures: 0,
             settle_residual_rad: 0.0,
             config_resend_pending: 0,
+            config_resend_retry_at: 0,
             config_resend_ticks: robot
                 .bus
                 .config_resend_offsets_s
@@ -1728,20 +1737,23 @@ impl<B: DriverBus> RtCore<B> {
 
     /// One full stored-config shot: `bus.boot_config_repeats` passes to
     /// every arm node and the CAN gripper motor (the vendor pushes 4 per
-    /// shot; the config key governs the redundancy).
+    /// shot; the config key governs the redundancy), one node per tick.
+    /// Sent in a single tick, the shot's ~200 frames hold every poll
+    /// reply past the stale window and set off the self-heal resends on
+    /// top of it.
     fn config_repush(&mut self) {
         for i in 0..MAX_JOINTS {
-            self.resend_config(self.node_of[i]);
+            self.config_resend_pending |= 1u16 << self.node_of[i];
         }
         if self.has_can_gripper {
-            self.resend_config(self.gripper_node);
+            self.config_resend_pending |= 1u16 << self.gripper_node;
         }
     }
 
     /// Push one node's stored config with the configured redundancy. A
-    /// refusal (TX queue full) is counted and the node queued for a
-    /// retry on a later tick: a node silently left on firmware defaults
-    /// is exactly what the shots exist to prevent.
+    /// refusal (TX queue full) is counted and the node kept queued for a
+    /// retry after the backoff: a node silently left on firmware
+    /// defaults is exactly what the shots exist to prevent.
     fn resend_config(&mut self, node: NodeId) {
         let bit = 1u16 << node;
         match self.bus.resend_node_config(node, self.boot.config_repeats) {
@@ -1749,13 +1761,18 @@ impl<B: DriverBus> RtCore<B> {
             Err(_) => {
                 self.config_resend_failures = self.config_resend_failures.saturating_add(1);
                 self.config_resend_pending |= bit;
+                self.config_resend_retry_at = self.tick + u64::from(self.tx_fault_latch_ticks);
             }
         }
     }
 
-    /// Retry one queued node per tick once the bus is not silent.
+    /// Push one owed node per tick once the bus is not silent and the
+    /// last refusal's backoff has passed.
     fn drain_config_resends(&mut self) {
-        if self.config_resend_pending == 0 || self.bus.is_silent() {
+        if self.config_resend_pending == 0
+            || self.bus.is_silent()
+            || self.tick < self.config_resend_retry_at
+        {
             return;
         }
         let node = self.config_resend_pending.trailing_zeros() as NodeId;
@@ -2524,16 +2541,10 @@ impl<B: DriverBus> RtCore<B> {
             if self.has_can_gripper {
                 self.freshness_check(self.gripper_node, GRIPPER_ERR_IDX);
             }
-            // Reconnect path: re-send stored config to nodes whose
-            // stale→fresh edge happened in this drain.
-            let mask = self.bus_state.reconnected_mask;
-            if mask != 0 {
-                for n in 0..par6_bus::MAX_NODES {
-                    if mask & (1 << n) != 0 {
-                        self.resend_config(n as NodeId);
-                    }
-                }
-            }
+            // Reconnect path: nodes whose stale→fresh edge happened in
+            // this drain are owed their stored config, one per tick — a
+            // bus-wide hiccup reconnects every node in the same tick.
+            self.config_resend_pending |= self.bus_state.reconnected_mask;
             // Per-type motor fault flags, trusted only while the node's
             // per-frame live fault bit is set (live-bit gating).
             let drive_faults = self.tick >= self.drive_faults_from;

@@ -34,11 +34,12 @@ fn nodes() -> Vec<u8> {
         .collect()
 }
 
-/// Every node gets `boot_config_repeats` passes on every shot: at boot on
-/// the 50/150/300 schedule, and again when a FLASHING window ends — the
-/// one place a driver can power-cycle or come back reflashed without the
-/// freshness clock noticing, since `rebase()` stamps every node seen on
-/// exit. The exit pushes at once and re-arms the schedule from itself.
+/// Every node gets `boot_config_repeats` passes on every shot, one node
+/// per tick: at boot on the 50/150/300 schedule, and again when a
+/// FLASHING window ends — the one place a driver can power-cycle or come
+/// back reflashed without the freshness clock noticing, since `rebase()`
+/// stamps every node seen on exit. The exit starts its pass at once and
+/// re-arms the schedule from itself.
 #[test]
 fn every_config_shot_pushes_each_node_its_redundancy_at_boot_and_after_flashing() {
     let repeats = common::bundle().robot.bus.boot_config_repeats as usize;
@@ -48,6 +49,7 @@ fn every_config_shot_pushes_each_node_its_redundancy_at_boot_and_after_flashing(
         shots.len() > 1,
         "the shipped config schedules more than one shot"
     );
+    let shot_ticks = nodes().len() as u32;
     let each_node_got = |rig: &mut common::Rig, what: &str| {
         for node in nodes() {
             assert_eq!(
@@ -65,7 +67,7 @@ fn every_config_shot_pushes_each_node_its_redundancy_at_boot_and_after_flashing(
             rig.tick();
         }
         rig.clear_tx();
-        rig.tick();
+        rig.tick_n(shot_ticks);
         each_node_got(&mut rig, &format!("the boot shot at tick {shot}"));
     }
 
@@ -78,13 +80,14 @@ fn every_config_shot_pushes_each_node_its_redundancy_at_boot_and_after_flashing(
     rig.clear_tx();
     rig.cmd(RtCommand::SetMode(Mode::Idle));
     assert_eq!(rig.snap().mode, Mode::Idle);
-    each_node_got(&mut rig, "the FLASHING exit");
     let exit_tick = rig.snap().tick;
+    rig.tick_n(shot_ticks);
+    each_node_got(&mut rig, "the FLASHING exit");
     while rig.snap().tick < exit_tick + shots[0] - 1 {
         rig.tick();
     }
     rig.clear_tx();
-    rig.tick();
+    rig.tick_n(shot_ticks);
     each_node_got(&mut rig, "the first shot after the exit");
     // The boot selfcheck did not re-run: no CAN_LOST relatch on the way.
     let s = rig.snap();
@@ -152,13 +155,19 @@ fn a_retune_is_what_the_drive_holds_and_what_later_resends_carry() {
     tuned(&mut sim, "the FLASHING exit's resend carries the tune");
 }
 
-/// A stored-config shot the bus refuses (TX queue full) is counted and
-/// retried until the node's push goes through, instead of leaving that
-/// node on firmware defaults with nothing recorded.
+/// A stored-config push the bus refuses (TX queue full) is counted and
+/// retried until it lands, instead of leaving that node on firmware
+/// defaults with nothing recorded — but not on the next tick: a refusal
+/// means the queue is full, and a push every tick kept it full for good
+/// on the arm, refusing the joint commands too. Retries come once per
+/// lost window, and nothing else is pushed inside it.
 #[test]
-fn a_refused_config_shot_is_counted_and_retried_until_it_lands() {
-    let repeats = common::bundle().robot.bus.boot_config_repeats as usize;
-    let node = common::bundle().robot.joints[3].node_id;
+fn a_refused_config_push_is_counted_and_retried_once_per_lost_window() {
+    let robot = common::bundle().robot;
+    let repeats = robot.bus.boot_config_repeats as usize;
+    let lost_ticks = robot.ticks(robot.bus.lost_s);
+    let node = robot.joints[3].node_id;
+    let shot_ticks = nodes().len() as u32;
     let mut rig = common::Rig::new();
     rig.boot_to_idle();
     rig.core.bus_mut().refuse_config_sends = 1 << node;
@@ -168,22 +177,29 @@ fn a_refused_config_shot_is_counted_and_retried_until_it_lands() {
         rig.tick();
     }
     rig.clear_tx();
-    rig.tick();
+    rig.tick_n(shot_ticks);
     assert_eq!(
         rig.config_passes_for(node),
         0,
         "the refused node got nothing"
     );
+    assert_eq!(
+        rig.snap().loop_stats.config_resend_failures,
+        1,
+        "one refusal: no retry inside the backoff"
+    );
+    rig.tick_n(2 * lost_ticks);
+    let failures = rig.snap().loop_stats.config_resend_failures;
     assert!(
-        rig.snap().loop_stats.config_resend_failures >= 1,
-        "the refusal must be counted"
+        (2..=3).contains(&failures),
+        "one retry per lost window over two windows, not {failures}"
     );
 
-    // The queue drains: the pending node is pushed without waiting for
-    // the next scheduled shot.
+    // The queue drains: the node is pushed at the next retry, without
+    // waiting for the next scheduled shot.
     rig.core.bus_mut().refuse_config_sends = 0;
     rig.clear_tx();
-    rig.tick_n(3);
+    rig.tick_n(lost_ticks + 1);
     assert_eq!(
         rig.config_passes_for(node),
         repeats,

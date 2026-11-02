@@ -580,6 +580,17 @@ fn a_stale_node_gets_one_self_heal_resend_per_episode() {
     let stale_ticks = bus.ticks(bus.bus.stale_warn_s);
     let config_passes = |rig: &mut Rig| rig.config_passes_for(3);
 
+    // Past the boot's own config shots, which push every node.
+    let last_shot = bus
+        .bus
+        .config_resend_offsets_s
+        .iter()
+        .map(|s| u64::from(bus.ticks(*s)))
+        .max()
+        .unwrap_or(0);
+    while rig.snap().tick <= last_shot + MAX_JOINTS as u64 + 1 {
+        rig.tick();
+    }
     rig.clear_tx();
     rig.skip_nodes = 1 << 3;
     rig.tick_n(stale_ticks + 2);
@@ -597,13 +608,19 @@ fn a_stale_node_gets_one_self_heal_resend_per_episode() {
     assert_eq!(config_passes(&mut rig), 1, "the one-shot must not repeat");
 
     // Recovery re-arms; the NEXT silence episode fires again. The
-    // stale→fresh edge resend also fires here, so count from a clean log.
+    // stale→fresh edge resend also fires here, the tick after the edge,
+    // so count from a clean log.
     rig.skip_nodes = 0;
-    rig.tick_n(8);
+    let mut budget = 2 * stale_ticks;
+    while has_error(&mut rig, ErrorCode::CanStale, Some(3)) && budget > 0 {
+        rig.tick();
+        budget -= 1;
+    }
     assert!(
         !has_error(&mut rig, ErrorCode::CanStale, Some(3)),
         "recovered before the second episode starts"
     );
+    rig.tick();
     rig.clear_tx();
     rig.skip_nodes = 1 << 3;
     rig.tick_n(stale_ticks + 2);
