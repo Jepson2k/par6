@@ -1271,7 +1271,9 @@ fn each_profile_plans_its_own_minimum_time_shape() {
         l.acceleration_rad_s2,
         l.jerk_rad_s3.expect("exec jerk"),
     );
-    let d: f64 = 0.5;
+    // Short enough that no profile reaches cruise and the jerk-limited
+    // ones never reach the acceleration limit.
+    let d = (1.6 * a * a * a / (j * j)).min(0.5);
     let expected = [
         ("TRAPEZOID", 2.0 * (d / a).sqrt()),
         ("QUINTIC", (5.7735 * d / a).sqrt()),
@@ -1327,7 +1329,9 @@ fn a_timed_move_under_the_startup_profile_is_toppra_timed() {
         l.acceleration_rad_s2,
         l.jerk_rad_s3.expect("exec jerk"),
     );
-    let d: f64 = 0.5;
+    // Short enough that no profile reaches cruise and the jerk-limited
+    // ones never reach the acceleration limit.
+    let d = (1.6 * a * a * a / (j * j)).min(0.5);
     let toppra = 2.0 * (d / a).sqrt();
     let ruckig = (32.0 * d / j).cbrt();
     // The regime the formulas describe, and one that tells the two apart.

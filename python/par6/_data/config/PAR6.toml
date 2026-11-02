@@ -87,10 +87,14 @@ acceleration_rad_s2 = 32.0
 jerk_rad_s3 = 16000.0
 torque_rate_nm_s = 364.0
 
+# EXEC jerk is 10x the acceleration (the cartesian ratio): the startup
+# profile is jerk-limited, and at 3x every move spent 0.3 s per ramp. A
+# ramp of a few tens of ms is already what keeps the torque feedforward
+# from stepping (J1 was clean to 18 rad/s^2 at 1000 rad/s^3 on the arm).
 [joints.limits.exec]
 velocity_rad_s = 4.8
 acceleration_rad_s2 = 9.6
-jerk_rad_s3 = 28.8
+jerk_rad_s3 = 96.0
 
 # STREAM caps equal EXEC on every joint: the limiter following 50 Hz
 # targets under the hard-limit caps braked and re-accelerated toward each
@@ -147,7 +151,7 @@ torque_rate_nm_s = 2005.0
 [joints.limits.exec]
 velocity_rad_s = 1.5
 acceleration_rad_s2 = 3.0
-jerk_rad_s3 = 9.0
+jerk_rad_s3 = 30.0
 
 [joints.limits.stream]
 velocity_rad_s = 1.5
@@ -202,7 +206,7 @@ torque_rate_nm_s = 1483.0
 [joints.limits.exec]
 velocity_rad_s = 1.7
 acceleration_rad_s2 = 3.4
-jerk_rad_s3 = 10.2
+jerk_rad_s3 = 34.0
 
 [joints.limits.stream]
 velocity_rad_s = 1.7
@@ -253,7 +257,7 @@ torque_rate_nm_s = 173.0
 [joints.limits.exec]
 velocity_rad_s = 7.7
 acceleration_rad_s2 = 15.4
-jerk_rad_s3 = 46.2
+jerk_rad_s3 = 154.0
 
 [joints.limits.stream]
 velocity_rad_s = 7.7
@@ -304,7 +308,7 @@ torque_rate_nm_s = 173.0
 [joints.limits.exec]
 velocity_rad_s = 7.7
 acceleration_rad_s2 = 15.4
-jerk_rad_s3 = 46.2
+jerk_rad_s3 = 154.0
 
 [joints.limits.stream]
 velocity_rad_s = 7.7
@@ -363,7 +367,7 @@ torque_rate_nm_s = 198.0
 [joints.limits.exec]
 velocity_rad_s = 3.1
 acceleration_rad_s2 = 6.2
-jerk_rad_s3 = 18.6
+jerk_rad_s3 = 62.0
 
 [joints.limits.stream]
 velocity_rad_s = 3.1
