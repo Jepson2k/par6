@@ -291,6 +291,7 @@ fn rejects_degenerate_inputs_across_the_ffi() {
             3,
             vel.as_ptr(),
             acc.as_ptr(),
+            std::ptr::null(),
             0,
             std::ptr::null(),
             3,
@@ -371,8 +372,9 @@ fn linear_degree_keeps_the_path_on_the_waypoints() {
         (0usize, par6_kin::PathDegree::Linear),
         (1, par6_kin::PathDegree::Cubic),
     ] {
-        let traj = Trajectory::parameterize_with(&way, nq, &vel, &acc, None, None, degree, None)
-            .expect("plan");
+        let traj =
+            Trajectory::parameterize_with(&way, nq, &vel, &acc, None, None, None, degree, None)
+                .expect("plan");
         let duration = traj.duration();
         let mut q = vec![0.0; nq];
         let mut qd = vec![0.0; nq];
@@ -395,5 +397,155 @@ fn linear_degree_keeps_the_path_on_the_waypoints() {
         "the cubic spline tracked the chain to {:.3e} rad — this test no \
          longer distinguishes the two path types",
         worst[1]
+    );
+}
+
+/// Jerk limits smooth the timing and only the timing: on a straight line
+/// the trajectory stays on it, starts and ends at rest on its endpoints,
+/// lasts longer by the window that ramps one acceleration step within the
+/// jerk limit (the line cruises between its steps), and ramps the
+/// acceleration TOPPRA steps. Through a bend TOPPRA slows for, it stays
+/// inside the limits, its velocities and accelerations the derivatives of
+/// its positions.
+#[test]
+fn jerk_limits_smooth_the_timing_and_keep_the_path() {
+    let nq = 6usize;
+    let line: Vec<f64> = vec![
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+        0.4, 0.1, -0.2, 0.0, 0.1, 0.0, //
+    ];
+    let (vel, acc, jerk) = (vec![1.0; nq], vec![4.0; nq], vec![40.0; nq]);
+    let plan = |way: &[f64], jerk: Option<&[f64]>, degree| {
+        Trajectory::parameterize_with(way, nq, &vel, &acc, jerk, None, None, degree, None)
+            .expect("plan")
+    };
+    let (mut q, mut qd, mut qdd) = (vec![0.0; nq], vec![0.0; nq], vec![0.0; nq]);
+
+    let raw = plan(&line, None, par6_kin::PathDegree::Linear);
+    let smooth = plan(&line, Some(&jerk), par6_kin::PathDegree::Linear);
+    let window = 4.0 / 40.0;
+    assert!(
+        (smooth.duration() - raw.duration() - window).abs() < 1e-3,
+        "{} s smoothed against {} s raw: the line takes one window longer",
+        smooth.duration(),
+        raw.duration()
+    );
+    for (t, end) in [(0.0, &line[..nq]), (smooth.duration(), &line[nq..])] {
+        smooth
+            .sample_into(t, &mut q, &mut qd, &mut qdd)
+            .expect("sample");
+        for j in 0..nq {
+            assert!(
+                (q[j] - end[j]).abs() < 1e-9 && qd[j].abs() < 1e-9,
+                "t={t} j={j}"
+            );
+        }
+    }
+    let mut off_path = 0.0f64;
+    let mut rate = [0.0f64; 2];
+    let mut before = vec![0.0; nq];
+    for (slot, traj) in [(0usize, &raw), (1, &smooth)] {
+        let n = 4000;
+        let dt = traj.duration() / n as f64;
+        before.fill(0.0);
+        for k in 0..=n {
+            traj.sample_into(k as f64 * dt, &mut q, &mut qd, &mut qdd)
+                .expect("sample");
+            off_path = off_path.max(distance_to_polyline(&q, &line, nq));
+            for j in 0..nq {
+                rate[slot] = rate[slot].max((qdd[j] - before[j]).abs() / dt);
+            }
+            before.copy_from_slice(&qdd);
+        }
+    }
+    assert!(
+        off_path < 1e-9,
+        "the trajectory left the line by {off_path:.3e} rad"
+    );
+    assert!(
+        rate[0] > 1e3,
+        "TOPPRA's own profile showed no step ({})",
+        rate[0]
+    );
+    assert!(
+        rate[1] <= 40.0 * 1.01,
+        "the smoothed acceleration changed at {} rad/s^3 against a 40 limit",
+        rate[1]
+    );
+
+    // A cubic spline through a sharp corner: TOPPRA slows into a narrow dip
+    // there, which a plain window average would carry through at speed.
+    let corner: Vec<f64> = vec![
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+        0.4, 0.1, -0.2, 0.0, 0.1, 0.0, //
+        0.2, 0.5, 0.3, 0.1, -0.2, 0.1, //
+        0.6, 0.2, 0.0, -0.1, 0.3, 0.0, //
+    ];
+    let traj = plan(&corner, Some(&jerk), par6_kin::PathDegree::Cubic);
+    let total = traj.duration();
+    let h = 1e-5;
+    let (mut qm, mut qdm, mut qp, mut qdp) =
+        (vec![0.0; nq], vec![0.0; nq], vec![0.0; nq], vec![0.0; nq]);
+    let mut scratch = vec![0.0; nq];
+    let (mut worst_v, mut worst_a) = (0.0f64, 0.0f64);
+    for k in 1..2000 {
+        let t = total * k as f64 / 2000.0;
+        traj.sample_into(t, &mut q, &mut qd, &mut qdd)
+            .expect("sample");
+        traj.sample_into(t - h, &mut qm, &mut qdm, &mut scratch)
+            .expect("sample");
+        traj.sample_into(t + h, &mut qp, &mut qdp, &mut scratch)
+            .expect("sample");
+        for j in 0..nq {
+            let v = (qp[j] - qm[j]) / (2.0 * h);
+            let a = (qdp[j] - qdm[j]) / (2.0 * h);
+            assert!((v - qd[j]).abs() < 1e-5, "qd[{j}] at {t}: {} vs {v}", qd[j]);
+            assert!(
+                (a - qdd[j]).abs() < 1e-2,
+                "qdd[{j}] at {t}: {} vs {a}",
+                qdd[j]
+            );
+            worst_v = worst_v.max(qd[j].abs() / vel[j]);
+            worst_a = worst_a.max(qdd[j].abs() / acc[j]);
+        }
+    }
+    assert!(
+        worst_v <= 1.01,
+        "velocity reached {worst_v:.3} of its limit"
+    );
+    assert!(
+        worst_a <= 1.01,
+        "acceleration reached {worst_a:.3} of its limit"
+    );
+
+    for bad in [0.0, -1.0, f64::NAN] {
+        let jerk = vec![bad; nq];
+        assert!(
+            matches!(
+                Trajectory::parameterize_with(
+                    &line,
+                    nq,
+                    &vel,
+                    &acc,
+                    Some(&jerk),
+                    None,
+                    None,
+                    par6_kin::PathDegree::Linear,
+                    None
+                ),
+                Err(Error::Create(_))
+            ),
+            "jerk {bad} was accepted"
+        );
+    }
+    let free = plan(
+        &line,
+        Some(&[f64::INFINITY; 6]),
+        par6_kin::PathDegree::Linear,
+    );
+    assert_eq!(
+        free.duration(),
+        raw.duration(),
+        "unconstrained jerk smooths nothing"
     );
 }

@@ -1308,10 +1308,12 @@ fn each_profile_plans_its_own_minimum_time_shape() {
 }
 
 /// The startup profile is the jerk-limited RUCKIG, and a duration-based
-/// `move_j` under it is timed by TOPPRA: asked for less than the optimum
-/// it takes TOPPRA's acceleration-bound minimum (2·√(d/a)), not RUCKIG's
-/// jerk-bound one (∛(32·d/j)); asked for more, it takes what it was
-/// asked; with no duration it takes RUCKIG's.
+/// `move_j` under it is timed by TOPPRA with its path timing smoothed to
+/// the jerk limit: asked for less than the optimum it takes TOPPRA's
+/// acceleration-bound minimum (2·√(d/a)) plus the smoothing window
+/// (2·a/j, the bang-bang swing over the jerk limit), and its commanded
+/// jerk stays inside the limit; asked for more, it takes what it was
+/// asked; with no duration it takes RUCKIG's (∛(32·d/j)).
 #[test]
 fn a_timed_move_under_the_startup_profile_is_toppra_timed() {
     let mut preview =
@@ -1332,7 +1334,7 @@ fn a_timed_move_under_the_startup_profile_is_toppra_timed() {
     // Short enough that no profile reaches cruise and the jerk-limited
     // ones never reach the acceleration limit.
     let d = (1.6 * a * a * a / (j * j)).min(0.5);
-    let toppra = 2.0 * (d / a).sqrt();
+    let toppra = 2.0 * (d / a).sqrt() + 2.0 * a / j;
     let ruckig = (32.0 * d / j).cbrt();
     // The regime the formulas describe, and one that tells the two apart.
     assert!((a * d).sqrt() < v, "the move must not reach cruise");
@@ -1340,7 +1342,10 @@ fn a_timed_move_under_the_startup_profile_is_toppra_timed() {
         j * ruckig / 4.0 < a,
         "the jerk-limited move must not reach the acceleration limit"
     );
-    assert!(toppra * 1.03 + dt < ruckig, "{toppra} s vs {ruckig} s");
+    assert!(
+        (toppra - ruckig).abs() > 0.03 * toppra + 2.0 * dt,
+        "{toppra} s vs {ruckig} s"
+    );
     let mut away = start;
     away[0] += d.to_degrees();
     let submit = |preview: &mut Preview, key, angles, duration: Option<f64>| {
@@ -1354,23 +1359,42 @@ fn a_timed_move_under_the_startup_profile_is_toppra_timed() {
             rel: false,
         }));
         assert!(r.error.is_none(), "{:?}", r.error);
-        r.duration_s
+        r
     };
 
-    let took = submit(&mut preview, 6101, away, Some(0.1));
+    let timed = submit(&mut preview, 6101, away, Some(0.1));
     assert!(
-        (took - toppra).abs() <= 0.03 * toppra + dt,
-        "asked for 0.1 s, the move took {took:.4} s; TOPPRA's optimum is {toppra:.4} s"
+        (timed.duration_s - toppra).abs() <= 0.03 * toppra + dt,
+        "asked for 0.1 s, the move took {:.4} s; smoothed TOPPRA's optimum is {toppra:.4} s",
+        timed.duration_s
     );
-    let took = submit(&mut preview, 6102, start, Some(2.0));
+    let took = submit(&mut preview, 6102, start, Some(2.0)).duration_s;
     assert!(
         (took - 2.0).abs() <= dt + 1e-6,
         "asked for 2 s, the move took {took:.4} s"
     );
-    let took = submit(&mut preview, 6103, away, None);
+    let took = submit(&mut preview, 6103, away, None).duration_s;
     assert!(
         took >= ruckig - 1e-6 && took <= ruckig + dt + 1e-6,
         "with no duration the move took {took:.4} s; RUCKIG's shape takes {ruckig:.4} s"
+    );
+
+    // From rest to rest: the third difference of the commanded J1
+    // positions is their jerk averaged over three ticks.
+    let record = preview.plan_record(None);
+    let rows = span_joints(&record, timed.start_row, timed.rows);
+    let q: Vec<f64> = [start[0].to_radians(); 3]
+        .into_iter()
+        .chain(rows.iter().map(|r| r[0]))
+        .chain([away[0].to_radians(); 3])
+        .collect();
+    let jerk = q
+        .windows(4)
+        .map(|w| ((w[3] - 3.0 * w[2] + 3.0 * w[1] - w[0]) / dt.powi(3)).abs())
+        .fold(0.0, f64::max);
+    assert!(
+        jerk <= j * 1.05,
+        "the timed move commanded {jerk:.1} rad/s^3 against a {j} rad/s^3 limit"
     );
 }
 

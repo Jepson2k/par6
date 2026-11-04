@@ -64,6 +64,7 @@ impl Trajectory {
             nq,
             vel_limit,
             acc_limit,
+            None,
             n_gridpoints,
             None,
             PathDegree::Cubic,
@@ -85,8 +86,16 @@ impl Trajectory {
     /// `max_path_speed` caps `ds/dt`. Against arc-length knots that is a
     /// ceiling on the speed the tool crosses the path at, which is what
     /// holds a process move to one speed instead of letting it run away
-    #[allow(clippy::too_many_arguments)]
     /// wherever the joints happen to have room.
+    ///
+    /// `jerk_limit` (`nq` values, > 0, `INFINITY` unconstrained) smooths
+    /// TOPPRA's bang-bang acceleration: the path position is averaged over
+    /// the shortest window that ramps each joint's acceleration steps within
+    /// its limit, after further solves cap the path speed and lower the
+    /// acceleration limits where the average would pass them, so it stays
+    /// inside the limits through bends (a caller that must hold them exactly
+    /// stretches any remainder). The path is unchanged and
+    /// [`Trajectory::duration`] includes the window.
     // Arity is the C entry point's, not a choice: bundling these into a
     // params struct would put a shape between the caller and the ABI that
     // this crate exists to expose verbatim.
@@ -96,6 +105,7 @@ impl Trajectory {
         nq: usize,
         vel_limit: &[f64],
         acc_limit: &[f64],
+        jerk_limit: Option<&[f64]>,
         n_gridpoints: Option<u32>,
         knots: Option<&[f64]>,
         degree: PathDegree,
@@ -112,6 +122,14 @@ impl Trajectory {
                 expected: nq,
                 got: acc_limit.len(),
             });
+        }
+        if let Some(jerk) = jerk_limit {
+            if jerk.len() != nq {
+                return Err(Error::Dimension {
+                    expected: nq,
+                    got: jerk.len(),
+                });
+            }
         }
         // Semantic validation (waypoint count, limit signs, finiteness) is
         // the C side's contract; here only slice safety is enforced.
@@ -159,6 +177,7 @@ impl Trajectory {
                 c_nq,
                 vel_limit.as_ptr(),
                 acc_limit.as_ptr(),
+                jerk_limit.map_or(std::ptr::null(), <[f64]>::as_ptr),
                 c_grid,
                 knots.map_or(std::ptr::null(), <[f64]>::as_ptr),
                 degree as i32,

@@ -14,6 +14,7 @@
 #include <cmath>
 #include <cstddef>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -55,6 +56,11 @@ Eigen::Index segment_index(const double *grid, Eigen::Index n, double x) {
 /* Immutable after create; par6_traj_sample only reads. */
 struct par6_traj {
     int32_t nq = 0;
+    /* The TOPPRA profile's own length, and the smoothing window the path
+     * position is averaged over (0 = unsmoothed); the trajectory lasts
+     * their sum. */
+    double profile_end = 0.0;
+    double window = 0.0;
     double duration = 0.0;
 
     /* Constant-acceleration profile over the TOPPRA grid (the same
@@ -62,6 +68,9 @@ struct par6_traj {
      * the time is ts[k], path position ss[k], path velocity vs[k]; path
      * acceleration us[k] is constant over [ts[k], ts[k+1]). */
     Eigen::VectorXd ts, ss, vs, us;
+    /* Is[k] = integral of s over [0, ts[k]]: what a window average of the
+     * path position needs, exact for the piecewise-quadratic s(t). */
+    Eigen::VectorXd Is;
 
     /* Natural-cubic-spline geometric path: segment j covers path parameter
      * [breaks[j], breaks[j+1]] with q_i(s) evaluated by Horner on
@@ -70,11 +79,288 @@ struct par6_traj {
     std::vector<Eigen::MatrixXd> coeffs;
 };
 
+namespace {
+
+/* The TOPPRA profile at time t: path position, speed and acceleration. At
+ * rest before the start and after the end, which is what a window
+ * reaching past either end averages over. */
+struct Profile {
+    double s, v, u;
+};
+
+Profile profile_at(const par6_traj &h, double t) {
+    const Eigen::Index last = h.ts.size() - 1;
+    if (t <= 0.0) return {h.ss[0], 0.0, 0.0};
+    if (t >= h.profile_end) return {h.ss[last], 0.0, 0.0};
+    const Eigen::Index k = segment_index(h.ts.data(), h.ts.size(), t);
+    const double dt = t - h.ts[k];
+    const double u = h.us[k];
+    return {h.ss[k] + dt * h.vs[k] + 0.5 * dt * dt * u, h.vs[k] + dt * u, u};
+}
+
+/* Integral of the path position over [0, t], continued at rest outside
+ * the profile. */
+double integral_at(const par6_traj &h, double t) {
+    const Eigen::Index last = h.ts.size() - 1;
+    if (t <= 0.0) return h.ss[0] * t;
+    if (t >= h.profile_end)
+        return h.Is[last] + h.ss[last] * (t - h.profile_end);
+    const Eigen::Index k = segment_index(h.ts.data(), h.ts.size(), t);
+    const double d = t - h.ts[k];
+    return h.Is[k] + h.ss[k] * d + 0.5 * h.vs[k] * d * d +
+           h.us[k] * d * d * d / 6.0;
+}
+
+/* The path position, speed and acceleration the trajectory runs at time t:
+ * TOPPRA's profile, or with a window its path position averaged over the
+ * trailing window. The average's rate is the difference of the positions
+ * at the window's ends over its width, and its acceleration the same of the
+ * speeds, so each step TOPPRA takes in s'' becomes a ramp over the window.
+ * Averaging moves only the timing along the path, never the path itself. */
+Profile smoothed_at(const par6_traj &h, double t) {
+    Profile at = profile_at(h, t);
+    if (h.window > 0.0) {
+        const double w = h.window;
+        const Profile then = profile_at(h, t - w);
+        at = {(integral_at(h, t) - integral_at(h, t - w)) / w,
+              (at.s - then.s) / w, (at.v - then.v) / w};
+    }
+    /* Rounding can carry the position a hair past either end of the path. */
+    at.s = std::min(std::max(at.s, h.ss[0]), h.ss[h.ss.size() - 1]);
+    return at;
+}
+
+/* Joint acceleration limits scaled per gridpoint. */
+class ScaledJointAcceleration : public toppra::LinearConstraint {
+  public:
+    ScaledJointAcceleration(Eigen::VectorXd limit, Eigen::VectorXd scale)
+        : toppra::LinearConstraint(2 * limit.size(), limit.size(), false,
+                                   false, false),
+          m_limit(std::move(limit)), m_scale(std::move(scale)) {}
+
+  protected:
+    void computeParams_impl(const toppra::GeometricPath &path,
+                            const toppra::Vector &gridpoints,
+                            toppra::Vectors &a, toppra::Vectors &b,
+                            toppra::Vectors &c, toppra::Matrices &F,
+                            toppra::Vectors &g, toppra::Bounds &,
+                            toppra::Bounds &) override {
+        const Eigen::Index n = m_limit.size();
+        for (Eigen::Index i = 0; i < gridpoints.size(); ++i) {
+            const auto k = static_cast<size_t>(i);
+            a[k] = path.eval_single(gridpoints[i], 1);
+            b[k] = path.eval_single(gridpoints[i], 2);
+            c[k].setZero();
+            F[k].topRows(n).setIdentity();
+            F[k].bottomRows(n).setZero();
+            F[k].bottomRows(n).diagonal().setConstant(-1);
+            g[k].head(n) = m_limit * m_scale[i];
+            g[k].tail(n) = m_limit * m_scale[i];
+        }
+    }
+
+  private:
+    Eigen::VectorXd m_limit, m_scale;
+};
+
+/* A ceiling on the path speed at each gridpoint. */
+class PathSpeedCap : public toppra::LinearConstraint {
+  public:
+    explicit PathSpeedCap(Eigen::VectorXd caps)
+        : toppra::LinearConstraint(0, 0, true, false, true),
+          m_caps(std::move(caps)) {}
+
+  protected:
+    void computeParams_impl(const toppra::GeometricPath &,
+                            const toppra::Vector &gridpoints, toppra::Vectors &,
+                            toppra::Vectors &, toppra::Vectors &,
+                            toppra::Matrices &, toppra::Vectors &,
+                            toppra::Bounds &, toppra::Bounds &xbound) override {
+        for (Eigen::Index i = 0; i < gridpoints.size(); ++i) {
+            xbound[static_cast<size_t>(i)][0] = 0.0;
+            xbound[static_cast<size_t>(i)][1] = m_caps[i] * m_caps[i];
+        }
+    }
+
+  private:
+    Eigen::VectorXd m_caps;
+};
+
+/* The shortest window the path position can be averaged over with every
+ * joint's jerk inside its limit. Averaged over W, a joint's acceleration
+ * changes at (qdd(t) - qdd(t - W)) / W, so W must cover the largest change
+ * in qdd across any span of that width. TOPPRA's qdd steps from rest into
+ * acceleration and back, and a move that cruises between steps only needs
+ * one step's change, where a bang-bang one that reverses within the window
+ * needs both; the spans feasible are not one interval, so W is scanned from
+ * the shortest candidate up. `pass` is the profile, sampled on an even
+ * clock and at rest outside it. */
+double smoothing_window(const par6_traj &pass, const toppra::GeometricPath &path,
+                        const double *jerk_limit, Eigen::Index dof) {
+    constexpr Eigen::Index samples = 2000;
+    const double h = pass.profile_end / samples;
+    /* qdd(k·h), k = 0..samples, plus rest on either side. */
+    Eigen::MatrixXd qdd = Eigen::MatrixXd::Zero(samples + 1, dof);
+    for (Eigen::Index k = 0; k <= samples; ++k) {
+        const Profile at = profile_at(pass, k * h);
+        const double s =
+            std::min(std::max(at.s, pass.ss[0]), pass.ss[pass.ss.size() - 1]);
+        const toppra::Vector d1 = path.eval_single(s, 1);
+        const toppra::Vector d2 = path.eval_single(s, 2);
+        qdd.row(k) = (d2 * at.v * at.v + d1 * at.u).transpose();
+    }
+    auto value = [&](Eigen::Index k, Eigen::Index i) {
+        return (k < 0 || k > samples) ? 0.0 : qdd(k, i);
+    };
+    double longest = 0.0;
+    for (Eigen::Index i = 0; i < dof; ++i) {
+        if (!std::isfinite(jerk_limit[i])) continue;
+        const double swing = std::max(qdd.col(i).maxCoeff(), 0.0) -
+                             std::min(qdd.col(i).minCoeff(), 0.0);
+        longest = std::max(longest, swing / jerk_limit[i]);
+    }
+    if (longest <= 0.0) return 0.0;
+    const Eigen::Index last = static_cast<Eigen::Index>(std::ceil(longest / h));
+    for (Eigen::Index m = 1; m <= last; ++m) {
+        bool fits = true;
+        for (Eigen::Index i = 0; i < dof && fits; ++i) {
+            if (!std::isfinite(jerk_limit[i])) continue;
+            const double allowed = jerk_limit[i] * m * h;
+            for (Eigen::Index k = 0; k <= samples + m && fits; ++k) {
+                fits = std::abs(value(k, i) - value(k - m, i)) <= allowed;
+            }
+        }
+        if (fits) return m * h;
+    }
+    return longest;
+}
+
+/* The fastest path speed the joint limits allow at path position s, the
+ * maximum-velocity curve: every joint under its velocity limit, and some
+ * path acceleration u keeping every joint's q'·u + q''·sd² inside its
+ * acceleration limit. Each joint's acceleration limit confines u to an
+ * interval that shrinks as sd² grows; the intervals share a point while
+ * every pair of them overlaps, and a pair stops overlapping past
+ * (a_j·|q'_k| + a_k·|q'_j|) / |q''_j·q'_k − q''_k·q'_j|. A joint the path
+ * does not move (q' = 0) is bounded by its curvature alone. */
+double max_path_speed_at(const toppra::GeometricPath &path, double s,
+                         const double *vel, const double *acc,
+                         double max_path_speed, Eigen::Index dof) {
+    constexpr double tiny = 1e-12;
+    const toppra::Vector d1 = path.eval_single(s, 1);
+    const toppra::Vector d2 = path.eval_single(s, 2);
+    double sd = max_path_speed > 0.0 ? max_path_speed
+                                     : std::numeric_limits<double>::infinity();
+    double x = std::numeric_limits<double>::infinity();
+    for (Eigen::Index j = 0; j < dof; ++j) {
+        if (std::abs(d1[j]) > tiny) {
+            sd = std::min(sd, vel[j] / std::abs(d1[j]));
+        } else if (std::abs(d2[j]) > tiny) {
+            x = std::min(x, acc[j] / std::abs(d2[j]));
+        }
+        for (Eigen::Index k = j + 1; k < dof; ++k) {
+            const double den = std::abs(d2[j] * d1[k] - d2[k] * d1[j]);
+            if (den > tiny) {
+                x = std::min(x, (acc[j] * std::abs(d1[k]) +
+                                 acc[k] * std::abs(d1[j])) /
+                                    den);
+            }
+        }
+    }
+    return std::min(sd, std::sqrt(x));
+}
+
+/* The path-speed ceiling a window average stays under: at each gridpoint,
+ * the lowest speed limit within half the window of it either way along the
+ * first pass's timing. The average lands where the path stood half a window
+ * earlier and draws on the speeds half a window either side of that, so it
+ * stays under what the path allows there, and a narrow dip the first pass
+ * took (a bend it slowed for) is widened instead of averaged away.
+ * `limit` is the maximum-velocity curve, which leaves out the rest-to-rest
+ * ramps: those are slow for the boundary, not the path. */
+Eigen::VectorXd window_caps(const Eigen::VectorXd &ts,
+                            const Eigen::VectorXd &limit, double reach) {
+    const Eigen::Index n = ts.size();
+    Eigen::VectorXd caps(n);
+    Eigen::Index lo = 0, hi = 0;
+    for (Eigen::Index k = 0; k < n; ++k) {
+        while (ts[lo] < ts[k] - reach) ++lo;
+        while (hi + 1 < n && ts[hi + 1] <= ts[k] + reach) ++hi;
+        caps[k] = limit.segment(lo, hi - lo + 1).minCoeff();
+    }
+    return caps;
+}
+
+/* The constant-acceleration profile toppra's ConstAccel parametrizer
+ * builds from a solution, written into the handle. */
+void store_profile(par6_traj &h, const toppra::Vector &gridpoints,
+                   const toppra::Vector &xs, const Eigen::VectorXd &ts) {
+    h.ts = ts;
+    h.ss = gridpoints;
+    h.vs = xs.cwiseSqrt();
+    const Eigen::Index n_seg = h.ss.size() - 1;
+    h.us.resize(n_seg);
+    for (Eigen::Index k = 0; k < n_seg; ++k) {
+        h.us[k] = 0.5 * (xs[k + 1] - xs[k]) / (h.ss[k + 1] - h.ss[k]);
+    }
+    h.profile_end = h.ts[h.ts.size() - 1];
+    h.Is.resize(h.ts.size());
+    h.Is[0] = 0.0;
+    for (Eigen::Index k = 0; k < n_seg; ++k) {
+        const double d = h.ts[k + 1] - h.ts[k];
+        h.Is[k + 1] = h.Is[k] + h.ss[k] * d + 0.5 * h.vs[k] * d * d +
+                      h.us[k] * d * d * d / 6.0;
+    }
+}
+
+/* Where the smoothed trajectory asks a joint for more than its acceleration
+ * limit, lower the limits on the stretch of path the average drew from by
+ * that excess. Averaged over the window, the path acceleration TOPPRA held
+ * at each point is spent where the joints answer it differently, and along
+ * a path whose joint ratios change quickly (near a wrist singularity,
+ * through a blend) that can pass a limit TOPPRA held. Returns whether any
+ * sample was over. */
+bool lower_where_over(const par6_traj &h, const toppra::GeometricPath &path,
+                      const double *acc_limit, Eigen::Index dof,
+                      Eigen::VectorXd &scale) {
+    constexpr Eigen::Index samples = 2000;
+    const double step = (h.profile_end + h.window) / samples;
+    Eigen::VectorXd factor = Eigen::VectorXd::Ones(scale.size());
+    bool over = false;
+    for (Eigen::Index k = 0; k <= samples; ++k) {
+        const double t = k * step;
+        const Profile at = smoothed_at(h, t);
+        const toppra::Vector d1 = path.eval_single(at.s, 1);
+        const toppra::Vector d2 = path.eval_single(at.s, 2);
+        double r = 0.0;
+        for (Eigen::Index i = 0; i < dof; ++i) {
+            r = std::max(r, std::abs(d2[i] * at.v * at.v + d1[i] * at.u) /
+                                acc_limit[i]);
+        }
+        if (r <= 1.0 + 1e-6) continue;
+        over = true;
+        const double lo = profile_at(h, t - h.window).s;
+        const double hi = profile_at(h, t).s;
+        const double *first = std::lower_bound(h.ss.data(),
+                                               h.ss.data() + h.ss.size(), lo);
+        const double *last = std::upper_bound(first, h.ss.data() + h.ss.size(), hi);
+        for (const double *g = first; g != last; ++g) {
+            const Eigen::Index j = g - h.ss.data();
+            factor[j] = std::max(factor[j], r);
+        }
+    }
+    scale = scale.cwiseQuotient(factor);
+    return over;
+}
+
+} // namespace
+
 extern "C" {
 
 par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
                             int32_t nq, const double *vel_limit,
-                            const double *acc_limit, int32_t n_gridpoints,
+                            const double *acc_limit, const double *jerk_limit,
+                            int32_t n_gridpoints,
                             const double *knots, int32_t degree,
                             double max_path_speed,
                             char *err_buf, int32_t err_len) {
@@ -124,6 +410,12 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
             !std::isfinite(acc_limit[i]) || acc_limit[i] <= 0.0) {
             write_err(err_buf, err_len,
                       "vel/acc limits must be finite and > 0");
+            return nullptr;
+        }
+        if (jerk_limit != nullptr &&
+            (std::isnan(jerk_limit[i]) || jerk_limit[i] <= 0.0)) {
+            write_err(err_buf, err_len,
+                      "jerk limits must be > 0 (infinity = unconstrained)");
             return nullptr;
         }
     }
@@ -240,15 +532,57 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
 
         auto h = std::unique_ptr<par6_traj>(new par6_traj());
         h->nq = nq;
-        h->ts = ca.getTimes();
-        h->ss = data.gridpoints;
-        h->vs = xs.cwiseSqrt();
-        const Eigen::Index n_seg = h->ss.size() - 1;
-        h->us.resize(n_seg);
-        for (Eigen::Index k = 0; k < n_seg; ++k) {
-            h->us[k] = 0.5 * (xs[k + 1] - xs[k]) / (h->ss[k + 1] - h->ss[k]);
+        store_profile(*h, data.gridpoints, xs, ca.getTimes());
+        if (jerk_limit != nullptr) {
+            h->window = smoothing_window(*h, *path, jerk_limit, dof);
         }
-        h->duration = h->ts[h->ts.size() - 1];
+        if (h->window > 0.0) {
+            Eigen::VectorXd limit(h->ss.size());
+            for (Eigen::Index i = 0; i < h->ss.size(); ++i) {
+                limit[i] = max_path_speed_at(*path, h->ss[i], vel_limit,
+                                             acc_limit, max_path_speed, dof);
+            }
+            auto cap = std::make_shared<PathSpeedCap>(
+                window_caps(h->ts, limit, 0.5 * h->window));
+            const toppra::Vector grid = data.gridpoints;
+            Eigen::VectorXd scale = Eigen::VectorXd::Ones(grid.size());
+            for (int round = 0;; ++round) {
+                auto acc = std::make_shared<ScaledJointAcceleration>(alim, scale);
+                acc->discretizationType(toppra::DiscretizationType::Interpolation);
+                toppra::algorithm::TOPPRA capped({vc, acc, cap}, path);
+                capped.setGridpoints(grid);
+                const toppra::ReturnCode rc2 =
+                    capped.computePathParametrization(0.0, 0.0);
+                if (rc2 != toppra::ReturnCode::OK) {
+                    std::string msg =
+                        "TOPPRA failed under the smoothing caps (code " +
+                        std::to_string(static_cast<int>(rc2)) + "): " +
+                        capped.getErrorMessage();
+                    write_err(err_buf, err_len, msg.c_str());
+                    return nullptr;
+                }
+                const toppra::ParametrizationData &data2 =
+                    capped.getParameterizationData();
+                const toppra::Vector xs2 = data2.parametrization.cwiseMax(0.0);
+                const toppra::parametrizer::ConstAccel ca2(path, data2.gridpoints,
+                                                           xs2);
+                if (!ca2.validate()) {
+                    write_err(err_buf, err_len,
+                              "smoothed parameterization failed validation");
+                    return nullptr;
+                }
+                store_profile(*h, data2.gridpoints, xs2, ca2.getTimes());
+                h->window = smoothing_window(*h, *path, jerk_limit, dof);
+                /* Each round lowers the limits where the last one was over;
+                 * a few close the gap, and a caller that must hold the
+                 * limits exactly stretches whatever is left. */
+                if (round == 3 ||
+                    !lower_where_over(*h, *path, acc_limit, dof, scale)) {
+                    break;
+                }
+            }
+        }
+        h->duration = h->profile_end + h->window;
         if (!std::isfinite(h->duration) || h->duration <= 0.0) {
             write_err(err_buf, err_len,
                       "parameterization produced a non-positive or non-finite "
@@ -311,12 +645,8 @@ par6_status par6_traj_sample(const par6_traj *h, double t, double *out_q,
     }
     t = std::min(std::max(t, 0.0), h->duration);
 
-    const Eigen::Index k = segment_index(h->ts.data(), h->ts.size(), t);
-    const double dt = t - h->ts[k];
-    const double u = h->us[k];
-    const double v = h->vs[k] + dt * u;
-    double s = h->ss[k] + dt * h->vs[k] + 0.5 * dt * dt * u;
-    s = std::min(std::max(s, h->breaks[0]), h->breaks[h->breaks.size() - 1]);
+    const Profile at = smoothed_at(*h, t);
+    const double s = at.s, v = at.v, u = at.u;
 
     const Eigen::Index j = segment_index(h->breaks.data(), h->breaks.size(), s);
     const double ds = s - h->breaks[j];

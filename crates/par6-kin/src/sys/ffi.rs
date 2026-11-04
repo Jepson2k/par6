@@ -196,6 +196,7 @@ extern "C" {
         nq: i32,
         vel_limit: *const f64,
         acc_limit: *const f64,
+        jerk_limit: *const f64,
         n_gridpoints: i32,
         knots: *const f64,
         degree: i32,

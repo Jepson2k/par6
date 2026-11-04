@@ -1073,10 +1073,11 @@ impl Par6Planner {
         })
     }
 
-    /// TOPPRA-time a joint waypoint list and sample it at tick dt.
-    /// A requested `min_duration` is a minimum: TOPPRA's optimum bounds
-    /// how fast the path can be driven, a longer request time-scales the
-    /// whole trajectory (velocities scale with it, so limits still hold).
+    /// TOPPRA-time a joint waypoint list, smooth the timing to the jerk
+    /// limits, and sample it at tick dt. A requested `min_duration` is a
+    /// minimum: the smoothed optimum bounds how fast the path can be
+    /// driven, a longer request time-scales the whole trajectory
+    /// (velocities scale with it, so limits still hold).
     fn toppra_samples(
         &self,
         waypoints: &[f64],
@@ -1131,23 +1132,70 @@ impl Par6Planner {
             .iter()
             .map(|a| a * accel_frac)
             .collect();
-        let traj = par6_kin::Trajectory::parameterize_with(
-            waypoints,
-            MAX_JOINTS,
-            &vel,
-            &acc,
-            None,
-            knots,
-            degree,
-            max_path_speed,
-        )
-        .map_err(|e| {
-            make_error(
-                ErrorCode::TrajNoSteps,
-                UNATTRIBUTED,
-                &[("detail", &e.to_string())],
+        // Jerk rides the acceleration fraction, as it does for joint-space
+        // profiles. TOPPRA's acceleration is bang-bang, and the EXEC inertia
+        // feedforward turns every step in it into a torque step, which rang
+        // J1's drivetrain; the shim smooths the timing to these limits.
+        let jerk: Vec<f64> = self
+            .exec_limits
+            .jerk
+            .iter()
+            .map(|j| j * accel_frac)
+            .collect();
+        let solve = |acc: &[f64]| {
+            par6_kin::Trajectory::parameterize_with(
+                waypoints,
+                MAX_JOINTS,
+                &vel,
+                acc,
+                Some(&jerk),
+                None,
+                knots,
+                degree,
+                max_path_speed,
             )
-        })?;
+            .map_err(|e| {
+                make_error(
+                    ErrorCode::TrajNoSteps,
+                    UNATTRIBUTED,
+                    &[("detail", &e.to_string())],
+                )
+            })
+        };
+        let sampling_failed = |e: par6_kin::sys::Error| {
+            make_error(
+                ErrorCode::MotnSetupFailed,
+                UNATTRIBUTED,
+                &[("detail", &format!("trajectory sampling failed: {e}"))],
+            )
+        };
+        let sample = |traj: &par6_kin::Trajectory,
+                      t_eff: f64|
+         -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
+            let scale = traj.duration() / t_eff;
+            let n = ((t_eff / self.dt).ceil() as usize).max(1);
+            let mut samples = Vec::with_capacity(n);
+            let (mut q, mut qd, mut qdd) =
+                ([0.0; MAX_JOINTS], [0.0; MAX_JOINTS], [0.0; MAX_JOINTS]);
+            for k in 1..=n {
+                let t = ((k as f64) * self.dt).min(t_eff) * scale;
+                traj.sample_into(t, &mut q, &mut qd, &mut qdd)
+                    .map_err(sampling_failed)?;
+                let mut qqa = [0.0; 3 * MAX_JOINTS];
+                qqa[..MAX_JOINTS].copy_from_slice(&q);
+                for (out, v) in qqa[MAX_JOINTS..2 * MAX_JOINTS].iter_mut().zip(qd.iter()) {
+                    *out = v * scale;
+                }
+                // A min-duration stretch is a time reparameterization t → t/scale:
+                // velocities pick up one factor of `scale`, accelerations two.
+                for (out, a) in qqa[2 * MAX_JOINTS..].iter_mut().zip(qdd.iter()) {
+                    *out = a * scale * scale;
+                }
+                samples.push(qqa);
+            }
+            Ok(samples)
+        };
+        let traj = solve(&acc)?;
         let t_path = traj.duration();
         if !t_path.is_finite() || t_path <= 0.0 {
             return Err(make_error(
@@ -1156,32 +1204,14 @@ impl Par6Planner {
                 &[("detail", &format!("TOPPRA produced duration {t_path}"))],
             ));
         }
-        let t_eff = t_path.max(min_duration.unwrap_or(0.0));
-        let scale = t_path / t_eff;
-        let n = ((t_eff / self.dt).ceil() as usize).max(1);
-        let mut samples = Vec::with_capacity(n);
-        let (mut q, mut qd, mut qdd) = ([0.0; MAX_JOINTS], [0.0; MAX_JOINTS], [0.0; MAX_JOINTS]);
-        for k in 1..=n {
-            let t = ((k as f64) * self.dt).min(t_eff) * scale;
-            traj.sample_into(t, &mut q, &mut qd, &mut qdd)
-                .map_err(|e| {
-                    make_error(
-                        ErrorCode::MotnSetupFailed,
-                        UNATTRIBUTED,
-                        &[("detail", &format!("trajectory sampling failed: {e}"))],
-                    )
-                })?;
-            let mut qqa = [0.0; 3 * MAX_JOINTS];
-            qqa[..MAX_JOINTS].copy_from_slice(&q);
-            for (out, v) in qqa[MAX_JOINTS..2 * MAX_JOINTS].iter_mut().zip(qd.iter()) {
-                *out = v * scale;
-            }
-            // A min-duration stretch is a time reparameterization t → t/scale:
-            // velocities pick up one factor of `scale`, accelerations two.
-            for (out, a) in qqa[2 * MAX_JOINTS..].iter_mut().zip(qdd.iter()) {
-                *out = a * scale * scale;
-            }
-            samples.push(qqa);
+        let samples = sample(&traj, t_path.max(min_duration.unwrap_or(0.0)))?;
+        // The smoothing holds the limits only as closely as its rounds
+        // converge; whatever it leaves, stretching time by k divides every
+        // velocity by k and every acceleration by k².
+        let excess = limit_excess(&samples, &vel, &acc);
+        if excess > 1.0 + 1e-9 {
+            let t_eff = (samples.len() as f64 * self.dt) * excess;
+            return sample(&traj, t_eff);
         }
         Ok(samples)
     }
@@ -3007,6 +3037,22 @@ fn rt_error(snap: &StateSnapshot) -> WireError {
             &[("detail", "the RT core latched a hard error")],
         )
     })
+}
+
+/// How far a sample stream runs past its limits: the time stretch that
+/// brings its worst joint velocity and acceleration back inside them, 1.0
+/// or less when it is already inside.
+fn limit_excess(samples: &[[f64; 3 * MAX_JOINTS]], vel: &[f64], acc: &[f64]) -> f64 {
+    samples
+        .iter()
+        .flat_map(|qqa| {
+            (0..MAX_JOINTS).map(move |j| {
+                let v = qqa[MAX_JOINTS + j].abs() / vel[j];
+                let a = (qqa[2 * MAX_JOINTS + j].abs() / acc[j]).sqrt();
+                v.max(a)
+            })
+        })
+        .fold(0.0, f64::max)
 }
 
 #[cfg(test)]

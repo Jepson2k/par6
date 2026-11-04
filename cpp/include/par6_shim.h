@@ -183,6 +183,17 @@ typedef struct par6_traj par6_traj;
  *   nq            joints per waypoint, >= 1.
  *   vel_limit     nq doubles, finite and > 0 [rad/s].
  *   acc_limit     nq doubles, finite and > 0 [rad/s^2].
+ *   jerk_limit    optional (may be NULL): nq doubles, > 0, infinity for an
+ *                 unconstrained joint [rad/s^3]. TOPPRA's acceleration is
+ *                 bang-bang; with jerk limits the path position is averaged
+ *                 over the shortest window that ramps each joint's steps in
+ *                 acceleration within its limit. A second solve caps the
+ *                 path speed at the lowest limit within half a window of
+ *                 each point, and up to three more lower the acceleration
+ *                 limits where the average still passes them, so it stays
+ *                 inside the limits through bends (a caller that must hold
+ *                 them exactly stretches any remainder). The path is
+ *                 unchanged; the trajectory lasts longer by the window.
  *   n_gridpoints  path-parameter discretization: <= 0 selects an automatic
  *                 grid (recommended); otherwise >= 2 gridpoints.
  *   err_buf       optional (may be NULL): receives a NUL-terminated error
@@ -195,6 +206,7 @@ typedef struct par6_traj par6_traj;
 par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
                             int32_t nq,
                             const double *vel_limit, const double *acc_limit,
+                            const double *jerk_limit,
                             int32_t n_gridpoints,
                             const double *knots, int32_t degree,
                             double max_path_speed,
@@ -454,9 +466,12 @@ par6_status par6_kin_set_tool(par6_kin *h, double mass, const double *com3,
  *     end-effector frame). Purely additive; a stale v9 library fails to
  *     link it.
  * v13: par6_kin_momentum added (M(q) v and C(q, v)^T v for the collision
- *     observer). Purely additive; a stale v12 library fails to link it. */
+ *     observer). Purely additive; a stale v12 library fails to link it.
+ * v14: par6_traj_create takes jerk_limit after acc_limit, and with it
+ *     smooths the trajectory to the jerk limits. A stale v13 library would
+ *     read the jerk pointer as n_gridpoints. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 13
+#define PAR6_SHIM_ABI_VERSION 14
 
 /* The byte layout of the value structs that cross this boundary, so the
  * Rust mirrors can check they read the same bytes: each struct's size,

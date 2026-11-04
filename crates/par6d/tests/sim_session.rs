@@ -1339,6 +1339,19 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         "QUINTIC" => 1.875 * d / (5.7735 * d / a).sqrt(),
         "SEPTIC" => 2.1875 * d / (52.5 * d / j).cbrt(),
         "RUCKIG" => j * t_ruckig * t_ruckig / 16.0,
+        // TOPPRA's bang-bang triangle, its timing averaged over the
+        // shortest window whose change in acceleration fits the jerk limit:
+        // the full swing (2a), unless the window can span the whole move,
+        // whose ends change it by a alone.
+        "TOPPRA" => {
+            let t = 2.0 * (d / a).sqrt();
+            let w = (2.0 * a / j).min(t.max(a / j));
+            if w >= t {
+                d / w
+            } else {
+                (a * d).sqrt() * (1.0 - w / (2.0 * t))
+            }
+        }
         other => panic!("no prediction for {other}"),
     };
     let outruns = |fast: (&str, f64), slow: (&str, f64)| {
@@ -1368,12 +1381,11 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     // probe it is held under the quintic just as ruckig is.
     let septic = peak_speed_under(&rig, &mut c, "SEPTIC", 5104);
     outruns(("QUINTIC", quintic), ("SEPTIC", septic));
+    // TOPPRA's timing is smoothed to the jerk limit by an average that
+    // costs the probe more than RUCKIG's ramp does, so it is held under
+    // RUCKIG.
     let toppra = peak_speed_under(&rig, &mut c, "TOPPRA", 5102);
-    assert!(
-        toppra > ruckig,
-        "TOPPRA (time-optimal, no jerk limit) must not be held under \
-         jerk-limited RUCKIG: peak speed {toppra:.3} vs {ruckig:.3} rad/s"
-    );
+    outruns(("RUCKIG", ruckig), ("TOPPRA", toppra));
 
     // ---- tools. The tool the runtime boots wearing reports from boot; a
     // client does not have to ask for what the arm is physically wearing.
