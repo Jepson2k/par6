@@ -379,6 +379,11 @@ const VIBRATION_ZETA_MAX: f64 = std::f64::consts::FRAC_1_SQRT_2;
 /// The joints whose current is fitted: the base, shoulder and elbow carry
 /// the arm's mass, the wrist's drives barely feel it.
 const VIBRATION_JOINTS: usize = 3;
+/// The joints whose load changes with the pose: the base and shoulder
+/// carry the arm's reach. The elbow carries the forearm and wrist the same
+/// way in every pose, since the wrist cannot change its leverage, and the
+/// wrist joints carry only the tool, so their ready pose is their heaviest.
+const REACH_JOINTS: usize = 2;
 /// The fit's grid: damped frequency \[Hz\] and decay rate \[1/s\] steps,
 /// coarse and then about the coarse best. The decay reaches critical
 /// damping at the band's top, so a settle fits as one instead of being
@@ -6280,9 +6285,10 @@ struct HeavyPose {
     span: (f64, f64),
 }
 
-/// Per joint, the identification pose where it carries the most inertia,
-/// when that is more than at ready and the straight line from ready to it
-/// is clear. Planned before anything moves, as the spans are.
+/// Per joint of the first `REACH_JOINTS`, the identification pose where it
+/// carries the most inertia, when that is more than at ready and the
+/// straight line from ready to it is clear. Planned before anything moves,
+/// as the spans are.
 fn heaviest_poses(
     bundle: &ConfigBundle,
     assets: &Path,
@@ -6297,7 +6303,7 @@ fn heaviest_poses(
         .map(|q| joint_inertia(&mut kin, bundle, *q))
         .collect::<Result<_>>()?;
     let mut out = [None; N];
-    for (j, slot) in out.iter_mut().enumerate() {
+    for (j, slot) in out.iter_mut().enumerate().take(REACH_JOINTS) {
         let Some(i) =
             (0..identification.len()).max_by(|a, b| inertias[*a][j].total_cmp(&inertias[*b][j]))
         else {
