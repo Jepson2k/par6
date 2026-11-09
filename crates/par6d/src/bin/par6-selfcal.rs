@@ -568,6 +568,15 @@ struct Searched {
     failed: Option<f64>,
 }
 
+/// Why a limits probe failed. A runaway is the joint's velocity loop
+/// breaking at speed, at the commanded speed it broke at \[rad/s\];
+/// anything else is the move asking more than the joint gives.
+#[derive(Clone, Copy, Debug)]
+enum Failed {
+    Runaway(f64),
+    Other,
+}
+
 /// What a joint carries at one pose across a span: inertia \[kg·m²\], the
 /// most gravity torque on the span and Coulomb friction \[Nm\], viscous
 /// friction \[Nm·s/rad\], its current per Nm and its current limit \[mA\].
@@ -5552,8 +5561,37 @@ impl Arm {
         let start = load
             .share(exec.acceleration, length, exec.velocity)
             .min(1.0);
-        let Some(share) = self.search_up(at, start, 1.0, LIMITS_STEP, true, true, None, &|s| {
-            caps(s, exec.velocity)
+        // First the speed the joint's gains hold: a runaway is its velocity
+        // loop breaking at speed, whatever current a move may spend. J4's
+        // rang above about 4 rad/s at every acceleration (2026-11-09), and a
+        // share search at EXEC's 7.7 rad/s walked its acceleration down to
+        // 9.6 rad/s2, until its probes no longer got that fast. Each runaway
+        // moves the speed below where that probe broke.
+        let mut held = exec.velocity;
+        let mut seed = None;
+        while let Some(c) = caps(start, held) {
+            match self.limits_step(at, c)? {
+                Ok((ripple, peak_ma)) => {
+                    seed = Some(Searched {
+                        value: start,
+                        caps: c,
+                        ripple,
+                        peak_ma,
+                        bounded: false,
+                        failed: None,
+                    });
+                    break;
+                }
+                Err(Failed::Runaway(broke))
+                    if broke / LIMITS_STEP >= LIMITS_MIN_FACTOR * exec.velocity =>
+                {
+                    held = held.min(broke / LIMITS_STEP);
+                }
+                Err(_) => break,
+            }
+        }
+        let Some(share) = self.search_up(at, start, 1.0, LIMITS_STEP, true, true, seed, &|s| {
+            caps(s, held)
         })?
         else {
             return Ok(None);
@@ -5563,7 +5601,7 @@ impl Arm {
         let speed = |v: f64| caps(share.value, v);
         let Some(mut velocity) = self.search_up(
             at,
-            exec.velocity,
+            held,
             fastest,
             LIMITS_STEP,
             false,
@@ -5731,7 +5769,7 @@ impl Arm {
         }
         for g in candidates {
             self.gain_configure(at.j, g)?;
-            let passed = self.limits_step(at, caps)?.is_some();
+            let passed = self.limits_step(at, caps)?.is_ok();
             self.emit(Event::LimitsGains(
                 self.tick,
                 at.j,
@@ -5842,8 +5880,13 @@ impl Arm {
     }
 
     /// One probe at `caps`, run once more when it fails: a failure counts
-    /// only when it repeats. Its ripple and peak current when it passes.
-    fn limits_step(&mut self, at: ProbeAt, caps: Caps) -> Result<Option<(f64, f64)>> {
+    /// only when it repeats. Its ripple and peak current when it passes,
+    /// the second failure when it does not.
+    fn limits_step(
+        &mut self,
+        at: ProbeAt,
+        caps: Caps,
+    ) -> Result<std::result::Result<(f64, f64), Failed>> {
         self.cool(at.j)?;
         let needed = LIMITS_RESOLUTION * caps.velocity / self.per_tick(at.j).abs();
         if needed > self.drive_velocity[at.j] {
@@ -5851,8 +5894,8 @@ impl Arm {
             self.retune(at.j, self.bundle.robot.joints[at.j].ilim_ma)?;
         }
         match self.probe(at, caps)? {
-            Some(passed) => Ok(Some(passed)),
-            None => self.probe(at, caps),
+            Ok(passed) => Ok(Ok(passed)),
+            Err(_) => self.probe(at, caps),
         }
     }
 
@@ -5909,6 +5952,7 @@ impl Arm {
             };
             Ok(arm
                 .limits_step(at, caps)?
+                .ok()
                 .map(|(ripple, peak_ma)| Searched {
                     value,
                     caps,
@@ -6019,15 +6063,20 @@ impl Arm {
     /// One step: a short move out and back, where acceleration and jerk set
     /// the duration, then the full span both ways, where speed does when
     /// the span is long enough. The worst speed ripple of the moves, as a
-    /// fraction of each one's peak commanded speed, when every move passed;
-    /// the joint is back at `home` either way.
+    /// fraction of each one's peak commanded speed, and the peak current,
+    /// when every move passed; why the step failed when one did not. The
+    /// joint is back at `home` either way.
     ///
     /// Each probe is a trial on the joint's own gains: the search
     /// walks up to where the loop breaks (J1 rang at about 83 Hz and reached
     /// 121 deg/s at 15x its acceleration, 2026-11-07), so a runaway there
     /// stops the move, calms the joint and fails the step, as a gain trial's
     /// does, instead of ending the run.
-    fn probe(&mut self, at: ProbeAt, caps: Caps) -> Result<Option<(f64, f64)>> {
+    fn probe(
+        &mut self,
+        at: ProbeAt,
+        caps: Caps,
+    ) -> Result<std::result::Result<(f64, f64), Failed>> {
         let ProbeAt {
             j,
             home,
@@ -6047,7 +6096,7 @@ impl Arm {
         self.sane_gains[j] = Some(sane);
         self.gain_joint = Some(j);
         let mut loud = false;
-        let result = (|| -> Result<Option<(f64, f64)>> {
+        let result = (|| -> Result<std::result::Result<(f64, f64), Failed>> {
             let mut ripple = 0.0_f64;
             let mut peak_ma = 0.0_f64;
             for (target, scored) in moves {
@@ -6066,7 +6115,7 @@ impl Arm {
                             Some("positioning"),
                             self.state.nodes[self.node(j)].temperature_c,
                         ));
-                        return Ok(None);
+                        return Ok(Err(Failed::Other));
                     }
                     continue;
                 }
@@ -6100,7 +6149,11 @@ impl Arm {
                         Some(why),
                         self.state.nodes[self.node(j)].temperature_c,
                     ));
-                    return Ok(None);
+                    return Ok(Err(if m.outcome == Outcome::Unstable {
+                        Failed::Runaway(m.peak_command_rad_s)
+                    } else {
+                        Failed::Other
+                    }));
                 }
             }
             self.emit(Event::LimitsStep(
@@ -6111,7 +6164,7 @@ impl Arm {
                 None,
                 self.state.nodes[self.node(j)].temperature_c,
             ));
-            Ok(Some((ripple, peak_ma)))
+            Ok(Ok((ripple, peak_ma)))
         })();
         self.sane_gains[j] = None;
         self.gain_joint = None;
