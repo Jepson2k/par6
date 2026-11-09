@@ -5600,7 +5600,12 @@ impl Arm {
         }
         let v = velocity.caps;
         let mut found = self.found(j, span, v, share.ripple.max(velocity.ripple))?;
-        found.share = Some(share.value);
+        // A share no failing step bounded is the drive's whole limit: its
+        // probes stopped drawing more current, or drew all of it, and passed.
+        // J3's drew 0.73 to 0.86 A from 25 to 313 rad/s2 at 1.36 rad/s
+        // (2026-11-08); the last share probed would have read as a bound
+        // that gravity alone passes at other poses.
+        found.share = Some(if share.bounded { share.value } else { 1.0 });
         found.share_bounded = share.bounded;
         found.gains = tuned;
         self.emit(Event::Phase("limits: jerk under Ruckig at ready", j));
@@ -5670,6 +5675,7 @@ impl Arm {
             return Ok(None);
         };
         let mut share = found.value;
+        let mut bounded = found.bounded;
         loop {
             if let Some(base) = caps(share) {
                 if let Some(jerk) = self.search_up(
@@ -5686,6 +5692,9 @@ impl Arm {
                         jerk: jerk.value,
                         ..base
                     };
+                    // As at ready: unbounded, the share is as high as the
+                    // search could go.
+                    let share = if bounded { share } else { upper };
                     return Ok(Some((caps, share, found.ripple.max(jerk.ripple))));
                 }
             }
@@ -5693,6 +5702,7 @@ impl Arm {
             // joint holds with this load: J1 sat at its current limit from
             // the first ticks of 32 rad/s2 with the arm out (2026-11-07).
             share /= LIMITS_STEP;
+            bounded = true;
             if share < LIMITS_MIN_FACTOR * found.value {
                 return Ok(None);
             }
