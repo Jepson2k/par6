@@ -47,8 +47,8 @@ pub use robot::{
     BusConfig, CollisionConfig, CollisionMode, ControlMode, DriverType, Gains, JogDefaults,
     JogProfile, JointConfig, JointLimits, KtFetchConfig, KtSource, LimitMode, ModeLimits,
     MotionConfig, ProtocolConfig, ResolvedLimits, RippleHarmonic, RobotConfig, RobotSection,
-    ScanConfig, SelfcalConfig, SimConfig, StreamDefaults, TimingConfig, WatchdogAction,
-    MAX_OPEN_RETRY_S, MAX_RIPPLE_HARMONICS, WATCHDOG_TIMEOUT_MS,
+    ScanConfig, SelfcalConfig, SimConfig, StreamDefaults, ThermalConfig, TimingConfig,
+    VibrationConfig, WatchdogAction, MAX_OPEN_RETRY_S, MAX_RIPPLE_HARMONICS, WATCHDOG_TIMEOUT_MS,
 };
 
 use std::path::Path;
@@ -493,12 +493,14 @@ mod tests {
             acceleration_rad_s2: 2.0,
             jerk_rad_s3: None,
             torque_rate_nm_s: None,
+            current_fraction: None,
         });
         limits.jog = Some(ModeLimits {
             velocity_rad_s: 1.0,
             acceleration_rad_s2: 2.0,
             jerk_rad_s3: Some(5.0),
             torque_rate_nm_s: Some(50.0),
+            current_fraction: None,
         });
         limits.stream = None;
         let exec = limits.for_mode(LimitMode::Exec);
@@ -988,6 +990,26 @@ mod tests {
         let err = cfg.validate().unwrap_err().to_string();
         assert!(
             err.contains("joints[0].limits.exec.velocity_rad_s"),
+            "{err}"
+        );
+
+        // a current budget is a share of the drive's limit, for EXEC only
+        for bad in [0.0, -0.5, 1.5, f64::NAN] {
+            let mut cfg = good.clone();
+            cfg.joints[0].limits.exec.as_mut().unwrap().current_fraction = Some(bad);
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("joints[0].limits.exec.current_fraction"),
+                "{bad}: {err}"
+            );
+        }
+        let mut cfg = good.clone();
+        let mut stream = cfg.joints[0].limits.exec.unwrap();
+        stream.current_fraction = Some(0.7);
+        cfg.joints[0].limits.stream = Some(stream);
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("joints[0].limits.stream.current_fraction"),
             "{err}"
         );
 

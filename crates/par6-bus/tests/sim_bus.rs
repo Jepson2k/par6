@@ -19,8 +19,8 @@ use par6_bus::spectral::codec::{
 };
 use par6_bus::spectral::convert::{ticks_per_radian, JointConversion};
 use par6_bus::{
-    BusState, DriverBus, FirmwareGripperCommand, Freshness, GripperCommand, JointCommand,
-    ObjectDetection, PollAction, PollKind,
+    BusState, DriveRange, DriverBus, FirmwareGripperCommand, Freshness, GripperCommand,
+    JointCommand, ObjectDetection, PollAction, PollKind,
 };
 use par6_config::{HomingStrategy, RobotConfig, ToolConfig};
 use par6_proto::{Layer, Physical, Shape};
@@ -1211,6 +1211,84 @@ fn velocity_integral_restarts_after_another_mode_and_carries_across_the_cascade(
             );
         }
     }
+}
+
+#[test]
+fn a_drive_trips_and_brakes_a_joint_leaving_its_armed_range_and_lets_it_back_in() {
+    let robot = par6();
+    let mut rig = Rig::boot(&robot, None, Some(&calibration_pose(&robot)));
+    let node = robot.joints[0].node_id;
+    let n = usize::from(node);
+    let mut cmds = rig.idle_cmds();
+    for _ in 0..3 {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+    let read = |rig: &mut Rig, kind: PollKind| {
+        rig.bus
+            .queue_poll_override(PollAction::Poll { node, kind }, 1);
+        rig.step(&rig.idle_cmds(), &GripperCommand::NoGripper);
+        rig.step(&rig.idle_cmds(), &GripperCommand::NoGripper);
+    };
+    read(&mut rig, PollKind::Range);
+    assert_eq!(rig.state.nodes[n].range, Some(DriveRange::Disarmed));
+
+    let here = rig.state.nodes[n].position_ticks.unwrap();
+    let (min_ticks, max_ticks) = (here - 2000, here + 2000);
+    rig.bus
+        .set_range(node, Some((min_ticks, max_ticks)))
+        .unwrap();
+    read(&mut rig, PollKind::Range);
+    assert_eq!(
+        rig.state.nodes[n].range,
+        Some(DriveRange::Armed {
+            min_ticks,
+            max_ticks
+        })
+    );
+
+    let drive = |rig: &mut Rig, cmds: &mut [JointCommand], speed: i32, seconds: f64| {
+        cmds[0] = JointCommand::velocity(speed, 0);
+        for _ in 0..robot.ticks(seconds) {
+            rig.step(cmds, &GripperCommand::NoGripper);
+        }
+    };
+    // Out past the top: the drive trips the moment it crosses, and lets go.
+    drive(&mut rig, &mut cmds, 8000, 0.6);
+    assert!(rig.state.nodes[n].live_error_bit, "no trip past the range");
+    read(&mut rig, PollKind::Errors);
+    let flags = rig.state.nodes[n].error_flags.unwrap();
+    assert!(flags.range && flags.error, "{flags:?}");
+    assert_eq!(rig.state.nodes[n].current_ma, Some(0));
+    let tripped_at = rig.state.nodes[n].position_ticks.unwrap();
+    assert!(
+        (max_ticks..max_ticks + 400).contains(&tripped_at),
+        "it ran on to {tripped_at} past {max_ticks}"
+    );
+
+    // Cleared once it has stopped, still outside: back in is allowed, and
+    // stays clear. Cleared while still running out, it trips again.
+    for _ in 0..robot.ticks(0.5) {
+        rig.step(&rig.idle_cmds(), &GripperCommand::NoGripper);
+    }
+    rig.bus.send_clear_error(node, 3).unwrap();
+    drive(&mut rig, &mut cmds, -8000, 0.3);
+    assert!(
+        !rig.state.nodes[n].live_error_bit,
+        "driving back in tripped"
+    );
+    let back = rig.state.nodes[n].position_ticks.unwrap();
+    assert!((min_ticks..max_ticks).contains(&back), "{back}");
+    // And out again trips again.
+    drive(&mut rig, &mut cmds, 8000, 0.6);
+    assert!(rig.state.nodes[n].live_error_bit);
+
+    // Disarmed, nothing stops it.
+    rig.bus.send_clear_error(node, 3).unwrap();
+    rig.bus.set_range(node, None).unwrap();
+    drive(&mut rig, &mut cmds, 8000, 0.3);
+    assert!(!rig.state.nodes[n].live_error_bit);
+    read(&mut rig, PollKind::Range);
+    assert_eq!(rig.state.nodes[n].range, Some(DriveRange::Disarmed));
 }
 
 /// Encoder differences are averaged over 3.2 ms by the drive; slowing

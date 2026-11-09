@@ -10,8 +10,8 @@
 //! |---|---|---|---|
 //! | BOOTING | — | 0 | 0 |
 //! | IDLE (homed ∧ enabled ∧ grav-on) | — | — | G(q) |
-//! | IDLE otherwise | — | 0 | 0 |
-//! | ACTIVE_ERROR | — | 0 | 0 | (active zero-velocity hold)
+//! | IDLE otherwise | — | 0 | G(q) if homed ∧ grav-on |
+//! | ACTIVE_ERROR | — | 0 | G(q) if homed ∧ grav-on | (active zero-velocity hold)
 //! | SAFETY_STOP | — | — | 0 Nm | (fully limp)
 //! | JOG | integrated | ramped | G(q) if grav-on |
 //! | EXEC | sample | sample | plan FF + G(q) |
@@ -72,22 +72,43 @@ pub fn law_booting(out: &mut [JointSetpoint; MAX_JOINTS]) {
     out.fill(JointSetpoint::zero_velocity());
 }
 
-/// IDLE: torque-only gravity hold when `homed ∧ enabled ∧ grav-on` — NO
-/// position hold — otherwise active zero-velocity.
-pub fn law_idle(gravity_hold: bool, g: &[f64; MAX_JOINTS], out: &mut [JointSetpoint; MAX_JOINTS]) {
-    if gravity_hold {
+/// IDLE: torque-only gravity hold when enabled with `gravity` — NO
+/// position hold — otherwise the zero-velocity hold.
+pub fn law_idle(
+    enabled: bool,
+    gravity: bool,
+    g: &[f64; MAX_JOINTS],
+    out: &mut [JointSetpoint; MAX_JOINTS],
+) {
+    if enabled && gravity {
         for i in 0..MAX_JOINTS {
             out[i] = JointSetpoint::torque_only(g[i]);
         }
     } else {
-        out.fill(JointSetpoint::zero_velocity());
+        law_hold(gravity, g, out);
     }
 }
 
-/// ACTIVE_ERROR: active zero-velocity hold (e-stop lands here — motors
-/// stay energized).
-pub fn law_active_error(out: &mut [JointSetpoint; MAX_JOINTS]) {
-    out.fill(JointSetpoint::zero_velocity());
+/// ACTIVE_ERROR: the zero-velocity hold (e-stop lands here — motors stay
+/// energized).
+pub fn law_active_error(
+    gravity: bool,
+    g: &[f64; MAX_JOINTS],
+    out: &mut [JointSetpoint; MAX_JOINTS],
+) {
+    law_hold(gravity, g, out);
+}
+
+/// Active zero velocity, carrying G(q) whenever it is known: an arm that
+/// stood on its gravity support and lost it would drop until each loop
+/// wound up what the support carried.
+fn law_hold(gravity: bool, g: &[f64; MAX_JOINTS], out: &mut [JointSetpoint; MAX_JOINTS]) {
+    for i in 0..MAX_JOINTS {
+        out[i] = JointSetpoint {
+            torque_nm: Some(if gravity { g[i] } else { 0.0 }),
+            ..JointSetpoint::zero_velocity()
+        };
+    }
 }
 
 /// SAFETY_STOP: fully limp — torque-only 0 Nm.

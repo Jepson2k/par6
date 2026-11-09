@@ -9,7 +9,7 @@ use crate::spectral::codec::{
     unpack_f32, unpack_i16, unpack_i24, unpack_u32, CommandId, CAPTURE_LEN, CAPTURE_STATUS_CHANNEL,
     CAPTURE_VEL_SCALE, RIPPLE_SLOTS,
 };
-use crate::types::{DeviceInfo, ErrorFlags, NodeId};
+use crate::types::{DeviceInfo, DriveRange, ErrorFlags, NodeId};
 
 /// Firmware cascade frequency [Hz], from STEPFOC constants.h at 32fb5b5.
 /// The physics integrates between loop evaluations; scaling the integral
@@ -28,6 +28,9 @@ pub(crate) const FW_LOOP_DT: f64 = 1.0 / FW_LOOP_HZ;
 const VELOCITY_WINDOW: usize = 20;
 /// The longest speed filter the firmware takes (cmd 41).
 const VELOCITY_WINDOW_MAX: usize = 64;
+/// The firmware's outward speed past an armed range that trips it
+/// \[ticks/s\].
+const RANGE_OUTWARD_TICKS_S: f64 = 1000.0;
 
 /// Bridge MOSFET on-resistance \[ohm\] (STEPFOC `Rdson`). Two of them
 /// sit in the winding's current path.
@@ -196,6 +199,8 @@ pub(crate) struct VirtualDriver {
     capture_phase: Vec<i16>,
     /// Ripple feedforward slots (cmd 40): (harmonic, cosine mA, sine mA).
     ripple: [(u8, i16, i16); RIPPLE_SLOTS as usize],
+    /// The joint range it enforces (cmd 44).
+    range: DriveRange,
     /// The rotor's electrical phase this loop, 0..16383 per cycle, as the
     /// firmware derives it from the raw count.
     phase: u32,
@@ -267,6 +272,7 @@ impl VirtualDriver {
             capture_iq: vec![0; usize::from(CAPTURE_LEN)],
             capture_phase: vec![0; usize::from(CAPTURE_LEN)],
             ripple: [(0, 0, 0); RIPPLE_SLOTS as usize],
+            range: DriveRange::Disarmed,
             phase: 0,
             written: [None; 7],
             flags: ErrorFlags {
@@ -378,6 +384,21 @@ impl VirtualDriver {
                     self.velocity_window = window;
                     self.velocity_samples = 0;
                 }
+                ReplyKind::None
+            }
+            (Range, 8) => {
+                let min_ticks = i32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+                let max_ticks = i32::from_be_bytes([d[4], d[5], d[6], d[7]]);
+                if min_ticks < max_ticks {
+                    self.range = DriveRange::Armed {
+                        min_ticks,
+                        max_ticks,
+                    };
+                }
+                ReplyKind::None
+            }
+            (Range, 0) => {
+                self.range = DriveRange::Disarmed;
                 ReplyKind::None
             }
             (Ripple, 6) if d[0] < RIPPLE_SLOTS => {
@@ -593,6 +614,18 @@ impl VirtualDriver {
             / self.velocity_samples as f64)
             .trunc();
         self.measured_velocity = vel_ticks_s;
+        if let DriveRange::Armed {
+            min_ticks,
+            max_ticks,
+        } = self.range
+        {
+            if (pos_ticks > f64::from(max_ticks) && vel_ticks_s > RANGE_OUTWARD_TICKS_S)
+                || (pos_ticks < f64::from(min_ticks) && vel_ticks_s < -RANGE_OUTWARD_TICKS_S)
+            {
+                self.flags.range = true;
+                self.flags.error = true;
+            }
+        }
         let driven = self.cur_out_ma;
         let out = self.control_law(pos_ticks, vel_ticks_s, shaft_ticks_s);
         self.record_capture(vel_ticks_s, driven);
@@ -864,6 +897,17 @@ impl VirtualDriver {
             || f.current
             || f.estop
             || f.watchdog
+            || f.range
+    }
+
+    /// The joint range it enforces (cmd 44).
+    pub fn range(&self) -> DriveRange {
+        self.range
+    }
+
+    /// Drop the range, as a restart does.
+    pub fn disarm_range(&mut self) {
+        self.range = DriveRange::Disarmed;
     }
 
     /// Current cmd-26 flag state.

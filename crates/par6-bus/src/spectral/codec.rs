@@ -8,8 +8,8 @@
 use par6_config::WatchdogAction;
 
 use crate::types::{
-    DeviceInfo, ErrorFlags, FirmwareGripperCommand, GripperCommand, GripperReply, HallState,
-    JointCommand, NodeId, ObjectDetection, Pack, PollKind,
+    DeviceInfo, DriveRange, ErrorFlags, FirmwareGripperCommand, GripperCommand, GripperReply,
+    HallState, JointCommand, NodeId, ObjectDetection, Pack, PollKind,
 };
 
 /// Classic CAN 2.0A payload capacity.
@@ -163,6 +163,11 @@ pub enum CommandId {
     /// arbitration id with a host cmd 39 request: two frames with one id
     /// and different lengths both win arbitration and collide.
     CaptureStreamData = 43,
+    /// 44 — Range (DLC 8: i32 min, i32 max drive position \[ticks\]; DLC 0
+    /// disarms; read with an RTR, answered DLC 8 armed or DLC 0 not; par6
+    /// firmware). Past either end while still moving out, the drive trips
+    /// (error byte 1 b4) and brakes its motor.
+    Range = 44,
     /// 60 — Respond_Gripper_data (D→H DLC 4).
     RespondGripperData = 60,
     /// 61 — Gripper_data_pack (DLC 5, or DLC 0 = empty watchdog poll).
@@ -220,6 +225,7 @@ impl CommandId {
             41 => VelocityWindow,
             42 => CaptureStream,
             43 => CaptureStreamData,
+            44 => Range,
             60 => RespondGripperData,
             61 => GripperDataPack,
             62 => GripperCalibrate,
@@ -328,6 +334,7 @@ fn unpack_error_flags(b0: u8, b1: u8) -> ErrorFlags {
         calibrated: b1[0],
         activated: b1[1],
         watchdog: b1[2],
+        range: b1[3],
     }
 }
 
@@ -593,6 +600,21 @@ pub fn encode_readback_request(node: NodeId, kind: crate::ConfigKind) -> CanFram
     CanFrame::rtr_frame(pack_can_id(node, cmd, false))
 }
 
+/// Arm `node`'s joint range over drive positions `[min, max]` \[ticks\]
+/// (cmd 44), or disarm it with `None`.
+pub fn encode_range(node: NodeId, range: Option<(i32, i32)>) -> CanFrame {
+    let id = pack_can_id(node, CommandId::Range, false);
+    match range {
+        Some((min, max)) => {
+            let mut d = [0u8; 8];
+            d[..4].copy_from_slice(&min.to_be_bytes());
+            d[4..].copy_from_slice(&max.to_be_bytes());
+            CanFrame::data_frame(id, &d)
+        }
+        None => CanFrame::data_frame(id, &[]),
+    }
+}
+
 /// Loop divisor 1 records every control loop (6250 Hz); a capture holds at
 /// most [`CAPTURE_LEN`] samples per channel.
 pub const CAPTURE_LEN: u16 = 1024;
@@ -729,6 +751,7 @@ pub fn poll_command(kind: PollKind) -> CommandId {
         PollKind::Encoder => CommandId::EncoderData,
         PollKind::Kt => CommandId::RespondKt,
         PollKind::Ping => CommandId::Ping,
+        PollKind::Range => CommandId::Range,
     }
 }
 
@@ -864,6 +887,8 @@ pub enum Payload {
     Errors(ErrorFlags),
     /// A configuration command's answer to a read request (par6 firmware).
     Readback(Readback),
+    /// cmd 44 reply: the range the drive enforces.
+    Range(DriveRange),
     /// cmd 39 reply: two consecutive samples of one capture channel,
     /// `samples[k]` = sample `2 * chunk + k`; zero past what was recorded.
     Capture {
@@ -1152,6 +1177,16 @@ pub fn decode_frame(frame: &CanFrame) -> Result<DecodedFrame, DecodeError> {
                 kpp: unpack_f32([d[0], d[1], d[2], d[3]]),
             })
         }
+        CommandId::Range => match frame.payload().len() {
+            0 => Payload::Range(DriveRange::Disarmed),
+            _ => {
+                expect_dlc(frame, node, raw_cmd, err_bit, 8)?;
+                Payload::Range(DriveRange::Armed {
+                    min_ticks: unpack_i32([d[0], d[1], d[2], d[3]]),
+                    max_ticks: unpack_i32([d[4], d[5], d[6], d[7]]),
+                })
+            }
+        },
         // Host→driver commands — receiving one is never a reply.
         CommandId::Estop
         | CommandId::ClearError
@@ -1533,6 +1568,47 @@ mod tests {
         assert!(
             decode_frame(&request).is_err(),
             "the request itself is not an answer"
+        );
+    }
+
+    #[test]
+    fn range_frames_arm_disarm_and_read_back() {
+        let arm = encode_range(4, Some((-123_456, 789_012)));
+        assert_eq!(unpack_can_id(arm.id), (4, 44, false));
+        // The drive answers a read in the layout the write used.
+        let answer = CanFrame::data_frame(pack_can_id(4, CommandId::Range, true), arm.payload());
+        let decoded = decode_frame(&answer).expect("an answer");
+        assert!(decoded.err_bit);
+        assert_eq!(
+            decoded.payload,
+            Payload::Range(DriveRange::Armed {
+                min_ticks: -123_456,
+                max_ticks: 789_012
+            })
+        );
+        let disarm = encode_range(4, None);
+        assert!(disarm.payload().is_empty() && !disarm.rtr);
+        let answer = CanFrame::data_frame(pack_can_id(4, CommandId::Range, false), &[]);
+        assert_eq!(
+            decode_frame(&answer).unwrap().payload,
+            Payload::Range(DriveRange::Disarmed)
+        );
+        let odd = CanFrame::data_frame(pack_can_id(4, CommandId::Range, false), &[0; 5]);
+        assert!(decode_frame(&odd).is_err(), "a wrong length is refused");
+        assert!(decode_frame(&encode_poll(4, PollKind::Range)).is_err());
+
+        // A trip reports in error byte 1 bit 4.
+        let errors = CanFrame::data_frame(
+            pack_can_id(4, CommandId::StateOfErrors, true),
+            &[0b1000_0000, 0b1001_0000],
+        );
+        let Payload::Errors(flags) = decode_frame(&errors).unwrap().payload else {
+            panic!("an error reply");
+        };
+        assert!(flags.error && flags.range && flags.calibrated && !flags.watchdog);
+        assert_eq!(
+            flags.faults().collect::<Vec<_>>(),
+            vec![crate::Fault::Range]
         );
     }
 

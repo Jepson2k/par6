@@ -112,6 +112,20 @@ pub enum ErrorCode {
     /// Per-joint: contact, the estimate past the contact threshold
     /// (warning, clears as a collision warning does).
     Contact,
+    /// Per-joint: the joint's loop oscillated; the arm holds, a velocity
+    /// loop that rang on calmer gains (hard latch).
+    Oscillation,
+    /// Per-joint: the joint left the range its drive enforces, and the
+    /// drive tripped and braked its motor (hard latch).
+    JointRange,
+    /// Per-joint: the drive dropped the range it had confirmed, which only
+    /// a restart does; its count, and the arm's reference, are gone (hard
+    /// latch, un-homes the arm).
+    RangeLost,
+    /// Per-joint: homing finished but the drive never confirmed its range,
+    /// so the arm stays unhomed (hard latch). A drive without the par6
+    /// firmware's cmd 44 never does.
+    RangeNotArmed,
 }
 
 impl ErrorCode {
@@ -514,6 +528,10 @@ pub struct StateSnapshot {
     /// minus model with inertia and friction taken out too; `tau_ext`
     /// while the observer is off.
     pub tau_observed: [f64; MAX_JOINTS],
+    /// Per joint, the drive current sent per joint Nm \[mA/Nm\], signed
+    /// by the joint's direction: the config's torque constant until the
+    /// drives' own are adopted at boot.
+    pub torque_ma_factor: [f64; MAX_JOINTS],
     /// Per-node motor telemetry: arm joints 0..MAX_JOINTS, gripper last.
     pub nodes: [NodeState; NUM_NODES],
     /// Per-node data-age classification, same order — the backend's own
@@ -609,6 +627,7 @@ impl Default for StateSnapshot {
             gravity_torque_nm: [0.0; MAX_JOINTS],
             tau_ext: [0.0; MAX_JOINTS],
             tau_observed: [0.0; MAX_JOINTS],
+            torque_ma_factor: [0.0; MAX_JOINTS],
             nodes: [NodeState::default(); NUM_NODES],
             node_freshness: [Freshness::Unknown; NUM_NODES],
             gripper: GripperState::default(),

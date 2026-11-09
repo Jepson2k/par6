@@ -173,6 +173,61 @@ fn a_home_after_a_tool_change_homes_as_the_tool_now_fitted() {
     );
 }
 
+/// Every drive takes its joint's range at that joint's reference, and the
+/// arm counts as homed only with every drive answering with it; a drive
+/// that later answers without it has restarted, and the arm is unhomed.
+#[test]
+fn the_arm_is_homed_only_with_every_drive_guarding_its_range() {
+    let bundle = common::bundle();
+    let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&bundle);
+    let dt = core.tick_dt_s();
+    start_homing(&mut core, &mut handles, &tx);
+    let mut finished = false;
+    for _ in 0..(200.0 / dt) as usize {
+        core.tick(dt, false);
+        let s = handles.snapshots.latest();
+        if !s.homing.active {
+            finished = true;
+            break;
+        }
+    }
+    assert!(finished, "the home never finished");
+    let s = handles.snapshots.latest();
+    assert!(s.homed, "homed: {:?}", s.homing);
+    for (j, joint) in bundle.robot.joints.iter().enumerate() {
+        let Some(par6_bus::DriveRange::Armed {
+            min_ticks,
+            max_ticks,
+        }) = s.nodes[usize::from(joint.node_id)].range
+        else {
+            panic!("J{} guards no range", j + 1);
+        };
+        let here = s.nodes[usize::from(joint.node_id)].position_ticks.unwrap();
+        assert!(
+            (min_ticks..=max_ticks).contains(&here),
+            "J{} at {here} outside its range {min_ticks}..{max_ticks}",
+            j + 1
+        );
+    }
+
+    // J3's drive loses its range, as a restart loses it.
+    let node = bundle.robot.joints[2].node_id;
+    par6_bus::DriverBus::set_range(core.bus_mut(), node, None).unwrap();
+    for _ in 0..(1.5 / dt) as usize {
+        core.tick(dt, false);
+    }
+    let s = handles.snapshots.latest();
+    assert!(!s.homed, "a drive that restarted left the arm homed");
+    assert!(
+        s.errors.contains(par6_rt::state::ErrorEntry {
+            code: par6_rt::state::ErrorCode::RangeLost,
+            joint: Some(2),
+        }),
+        "{:?}",
+        s.errors.as_slice()
+    );
+}
+
 /// A driven tool taken off leaves nothing reading on its node, whichever
 /// tick the change lands on: a reply in flight as the jaw came off is not
 /// a reading of anything on the arm, and with no poll after it would read
@@ -1677,44 +1732,5 @@ fn two_passes_that_disagree_fail_the_joint_and_restore_its_limits() {
             "the drive is back on its normal current limit"
         ),
         other => panic!("no limits read back: {other:?}"),
-    }
-}
-
-/// A motor latches at its stop where its mounting puts it within one turn,
-/// so a reference more than 1 deg from this arm's recorded latch fails the
-/// joint; one a whole motor turn away is the same spot.
-#[test]
-fn a_latch_away_from_the_arms_recorded_one_fails_the_joint() {
-    let mut bundle = single_joint_bundle(0);
-    let start = short_of_j0_stop(&bundle, 0.3);
-    let (outcome, h) = home_j0(&bundle, start, |_, _, _| 0.0);
-    assert_eq!(outcome, SeqStatus::Complete);
-    let joint = &bundle.robot.joints[0];
-    let offset = bundle
-        .effective_home_offset(0)
-        .unwrap_or(bundle.robot.homing.joints[0].home_offset_rad);
-    let latched = i64::from(h.conv[0].motor_ticks(offset));
-    let counts = 1i64 << joint.encoder_bits;
-    let per_deg = counts as f64 * joint.gear_ratio / 360.0;
-    for (recorded_deg, turns, homes) in [
-        (0.5, 0, true),
-        (0.0, 1, true),
-        (-1.5, 0, false),
-        (1.5, 0, false),
-    ] {
-        let recorded = latched + (recorded_deg * per_deg).round() as i64 + turns * counts;
-        bundle.robot.homing.joints[0].endstop_latch_ticks =
-            Some(u32::try_from(recorded.rem_euclid(counts)).unwrap());
-        let (outcome, h) = home_j0(&bundle, start, |_, _, _| 0.0);
-        if homes {
-            assert_eq!(
-                outcome,
-                SeqStatus::Complete,
-                "{recorded_deg} deg, {turns} turns"
-            );
-        } else {
-            assert_eq!(outcome, SeqStatus::Failed, "{recorded_deg} deg off");
-            assert_eq!(h.sys.status().phase[0], HomingPhase::Settle);
-        }
     }
 }

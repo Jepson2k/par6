@@ -600,9 +600,7 @@ mod tests {
         let ripple: toml_edit::Array = [1.0, 2.0].into_iter().collect();
         overlay.set_joint("joint5", &[], "ripple", ripple).unwrap();
         overlay.remove_joint_key("joint5", "ripple").unwrap();
-        overlay
-            .set_homing_joint(2, "endstop_latch_ticks", 11743)
-            .unwrap();
+        overlay.set_homing_joint(2, "timeout_s", 9.5).unwrap();
         let written = overlay.to_string();
         assert!(
             written.contains("# This arm.")
@@ -624,7 +622,7 @@ mod tests {
              [[joints]]\nname = \"joint2\"\n[joints.gains]\nkpv = 0.02\nkiv = 0.0005\nkpp = 3.0\n\
              [[joints]]\nname = \"joint5\"\n[joints.limits.exec]\nvelocity_rad_s = 7.7\n\
              [homing]\n[[homing.joints]]\ncurrent_ma = 9.0\n[[homing.joints]]\ncurrent_ma = 2.0\n\
-             [[homing.joints]]\ncurrent_ma = 3.0\nendstop_latch_ticks = 11743\n",
+             [[homing.joints]]\ncurrent_ma = 3.0\ntimeout_s = 9.5\n",
         );
         assert_eq!(
             base, want,

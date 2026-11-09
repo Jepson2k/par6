@@ -43,11 +43,11 @@ mod types;
 
 pub use backend::RuntimeBus;
 pub use bus::DriverBus;
-pub use hw::sched::{ConfigKind, DEVICE_INFO_PERIOD_SLOTS};
+pub use hw::sched::{ConfigKind, DEVICE_INFO_PERIOD_SLOTS, RANGE_PERIOD_SLOTS};
 pub use hw::{OpenError, SocketCanBus};
 pub use loopback::{LoopbackBus, Reply, TxRecord};
 pub use types::{
-    BusError, BusState, CaptureBuffer, DeviceInfo, DriveTune, ErrorFlags, Fault,
+    BusError, BusState, CaptureBuffer, DeviceInfo, DriveRange, DriveTune, ErrorFlags, Fault,
     FirmwareGripperCommand, Freshness, GripperCommand, GripperReply, GripperState, HallState,
     JointCommand, LinkHealth, LinkState, NodeId, NodeState, ObjectDetection, Pack, PollAction,
     PollKind, MAX_NODES, NODE_BOOTLOADER, NODE_GRIPPER, NODE_HOST, NODE_TIMING_DUMMY,

@@ -98,6 +98,7 @@ class ErrorCode(IntEnum):
     SYS_STREAM_FAULT = 64
     SYS_CONTACT = 65
     SYS_COLLISION_WARNING = 66
+    SYS_JOINT_OSCILLATION = 67
 
 class Frame(IntEnum):
     """Reference frame a Cartesian target is expressed in."""

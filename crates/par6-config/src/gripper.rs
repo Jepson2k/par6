@@ -272,12 +272,6 @@ impl ToolConfig {
                     "gripper-dependent overrides apply to ARM joints, not the gripper itself",
                 ));
             }
-            if h.endstop_latch_ticks.is_some() {
-                return Err(invalid(
-                    "homing.endstop_latch_ticks",
-                    "the latch check is an arm joint's, not the gripper's",
-                ));
-            }
         }
         for (i, o) in self.arm_joint_home_offsets.iter().enumerate() {
             if o.joint >= 16 {

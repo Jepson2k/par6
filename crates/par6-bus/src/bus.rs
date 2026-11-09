@@ -145,6 +145,13 @@ pub trait DriverBus {
     /// node's reconnect resend.
     fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError>;
 
+    /// Arm `node`'s joint range over drive positions `[min, max]` \[ticks\]
+    /// (cmd 44), or disarm it with `None`, and read it back at once into
+    /// `NodeState::range`. Sent now and never kept for a resend: a drive
+    /// that restarted counts from its single-turn angle again, and a range
+    /// in the count it had would guard the wrong span.
+    fn set_range(&mut self, node: NodeId, range: Option<(i32, i32)>) -> Result<(), BusError>;
+
     /// Have `node` send its whole capture (cmd 42) as the same replies a
     /// [`PollAction::CaptureRead`] gets, paced by the drive; they land in
     /// [`DriverBus::capture`] as they arrive. Pairs the bus drops are read

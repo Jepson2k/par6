@@ -84,6 +84,9 @@ impl DriverBus for Hardware {
     fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError> {
         self.plant.set_velocity_window(node, window)
     }
+    fn set_range(&mut self, node: NodeId, range: Option<(i32, i32)>) -> Result<(), BusError> {
+        self.plant.set_range(node, range)
+    }
     fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
         self.plant.capture_stream(node)
     }

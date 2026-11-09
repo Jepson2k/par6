@@ -105,12 +105,6 @@ const STALL_DISP_FACTOR: f64 = 0.08 * 0.25;
 /// 750-850 mA 0.23-0.36 deg off.
 const BRAKE_ON_MA: f64 = 300.0;
 const BRAKE_OFF_MA: f64 = 150.0;
-/// How far from this arm's recorded latch a joint may latch, at the joint
-/// \[rad\]: 1 deg, the vendor's tolerance for the same check. This arm's
-/// latches repeated within 0.1 deg over three selfcal runs (2026-10-24/25);
-/// a false stall the vendor caught was 4.8 deg short, a skipped belt half a
-/// motor turn.
-const LATCH_TOL_RAD: f64 = 1.0 * std::f64::consts::PI / 180.0;
 /// In-position tolerance for position moves \[ticks\].
 const POS_TOL_TICKS: i64 = 50;
 /// Limits-frame repeats around homing.
@@ -178,27 +172,6 @@ pub struct HomerParams {
     pub normal_vel_limit: f32,
     pub normal_ilim: f32,
     pub dt: f64,
-    /// This arm's latch to check the reference against.
-    pub latch: Option<LatchCheck>,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct LatchCheck {
-    /// The recorded latch within one motor turn \[ticks\].
-    pub ticks: i64,
-    /// Encoder counts per motor turn.
-    pub counts: i64,
-    /// Motor ticks per joint radian.
-    pub ticks_per_rad: f64,
-}
-
-impl LatchCheck {
-    /// How far `latched` sits from the recorded latch, at the joint \[rad\].
-    pub fn off_rad(&self, latched: i32) -> f64 {
-        let half = self.counts / 2;
-        let off = (i64::from(latched) - self.ticks + half).rem_euclid(self.counts) - half;
-        off as f64 / self.ticks_per_rad
-    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -268,20 +241,7 @@ impl HomerParams {
             normal_vel_limit: normal_vel_limit as f32,
             normal_ilim: normal_ilim as f32,
             dt,
-            latch: None,
         }
-    }
-
-    /// Check the reference against the arm's recorded latch, when the
-    /// config carries one.
-    pub fn with_latch_check(mut self, jh: &JointHoming, joint: &par6_config::JointConfig) -> Self {
-        let counts = 1i64 << joint.encoder_bits;
-        self.latch = jh.endstop_latch_ticks.map(|ticks| LatchCheck {
-            ticks: i64::from(ticks).rem_euclid(counts),
-            counts,
-            ticks_per_rad: counts as f64 / std::f64::consts::TAU * joint.gear_ratio.abs(),
-        });
-        self
     }
 }
 
@@ -333,8 +293,6 @@ pub enum HomerFailure {
     Slid { ticks: i64 },
     /// No valid position to latch.
     NoPosition,
-    /// The latch sits this far from the arm's recorded one \[rad\].
-    Latch { off_rad: f64 },
     /// The post-home target was not reached.
     PostMove,
 }
@@ -351,13 +309,6 @@ impl std::fmt::Display for HomerFailure {
                 "it slid {ticks} ticks off its stall in the release: a false stall, not its stop"
             ),
             Self::NoPosition => write!(f, "its position never read valid at the stop"),
-            Self::Latch { off_rad } => write!(
-                f,
-                "it latched {:+.2} deg from where this arm latches (endstop_latch_ticks): a \
-                 false stall, a skipped belt or a slipping coupling; after a deliberate change, \
-                 remove the value and the next par6-selfcal --apply records the new spot",
-                off_rad.to_degrees()
-            ),
             Self::PostMove => write!(f, "its post-home target was not reached"),
         }
     }
@@ -798,12 +749,6 @@ impl Homer {
                             return self.fail(HomerFailure::NoPosition);
                         }
                         Some(latched) => {
-                            if let Some(check) = p.latch {
-                                let off_rad = check.off_rad(latched);
-                                if off_rad.abs() > LATCH_TOL_RAD {
-                                    return self.fail(HomerFailure::Latch { off_rad });
-                                }
-                            }
                             self.phase = if p.post.is_some() {
                                 HPhase::PostMove
                             } else {
@@ -1051,8 +996,7 @@ impl HomingSystem {
                 joint.velocity_limit_ticks_s,
                 joint.ilim_ma,
                 dt,
-            )
-            .with_latch_check(jh, joint);
+            );
             // The post move's span is sized at its start (peak tangent
             // 1.5·d/span at the post-home speed), from at most the whole range.
             if let Some(post) = &jh.post_home {

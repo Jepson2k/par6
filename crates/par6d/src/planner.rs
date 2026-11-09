@@ -328,6 +328,10 @@ pub(crate) struct Par6Planner {
     heartbeat: ExecHeartbeat,
     snapshots: SnapshotReader<StateSnapshot>,
     exec_limits: MotionLimits,
+    /// The drive current EXEC moves may spend, when the config sets one.
+    current: Option<crate::current::CurrentBudget>,
+    /// The shaper for the arm's vibration on its support, when measured.
+    shaper: Option<crate::shaping::Shaper>,
     /// The configured home pose \[rad\] — where a HOME on an already
     /// referenced arm returns to.
     home_pose_rad: [f64; MAX_JOINTS],
@@ -600,6 +604,17 @@ impl Par6Planner {
         swap: PlannerSwap,
     ) -> Result<Self, MotionError> {
         let exec_limits = MotionLimits::from_config(&bundle.robot, par6_config::LimitMode::Exec)?;
+        let current = crate::current::CurrentBudget::from_config(&bundle.robot)?;
+        let shaper = bundle
+            .robot
+            .vibration
+            .as_ref()
+            .map(|v| crate::shaping::Shaper::covering(&v.frequencies_hz))
+            .transpose()
+            .map_err(|reason| MotionError::InvalidInput {
+                what: "vibration.frequencies_hz",
+                reason,
+            })?;
         let PlannerKin {
             kin,
             collision,
@@ -624,6 +639,8 @@ impl Par6Planner {
             heartbeat,
             snapshots,
             exec_limits,
+            current,
+            shaper,
             near_singularity: None,
             home_pose_rad,
             dt,
@@ -864,6 +881,10 @@ impl Par6Planner {
         samples: Vec<[f64; 3 * MAX_JOINTS]>,
         seen_exec: bool,
     ) -> Result<InFlightKind, WireError> {
+        let samples = match &self.shaper {
+            Some(shaper) => shaper.shape(&start_q, &samples, self.dt),
+            None => samples,
+        };
         par6_motion::gate::check_commanded_accel(
             samples.iter().map(|qqa| {
                 let mut qd = [0.0; MAX_JOINTS];
@@ -973,6 +994,26 @@ impl Par6Planner {
         self.start_exec(snap.q, samples, snap.mode == Mode::Exec)
     }
 
+    /// The current budget in the scale the RT converts torque with now.
+    fn current_budget(&mut self) -> Result<Option<crate::current::CurrentBudget>, WireError> {
+        let Some(budget) = self.current else {
+            return Ok(None);
+        };
+        let snap = self.snapshots.latest();
+        let temperature_c = budget.nodes().map(|n| {
+            snap.nodes
+                .get(n)
+                .and_then(|s| s.temperature_c)
+                .map(f64::from)
+        });
+        budget
+            .at_scale(&snap.torque_ma_factor, &temperature_c)
+            .map(Some)
+            .map_err(|detail| {
+                make_error(ErrorCode::TrajNoSteps, UNATTRIBUTED, &[("detail", &detail)])
+            })
+    }
+
     /// The tick-rate samples a joint-space move from `start` to `target`
     /// \[rad\] compiles to under the SELECTED profile. Empty = the move
     /// has no path to run (start and target are the same configuration).
@@ -980,7 +1021,7 @@ impl Par6Planner {
     /// Planning without starting is also how a queued move is TIMED for
     /// the queue ETA, so this stays free of side effects.
     fn joint_move_samples(
-        &self,
+        &mut self,
         start: &[f64; MAX_JOINTS],
         target: &[f64; MAX_JOINTS],
         duration: Option<f64>,
@@ -989,6 +1030,11 @@ impl Par6Planner {
     ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
         let profile = match (self.profile, duration) {
             (Profile::Ruckig, Some(_)) => Profile::Toppra,
+            // With a current budget the move is timed against the torque
+            // each pose on the path leaves, not one cap set by the worst
+            // pose for the whole move; the timing is smoothed to the jerk
+            // limits, so the inertia feedforward never steps.
+            (Profile::Ruckig, None) if self.current.is_some() => Profile::Toppra,
             (profile, _) => profile,
         };
         let kind = match profile {
@@ -1018,6 +1064,20 @@ impl Par6Planner {
             }
         };
         let mut limits = self.exec_limits;
+        if let Some(budget) = self.current_budget()? {
+            let velocity = limits.velocity.map(|v| v * speed.unwrap_or(1.0));
+            limits.acceleration = budget
+                .accel_caps(
+                    &mut self.kin,
+                    start,
+                    target,
+                    &velocity,
+                    &limits.acceleration,
+                )
+                .map_err(|detail| {
+                    make_error(ErrorCode::TrajNoSteps, UNATTRIBUTED, &[("detail", &detail)])
+                })?;
+        }
         if let Some(accel) = accel {
             for a in limits.acceleration.iter_mut() {
                 *a *= accel;
@@ -1079,7 +1139,7 @@ impl Par6Planner {
     /// driven, a longer request time-scales the whole trajectory
     /// (velocities scale with it, so limits still hold).
     fn toppra_samples(
-        &self,
+        &mut self,
         waypoints: &[f64],
         speed: Option<f64>,
         accel: Option<f64>,
@@ -1109,7 +1169,7 @@ impl Par6Planner {
     /// the move (parol6 times a degree-1 path, and has no such gate).
     #[allow(clippy::too_many_arguments)]
     fn toppra_samples_with(
-        &self,
+        &mut self,
         waypoints: &[f64],
         speed: Option<f64>,
         accel: Option<f64>,
@@ -1142,26 +1202,42 @@ impl Par6Planner {
             .iter()
             .map(|j| j * accel_frac)
             .collect();
-        let solve = |acc: &[f64]| {
-            par6_kin::Trajectory::parameterize_with(
-                waypoints,
-                MAX_JOINTS,
-                &vel,
-                acc,
-                Some(&jerk),
-                None,
-                knots,
-                degree,
-                max_path_speed,
-            )
-            .map_err(|e| {
-                make_error(
-                    ErrorCode::TrajNoSteps,
-                    UNATTRIBUTED,
-                    &[("detail", &e.to_string())],
-                )
-            })
+        let budget = self.current_budget()?;
+        let kin = &mut self.kin;
+        let mut model = |q: &[f64], v: &[f64], a: &[f64], tau: &mut [f64]| {
+            let Some(budget) = &budget else { return false };
+            let arr = |x: &[f64]| -> [f64; NQ] { std::array::from_fn(|k| x[k]) };
+            match budget.inverse_dynamics(kin, &arr(q), &arr(v), &arr(a)) {
+                Ok(t) => {
+                    tau.copy_from_slice(&t);
+                    true
+                }
+                Err(_) => false,
+            }
         };
+        let torque_limit = budget.map(|b| *b.torque_nm());
+        let traj = par6_kin::Trajectory::parameterize_with(
+            waypoints,
+            MAX_JOINTS,
+            &vel,
+            &acc,
+            Some(&jerk),
+            None,
+            knots,
+            degree,
+            max_path_speed,
+            torque_limit.as_ref().map(|limit| par6_kin::TorqueLimits {
+                inverse_dynamics: &mut model,
+                limit,
+            }),
+        )
+        .map_err(|e| {
+            make_error(
+                ErrorCode::TrajNoSteps,
+                UNATTRIBUTED,
+                &[("detail", &e.to_string())],
+            )
+        })?;
         let sampling_failed = |e: par6_kin::sys::Error| {
             make_error(
                 ErrorCode::MotnSetupFailed,
@@ -1195,7 +1271,6 @@ impl Par6Planner {
             }
             Ok(samples)
         };
-        let traj = solve(&acc)?;
         let t_path = traj.duration();
         if !t_path.is_finite() || t_path <= 0.0 {
             return Err(make_error(
@@ -1207,8 +1282,14 @@ impl Par6Planner {
         let samples = sample(&traj, t_path.max(min_duration.unwrap_or(0.0)))?;
         // The smoothing holds the limits only as closely as its rounds
         // converge; whatever it leaves, stretching time by k divides every
-        // velocity by k and every acceleration by k².
-        let excess = limit_excess(&samples, &vel, &acc);
+        // velocity by k and every acceleration by k², and the torque each
+        // spends on moving by k².
+        let mut excess = limit_excess(&samples, &vel, &acc);
+        if let Some(budget) = &budget {
+            excess = excess.max(torque_excess(budget, &mut self.kin, &samples).map_err(
+                |detail| make_error(ErrorCode::TrajNoSteps, UNATTRIBUTED, &[("detail", &detail)]),
+            )?);
+        }
         if excess > 1.0 + 1e-9 {
             let t_eff = (samples.len() as f64 * self.dt) * excess;
             return sample(&traj, t_eff);
@@ -1623,7 +1704,7 @@ impl Par6Planner {
     /// not.
     #[allow(clippy::too_many_arguments)]
     fn arclen_samples(
-        &self,
+        &mut self,
         waypoints: &[f64],
         poses: &[Pose],
         speed: Option<f64>,
@@ -3055,9 +3136,50 @@ fn limit_excess(samples: &[[f64; 3 * MAX_JOINTS]], vel: &[f64], acc: &[f64]) -> 
         .fold(0.0, f64::max)
 }
 
+/// The time stretch that brings the torque a sample stream spends on moving
+/// inside what `budget` leaves after gravity, 1.0 or less when it is
+/// already inside.
+///
+/// Stretching time by k divides the inertial and velocity-squared torque by
+/// k² and the viscous torque by k, so with u = 1/k a sample fits while
+/// `rigid·u² + viscous·u` stays inside the room.
+fn torque_excess(
+    budget: &crate::current::CurrentBudget,
+    kin: &mut crate::kin::CartKin,
+    samples: &[[f64; 3 * MAX_JOINTS]],
+) -> Result<f64, String> {
+    let zero = [0.0; NQ];
+    let mut worst = 0.0f64;
+    for qqa in samples {
+        let part = |k: usize| -> [f64; NQ] { std::array::from_fn(|j| qqa[k * MAX_JOINTS + j]) };
+        let (q, qd, qdd) = (part(0), part(1), part(2));
+        let g = budget.inverse_dynamics(kin, &q, &zero, &zero)?;
+        let tau = budget.inverse_dynamics(kin, &q, &qd, &qdd)?;
+        let viscous = budget.viscous_nm(&qd);
+        for j in 0..NQ {
+            let room = budget.torque_nm()[j] - g[j].abs();
+            let rigid = (tau[j] - g[j]).abs();
+            let viscous = viscous[j].abs();
+            if rigid + viscous == 0.0 {
+                continue;
+            }
+            let fits = if room <= 0.0 {
+                0.0
+            } else if rigid > 0.0 {
+                (viscous.hypot(2.0 * (rigid * room).sqrt()) - viscous) / (2.0 * rigid)
+            } else {
+                room / viscous
+            };
+            worst = worst.max(1.0 / fits);
+        }
+    }
+    Ok(worst)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use par6_bus::spectral::torque_to_ma_factor;
     use par6_rt::{sample_ring, snapshot_channel, RtCommand, SampleConsumer, SnapshotWriter};
     use std::sync::mpsc;
 
@@ -3073,9 +3195,15 @@ mod tests {
     }
 
     fn rig() -> Rig {
+        rig_with(|_| {})
+    }
+
+    /// [`rig`] on the shipped config as `edit` leaves it.
+    fn rig_with(edit: impl FnOnce(&mut ConfigBundle)) -> Rig {
         let path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
-        let bundle = ConfigBundle::load(&path).expect("config");
+        let mut bundle = ConfigBundle::load(&path).expect("config");
+        edit(&mut bundle);
         let opts = crate::Options {
             sim: true,
             config: Some(path.clone()),
@@ -3115,6 +3243,116 @@ mod tests {
             _cmds: cmds_rx,
             _ring: ring,
         }
+    }
+
+    /// Held to a share of J1's current, a J1 move draws no more current than
+    /// that share, friction included and converted with the torque constant
+    /// J1's drive reported, wherever the arm is: with the arm reaching out,
+    /// where J1 carries more inertia, the same move takes longer than with
+    /// it folded, under the jerk-limited profile and a timed (TOPPRA) move
+    /// alike. Without a budget the pose makes no difference.
+    #[test]
+    fn a_joint_move_draws_no_more_current_than_its_budget_wherever_the_arm_is() {
+        let mut robot = None;
+        let mut held = rig_with(|b| {
+            b.robot.joints[0]
+                .limits
+                .exec
+                .as_mut()
+                .unwrap()
+                .current_fraction = Some(0.7);
+            robot = Some(b.robot.clone());
+        });
+        let robot = robot.unwrap();
+        let j1 = &robot.joints[0];
+        // J1's drive on the arm, 2026-11-07; the config carries 0.28.
+        let ma_per_nm =
+            torque_to_ma_factor(j1.gear_ratio, j1.gear_efficiency, 0.2516, j1.dir).abs();
+        let mut snap = StateSnapshot::default();
+        snap.torque_ma_factor[0] = ma_per_nm;
+        held.snap_w.publish(&snap);
+        let allowed_ma = 0.7 * j1.ilim_ma;
+        let (coulomb, viscous) = (robot.sim.coulomb_nm[0], robot.sim.viscous_nm_s[0]);
+
+        let mut free = rig();
+        let budget = held.p.current.expect("a J1 budget");
+        let zero = [0.0; NQ];
+        let j1_inertia = |kin: &mut crate::kin::CartKin, q: &[f64; NQ]| {
+            let g = budget.inverse_dynamics(kin, q, &zero, &zero).unwrap();
+            let mut unit = zero;
+            unit[0] = 1.0;
+            budget.inverse_dynamics(kin, q, &zero, &unit).unwrap()[0] - g[0]
+        };
+        let folded = [
+            0.0,
+            -90f64.to_radians(),
+            180f64.to_radians(),
+            0.0,
+            0.0,
+            180f64.to_radians(),
+        ];
+        let mut out = folded;
+        let mut most = 0.0;
+        for j2 in [-130.0f64, -100.0, -70.0, -40.0, -10.0] {
+            for j3 in [120.0f64, 160.0, 200.0, 240.0, 280.0, 320.0, 360.0] {
+                let q = [
+                    0.0,
+                    j2.to_radians(),
+                    j3.to_radians(),
+                    0.0,
+                    0.0,
+                    180f64.to_radians(),
+                ];
+                let m = j1_inertia(&mut held.p.kin, &q);
+                if m > most {
+                    (most, out) = (m, q);
+                }
+            }
+        }
+        assert!(
+            most > 1.5 * j1_inertia(&mut held.p.kin, &folded),
+            "no pose here reaches out far enough to tell the two apart"
+        );
+
+        let run = |rig: &mut Rig, from: &[f64; NQ], duration: Option<f64>| {
+            let mut to = *from;
+            to[0] += 1.0;
+            let samples = rig
+                .p
+                .joint_move_samples(from, &to, duration, Some(1.0), None)
+                .expect("plan");
+            let worst = samples
+                .iter()
+                .map(|qqa| {
+                    let part = |k: usize| -> [f64; NQ] { std::array::from_fn(|j| qqa[k * NQ + j]) };
+                    let v = part(1)[0];
+                    let friction = if v == 0.0 { 0.0 } else { coulomb.copysign(v) } + viscous * v;
+                    let tau = budget
+                        .inverse_dynamics(&mut rig.p.kin, &part(0), &part(1), &part(2))
+                        .unwrap()[0]
+                        + friction;
+                    tau.abs() * ma_per_nm / allowed_ma
+                })
+                .fold(0.0, f64::max);
+            (samples.len(), worst)
+        };
+        for duration in [None, Some(0.05)] {
+            let (near, near_worst) = run(&mut held, &folded, duration);
+            let (far, far_worst) = run(&mut held, &out, duration);
+            assert!(
+                far > near,
+                "{duration:?}: {far} ticks reaching out against {near} folded"
+            );
+            for worst in [near_worst, far_worst] {
+                assert!(
+                    worst <= 1.02,
+                    "{duration:?}: J1 drew {worst:.3} of its current budget"
+                );
+            }
+        }
+        let (near, _) = run(&mut free, &folded, None);
+        let (far, _) = run(&mut free, &out, None);
+        assert_eq!(near, far, "with no budget the pose made a difference");
     }
 
     /// The runtime in `mode` with the gripper drive reporting `tool_id`.

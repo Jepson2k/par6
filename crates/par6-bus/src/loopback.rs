@@ -550,6 +550,11 @@ impl DriverBus for LoopbackBus {
         self.ensure_ready()
     }
 
+    /// Nothing on the loopback enforces it; the request is accepted.
+    fn set_range(&mut self, _node: NodeId, _range: Option<(i32, i32)>) -> Result<(), BusError> {
+        self.ensure_ready()
+    }
+
     /// Nothing on the loopback applies it; the request is accepted.
     fn set_ripple(
         &mut self,

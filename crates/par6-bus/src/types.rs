@@ -218,6 +218,25 @@ pub enum PollKind {
     Kt,
     /// cmd 10 → liveness ping.
     Ping,
+    /// cmd 44 → `NodeState::range` (par6 firmware).
+    Range,
+}
+
+/// The joint range a drive enforces (cmd 44, par6 firmware): past either
+/// end while still moving out, the drive trips and brakes its motor. Its
+/// own multi-turn count, so it holds only until the drive restarts, which
+/// drops it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriveRange {
+    /// No range: nothing stops the motor wherever it goes.
+    Disarmed,
+    /// Armed over these drive positions \[encoder ticks\].
+    Armed {
+        /// Lowest position allowed.
+        min_ticks: i32,
+        /// Highest position allowed.
+        max_ticks: i32,
+    },
 }
 
 /// A single-slot override that preempts the round-robin poll for
@@ -399,6 +418,8 @@ pub struct ErrorFlags {
     pub activated: bool,
     /// Watchdog fired (byte 1 b5).
     pub watchdog: bool,
+    /// The joint left its armed range (byte 1 b4, par6 firmware).
+    pub range: bool,
 }
 
 /// One drive fault bit, named the way the whole stack reports it.
@@ -424,6 +445,8 @@ pub enum Fault {
     EstopMotor,
     /// Driver watchdog fired.
     Watchdog,
+    /// The joint left the range its drive enforces.
+    Range,
 }
 
 impl Fault {
@@ -438,6 +461,7 @@ impl Fault {
             Self::Current => "current",
             Self::EstopMotor => "estop_motor",
             Self::Watchdog => "watchdog",
+            Self::Range => "range",
         }
     }
 }
@@ -462,6 +486,7 @@ impl ErrorFlags {
             (self.current, Fault::Current),
             (self.estop, Fault::EstopMotor),
             (self.watchdog, Fault::Watchdog),
+            (self.range, Fault::Range),
         ]
         .into_iter()
         .filter_map(|(set, fault)| set.then_some(fault))
@@ -536,6 +561,9 @@ pub struct NodeState {
     /// What the drive answered to configuration read requests, per
     /// configuration frame; `None` until one answered.
     pub readback: [Option<crate::spectral::codec::Readback>; 7],
+    /// The range the drive says it enforces (cmd 44); `None` until it
+    /// answered.
+    pub range: Option<DriveRange>,
     /// Ticks since this node's last frame; `u64::MAX` = never seen.
     pub data_age_ticks: u64,
 }
@@ -557,6 +585,7 @@ impl Default for NodeState {
             live_error_bit: false,
             data_age_ticks: u64::MAX,
             readback: [None; 7],
+            range: None,
         }
     }
 }

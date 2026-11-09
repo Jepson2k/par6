@@ -29,6 +29,7 @@ mod braking_tests;
 mod bridge;
 pub mod calibrate;
 pub mod collision_world;
+mod current;
 pub mod daemon;
 mod execution_path;
 mod grant;
@@ -38,6 +39,7 @@ pub mod options;
 mod planner;
 pub mod preview;
 pub mod ripple;
+pub mod shaping;
 pub mod vitals;
 
 pub use bridge::{held_jog_travel, stream_stopping_travel};

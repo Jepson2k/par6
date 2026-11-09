@@ -115,7 +115,7 @@ pub use wrap::wrap_to_window;
 
 // The generic Pinocchio layer: par6-bus drives the torque plant with it
 // and par6d/par6-motion parameterize trajectories with it.
-pub use sys::{Layer, Model, PathDegree, ToolParams, Trajectory};
+pub use sys::{Layer, Model, PathDegree, ToolParams, TorqueLimits, Trajectory};
 
 mod kin;
 

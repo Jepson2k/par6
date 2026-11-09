@@ -47,7 +47,7 @@ use par6_config::{KtSource, RobotConfig, ToolConfig};
 use par6_proto::{Layer, Shape};
 
 use crate::bus::DriverBus;
-use crate::hw::sched::{FreshnessClock, DEVICE_INFO_PERIOD_SLOTS};
+use crate::hw::sched::{FreshnessClock, DEVICE_INFO_PERIOD_SLOTS, RANGE_PERIOD_SLOTS};
 use crate::node_config::NodeConfig;
 use crate::spectral::codec::{
     decode_frame, encode_clear_error, encode_current_gains, encode_gripper_command,
@@ -62,9 +62,9 @@ use crate::spectral::codec::{
 use crate::spectral::convert::JointConversion;
 use crate::types::CaptureBuffer;
 use crate::types::{
-    BusError, BusState, DeviceInfo, DriveTune, ErrorFlags, FirmwareGripperCommand, Freshness,
-    GripperCommand, HallState, JointCommand, LinkHealth, LinkState, NodeId, PollAction, PollKind,
-    MAX_NODES,
+    BusError, BusState, DeviceInfo, DriveRange, DriveTune, ErrorFlags, FirmwareGripperCommand,
+    Freshness, GripperCommand, HallState, JointCommand, LinkHealth, LinkState, NodeId, PollAction,
+    PollKind, MAX_NODES,
 };
 
 use driver::Electrical;
@@ -156,6 +156,7 @@ pub struct SimBus {
     poll_cursor: u64,
     slot_counter: u64,
     di_remaining: usize,
+    range_remaining: usize,
     override_slot: Option<(PollAction, u16)>,
     joints_sent_this_tick: bool,
     health: LinkHealth,
@@ -221,6 +222,7 @@ impl SimBus {
             poll_cursor: 0,
             slot_counter: 0,
             di_remaining: 0,
+            range_remaining: 0,
             override_slot: None,
             joints_sent_this_tick: false,
             health: LinkHealth::default(),
@@ -296,6 +298,8 @@ impl SimBus {
             let wire = f64::from(map.conv.motor_ticks(q)) + map.report_offset;
             let hold_ma = self.plant().landed_load_nm(j) * map.factor_ma_per_nm;
             self.drivers[j].reseed_hold(wire, hold_ma);
+            // The wire count moved under it, as a restart moves a drive's.
+            self.drivers[j].disarm_range();
         }
         // Replies queued this tick describe the pose the arm just left;
         // drained under the re-based reference they would read as a jump
@@ -717,7 +721,7 @@ impl SimBus {
                 flags.calibrated,
                 flags.activated,
                 flags.watchdog,
-                false,
+                flags.range,
                 false,
                 false,
                 false,
@@ -798,6 +802,21 @@ impl SimBus {
                 pack_can_id(node, CommandId::RespondKt, err),
                 &pack_f32(d.kt_nm_a),
             ),
+            PollKind::Range => {
+                let id = pack_can_id(node, CommandId::Range, err);
+                match d.range() {
+                    DriveRange::Armed {
+                        min_ticks,
+                        max_ticks,
+                    } => {
+                        let mut p = [0u8; 8];
+                        p[0..4].copy_from_slice(&pack_i32(min_ticks));
+                        p[4..8].copy_from_slice(&pack_i32(max_ticks));
+                        CanFrame::data_frame(id, &p)
+                    }
+                    DriveRange::Disarmed => CanFrame::data_frame(id, &[]),
+                }
+            }
             PollKind::Ping => CanFrame::data_frame(pack_can_id(node, CommandId::Ping, err), &[]),
             PollKind::Encoder => {
                 let (pos, spd, _) = motion.unwrap_or((0, 0, 0));
@@ -1087,6 +1106,7 @@ impl SimBus {
                 s.combined_telemetry = true;
             }
             Payload::Readback(r) => state.nodes[n].readback[r.kind().index()] = Some(r),
+            Payload::Range(range) => state.nodes[n].range = Some(range),
             // Kept by the backend, not the shared state: see `SimBus::captures`.
             Payload::Capture { .. } | Payload::CaptureStatus { .. } => {}
             Payload::DeviceInfo(info) => state.nodes[n].device_info = Some(info),
@@ -1364,6 +1384,16 @@ impl DriverBus for SimBus {
         if self.slot_counter.is_multiple_of(DEVICE_INFO_PERIOD_SLOTS) {
             self.di_remaining = self.poll_targets();
         }
+        if self.range_remaining > 0 {
+            let idx = self.poll_targets() - self.range_remaining;
+            self.range_remaining -= 1;
+            let node = self.poll_target_node(idx);
+            self.deliver_rtr(node, PollKind::Range);
+            return Ok(());
+        }
+        if self.slot_counter.is_multiple_of(RANGE_PERIOD_SLOTS) {
+            self.range_remaining = self.poll_targets();
+        }
         // Every simulated drive runs the par6 firmware, so one combined
         // poll per target is the whole cycle.
         let idx = self.poll_cursor as usize % self.poll_targets();
@@ -1595,6 +1625,13 @@ impl DriverBus for SimBus {
         self.deliver_frame(&crate::spectral::codec::encode_velocity_window(
             node, window,
         ));
+        Ok(())
+    }
+
+    fn set_range(&mut self, node: NodeId, range: Option<(i32, i32)>) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        self.deliver_frame(&crate::spectral::codec::encode_range(node, range));
+        self.deliver_rtr(node, PollKind::Range);
         Ok(())
     }
 

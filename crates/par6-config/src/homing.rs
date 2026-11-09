@@ -96,14 +96,6 @@ pub struct JointHoming {
     /// against the gripper body).
     #[serde(default)]
     pub home_offset_gripper_dependent: bool,
-    /// Where this arm's motor latches at its stop, within one motor turn
-    /// \[encoder ticks\]: fixed by how the motor was mounted, repeating
-    /// within a few ticks, so a latch elsewhere is a false stall, a skipped
-    /// belt or a slipping coupling and fails homing. `par6-selfcal --apply`
-    /// writes it into the arm's local overlay; omit it to skip the check.
-    /// Not on a joint that homes against the tool.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub endstop_latch_ticks: Option<u32>,
 }
 
 /// Gripper homing flavor referenced by a sequence step.
@@ -286,12 +278,6 @@ impl JointHoming {
                     "must be above current_ma, the limit it replaces while braking",
                 ));
             }
-        }
-        if self.endstop_latch_ticks.is_some() && self.home_offset_gripper_dependent {
-            return Err(invalid(
-                f("endstop_latch_ticks"),
-                "a joint that homes against the tool latches where the tool puts it — remove it",
-            ));
         }
         if self.timeout_s <= 0.0 {
             return Err(invalid(f("timeout_s"), "must be > 0"));

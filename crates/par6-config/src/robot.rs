@@ -110,6 +110,15 @@ pub struct ModeLimits {
     /// Commanded-torque slew limit \[Nm/s\]. `None` = ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub torque_rate_nm_s: Option<f64>,
+    /// Share of the drive's current limit (`ilim_ma`) a planned move's
+    /// feedforward may spend, the rest left to the loop: each move's joint
+    /// accelerations are held to what that current drives at the arm's
+    /// pose, through the dynamics model, under `acceleration_rad_s2`.
+    /// The inertia a joint carries changes with the arm's reach (J1's
+    /// doubled with the arm out, 2026-11-07), so no one acceleration fits
+    /// everywhere. `None` = `acceleration_rad_s2` alone. EXEC only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_fraction: Option<f64>,
 }
 
 /// Control modes that carry their own kinodynamic limit set.
@@ -134,6 +143,9 @@ pub struct ResolvedLimits {
     pub jerk_rad_s3: Option<f64>,
     /// Torque slew limit \[Nm/s\]; `None` when the ceiling declares none.
     pub torque_rate_nm_s: Option<f64>,
+    /// Share of the drive's current limit a planned move's feedforward may
+    /// spend; `None` when the mode sets none (see `ModeLimits`).
+    pub current_fraction: Option<f64>,
 }
 
 /// Position limits plus the hardware kinodynamic ceiling and optional
@@ -178,6 +190,10 @@ pub struct JointLimits {
     pub stream: Option<ModeLimits>,
 }
 
+/// How far past its travel a joint may go before its drive trips
+/// (`JointLimits::drive_range_rad`) \[rad\].
+pub const DRIVE_RANGE_MARGIN_RAD: f64 = 2.0 * std::f64::consts::PI / 180.0;
+
 impl JointLimits {
     /// The mechanical endstops \[rad\]; `None` on a continuous joint,
     /// whose `hard_*` is only its homing-search envelope.
@@ -190,6 +206,15 @@ impl JointLimits {
     pub fn travel_rad(&self) -> (f64, f64) {
         self.endstops()
             .unwrap_or((self.soft_min_rad, self.soft_max_rad))
+    }
+
+    /// The span the joint's drive enforces itself \[rad\]: its travel with
+    /// `DRIVE_RANGE_MARGIN_RAD` either side, since a joint referenced
+    /// against its stop sits at or just past its hard limit (J1 references
+    /// 0.6 deg past its hard_max, J4 by default 0.9 deg below its hard_min).
+    pub fn drive_range_rad(&self) -> (f64, f64) {
+        let (lo, hi) = self.travel_rad();
+        (lo - DRIVE_RANGE_MARGIN_RAD, hi + DRIVE_RANGE_MARGIN_RAD)
     }
 
     /// Resolve the limits one mode actually runs under, applying the
@@ -206,12 +231,14 @@ impl JointLimits {
                 acceleration_rad_s2: m.acceleration_rad_s2,
                 jerk_rad_s3: Some(m.jerk_rad_s3.unwrap_or(self.jerk_rad_s3)),
                 torque_rate_nm_s: Some(m.torque_rate_nm_s.unwrap_or(self.torque_rate_nm_s)),
+                current_fraction: m.current_fraction,
             },
             None => ResolvedLimits {
                 velocity_rad_s: self.velocity_rad_s,
                 acceleration_rad_s2: self.acceleration_rad_s2,
                 jerk_rad_s3: Some(self.jerk_rad_s3),
                 torque_rate_nm_s: Some(self.torque_rate_nm_s),
+                current_fraction: None,
             },
         }
     }
@@ -231,8 +258,16 @@ pub struct JointConfig {
     /// Torque constant \[Nm/A\]. When `robot.kt_source = "auto"` this is
     /// the fallback for a driver that does not answer the boot kt fetch.
     pub kt_nm_a: f64,
-    /// Driver current limit \[mA\] (cmd 20).
+    /// Driver current limit \[mA\] (cmd 20): the most the drive spends,
+    /// moving or holding.
     pub ilim_ma: f64,
+    /// The motor's continuous current rating \[mA\], from its datasheet:
+    /// what it carries indefinitely without overheating. With `[thermal]`,
+    /// a planned move may draw on `ilim_ma` while the motor is cool, and
+    /// on less as it heats, down to this or `ilim_ma`, whichever is lower.
+    /// Omitted = `ilim_ma` at any temperature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rated_current_ma: Option<f64>,
     /// Driver voltage limit \[mV\] (cmd 34); 0 = use VBUS. Old firmware
     /// ignores the frame.
     pub voltage_limit_mv: u32,
@@ -641,6 +676,42 @@ impl TimingConfig {
     };
 }
 
+/// `[vibration]`: the arm's natural frequencies on what it stands on,
+/// which par6-selfcal measures and every EXEC move is shaped not to
+/// excite: the support is part of the plant, so a new desk is a new
+/// calibration. Omitted = unshaped.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VibrationConfig {
+    /// Each measured mode's frequency \[Hz\]; the shaper covers the band
+    /// from the lowest to the highest.
+    pub frequencies_hz: Vec<f64>,
+}
+
+/// `[thermal]`: the motor temperatures, read from each drive's thermistor,
+/// over which a joint's planned current slides from its `ilim_ma` peak
+/// down to its `rated_current_ma`. A drive faults at its own limit (75 C
+/// in the STEPFOC's EEPROM) and lets go of its motor, which drops a
+/// loaded shoulder; the budget is back at the rating, which the motor
+/// holds indefinitely, before the drive gets there. Omitted = no derating.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ThermalConfig {
+    /// Below this the whole peak is available \[C\].
+    pub derate_from_c: f64,
+    /// At and above this only the rating is \[C\].
+    pub derate_to_c: f64,
+}
+
+impl ThermalConfig {
+    /// The share of the way from a joint's peak current down to its rating
+    /// at `temperature_c`: 0 when cool, 1 when hot.
+    pub fn derating(&self, temperature_c: f64) -> f64 {
+        ((temperature_c - self.derate_from_c) / (self.derate_to_c - self.derate_from_c))
+            .clamp(0.0, 1.0)
+    }
+}
+
 /// `[motion]`: the runtime's motion "feel" constants — sampling pitch,
 /// solver damping, jog full-scale rates, completion settling. Defaults
 /// are the values par6 shipped with as compiled constants; the section
@@ -999,6 +1070,12 @@ pub struct RobotConfig {
     /// Motion feel constants. Omitted = the shipped defaults.
     #[serde(default)]
     pub motion: MotionConfig,
+    /// The arm's natural frequencies on its support. Omitted = unshaped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vibration: Option<VibrationConfig>,
+    /// Motor temperatures the planned current derates over. Omitted = none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thermal: Option<ThermalConfig>,
     /// Torque-level sim plant parameters. Omitted = the vendor table.
     #[serde(default)]
     pub sim: SimConfig,
@@ -1173,6 +1250,23 @@ impl RobotConfig {
         self.validate_timing()?;
         self.validate_collision()?;
         self.validate_motion()?;
+        if let Some(vibration) = &self.vibration {
+            let f = &vibration.frequencies_hz;
+            if f.is_empty() || !f.iter().all(|f| f.is_finite() && *f > 0.0) {
+                return Err(invalid(
+                    "vibration.frequencies_hz",
+                    "must name at least one frequency, each finite and > 0",
+                ));
+            }
+        }
+        if let Some(t) = &self.thermal {
+            if !(t.derate_from_c.is_finite() && t.derate_to_c > t.derate_from_c) {
+                return Err(invalid(
+                    "thermal",
+                    "derate_to_c must be finite and above derate_from_c",
+                ));
+            }
+        }
         self.validate_shutdown()?;
         self.validate_sim()?;
         Ok(())
@@ -1235,6 +1329,11 @@ impl RobotConfig {
         }
         if j.ilim_ma <= 0.0 {
             return Err(invalid(f("ilim_ma"), "must be > 0"));
+        }
+        if j.rated_current_ma
+            .is_some_and(|r| !(r > 0.0 && r.is_finite()))
+        {
+            return Err(invalid(f("rated_current_ma"), "must be finite and > 0"));
         }
         if j.velocity_limit_ticks_s <= 0.0 {
             return Err(invalid(f("velocity_limit_ticks_s"), "must be > 0"));
@@ -1308,6 +1407,17 @@ impl RobotConfig {
                         mf("jerk_rad_s3"),
                         format!("must be in (0, {}] (the hardware ceiling)", l.jerk_rad_s3),
                     ));
+                }
+            }
+            if let Some(v) = m.current_fraction {
+                if name != "exec" {
+                    return Err(invalid(
+                        mf("current_fraction"),
+                        "only planned (exec) motion is held to a current budget",
+                    ));
+                }
+                if !(v > 0.0 && v <= 1.0) {
+                    return Err(invalid(mf("current_fraction"), "must be in (0, 1]"));
                 }
             }
             if let Some(v) = m.torque_rate_nm_s {

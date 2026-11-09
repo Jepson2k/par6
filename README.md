@@ -1211,8 +1211,9 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
 - **Anything that moves the arm reads the e-stop line** (ESTOP_1) every control tick, and
   refuses to start if it cannot.
 - **In normal operation an e-stop or any failure holds the arm where it is**, under power:
-  the runtime drops to ACTIVE_ERROR, a zero-velocity hold, and nothing moves until the
-  operator resets. Holding under power is a protective stop (IEC 60204-1 category 2); an
+  the runtime drops to ACTIVE_ERROR, a zero-velocity hold that keeps feeding `G(q)` forward
+  on a homed arm (dropping it lets J2 sag until its loop winds up the load), and nothing
+  moves until the operator resets. Holding under power is a protective stop (IEC 60204-1 category 2); an
   emergency stop is category 0 or 1 by that standard, but the PAR6 has no brakes, and
   removing power would drop the arm.
 - **A collision holds the arm too** with `[collision] mode = "stop"`: a momentum observer
@@ -1252,11 +1253,8 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
   an arm can be driven clear of an obstruction before it is referenced. The shoulder and
   elbow seek on a light contact current and raise their limit to `brake_current_ma` only
   while gravity drives them into their stops, since the contact current decides the
-  reference. A joint fails homing at once when its two passes stall apart, when it slides
-  off its stall during the release (a false stall), or when it latches more than 1 deg from
-  this arm's `endstop_latch_ticks`, which `par6-selfcal --apply` records in the local
-  overlay: a motor's latch within one turn is fixed by how it was mounted, so a latch
-  elsewhere is a false stall, a skipped belt or a slipping coupling. A completed
+  reference. A joint fails homing at once when its two passes stall apart, or when it slides
+  off its stall during the release (a false stall). A completed
   sequence is still refused when the ready-pose holding torque contradicts the gravity
   model by more than `homing.reference_check_nm` (a stall seek that latched short of its
   endstop); the joint reports `HOMING_FAILED` in its `Finished` phase. A boot scan that

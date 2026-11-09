@@ -594,6 +594,7 @@ fn apply_payload(decoded: &DecodedFrame, state: &mut BusState) {
             s.combined_telemetry = true;
         }
         Payload::Readback(r) => state.nodes[n].readback[r.kind().index()] = Some(r),
+        Payload::Range(range) => state.nodes[n].range = Some(range),
         // Kept by the backend, not the shared state: see `SocketCanBus::captures`.
         Payload::Capture { .. } | Payload::CaptureStatus { .. } => {}
         Payload::DeviceInfo(info) => state.nodes[n].device_info = Some(info),
@@ -937,6 +938,12 @@ impl DriverBus for SocketCanBus {
         self.send(&crate::spectral::codec::encode_velocity_window(
             node, window,
         ))
+    }
+
+    fn set_range(&mut self, node: NodeId, range: Option<(i32, i32)>) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        self.send(&crate::spectral::codec::encode_range(node, range))?;
+        self.send(&encode_poll(node, PollKind::Range))
     }
 
     fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {

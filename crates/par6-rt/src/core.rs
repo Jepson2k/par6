@@ -49,6 +49,8 @@ use crate::homing::{HomingSystem, SeqStatus};
 use crate::hooks::{
     CommandSource, FlashMarker, ForwardKin, JogEngine, RtCommand, SettlePolicy, StreamTracker,
 };
+use crate::oscillation::{RingGuard, CALM_GAIN_SHARE, HOLD_CYCLE, LOOP_RING};
+use crate::range::DriveRanges;
 use crate::ring::SampleConsumer;
 use crate::snapshot::{snapshot_channel, SnapshotReader, SnapshotWriter};
 use crate::state::{
@@ -311,6 +313,10 @@ pub enum GateRefusal {
     NotImplemented,
 }
 
+/// How long a completed homing waits for every drive to confirm its range
+/// \[s\]: four range sweeps at the shipped rate.
+const RANGES_CONFIRM_S: f64 = 2.0;
+
 /// The latch key one drive fault bit is held under.
 ///
 /// Exhaustive on purpose: [`par6_bus::Fault`] is the single list of bits
@@ -326,6 +332,7 @@ fn latch_key(fault: Fault) -> ErrorCode {
         Fault::Current => ErrorCode::Current,
         Fault::EstopMotor => ErrorCode::EstopMotor,
         Fault::Watchdog => ErrorCode::Watchdog,
+        Fault::Range => ErrorCode::JointRange,
     }
 }
 
@@ -617,6 +624,9 @@ pub struct RtCore<B: DriverBus> {
     /// per-node disconnect errors — the freshness lost window, so an
     /// outbound-dead link disables on the same clock as a silent one.
     tx_fault_latch_ticks: u32,
+    /// How long a completed homing waits for every drive to confirm its
+    /// range \[ticks\].
+    ranges_confirm_ticks: u32,
 
     // State-machine variables: mode, state, homed, errors.
     mode: Mode,
@@ -631,6 +641,11 @@ pub struct RtCore<B: DriverBus> {
     park_asserted: bool,
     gravity_comp: bool,
     not_homed_refused: bool,
+    /// The joint range each drive enforces; see [`crate::range`].
+    ranges: DriveRanges,
+    /// Homing completed and waits, until this tick, for every drive to
+    /// confirm its range before the arm counts as homed.
+    ranges_due: Option<u64>,
 
     // Measured state pipeline.
     q: [f64; MAX_JOINTS],
@@ -649,6 +664,12 @@ pub struct RtCore<B: DriverBus> {
     filters_seeded: bool,
     observer: MomentumObserver,
     collision: CollisionMonitor,
+    /// Flips of each joint's reported speed, which a ringing loop makes.
+    ring: RingGuard,
+    /// Swings of each held joint's current, which a limit cycle makes.
+    hold_cycle: RingGuard,
+    /// Joints a ring dropped to calmer gains, until the clear restores them.
+    calmed: [bool; MAX_JOINTS],
     /// The observer's model terms this tick: `M(q)·q̇` and `C(q,q̇)ᵀ·q̇`.
     momentum: [f64; MAX_JOINTS],
     coriolis: [f64; MAX_JOINTS],
@@ -891,10 +912,13 @@ impl<B: DriverBus> RtCore<B> {
             tx_fail_streak: 0,
             gripper_tx_fail_streak: 0,
             tx_fault_latch_ticks: robot.ticks(robot.bus.lost_s).max(1),
+            ranges_confirm_ticks: robot.ticks(RANGES_CONFIRM_S).max(1),
             mode: Mode::Booting,
             state: ArmState::Disabled,
             enable_seq: 0,
             homed: false,
+            ranges: DriveRanges::new(robot),
+            ranges_due: None,
             soft_estop: false,
             hw_estop: false,
             estop_standing: false,
@@ -912,6 +936,9 @@ impl<B: DriverBus> RtCore<B> {
             filters_seeded: false,
             observer: MomentumObserver::new(robot),
             collision: CollisionMonitor::new(robot),
+            ring: RingGuard::new(LOOP_RING),
+            hold_cycle: RingGuard::new(HOLD_CYCLE),
+            calmed: [false; MAX_JOINTS],
             momentum: [0.0; MAX_JOINTS],
             coriolis: [0.0; MAX_JOINTS],
             g: [0.0; MAX_JOINTS],
@@ -1062,6 +1089,24 @@ impl<B: DriverBus> RtCore<B> {
         }
     }
 
+    /// Send joint `i`'s drive its configured tune, its velocity loop's
+    /// gains scaled by `share`.
+    fn retune_joint(&mut self, i: usize, share: f64) {
+        let joint = &self.boot.robot.joints[i];
+        let mut gains = joint.gains;
+        gains.kpv *= share;
+        gains.kiv *= share;
+        let tune = par6_bus::DriveTune {
+            gains,
+            ilim_ma: joint.ilim_ma,
+            velocity_limit_ticks_s: joint.velocity_limit_ticks_s,
+            voltage_limit_mv: joint.voltage_limit_mv,
+        };
+        if let Err(e) = self.bus.retune_node(self.node_of[i], &tune, 1) {
+            log::error!("J{}: the drive refused its gains: {e}", i + 1);
+        }
+    }
+
     /// Whether the arm has stopped travelling: every joint inside
     /// [`RELEASE_REST_BAND_RAD`] of where it was for
     /// [`RELEASE_REST_WINDOW_S`].
@@ -1145,6 +1190,12 @@ impl<B: DriverBus> RtCore<B> {
             return;
         }
         self.conv[joint].set_home(motor_ticks, joint_rad);
+        self.ranges.arm(
+            &mut self.bus,
+            &mut self.bus_state.nodes,
+            joint,
+            &self.conv[joint],
+        );
         self.sector_done[joint] = true;
         let node = &mut self.bus_state.nodes[usize::from(self.node_of[joint])];
         node.position_ticks = None;
@@ -1504,7 +1555,13 @@ impl<B: DriverBus> RtCore<B> {
         lap(&mut mark, &mut laps, 7);
 
         // Phase 9: clear-sequence settle countdown.
-        self.errors.tick();
+        if self.errors.tick() {
+            for i in 0..MAX_JOINTS {
+                if std::mem::take(&mut self.calmed[i]) {
+                    self.retune_joint(i, 1.0);
+                }
+            }
+        }
         lap(&mut mark, &mut laps, 8);
 
         // Phases 2-9 are folded in before the publish so the snapshot
@@ -2173,6 +2230,9 @@ impl<B: DriverBus> RtCore<B> {
         match target {
             Mode::Homing => {
                 self.homed = false;
+                self.ranges_due = None;
+                self.ranges
+                    .disarm_all(&mut self.bus, &mut self.bus_state.nodes);
                 self.ref_check_sum = [0.0; MAX_JOINTS];
                 self.ref_check_n = 0;
                 self.homing.start(&mut self.bus);
@@ -2514,6 +2574,35 @@ impl<B: DriverBus> RtCore<B> {
                 .condition(ErrorCode::Contact, joint, self.collision.contact(i));
         }
 
+        // A ringing loop: its gains drop at once, and the latch holds the
+        // arm on them.
+        let ringing = self.ring.step(&self.qd);
+        let driven = self.state == ArmState::Enabled
+            && matches!(self.mode, Mode::Jog | Mode::Stream | Mode::Exec);
+        for (i, rings) in ringing.into_iter().enumerate() {
+            if driven && rings && !self.calmed[i] {
+                self.calmed[i] = true;
+                self.retune_joint(i, CALM_GAIN_SHARE);
+                self.errors.latch(ErrorCode::Oscillation, Some(i as u8));
+            }
+        }
+        // A held joint's limit cycle: the latch's hold closes no position
+        // loop, which is what ends it.
+        let mut load = [0.0; MAX_JOINTS];
+        for (i, joint) in self.boot.robot.joints.iter().enumerate().take(MAX_JOINTS) {
+            let factor = self.torque_ma_factor[i].abs();
+            if self.mirror.qd[i] != 0.0 || factor == 0.0 {
+                self.hold_cycle.reset(i);
+                continue;
+            }
+            load[i] = self.tau[i] * factor / joint.ilim_ma;
+        }
+        for (i, cycling) in self.hold_cycle.step(&load).into_iter().enumerate() {
+            if driven && cycling {
+                self.errors.latch(ErrorCode::Oscillation, Some(i as u8));
+            }
+        }
+
         if !self.bus.is_silent() {
             // A sustained TX-failure streak is a disconnect: the arm has
             // stopped receiving commands even if RX freshness still reads
@@ -2596,6 +2685,39 @@ impl<B: DriverBus> RtCore<B> {
                 >= u64::from(self.stream_timeout_ticks)
         {
             self.errors.latch(ErrorCode::RtiLinkLost, None);
+        }
+
+        // A drive that dropped the range it had confirmed has restarted:
+        // its count, and the arm's reference with it, are gone.
+        if let Some(j) = self.ranges.watch(&self.bus_state.nodes) {
+            log::warn!(
+                "J{}: its drive dropped the range it had confirmed, so it restarted: homing \
+                 invalidated",
+                j + 1
+            );
+            self.errors.latch(ErrorCode::RangeLost, Some(j as u8));
+            self.homed = false;
+            self.ranges_due = None;
+        }
+        if let Some(due) = self.ranges_due {
+            match self.ranges.unconfirmed() {
+                None => {
+                    log::info!("every drive confirmed its range: homed");
+                    self.homed = true;
+                    self.not_homed_refused = false;
+                    self.ranges_due = None;
+                }
+                Some(j) if self.tick >= due => {
+                    log::warn!(
+                        "J{}: its drive never confirmed its range (no par6 firmware cmd 44?): \
+                         the arm stays unhomed",
+                        j + 1
+                    );
+                    self.errors.latch(ErrorCode::RangeNotArmed, Some(j as u8));
+                    self.ranges_due = None;
+                }
+                Some(_) => {}
+            }
         }
 
         // Homing-failed warnings track the per-joint statuses.
@@ -2711,7 +2833,7 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     fn gravity_applied(&self) -> bool {
-        self.homed && self.state == ArmState::Enabled && self.gravity_comp
+        self.homed && self.gravity_comp
     }
 
     fn dispatch_and_send(&mut self) {
@@ -2735,6 +2857,15 @@ impl<B: DriverBus> RtCore<B> {
                 &mut self.cmds,
                 &mut self.homing_gcmd,
             );
+            // Each joint's drive takes its range the tick homing
+            // references it, in the count that reference maps.
+            let statuses = *self.homing.statuses();
+            for (j, status) in statuses.iter().enumerate().take(MAX_JOINTS) {
+                if *status == HomingJointStatus::Done && !self.ranges.is_armed(j) {
+                    self.ranges
+                        .arm(&mut self.bus, &mut self.bus_state.nodes, j, &self.conv[j]);
+                }
+            }
             self.mirror = CommandMirror::default();
             self.torque_slew.reset();
             self.send_joints();
@@ -2759,10 +2890,15 @@ impl<B: DriverBus> RtCore<B> {
                     let unreferenced: Vec<usize> = (0..MAX_JOINTS)
                         .filter(|&i| statuses[i] != HomingJointStatus::Done)
                         .collect();
-                    if unreferenced.is_empty() {
+                    if unreferenced.is_empty() && self.ranges.unconfirmed().is_none() {
                         log::info!("homing sequence complete");
                         self.homed = true;
                         self.not_homed_refused = false;
+                    } else if unreferenced.is_empty() {
+                        log::info!(
+                            "homing sequence complete; waiting for every drive to confirm its range"
+                        );
+                        self.ranges_due = Some(self.tick + u64::from(self.ranges_confirm_ticks));
                     } else if refused {
                         log::warn!("homing sequence FAILED the reference check");
                         self.homed = false;
@@ -2801,8 +2937,15 @@ impl<B: DriverBus> RtCore<B> {
 
         match self.mode {
             Mode::Booting => dispatch::law_booting(&mut self.setpoints),
-            Mode::Idle => dispatch::law_idle(self.gravity_applied(), &self.g, &mut self.setpoints),
-            Mode::ActiveError => dispatch::law_active_error(&mut self.setpoints),
+            Mode::Idle => dispatch::law_idle(
+                self.state == ArmState::Enabled,
+                self.gravity_applied(),
+                &self.g,
+                &mut self.setpoints,
+            ),
+            Mode::ActiveError => {
+                dispatch::law_active_error(self.gravity_applied(), &self.g, &mut self.setpoints)
+            }
             Mode::SafetyStop => dispatch::law_safety_stop(&mut self.setpoints),
             Mode::Jog => {
                 self.jog_blocked =
@@ -3102,6 +3245,7 @@ impl<B: DriverBus> RtCore<B> {
         s.tau_filtered = self.tau_filt;
         s.tau_ext = self.tau_static;
         s.tau_observed = self.tau_ext;
+        s.torque_ma_factor = self.torque_ma_factor;
         s.q_commanded = self.mirror.q;
         s.qd_commanded = self.mirror.qd;
         s.tau_commanded = self.mirror.tau;

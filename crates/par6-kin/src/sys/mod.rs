@@ -18,4 +18,4 @@ mod traj;
 
 pub use collision::{CollisionModel, Layer, ShapeDesc, ShapePlacement};
 pub use model::{Error, IkOptions, Model, ToolParams};
-pub use traj::{PathDegree, Trajectory};
+pub use traj::{PathDegree, TorqueLimits, Trajectory};

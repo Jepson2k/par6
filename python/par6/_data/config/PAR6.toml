@@ -40,6 +40,8 @@ node_id = 0
 driver_type = "stepfoc"
 kt_nm_a = 0.28
 ilim_ma = 1800.0
+# The 17HS24-2104S datasheet's rated current per phase.
+rated_current_ma = 2100.0
 # 0 = the bus (~24 V). The drives' factory 6 V clamp had J2 and J3 running
 # out of volts against back-EMF at half their speed; the current limit is
 # what protects the motor, not this.
@@ -112,6 +114,8 @@ node_id = 1
 driver_type = "stepfoc"
 kt_nm_a = 0.31
 ilim_ma = 2500.0
+# The 17HS24-2104S datasheet's rated current per phase.
+rated_current_ma = 2100.0
 voltage_limit_mv = 0
 # 17HS24-2104S datasheet phase values; the driver's own `Cal` measures both
 # and keeps them in EEPROM, so a commissioned arm can overwrite these.
@@ -166,6 +170,8 @@ node_id = 2
 driver_type = "stepfoc"
 kt_nm_a = 0.3
 ilim_ma = 2500.0
+# The 17HS24-2104S datasheet's rated current per phase.
+rated_current_ma = 2100.0
 voltage_limit_mv = 0
 # 17HS24-2104S datasheet phase values; the driver's own `Cal` measures both
 # and keeps them in EEPROM, so a commissioned arm can overwrite these.
@@ -221,6 +227,8 @@ node_id = 3
 driver_type = "stepfoc"
 kt_nm_a = 0.183
 ilim_ma = 2100.0
+# The 17HS16-2004S1 datasheet's rated current per phase.
+rated_current_ma = 2000.0
 voltage_limit_mv = 0
 # 17HS16-2004S1 datasheet phase values; the driver's own `Cal` measures both
 # and keeps them in EEPROM, so a commissioned arm can overwrite these.
@@ -272,6 +280,8 @@ node_id = 4
 driver_type = "stepfoc"
 kt_nm_a = 0.183
 ilim_ma = 2100.0
+# The 17HS16-2004S1 datasheet's rated current per phase.
+rated_current_ma = 2000.0
 voltage_limit_mv = 0
 # 17HS16-2004S1 datasheet phase values; the driver's own `Cal` measures both
 # and keeps them in EEPROM, so a commissioned arm can overwrite these.
@@ -323,6 +333,8 @@ node_id = 5
 driver_type = "stepfoc"
 kt_nm_a = 0.151
 ilim_ma = 1200.0
+# The 17HS08-1004S datasheet's rated current per phase.
+rated_current_ma = 1000.0
 voltage_limit_mv = 0
 # 17HS08-1004S datasheet phase values; the driver's own `Cal` measures both
 # and keeps them in EEPROM, so a commissioned arm can overwrite these.
@@ -374,6 +386,14 @@ velocity_rad_s = 3.1
 acceleration_rad_s2 = 6.2
 jerk_rad_s3 = 18.6
 torque_rate_nm_s = 198.0
+
+# The drives fault at 75 C on their thermistors (the STEPFOC EEPROM
+# default) and let go of their motors, which drops a loaded shoulder. Planned
+# moves draw on each drive's ilim_ma peak below 55 C and slide to the motor's
+# rated_current_ma, which it holds indefinitely, by 70 C.
+[thermal]
+derate_from_c = 55.0
+derate_to_c = 70.0
 
 # ============================================================ homing (per-joint)
 # From robots/PAR6.xml homing_* fields. The vendor encodes "no release phase"

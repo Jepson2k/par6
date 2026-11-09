@@ -170,6 +170,14 @@ int32_t par6_kin_ik_step(par6_kin *h,
 
 typedef struct par6_traj par6_traj;
 
+/* Inverse dynamics for a torque-limited parameterization: the joint
+ * torques (nq doubles into out_tau) that hold the arm at q while it moves
+ * at v and accelerates at a, gravity included. Returns 0 on success; any
+ * other value fails the par6_traj_create that called it. */
+typedef int32_t (*par6_inverse_dynamics_fn)(void *ctx, const double *q,
+                                            const double *v, const double *a,
+                                            double *out_tau);
+
 /* Time-optimal rest-to-rest parameterization of a joint-space path (TOPPRA).
  * The waypoints are interpolated over a path parameter (`degree` 1 for
  * straight lines between them, 3 for a natural cubic spline; `knots` gives
@@ -196,12 +204,18 @@ typedef struct par6_traj par6_traj;
  *                 unchanged; the trajectory lasts longer by the window.
  *   n_gridpoints  path-parameter discretization: <= 0 selects an automatic
  *                 grid (recommended); otherwise >= 2 gridpoints.
+ *   dynamics,     optional (both NULL, or both set with torque_limit):
+ *   dynamics_ctx  inverse dynamics, called with dynamics_ctx, which bounds
+ *                 |tau| <= torque_limit componentwise along the trajectory
+ *                 in every solve, the smoothing's included.
+ *   torque_limit  nq doubles, finite and > 0 [Nm].
  *   err_buf       optional (may be NULL): receives a NUL-terminated error
  *                 message of at most err_len bytes on failure.
  *
  * Rejected with NULL + message: NULL pointers, n_waypoints < 2, nq < 1,
  * n_gridpoints == 1, NaN/inf in waypoints or limits, zero/negative limits,
- * zero total displacement, and paths the solver cannot parameterize.
+ * dynamics without torque limits or the reverse, zero total displacement,
+ * a failed dynamics call, and paths the solver cannot parameterize.
  * Returns NULL on failure. */
 par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
                             int32_t nq,
@@ -210,6 +224,8 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
                             int32_t n_gridpoints,
                             const double *knots, int32_t degree,
                             double max_path_speed,
+                            par6_inverse_dynamics_fn dynamics,
+                            void *dynamics_ctx, const double *torque_limit,
                             char *err_buf, int32_t err_len);
 
 void par6_traj_destroy(par6_traj *h);
@@ -469,9 +485,13 @@ par6_status par6_kin_set_tool(par6_kin *h, double mass, const double *com3,
  *     observer). Purely additive; a stale v12 library fails to link it.
  * v14: par6_traj_create takes jerk_limit after acc_limit, and with it
  *     smooths the trajectory to the jerk limits. A stale v13 library would
- *     read the jerk pointer as n_gridpoints. */
+ *     read the jerk pointer as n_gridpoints.
+ * v15: par6_traj_create takes an inverse-dynamics callback, its context
+ *     and torque limits after max_path_speed, and with them bounds the
+ *     joint torques. A stale v14 library would read the callback as
+ *     err_buf. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 14
+#define PAR6_SHIM_ABI_VERSION 15
 
 /* The byte layout of the value structs that cross this boundary, so the
  * Rust mirrors can check they read the same bytes: each struct's size,

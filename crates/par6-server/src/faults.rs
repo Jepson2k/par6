@@ -54,6 +54,12 @@ pub fn rt_standing_error(snap: &StateSnapshot) -> Option<WireError> {
             UNATTRIBUTED,
             &[("joint", &e.joint.unwrap_or(0).to_string())],
         )
+    } else if let Some(e) = errs.iter().find(|e| e.code == RtCode::Oscillation) {
+        make_error(
+            ErrorCode::SysJointOscillation,
+            UNATTRIBUTED,
+            &[("joint", &e.joint.unwrap_or(0).to_string())],
+        )
     } else if has(RtCode::LoopCritical) {
         make_error(ErrorCode::SysLoopCritical, UNATTRIBUTED, &[])
     } else if has(RtCode::ExecLinkLost) {
@@ -205,6 +211,12 @@ mod tests {
                 Some(2),
                 ErrorCode::SysCollision,
                 "Joint 2",
+            ),
+            (
+                RtCode::Oscillation,
+                Some(1),
+                ErrorCode::SysJointOscillation,
+                "Joint 1",
             ),
             (
                 RtCode::ExecSettleTimeout,

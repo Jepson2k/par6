@@ -31,6 +31,12 @@ use crate::types::{Freshness, NodeId, PollAction, PollKind, MAX_NODES};
 /// each backend.
 pub const DEVICE_INFO_PERIOD_SLOTS: u64 = 1006;
 
+/// Poll slots between range sweeps (cmd 44 read-backs), ~0.5 s at the
+/// shipped 250 Hz: a drive that restarted has dropped the range the
+/// runtime armed, and its reference with it, and this is how soon the
+/// runtime learns of it.
+pub const RANGE_PERIOD_SLOTS: u64 = 125;
+
 /// What one poll slot resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PollStep {
@@ -64,6 +70,7 @@ pub(super) struct PollScheduler {
     cursor: u64,
     slot: u64,
     device_info_remaining: usize,
+    range_remaining: usize,
     override_slot: Option<(PollAction, u16)>,
 }
 
@@ -80,6 +87,7 @@ impl PollScheduler {
         self.cursor = 0;
         self.slot = 0;
         self.device_info_remaining = 0;
+        self.range_remaining = 0;
         self.override_slot = None;
         self.rebuild_cycle();
     }
@@ -140,6 +148,17 @@ impl PollScheduler {
         }
         if self.slot.is_multiple_of(DEVICE_INFO_PERIOD_SLOTS) {
             self.device_info_remaining = self.targets;
+        }
+        if self.range_remaining > 0 {
+            let target = self.targets - self.range_remaining;
+            self.range_remaining -= 1;
+            return Some(PollStep::Poll {
+                target,
+                kind: PollKind::Range,
+            });
+        }
+        if self.slot.is_multiple_of(RANGE_PERIOD_SLOTS) {
+            self.range_remaining = self.targets;
         }
         let (target, kind) = self.cycle[self.cursor as usize % self.cycle.len()];
         self.cursor += 1;

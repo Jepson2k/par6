@@ -1,4 +1,6 @@
-//! Stream release against the real driver and plant, advanced in virtual time.
+//! Stopping the arm, against the real driver and plant, advanced in virtual
+//! time: a stream's release, a joint whose loop rings, and the hold a hard
+//! error and its clear leave the arm on.
 use par6_bus::sim::{scene::Scene, SimBus};
 use par6_config::{ConfigBundle, LimitMode};
 use par6_motion::{MotionLimits, StreamingExecutor};
@@ -8,22 +10,29 @@ use par6_rt::{
     sample_ring, ArmState, CompletionPolicy, Mode, RtCommand, RtCore, RtHandles, RtHooks,
     SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle,
 };
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 
 struct Rig {
     core: RtCore<SimBus>,
     handles: RtHandles,
     commands: mpsc::Sender<RtCommand>,
+    estop_line: Arc<AtomicBool>,
     bundle: ConfigBundle,
     dt: f64,
 }
 
 impl Rig {
     fn boot(dt: f64, q: [f64; MAX_JOINTS]) -> Self {
+        Self::boot_with(dt, q, |_| {})
+    }
+
+    fn boot_with(dt: f64, q: [f64; MAX_JOINTS], edit: impl FnOnce(&mut ConfigBundle)) -> Self {
         let path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
         let mut bundle = ConfigBundle::load(&path).expect("config");
         bundle.robot.robot.tick_dt_s = dt;
+        edit(&mut bundle);
         let robot = &bundle.robot;
         let opts = crate::Options {
             sim: true,
@@ -39,7 +48,7 @@ impl Rig {
         let limits = MotionLimits::from_config(robot, LimitMode::Stream).expect("limits");
         let (commands, receiver) = mpsc::channel();
         let (_producer, samples) = sample_ring(4096);
-        let (estop, _line) = SharedLineGpio::new(true);
+        let (estop, estop_line) = SharedLineGpio::new(true);
         let (io, _lines) = SharedDigitalIo::new(robot.io.inputs.len(), robot.io.outputs.len());
         let (flash, _flag) = SharedFlashMarker::new();
         let hooks = RtHooks {
@@ -68,6 +77,7 @@ impl Rig {
             core,
             handles,
             commands,
+            estop_line,
             bundle,
             dt,
         };
@@ -162,5 +172,119 @@ fn a_released_stream_stops_the_plant_before_the_hold_takes_it() {
                 stopped.qd[j]
             );
         }
+    }
+}
+
+/// A joint whose loop rings is caught within a few of its replies: the arm
+/// stops on the latch with that joint quiet on calmer gains, and the clear
+/// puts its own gains back, on which the same drive rings and is caught
+/// again.
+#[test]
+fn a_ringing_joint_is_caught_calmed_and_given_back_its_gains_by_the_clear() {
+    let dt = 0.004;
+    let start = [0.0_f64, -10.0, 240.0, 0.0, 0.0, 180.0].map(f64::to_radians);
+    // At three times its velocity-loop gains the simulated J1 rings; at
+    // half of that it holds quiet.
+    let mut rig = Rig::boot_with(dt, start, |b| {
+        let gains = &mut b.robot.joints[0].gains;
+        gains.kpv *= 3.0;
+        gains.kiv *= 3.0;
+    });
+    let swing = |speeds: &[f64]| {
+        speeds
+            .windows(2)
+            .map(|w| (w[1] - w[0]).abs())
+            .fold(0.0, f64::max)
+    };
+    let drive = |rig: &mut Rig| -> Option<(u32, Vec<f64>)> {
+        rig.commands.send(RtCommand::SetMode(Mode::Stream)).unwrap();
+        rig.until("stream", |s| s.mode == Mode::Stream);
+        let mut speeds = Vec::new();
+        for i in 0..rig.bundle.robot.ticks(2.0) {
+            let mut q = start;
+            q[0] += 0.5 * f64::from(i) * dt;
+            rig.handles.stream.send(&par6_rt::StreamSetpoint {
+                q,
+                ..Default::default()
+            });
+            let s = rig.tick();
+            speeds.push(s.qd[0]);
+            if s.errors
+                .as_slice()
+                .iter()
+                .any(|e| e.code == par6_rt::ErrorCode::Oscillation && e.joint == Some(0))
+            {
+                return Some((i, speeds));
+            }
+        }
+        None
+    };
+    let (caught, speeds) = drive(&mut rig).expect("the ring was never caught");
+    assert!(swing(&speeds) > 1.5, "caught without a ring: {speeds:?}");
+    assert!(rig.tick().error_active, "the ring must latch");
+    let mut after = Vec::new();
+    for _ in 0..rig.bundle.robot.ticks(0.5) {
+        after.push(rig.tick().qd[0]);
+    }
+    let tail = &after[after.len() / 2..];
+    assert!(swing(tail) < 0.2, "still ringing on calmer gains: {tail:?}");
+    rig.commands.send(RtCommand::ClearErrors).unwrap();
+    rig.until("clear", |s| !s.error_active);
+    rig.commands.send(RtCommand::Enable).unwrap();
+    rig.until("enable", |s| s.state == ArmState::Enabled);
+    let (_, speeds) = drive(&mut rig).unwrap_or_else(|| {
+        panic!(
+            "back on its own gains the joint must ring again (caught first after {caught} ticks)"
+        )
+    });
+    assert!(
+        swing(&speeds) > 1.5,
+        "caught again without a ring: {speeds:?}"
+    );
+}
+
+/// A hard error stops the arm where it stands, and so does the clear that
+/// hands it back disabled: neither may take away the gravity support the
+/// arm stood on, or J2, carrying the arm out, drops until its loop winds up
+/// what the support carried (0.3° on the arm, 2026-11-08).
+#[test]
+fn a_hard_error_and_its_clear_hold_the_arm_where_it_stands() {
+    let dt = 0.004;
+    let start = [0.0_f64, -10.0, 240.0, 0.0, 0.0, 180.0].map(f64::to_radians);
+    let mut rig = Rig::boot(dt, start);
+    rig.commands.send(RtCommand::SetMode(Mode::Stream)).unwrap();
+    rig.until("stream", |s| s.mode == Mode::Stream);
+    for _ in 0..rig.bundle.robot.ticks(1.0) {
+        rig.handles.stream.send(&par6_rt::StreamSetpoint {
+            q: start,
+            ..Default::default()
+        });
+        rig.tick();
+    }
+    let stood = rig.handles.snapshots.latest().q;
+    let mut drop = [0.0_f64; MAX_JOINTS];
+    let mut watch = |rig: &mut Rig, s: f64| {
+        for _ in 0..rig.bundle.robot.ticks(s) {
+            let q = rig.tick().q;
+            for j in 0..MAX_JOINTS {
+                drop[j] = drop[j].max((q[j] - stood[j]).abs());
+            }
+        }
+    };
+    rig.estop_line.store(false, Ordering::Relaxed);
+    rig.until("the e-stop's hold", |s| s.mode == Mode::ActiveError);
+    watch(&mut rig, 0.5);
+    rig.estop_line.store(true, Ordering::Relaxed);
+    rig.commands.send(RtCommand::ClearErrors).unwrap();
+    rig.until("clear", |s| s.mode == Mode::Idle && !s.error_active);
+    assert_eq!(rig.handles.snapshots.latest().state, ArmState::Disabled);
+    watch(&mut rig, 0.5);
+    for (j, d) in drop.into_iter().enumerate() {
+        assert!(
+            d.to_degrees() < 0.05,
+            "J{} moved {:.3}° from where the arm stood",
+            j + 1,
+            d.to_degrees()
+        );
     }
 }

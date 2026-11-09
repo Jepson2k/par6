@@ -296,6 +296,9 @@ fn rejects_degenerate_inputs_across_the_ffi() {
             std::ptr::null(),
             3,
             0.0,
+            None,
+            std::ptr::null_mut(),
+            std::ptr::null(),
             err.as_mut_ptr(),
             err.len() as i32,
         );
@@ -372,9 +375,10 @@ fn linear_degree_keeps_the_path_on_the_waypoints() {
         (0usize, par6_kin::PathDegree::Linear),
         (1, par6_kin::PathDegree::Cubic),
     ] {
-        let traj =
-            Trajectory::parameterize_with(&way, nq, &vel, &acc, None, None, None, degree, None)
-                .expect("plan");
+        let traj = Trajectory::parameterize_with(
+            &way, nq, &vel, &acc, None, None, None, degree, None, None,
+        )
+        .expect("plan");
         let duration = traj.duration();
         let mut q = vec![0.0; nq];
         let mut qd = vec![0.0; nq];
@@ -416,7 +420,7 @@ fn jerk_limits_smooth_the_timing_and_keep_the_path() {
     ];
     let (vel, acc, jerk) = (vec![1.0; nq], vec![4.0; nq], vec![40.0; nq]);
     let plan = |way: &[f64], jerk: Option<&[f64]>, degree| {
-        Trajectory::parameterize_with(way, nq, &vel, &acc, jerk, None, None, degree, None)
+        Trajectory::parameterize_with(way, nq, &vel, &acc, jerk, None, None, degree, None, None)
             .expect("plan")
     };
     let (mut q, mut qd, mut qdd) = (vec![0.0; nq], vec![0.0; nq], vec![0.0; nq]);
@@ -531,6 +535,7 @@ fn jerk_limits_smooth_the_timing_and_keep_the_path() {
                     None,
                     None,
                     par6_kin::PathDegree::Linear,
+                    None,
                     None
                 ),
                 Err(Error::Create(_))
@@ -548,4 +553,111 @@ fn jerk_limits_smooth_the_timing_and_keep_the_path() {
         raw.duration(),
         "unconstrained jerk smooths nothing"
     );
+}
+
+/// Torque limits bound what the caller's inverse dynamics gives, in both
+/// the raw solve and the smoothed one. Against gravity a joint has less
+/// torque left to accelerate with than to brake with, so a rest-to-rest
+/// move speeds up gently and brakes hard: with `tau = I·a + G` and limit
+/// `L`, `(L − G)/I` up and `(L + G)/I` down, which fixes its duration.
+#[test]
+fn torque_limits_bound_the_dynamics_torque() {
+    const I: f64 = 0.5;
+    const G: f64 = 1.0;
+    const L: f64 = 3.0;
+    let line = [0.0, 1.0];
+    let (vel, acc) = ([10.0], [100.0]);
+    let mut model = |_q: &[f64], _v: &[f64], a: &[f64], tau: &mut [f64]| {
+        tau[0] = I * a[0] + G;
+        true
+    };
+    let mut plan = |jerk: Option<&[f64]>, limit: &[f64]| {
+        Trajectory::parameterize_with(
+            &line,
+            1,
+            &vel,
+            &acc,
+            jerk,
+            None,
+            None,
+            par6_kin::PathDegree::Linear,
+            None,
+            Some(par6_kin::TorqueLimits {
+                inverse_dynamics: &mut model,
+                limit,
+            }),
+        )
+    };
+    let worst = |traj: &Trajectory| {
+        let (mut q, mut qd, mut qdd) = ([0.0], [0.0], [0.0]);
+        (0..=2000)
+            .map(|k| {
+                traj.sample_into(
+                    traj.duration() * k as f64 / 2000.0,
+                    &mut q,
+                    &mut qd,
+                    &mut qdd,
+                )
+                .expect("sample");
+                (I * qdd[0] + G).abs() / L
+            })
+            .fold(0.0, f64::max)
+    };
+
+    let raw = plan(None, &[L]).expect("plan");
+    let (up, down) = ((L - G) / I, (L + G) / I);
+    let peak = (2.0 * up * down / (up + down)).sqrt();
+    let expected = peak / up + peak / down;
+    assert!(
+        (raw.duration() - expected).abs() < 0.01 * expected,
+        "{} s against {expected} s",
+        raw.duration()
+    );
+    assert!(
+        worst(&raw) <= 1.01,
+        "raw torque reached {:.3} of its limit",
+        worst(&raw)
+    );
+
+    let smooth = plan(Some(&[40.0]), &[L]).expect("plan");
+    assert!(smooth.duration() > raw.duration());
+    assert!(
+        worst(&smooth) <= 1.01,
+        "smoothed torque reached {:.3} of its limit",
+        worst(&smooth)
+    );
+
+    for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+        assert!(
+            matches!(plan(None, &[bad]), Err(Error::Create(_))),
+            "torque limit {bad} was accepted"
+        );
+    }
+    assert!(matches!(plan(None, &[L, L]), Err(Error::Dimension { .. })));
+
+    for failing in [false, true] {
+        let mut broken = |_q: &[f64], _v: &[f64], _a: &[f64], _tau: &mut [f64]| {
+            assert!(!failing, "a panicking model");
+            false
+        };
+        let result = Trajectory::parameterize_with(
+            &line,
+            1,
+            &vel,
+            &acc,
+            None,
+            None,
+            None,
+            par6_kin::PathDegree::Linear,
+            None,
+            Some(par6_kin::TorqueLimits {
+                inverse_dynamics: &mut broken,
+                limit: &[L],
+            }),
+        );
+        assert!(
+            matches!(&result, Err(Error::Create(msg)) if msg.contains("inverse dynamics")),
+            "a failing model gave {result:?}"
+        );
+    }
 }

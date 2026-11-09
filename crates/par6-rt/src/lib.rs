@@ -53,6 +53,8 @@ mod gripper_gate;
 pub mod gripper_settle;
 pub mod homing;
 pub mod hooks;
+mod oscillation;
+mod range;
 pub mod ring;
 pub mod rt;
 pub mod snapshot;

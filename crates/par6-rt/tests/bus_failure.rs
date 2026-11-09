@@ -213,6 +213,9 @@ impl DriverBus for FailingBus {
     fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError> {
         self.inner.set_velocity_window(node, window)
     }
+    fn set_range(&mut self, node: NodeId, range: Option<(i32, i32)>) -> Result<(), BusError> {
+        self.inner.set_range(node, range)
+    }
 
     fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
         self.inner.capture_stream(node)

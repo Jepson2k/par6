@@ -6,7 +6,18 @@
 // against cpp/include/par6_shim.h.
 #![allow(non_camel_case_types)]
 
-use core::ffi::c_char;
+use core::ffi::{c_char, c_void};
+
+/// `par6_inverse_dynamics_fn`: the joint torques (`nq` into `out_tau`) at
+/// `q` moving at `v` and accelerating at `a`, gravity included; 0 on
+/// success.
+pub type par6_inverse_dynamics_fn = unsafe extern "C" fn(
+    ctx: *mut c_void,
+    q: *const f64,
+    v: *const f64,
+    a: *const f64,
+    out_tau: *mut f64,
+) -> i32;
 
 /// Opaque kinematics handle (`struct par6_kin`).
 #[repr(C)]
@@ -189,6 +200,8 @@ extern "C" {
     /// cubic spline); `knots` gives the path parameter each waypoint sits
     /// at (finite, strictly increasing) or NULL for even spacing.
     /// `max_path_speed > 0` caps `ds/dt`; <= 0 leaves it unbounded.
+    /// `dynamics` (called with `dynamics_ctx`) and `torque_limit` (`nq`,
+    /// finite and > 0) go together and bound the joint torques.
     /// Returns NULL on failure with a message in `err_buf`.
     pub fn par6_traj_create(
         waypoints: *const f64,
@@ -201,6 +214,9 @@ extern "C" {
         knots: *const f64,
         degree: i32,
         max_path_speed: f64,
+        dynamics: Option<par6_inverse_dynamics_fn>,
+        dynamics_ctx: *mut c_void,
+        torque_limit: *const f64,
         err_buf: *mut c_char,
         err_len: i32,
     ) -> *mut par6_traj;

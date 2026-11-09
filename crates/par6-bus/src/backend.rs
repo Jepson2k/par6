@@ -129,6 +129,10 @@ impl DriverBus for RuntimeBus {
         dispatch!(self, set_velocity_window(node, window))
     }
 
+    fn set_range(&mut self, node: NodeId, range: Option<(i32, i32)>) -> Result<(), BusError> {
+        dispatch!(self, set_range(node, range))
+    }
+
     fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
         dispatch!(self, capture_stream(node))
     }

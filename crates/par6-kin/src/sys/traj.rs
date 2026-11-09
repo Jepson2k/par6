@@ -1,7 +1,9 @@
 //! Safe wrapper over the `par6_traj` handle (TOPPRA time-optimal
 //! path parameterization via toppra-cpp).
 
+use std::ffi::c_void;
 use std::fmt;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::ptr::NonNull;
 
 use super::ffi;
@@ -49,6 +51,51 @@ pub enum PathDegree {
     Cubic = 3,
 }
 
+/// Writes the joint torques (`nq` values) that hold the arm at `q` while it
+/// moves at `v` and accelerates at `a`, gravity included; `false` fails the
+/// parameterization.
+pub type InverseDynamics<'a> = dyn FnMut(&[f64], &[f64], &[f64], &mut [f64]) -> bool + 'a;
+
+/// Joint torque limits for [`Trajectory::parameterize_with`], against the
+/// caller's inverse dynamics.
+pub struct TorqueLimits<'a> {
+    /// The model the limits hold against.
+    pub inverse_dynamics: &'a mut InverseDynamics<'a>,
+    /// `|tau| <= limit` per joint, finite and > 0 \[Nm\].
+    pub limit: &'a [f64],
+}
+
+struct DynamicsCtx<'a> {
+    nq: usize,
+    f: &'a mut InverseDynamics<'a>,
+}
+
+unsafe extern "C" fn inverse_dynamics_trampoline(
+    ctx: *mut c_void,
+    q: *const f64,
+    v: *const f64,
+    a: *const f64,
+    out_tau: *mut f64,
+) -> i32 {
+    // SAFETY: `ctx` is the `DynamicsCtx` `parameterize_with` passed for the
+    // duration of the create call, and the shim hands `nq`-long buffers.
+    let ctx = unsafe { &mut *ctx.cast::<DynamicsCtx>() };
+    let n = ctx.nq;
+    let (q, v, a, tau) = unsafe {
+        (
+            std::slice::from_raw_parts(q, n),
+            std::slice::from_raw_parts(v, n),
+            std::slice::from_raw_parts(a, n),
+            std::slice::from_raw_parts_mut(out_tau, n),
+        )
+    };
+    // A panic must not unwind into C++.
+    match catch_unwind(AssertUnwindSafe(|| (ctx.f)(q, v, a, tau))) {
+        Ok(true) => 0,
+        _ => 1,
+    }
+}
+
 impl Trajectory {
     /// Parameterize `waypoints` through a natural cubic spline at even
     /// parameter spacing — see [`Trajectory::parameterize_with`].
@@ -68,6 +115,7 @@ impl Trajectory {
             n_gridpoints,
             None,
             PathDegree::Cubic,
+            None,
             None,
         )
     }
@@ -96,6 +144,9 @@ impl Trajectory {
     /// inside the limits through bends (a caller that must hold them exactly
     /// stretches any remainder). The path is unchanged and
     /// [`Trajectory::duration`] includes the window.
+    ///
+    /// `torque` bounds the joint torques its inverse dynamics gives, in
+    /// every solve including the smoothing's.
     // Arity is the C entry point's, not a choice: bundling these into a
     // params struct would put a shape between the caller and the ABI that
     // this crate exists to expose verbatim.
@@ -110,6 +161,7 @@ impl Trajectory {
         knots: Option<&[f64]>,
         degree: PathDegree,
         max_path_speed: Option<f64>,
+        torque: Option<TorqueLimits<'_>>,
     ) -> Result<Self, Error> {
         if vel_limit.len() != nq {
             return Err(Error::Dimension {
@@ -168,6 +220,31 @@ impl Trajectory {
                 });
             }
         }
+        let (mut ctx, torque_limit) = match torque {
+            Some(t) => {
+                if t.limit.len() != nq {
+                    return Err(Error::Dimension {
+                        expected: nq,
+                        got: t.limit.len(),
+                    });
+                }
+                (
+                    Some(DynamicsCtx {
+                        nq,
+                        f: t.inverse_dynamics,
+                    }),
+                    t.limit.as_ptr(),
+                )
+            }
+            None => (None, std::ptr::null()),
+        };
+        let (dynamics, dynamics_ctx) = match ctx.as_mut() {
+            Some(ctx) => (
+                Some(inverse_dynamics_trampoline as ffi::par6_inverse_dynamics_fn),
+                (ctx as *mut DynamicsCtx).cast::<c_void>(),
+            ),
+            None => (None, std::ptr::null_mut()),
+        };
 
         let mut err_buf = [0u8; 512];
         let raw = unsafe {
@@ -182,6 +259,9 @@ impl Trajectory {
                 knots.map_or(std::ptr::null(), <[f64]>::as_ptr),
                 degree as i32,
                 max_path_speed.unwrap_or(0.0),
+                dynamics,
+                dynamics_ctx,
+                torque_limit,
                 err_buf.as_mut_ptr().cast(),
                 err_buf.len() as i32,
             )

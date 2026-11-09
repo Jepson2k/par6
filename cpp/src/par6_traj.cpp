@@ -17,6 +17,7 @@
 #include <limits>
 #include <memory>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -163,6 +164,87 @@ class ScaledJointAcceleration : public toppra::LinearConstraint {
     Eigen::VectorXd m_limit, m_scale;
 };
 
+/* The caller's inverse dynamics. */
+class Dynamics {
+  public:
+    Dynamics(par6_inverse_dynamics_fn fn, void *ctx, Eigen::Index dof)
+        : m_fn(fn), m_ctx(ctx), m_zero(Eigen::VectorXd::Zero(dof)),
+          m_tau(dof) {}
+
+    toppra::Vector operator()(const toppra::Vector &q, const toppra::Vector &v,
+                              const toppra::Vector &a) {
+        if (m_fn(m_ctx, q.data(), v.data(), a.data(), m_tau.data()) != 0) {
+            throw std::runtime_error("inverse dynamics failed");
+        }
+        return m_tau;
+    }
+
+    const toppra::Vector &zero() const { return m_zero; }
+
+  private:
+    par6_inverse_dynamics_fn m_fn;
+    void *m_ctx;
+    toppra::Vector m_zero, m_tau;
+};
+
+/* The joint torques at path position s as tau = a·u + b·x + c in the path
+ * acceleration u and squared speed x. With q' and q'' the path's
+ * derivatives, tau(q, q'·sd, q'·u + q''·x) = M·q'·u + (M·q'' + C(q, q')·q')·x
+ * + g, and each term is one inverse-dynamics call less gravity. */
+struct TorqueRows {
+    toppra::Vector a, b, c;
+};
+
+TorqueRows torque_rows(Dynamics &dyn, const toppra::GeometricPath &path,
+                       double s) {
+    const toppra::Vector q = path.eval_single(s, 0);
+    const toppra::Vector d1 = path.eval_single(s, 1);
+    const toppra::Vector d2 = path.eval_single(s, 2);
+    TorqueRows rows;
+    rows.c = dyn(q, dyn.zero(), dyn.zero());
+    rows.a = dyn(q, dyn.zero(), d1) - rows.c;
+    rows.b = dyn(q, d1, d2) - rows.c;
+    return rows;
+}
+
+/* Joint torque limits, scaled per gridpoint (an empty scale is 1). */
+class ScaledJointTorque : public toppra::LinearConstraint {
+  public:
+    ScaledJointTorque(std::shared_ptr<Dynamics> dyn, Eigen::VectorXd limit,
+                      Eigen::VectorXd scale)
+        : toppra::LinearConstraint(2 * limit.size(), limit.size(), false,
+                                   false, false),
+          m_dyn(std::move(dyn)), m_limit(std::move(limit)),
+          m_scale(std::move(scale)) {}
+
+  protected:
+    void computeParams_impl(const toppra::GeometricPath &path,
+                            const toppra::Vector &gridpoints,
+                            toppra::Vectors &a, toppra::Vectors &b,
+                            toppra::Vectors &c, toppra::Matrices &F,
+                            toppra::Vectors &g, toppra::Bounds &,
+                            toppra::Bounds &) override {
+        const Eigen::Index n = m_limit.size();
+        for (Eigen::Index i = 0; i < gridpoints.size(); ++i) {
+            const auto k = static_cast<size_t>(i);
+            TorqueRows rows = torque_rows(*m_dyn, path, gridpoints[i]);
+            a[k] = rows.a;
+            b[k] = rows.b;
+            c[k] = rows.c;
+            F[k].topRows(n).setIdentity();
+            F[k].bottomRows(n).setZero();
+            F[k].bottomRows(n).diagonal().setConstant(-1);
+            const double scale = m_scale.size() == 0 ? 1.0 : m_scale[i];
+            g[k].head(n) = m_limit * scale;
+            g[k].tail(n) = m_limit * scale;
+        }
+    }
+
+  private:
+    std::shared_ptr<Dynamics> m_dyn;
+    Eigen::VectorXd m_limit, m_scale;
+};
+
 /* A ceiling on the path speed at each gridpoint. */
 class PathSpeedCap : public toppra::LinearConstraint {
   public:
@@ -235,39 +317,84 @@ double smoothing_window(const par6_traj &pass, const toppra::GeometricPath &path
     return longest;
 }
 
-/* The fastest path speed the joint limits allow at path position s, the
+/* Rows |A·u + B·x + C| <= L on the path acceleration u and squared speed
+ * x, one per joint and limit. */
+struct Rows {
+    std::vector<double> A, B, C, L;
+    void add(double a, double b, double c, double l) {
+        A.push_back(a);
+        B.push_back(b);
+        C.push_back(c);
+        L.push_back(l);
+    }
+};
+
+/* The largest x at which some u satisfies every row. Each row with A != 0
+ * confines u to an interval [lo + beta·x, hi + beta·x], beta = -B/A; the
+ * intervals share a point while every pair overlaps, and each pair's
+ * overlap is linear in x. A row with A = 0 bounds x by itself. */
+double max_squared_speed(const Rows &rows) {
+    constexpr double tiny = 1e-12;
+    const size_t n = rows.A.size();
+    std::vector<double> lo(n), hi(n), beta(n);
+    double x = std::numeric_limits<double>::infinity();
+    for (size_t r = 0; r < n; ++r) {
+        if (std::abs(rows.A[r]) <= tiny) {
+            if (rows.B[r] > tiny) {
+                x = std::min(x, (rows.L[r] - rows.C[r]) / rows.B[r]);
+            } else if (rows.B[r] < -tiny) {
+                x = std::min(x, (rows.L[r] + rows.C[r]) / -rows.B[r]);
+            }
+            continue;
+        }
+        const double e1 = (-rows.L[r] - rows.C[r]) / rows.A[r];
+        const double e2 = (rows.L[r] - rows.C[r]) / rows.A[r];
+        lo[r] = std::min(e1, e2);
+        hi[r] = std::max(e1, e2);
+        beta[r] = -rows.B[r] / rows.A[r];
+    }
+    for (size_t r = 0; r < n; ++r) {
+        if (std::abs(rows.A[r]) <= tiny) continue;
+        for (size_t k = 0; k < n; ++k) {
+            if (k == r || std::abs(rows.A[k]) <= tiny) continue;
+            /* lo_r + beta_r·x <= hi_k + beta_k·x */
+            const double slope = beta[r] - beta[k];
+            const double room = hi[k] - lo[r];
+            if (slope > tiny) {
+                x = std::min(x, room / slope);
+            } else if (room < 0.0) {
+                x = 0.0;
+            }
+        }
+    }
+    return std::max(x, 0.0);
+}
+
+/* The fastest path speed the limits allow at path position s, the
  * maximum-velocity curve: every joint under its velocity limit, and some
- * path acceleration u keeping every joint's q'·u + q''·sd² inside its
- * acceleration limit. Each joint's acceleration limit confines u to an
- * interval that shrinks as sd² grows; the intervals share a point while
- * every pair of them overlaps, and a pair stops overlapping past
- * (a_j·|q'_k| + a_k·|q'_j|) / |q''_j·q'_k − q''_k·q'_j|. A joint the path
- * does not move (q' = 0) is bounded by its curvature alone. */
+ * path acceleration holding every joint's acceleration q'·u + q''·x and,
+ * with `dyn`, its torque inside their limits. */
 double max_path_speed_at(const toppra::GeometricPath &path, double s,
                          const double *vel, const double *acc,
+                         Dynamics *dyn, const double *torque_limit,
                          double max_path_speed, Eigen::Index dof) {
     constexpr double tiny = 1e-12;
     const toppra::Vector d1 = path.eval_single(s, 1);
     const toppra::Vector d2 = path.eval_single(s, 2);
     double sd = max_path_speed > 0.0 ? max_path_speed
                                      : std::numeric_limits<double>::infinity();
-    double x = std::numeric_limits<double>::infinity();
+    Rows rows;
     for (Eigen::Index j = 0; j < dof; ++j) {
-        if (std::abs(d1[j]) > tiny) {
-            sd = std::min(sd, vel[j] / std::abs(d1[j]));
-        } else if (std::abs(d2[j]) > tiny) {
-            x = std::min(x, acc[j] / std::abs(d2[j]));
-        }
-        for (Eigen::Index k = j + 1; k < dof; ++k) {
-            const double den = std::abs(d2[j] * d1[k] - d2[k] * d1[j]);
-            if (den > tiny) {
-                x = std::min(x, (acc[j] * std::abs(d1[k]) +
-                                 acc[k] * std::abs(d1[j])) /
-                                    den);
-            }
+        if (std::abs(d1[j]) > tiny) sd = std::min(sd, vel[j] / std::abs(d1[j]));
+        rows.add(d1[j], d2[j], 0.0, acc[j]);
+    }
+    if (dyn != nullptr) {
+        const TorqueRows t = torque_rows(*dyn, path, s);
+        for (Eigen::Index j = 0; j < dof; ++j) {
+            rows.add(t.a[j], t.b[j], t.c[j], torque_limit[j]);
         }
     }
-    return std::min(sd, std::sqrt(x));
+    return std::min(sd, std::sqrt(max_squared_speed(rows)));
 }
 
 /* The path-speed ceiling a window average stays under: at each gridpoint,
@@ -314,14 +441,15 @@ void store_profile(par6_traj &h, const toppra::Vector &gridpoints,
 }
 
 /* Where the smoothed trajectory asks a joint for more than its acceleration
- * limit, lower the limits on the stretch of path the average drew from by
+ * or torque limit, lower the limits on the stretch of path the average drew from by
  * that excess. Averaged over the window, the path acceleration TOPPRA held
  * at each point is spent where the joints answer it differently, and along
  * a path whose joint ratios change quickly (near a wrist singularity,
  * through a blend) that can pass a limit TOPPRA held. Returns whether any
  * sample was over. */
 bool lower_where_over(const par6_traj &h, const toppra::GeometricPath &path,
-                      const double *acc_limit, Eigen::Index dof,
+                      const double *acc_limit, Dynamics *dyn,
+                      const double *torque_limit, Eigen::Index dof,
                       Eigen::VectorXd &scale) {
     constexpr Eigen::Index samples = 2000;
     const double step = (h.profile_end + h.window) / samples;
@@ -332,10 +460,18 @@ bool lower_where_over(const par6_traj &h, const toppra::GeometricPath &path,
         const Profile at = smoothed_at(h, t);
         const toppra::Vector d1 = path.eval_single(at.s, 1);
         const toppra::Vector d2 = path.eval_single(at.s, 2);
+        const toppra::Vector qd = d1 * at.v;
+        const toppra::Vector qdd = d2 * at.v * at.v + d1 * at.u;
         double r = 0.0;
         for (Eigen::Index i = 0; i < dof; ++i) {
-            r = std::max(r, std::abs(d2[i] * at.v * at.v + d1[i] * at.u) /
-                                acc_limit[i]);
+            r = std::max(r, std::abs(qdd[i]) / acc_limit[i]);
+        }
+        if (dyn != nullptr) {
+            const toppra::Vector tau =
+                (*dyn)(path.eval_single(at.s, 0), qd, qdd);
+            for (Eigen::Index i = 0; i < dof; ++i) {
+                r = std::max(r, std::abs(tau[i]) / torque_limit[i]);
+            }
         }
         if (r <= 1.0 + 1e-6) continue;
         over = true;
@@ -363,6 +499,8 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
                             int32_t n_gridpoints,
                             const double *knots, int32_t degree,
                             double max_path_speed,
+                            par6_inverse_dynamics_fn dynamics,
+                            void *dynamics_ctx, const double *torque_limit,
                             char *err_buf, int32_t err_len) {
     if (waypoints == nullptr || vel_limit == nullptr || acc_limit == nullptr) {
         write_err(err_buf, err_len, "waypoints/vel_limit/acc_limit is NULL");
@@ -418,6 +556,16 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
                       "jerk limits must be > 0 (infinity = unconstrained)");
             return nullptr;
         }
+        if (torque_limit != nullptr &&
+            (!std::isfinite(torque_limit[i]) || torque_limit[i] <= 0.0)) {
+            write_err(err_buf, err_len, "torque limits must be finite and > 0");
+            return nullptr;
+        }
+    }
+    if ((dynamics == nullptr) != (torque_limit == nullptr)) {
+        write_err(err_buf, err_len,
+                  "dynamics and torque_limit go together: both or neither");
+        return nullptr;
     }
     bool moved = false;
     for (std::ptrdiff_t i = dof; i < n_way * dof && !moved; ++i) {
@@ -492,7 +640,19 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
         vc->discretizationType(toppra::DiscretizationType::Interpolation);
         ac->discretizationType(toppra::DiscretizationType::Interpolation);
 
-        toppra::algorithm::TOPPRA algo({vc, ac}, path);
+        std::shared_ptr<Dynamics> dyn;
+        Eigen::VectorXd tlim;
+        toppra::LinearConstraintPtrs constraints{vc, ac};
+        if (dynamics != nullptr) {
+            dyn = std::make_shared<Dynamics>(dynamics, dynamics_ctx, dof);
+            tlim = Eigen::Map<const Eigen::VectorXd>(torque_limit, dof);
+            auto tc = std::make_shared<ScaledJointTorque>(dyn, tlim,
+                                                          Eigen::VectorXd());
+            tc->discretizationType(toppra::DiscretizationType::Interpolation);
+            constraints.push_back(tc);
+        }
+
+        toppra::algorithm::TOPPRA algo(constraints, path);
         if (n_gridpoints <= 0) {
             /* Where the solver checks its limits. Spread evenly, a tight
              * corner can fall entirely BETWEEN two gridpoints: the solver
@@ -540,7 +700,8 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
             Eigen::VectorXd limit(h->ss.size());
             for (Eigen::Index i = 0; i < h->ss.size(); ++i) {
                 limit[i] = max_path_speed_at(*path, h->ss[i], vel_limit,
-                                             acc_limit, max_path_speed, dof);
+                                             acc_limit, dyn.get(), torque_limit,
+                                             max_path_speed, dof);
             }
             auto cap = std::make_shared<PathSpeedCap>(
                 window_caps(h->ts, limit, 0.5 * h->window));
@@ -549,7 +710,14 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
             for (int round = 0;; ++round) {
                 auto acc = std::make_shared<ScaledJointAcceleration>(alim, scale);
                 acc->discretizationType(toppra::DiscretizationType::Interpolation);
-                toppra::algorithm::TOPPRA capped({vc, acc, cap}, path);
+                toppra::LinearConstraintPtrs capped_constraints{vc, acc, cap};
+                if (dyn) {
+                    auto tc = std::make_shared<ScaledJointTorque>(dyn, tlim, scale);
+                    tc->discretizationType(
+                        toppra::DiscretizationType::Interpolation);
+                    capped_constraints.push_back(tc);
+                }
+                toppra::algorithm::TOPPRA capped(capped_constraints, path);
                 capped.setGridpoints(grid);
                 const toppra::ReturnCode rc2 =
                     capped.computePathParametrization(0.0, 0.0);
@@ -577,7 +745,8 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
                  * a few close the gap, and a caller that must hold the
                  * limits exactly stretches whatever is left. */
                 if (round == 3 ||
-                    !lower_where_over(*h, *path, acc_limit, dof, scale)) {
+                    !lower_where_over(*h, *path, acc_limit, dyn.get(),
+                                      torque_limit, dof, scale)) {
                     break;
                 }
             }

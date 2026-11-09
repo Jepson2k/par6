@@ -103,6 +103,9 @@ wire_enum! {
         /// A joint's external torque passed its collision threshold with
         /// `[collision] mode = "warn"` (warning, self-clears).
         SysCollisionWarning = 66,
+        /// A joint's control loop oscillated (hard latch — the arm holds;
+        /// a ring in the velocity loop also drops it to calmer gains).
+        SysJointOscillation = 67,
     }
 }
 
@@ -393,6 +396,12 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
             cause: "Joint {joint}'s external torque passed its collision threshold while the arm moved.",
             effect: "Warning only: [collision] mode is warn, so the arm kept moving.",
             remedy: "Clear the obstruction; set mode = \"stop\" once the thresholds are measured.",
+        },
+        E::SysJointOscillation => ErrorTemplate {
+            title: "Joint oscillating",
+            cause: "Joint {joint}'s control loop oscillated: its speed or its current swung back and forth, swing after swing, as no move commands.",
+            effect: "Motion stopped and the arm held; error latched. A ring in the joint's velocity loop also halves that loop's gains until reset.",
+            remedy: "Send reset, and lower the joint's gains if it recurs: Kpp for a swing of a few hertz, Kpv and Kiv for a fast ring.",
         },
         E::MotnHomingFailed => ErrorTemplate {
             title: "Homing failed",

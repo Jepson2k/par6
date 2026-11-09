@@ -485,6 +485,25 @@ impl CartKin {
         Ok(tau)
     }
 
+    /// Joint torques `M(q)·q̈ + C(q,q̇)·q̇ + G(q)` \[Nm\], the gravity
+    /// correction included.
+    pub(crate) fn inverse_dynamics(
+        &mut self,
+        q: &[f64; NQ],
+        qd: &[f64; NQ],
+        qdd: &[f64; NQ],
+    ) -> Result<[f64; NQ], String> {
+        let mut tau = self.dyn_feedforward(q, qd, qdd)?;
+        let mut g = [0.0; NQ];
+        self.kin
+            .gravity(q, &mut g)
+            .map_err(|e| format!("gravity failed: {e}"))?;
+        for (t, g) in tau.iter_mut().zip(g) {
+            *t += g;
+        }
+        Ok(tau)
+    }
+
     /// FK matrix at the URDF's own TCP frame, offset NOT applied.
     fn fk_model(&mut self, q: &[f64; NQ]) -> Result<Pose, String> {
         let mut pose = [0.0; 16];

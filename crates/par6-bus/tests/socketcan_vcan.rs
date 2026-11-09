@@ -1007,6 +1007,16 @@ fn polls_reach_every_node_in_its_dialect_and_overrides_take_their_slots() {
         &mut bus,
         par6_bus::DEVICE_INFO_PERIOD_SLOTS as usize + 20,
     ));
+    // The range sweep (cmd 44 read-backs) cuts in every RANGE_PERIOD_SLOTS,
+    // one read-back per node each time.
+    let sweeps = par6_bus::DEVICE_INFO_PERIOD_SLOTS / par6_bus::RANGE_PERIOD_SLOTS - 1;
+    for &node in &nodes {
+        let read = long
+            .iter()
+            .filter(|(n, c)| *n == node && *c == CommandId::Range.raw())
+            .count();
+        assert!(read as u64 >= sweeps, "node {node} read back {read} times");
+    }
     let sweep: Vec<usize> = long
         .iter()
         .enumerate()
@@ -1028,13 +1038,21 @@ fn polls_reach_every_node_in_its_dialect_and_overrides_take_their_slots() {
     let mut all = nodes.clone();
     all.sort_unstable();
     assert_eq!(swept, all);
-    let before = long[sweep[0] - 1];
+    let robin = |slots: &[(NodeId, u8)]| -> Vec<(NodeId, u8)> {
+        slots
+            .iter()
+            .copied()
+            .filter(|(_, c)| *c != CommandId::Range.raw() && *c != CommandId::DeviceInfo.raw())
+            .collect()
+    };
+    let before = *robin(&long[..sweep[0]]).last().expect("a round-robin poll");
+    let after = robin(&long[sweep[sweep.len() - 1]..])[0];
     let at = polled
         .iter()
         .position(|p| *p == before)
         .expect("a round-robin poll");
     assert_eq!(
-        long[sweep[sweep.len() - 1] + 1],
+        after,
         polled[(at + 1) % polled.len()],
         "the round robin resumes at the poll after the one the sweep cut in on"
     );
