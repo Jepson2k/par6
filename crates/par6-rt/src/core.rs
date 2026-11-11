@@ -656,6 +656,8 @@ pub struct RtCore<B: DriverBus> {
 
     // Per-tick compute buffers.
     g: [f64; MAX_JOINTS],
+    /// The declared payload's share of `g`.
+    g_payload: [f64; MAX_JOINTS],
     setpoints: [JointSetpoint; MAX_JOINTS],
     cmds: [JointCommand; MAX_JOINTS],
     mirror: CommandMirror,
@@ -922,6 +924,7 @@ impl<B: DriverBus> RtCore<B> {
             settle_tolerance_rad: robot.motion.settle_tolerance_rad,
             reflex_deadline: None,
             g: [0.0; MAX_JOINTS],
+            g_payload: [0.0; MAX_JOINTS],
             setpoints: [JointSetpoint::zero_velocity(); MAX_JOINTS],
             cmds: [JointCommand::idle(); MAX_JOINTS],
             mirror: CommandMirror::default(),
@@ -1214,8 +1217,15 @@ impl<B: DriverBus> RtCore<B> {
     /// The gravity feedforward at the current `q`, scaled per joint.
     fn refresh_gravity(&mut self) {
         self.gravity.gravity(&self.q, &mut self.g);
-        for (g, scale) in self.g.iter_mut().zip(self.gravity_scale) {
+        self.gravity.payload_gravity(&self.q, &mut self.g_payload);
+        for ((g, share), scale) in self
+            .g
+            .iter_mut()
+            .zip(&mut self.g_payload)
+            .zip(self.gravity_scale)
+        {
             *g *= scale;
+            *share *= scale;
         }
     }
 
@@ -2559,10 +2569,13 @@ impl<B: DriverBus> RtCore<B> {
         // tick and latches until the operator has dealt with it; a
         // resting one reports.
         let watch = self.contact_watch();
-        if let Some(trip) =
-            self.contact
-                .update(&self.tau_ext, &self.qd, self.observer.effort(), watch)
-        {
+        if let Some(trip) = self.contact.update(
+            &self.tau_ext,
+            &self.qd,
+            self.observer.effort(),
+            &self.g_payload,
+            watch,
+        ) {
             self.errors.latch(ErrorCode::Contact, Some(trip.joint));
             self.begin_reflex(true);
         }

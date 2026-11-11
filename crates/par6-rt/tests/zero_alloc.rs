@@ -30,6 +30,10 @@ impl GravityModel for ArmModel {
     /// Nothing in this test declares a payload.
     fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
 
+    fn payload_gravity(&mut self, _q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
+        out.fill(0.0);
+    }
+
     fn dynamics(
         &mut self,
         q: &[f64; MAX_JOINTS],

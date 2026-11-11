@@ -463,12 +463,16 @@ impl Par6Planner {
                 source.cart_kin(&self.tool_offset)?,
                 source.collision()?,
                 source.collision()?,
-                crate::kin::load_gravity_kin(source.assets_dir(), Some(gripper))
-                    .map_err(crate::daemon::DaemonError::Kinematics)?,
+                crate::kin::KinGravity::load(
+                    source.assets_dir(),
+                    Some(gripper),
+                    &self.bundle.robot.gravity_correction,
+                )
+                .map_err(crate::daemon::DaemonError::Kinematics)?,
                 source.kin_fk(&self.tool_offset)?,
             ))
         })();
-        let (mut planner, bridge, housekeeping, mut collision, gate_collision, mut gravity, fk) =
+        let (mut planner, bridge, housekeeping, mut collision, gate_collision, gravity, fk) =
             rebuilt.map_err(|e| refused(format!("cannot load tool '{name}': {e}")))?;
         // The declared payload is held in the new tool's jaws as it was in
         // the old one's (the RT puts its own copy on its new model).
@@ -479,9 +483,6 @@ impl Par6Planner {
         collision
             .adopt_layers(&self.collision)
             .map_err(|e| refused(format!("tool '{name}': the keep-outs do not apply: {e}")))?;
-        gravity
-            .set_gravity_correction(&self.bundle.robot.gravity_correction)
-            .map_err(|e| refused(format!("tool '{name}': gravity correction refused: {e}")))?;
         // The offsets the new tool declares, for the joints whose home
         // reference is tool-dependent.
         let mut offsets: Vec<(usize, f64)> = Vec::new();
@@ -502,7 +503,7 @@ impl Par6Planner {
         let applied = Arc::new(AtomicBool::new(false));
         let raised = Arc::clone(&applied);
         self.link.op(Box::new(move |core| {
-            core.set_gravity(Box::new(crate::kin::KinGravity::new(gravity)));
+            core.set_gravity(Box::new(gravity));
             core.set_fk(Box::new(fk));
             // The jaw is part of the tool: its limits, its pinion and the
             // reference it homed against all belong to the one that just

@@ -193,11 +193,17 @@ impl ContactDetector {
     /// One tick. Returns the contact a moving arm has to stop for, the
     /// tick its window fills; the same crossing on an arm that only
     /// reports raises [`warning`](Self::warning) instead.
+    ///
+    /// `payload_g` is the declared payload's share of the gravity the
+    /// estimate was taken against. Until the payload is in the hand the
+    /// estimate reads its weight missing, so anything between nothing and
+    /// that is not a contact; a load beyond what was declared still is.
     pub fn update(
         &mut self,
         tau_ext: &[f64; MAX_JOINTS],
         qd: &[f64; MAX_JOINTS],
         effort: &[f64; MAX_JOINTS],
+        payload_g: &[f64; MAX_JOINTS],
         watch: ContactWatch,
     ) -> Option<ContactTrip> {
         let mut trip = None;
@@ -206,7 +212,9 @@ impl ContactDetector {
             let hidden = self.coulomb_nm[i]
                 * (1.0 - (qd[i].abs() / self.stiction_speed_rad_s).tanh())
                 + self.inertia_slack[i] * self.effort_held[i];
-            let signal = tau_ext[i] - tau_ext[i].clamp(-hidden, hidden);
+            let unheld = -payload_g[i];
+            let signal =
+                tau_ext[i] - tau_ext[i].clamp(unheld.min(0.0) - hidden, unheld.max(0.0) + hidden);
             // An average that kept its own counsel while nothing was
             // being read would meet the first armed tick with a level
             // from another time — an unreferenced arm's, say — and the

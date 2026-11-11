@@ -331,21 +331,43 @@ impl ForwardKin for KinFk {
 /// G(q) behind the RT [`GravityModel`] seam. A model failure must not
 /// kill the RT thread: hold the last good value (gravity is a
 /// feedforward, not a safety path).
+///
+/// Two copies of the arm: the one the payload is declared on, and one
+/// that never carries any, so the payload's own share of G(q) is their
+/// difference at whatever pose the arm is in.
 pub(crate) struct KinGravity {
     kin: Kin,
+    unloaded: Kin,
+    carrying: bool,
     scratch: [f64; MAX_JOINTS],
     last_good: [f64; MAX_JOINTS],
     last_good_dynamics: [f64; MAX_JOINTS],
+    last_good_payload: [f64; MAX_JOINTS],
 }
 
 impl KinGravity {
-    pub(crate) fn new(kin: Kin) -> Self {
-        Self {
-            kin,
+    /// The arm with `gripper` fitted and `correction` installed
+    /// (`[gravity_correction]`, empty for none).
+    pub(crate) fn load(
+        assets_dir: &Path,
+        gripper: Option<&par6_config::ToolConfig>,
+        correction: &[f64],
+    ) -> Result<Self, String> {
+        let corrected = || {
+            let mut kin = load_gravity_kin(assets_dir, gripper)?;
+            kin.set_gravity_correction(correction)
+                .map_err(|e| format!("gravity correction refused: {e}"))?;
+            Ok::<_, String>(kin)
+        };
+        Ok(Self {
+            kin: corrected()?,
+            unloaded: corrected()?,
+            carrying: false,
             scratch: [0.0; MAX_JOINTS],
             last_good: [0.0; MAX_JOINTS],
             last_good_dynamics: [0.0; MAX_JOINTS],
-        }
+            last_good_payload: [0.0; MAX_JOINTS],
+        })
     }
 }
 
@@ -360,9 +382,31 @@ impl GravityModel for KinGravity {
     fn set_payload(&mut self, mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>) {
         // Wire-validated before it gets here; a refusal now is a model
         // fault worth shouting about, not silently absorbing.
-        if let Err(e) = self.kin.set_tool(mass, com, inertia) {
-            log::error!("gravity payload update refused: {e}");
+        match self.kin.set_tool(mass, com, inertia) {
+            Ok(()) => self.carrying = mass > 0.0,
+            Err(e) => log::error!("gravity payload update refused: {e}"),
         }
+    }
+
+    fn payload_gravity(&mut self, q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
+        if !self.carrying {
+            out.fill(0.0);
+            return;
+        }
+        let mut unloaded = [0.0; MAX_JOINTS];
+        if self.kin.gravity(q, &mut self.scratch).is_ok()
+            && self.unloaded.gravity(q, &mut unloaded).is_ok()
+        {
+            for ((share, with), without) in self
+                .last_good_payload
+                .iter_mut()
+                .zip(&self.scratch)
+                .zip(&unloaded)
+            {
+                *share = with - without;
+            }
+        }
+        *out = self.last_good_payload;
     }
 
     fn dynamics(

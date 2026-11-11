@@ -410,3 +410,84 @@ fn a_move_begun_as_the_arm_is_referenced_is_not_a_contact() {
         target[0] - last.q[0]
     );
 }
+
+/// A payload is declared before the arm has it and stays declared until
+/// after it has let go, so for part of every pick the arm compensates a
+/// weight it does not hold and the estimate reads that weight missing.
+/// Anywhere between not holding it and holding it is not a contact. A load
+/// past the far side of that — more than was ever declared — still is.
+#[test]
+fn a_declared_payload_the_arm_is_not_holding_is_not_a_contact() {
+    let from = reach();
+    let to = [0.0_f64, -95.0, 250.0, 0.0, 30.0, 180.0].map(f64::to_radians);
+    let mut rig = SimRig::boot(0.004, from);
+    rig.hold();
+    rig.commands
+        .send(RtCommand::SetPayload {
+            mass: 0.8,
+            com: [0.0, 0.0, 0.05],
+            inertia: None,
+        })
+        .unwrap();
+
+    let limit = rig.bundle.robot.contact.sustained_nm[1];
+    let mut missing: f64 = 0.0;
+    for target in [to, from] {
+        for _ in 0..rig.ticks(3.0) {
+            let s = rig.stream(target);
+            assert!(
+                !s.protective_active,
+                "the missing payload was read as a contact: {:?}",
+                s.errors.as_slice()
+            );
+            if s.tau_ext[1].abs() > missing.abs() {
+                missing = s.tau_ext[1];
+            }
+        }
+    }
+    assert!(
+        missing.abs() > limit,
+        "0.8 kg at this reach is more than the shoulder's threshold, so the run above was \
+         only quiet because the payload was allowed for: {missing:+.2} Nm against {limit}"
+    );
+
+    // Half its weight carried — the block coming off the table — is
+    // still inside what was declared.
+    rig.push(1, 0.5 * missing);
+    for target in [to, from] {
+        for _ in 0..rig.ticks(3.0) {
+            let s = rig.stream(target);
+            assert!(
+                !s.protective_active,
+                "a payload half carried was read as a contact: {:?}",
+                s.errors.as_slice()
+            );
+        }
+    }
+
+    // A push the payload cannot account for: past carrying all of it.
+    rig.push(1, 0.0);
+    let mut moving = rig.stream(to);
+    for _ in 0..rig.ticks(1.0) {
+        moving = rig.stream(to);
+        if moving.qd[1].abs() > 0.2 {
+            break;
+        }
+    }
+    assert!(moving.qd[1].abs() > 0.2, "the shoulder never got moving");
+    rig.push(1, missing + missing.signum() * (limit + 1.5));
+    let mut hit = None;
+    for _ in 0..rig.ticks(0.5) {
+        let s = rig.stream(to);
+        if s.protective_active {
+            hit = Some(s);
+            break;
+        }
+    }
+    let hit = hit.expect("a load beyond the declared payload is a contact");
+    assert!(
+        latched(&hit, ErrorCode::Contact, 1),
+        "the shoulder is the joint that read it: {:?}",
+        hit.errors.as_slice()
+    );
+}

@@ -1070,16 +1070,13 @@ pub(crate) fn load_kin_stack(
 ) -> Result<KinStack, DaemonError> {
     use crate::kin::{KinFk, KinGravity, ToolOffset};
     let src = KinSource::resolve(opts, config_path, robot, active_tool)?;
-    let mut gravity_kin = crate::kin::load_gravity_kin(&src.assets_dir, active_tool)
+    let gravity = KinGravity::load(&src.assets_dir, active_tool, &robot.gravity_correction)
         .map_err(DaemonError::Kinematics)?;
-    gravity_kin
-        .set_gravity_correction(&robot.gravity_correction)
-        .map_err(|e| DaemonError::Kinematics(e.to_string()))?;
     let tool_offset = ToolOffset::new();
     Ok(KinStack {
         source: src.clone(),
         fk: KinFk::new(src.kin()?, tool_offset.clone()),
-        gravity: KinGravity::new(gravity_kin),
+        gravity,
         planner: src.cart_kin(&tool_offset)?,
         bridge: src.cart_kin(&tool_offset)?,
         housekeeping: src.cart_kin(&tool_offset)?,

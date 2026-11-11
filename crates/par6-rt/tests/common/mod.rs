@@ -88,6 +88,10 @@ impl GravityModel for ConstGravity {
     /// load it does not know about.
     fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
 
+    fn payload_gravity(&mut self, _q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
+        out.fill(0.0);
+    }
+
     /// A constant torque says nothing about inertia.
     fn dynamics(
         &mut self,
@@ -448,6 +452,10 @@ impl GravityModel for PlantGravity {
 
     /// The plant carries no declared payload, so neither does its model.
     fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
+
+    fn payload_gravity(&mut self, _q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
+        out.fill(0.0);
+    }
 
     /// Only the plant's gravity is read back here; par6d's model is the
     /// one that carries the arm's inertia.

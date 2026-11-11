@@ -678,6 +678,17 @@ impact_nm = [1.1, 1.0, 0.9, 0.3, 0.3, 0.2]
 impact_window_s = 0.016
 impact_highpass_s = 0.5
 stiction_speed_rad_s = 0.05
+# A joint working hard to accelerate the arm reads its own drivetrain
+# winding up as a torque nobody applied. Per joint, the share of the model's
+# inertial torque the estimate is allowed on that account, held for
+# inertia_hold_s after the effort passes so the ring-down is covered too.
+# The base turns the whole arm through its softest drivetrain.
+inertia_slack = [1.0, 0.5, 0.5, 0.5, 0.5, 0.5]
+inertia_hold_s = 0.2
+# A declared payload is allowed for separately and needs nothing here: from
+# set_payload until it is cleared, a joint may read anything between holding
+# that weight and not holding it. Declare it once the jaws have it and
+# before it is lifted; a lift nobody declared is a contact.
 # How long a warning stands after the signal last crossed a threshold.
 warning_hold_s = 1.0
 # The retreat: back to where the arm measured itself retreat_s before the

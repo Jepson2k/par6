@@ -33,6 +33,19 @@ pub trait GravityModel: Send {
     /// so here, in one line, deliberately.
     fn set_payload(&mut self, mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>);
 
+    /// Write the declared payload's share of G(q) \[Nm\] into `out` — what
+    /// `gravity` answers with the payload, less what it would answer
+    /// without. Must not allocate and must not block.
+    ///
+    /// A payload is declared before it is picked up and stays declared
+    /// until after it is put down, so for part of every pick and place the
+    /// arm is compensating a load it does not hold. Contact detection
+    /// allows the estimate that much, in that direction, and no more.
+    ///
+    /// No default body: a model that inherited "no payload" while its
+    /// `gravity` carried one would read every pick-up as a contact.
+    fn payload_gravity(&mut self, q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]);
+
     /// Write the torque the arm's own motion takes, `M(q)·a + C(q, v)·v`
     /// \[Nm\] — inverse dynamics with the gravity term left out — into
     /// `out`, and say whether this model describes the arm's inertia at
@@ -78,6 +91,10 @@ impl GravityModel for ZeroGravity {
     /// Nothing to carry it: this model compensates no gravity at all, so
     /// a payload changes nothing rather than being quietly lost.
     fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
+
+    fn payload_gravity(&mut self, _q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
+        out.fill(0.0);
+    }
 
     /// No arm behind it, so no inertia either.
     fn dynamics(
