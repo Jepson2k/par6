@@ -1330,7 +1330,7 @@ fn streaming_is_gated_by_the_collision_world_at_the_shipped_rate() {
 }
 
 fn streaming_gated_by_the_collision_world_at(dt: f64) {
-    let config = common::retimed_config(&format!("ffi-streamgate-{}", (dt * 1e3) as u32), dt);
+    let config = common::uncapped_config(&format!("ffi-streamgate-{}", (dt * 1e3) as u32), dt);
     let robot = par6_config::RobotConfig::load(&config).expect("collision-test config");
     let rig = Rig::boot_with(config);
     let mut c = Client::new(rig.addr());

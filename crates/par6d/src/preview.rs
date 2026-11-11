@@ -186,6 +186,12 @@ pub struct Preview {
     /// STREAM joint envelope, which a cartesian jog holds its per-tick
     /// step to.
     stream_limits: MotionLimits,
+    /// Per-joint JOG velocity limits \[rad/s\]: what a jog fraction of ±1
+    /// commands, before the tool-speed ceiling slows it.
+    jog_vel: [f64; MAX_JOINTS],
+    /// `[limits] tcp_speed_max_m_s`, which the runtime slows jogs and
+    /// servo targets to.
+    tool_speed_ceiling: f64,
     soft_max: [f64; MAX_JOINTS],
     snap: StateSnapshot,
     snap_w: SnapshotWriter<StateSnapshot>,
@@ -355,6 +361,8 @@ impl Preview {
             jog,
             cart: stack.cart,
             stream_limits,
+            jog_vel: jog_limits.velocity,
+            tool_speed_ceiling: robot.limits.tcp_speed_max_m_s,
             soft_min: stream_limits.soft_min,
             soft_max: stream_limits.soft_max,
             snap,
@@ -712,8 +720,8 @@ impl Preview {
         accel: Option<f64>,
     ) -> ServoPreview {
         let hold = hold_ticks.max(1);
-        self.stream
-            .set_scale(speed.unwrap_or(1.0), accel.unwrap_or(1.0));
+        let (speed, accel) = (speed.unwrap_or(1.0), accel.unwrap_or(1.0));
+        self.stream.set_scale(speed, accel);
         self.stream.activate(&self.snap.q);
         let mut out = ServoPreview {
             q: Vec::with_capacity(targets.len() * hold),
@@ -724,6 +732,24 @@ impl Preview {
         };
         let last = targets.len().saturating_sub(1);
         for (i, target) in targets.iter().enumerate() {
+            // Each datagram's speed is slowed to the tool-speed ceiling
+            // at the pose the arm is in, as the bridge slows it.
+            let at = self.snap.q;
+            let toward = std::array::from_fn(|j| {
+                let to_go = target[j] - at[j];
+                if to_go.abs() > crate::bridge::STREAM_ARRIVED_RAD {
+                    to_go.signum() * speed * self.stream_limits.velocity[j]
+                } else {
+                    0.0
+                }
+            });
+            let keep = crate::bridge::tool_speed_fraction(
+                &mut self.cart,
+                self.tool_speed_ceiling,
+                &at,
+                &toward,
+            );
+            self.stream.set_scale(speed * keep, accel);
             self.stream.set_target(target);
             for _ in 0..hold {
                 let mut q = [0.0; MAX_JOINTS];
@@ -1253,6 +1279,18 @@ impl Preview {
         }
         let mut fractions = [0.0; MAX_JOINTS];
         fractions[..NUM_JOINTS].copy_from_slice(&speeds);
+        // Slowed to the tool-speed ceiling at the pose the arm is in, as
+        // the bridge slows it before anything else sees the jog.
+        let asked = std::array::from_fn(|j| fractions[j] * self.jog_vel[j]);
+        let keep = crate::bridge::tool_speed_fraction(
+            &mut self.cart,
+            self.tool_speed_ceiling,
+            &self.snap.q,
+            &asked,
+        );
+        for fraction in fractions.iter_mut() {
+            *fraction *= keep;
+        }
         // The runtime admits a jog only if where it will be one lookahead
         // horizon ahead clears the world (`RtBridge`'s jog admission).
         let scale = accel.unwrap_or(1.0);

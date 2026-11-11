@@ -633,10 +633,12 @@ The stop, in order, all inside the tick that read the contact:
 
 1. The planned queue is abandoned and any stream is cut off; setpoints that arrive
    afterwards are discarded.
-2. The arm retreats to where it measured itself `retreat_s` earlier, no joint
-   further than `retreat_max_rad`. That is a pose it occupied a moment ago, so the
-   retreat needs no collision check; a joint that was outside its soft window is left
-   where it is rather than dragged to the limit.
+2. The arm retreats along its own track to where it measured itself `retreat_s` of
+   travel earlier, no joint further than `retreat_max_rad`. That is a pose it occupied
+   a moment ago, so the retreat needs no collision check; a joint that was outside its
+   soft window is left where it is rather than dragged to the limit. The track is
+   kept by distance as well as by time: an arm that crept in, or had already stalled
+   against what it touched, still backs off, by at least half of `retreat_max_rad`.
 3. At rest, or after `retreat_timeout_s`, it holds position under power.
 
 A contact is **protective**, a third class beside hard errors and warnings. The arm

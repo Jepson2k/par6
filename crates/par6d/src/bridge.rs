@@ -243,7 +243,7 @@ const STREAM_MOVING_RAD_S: f64 = 0.01;
 /// How far a joint has to be from a servo target \[rad\] before it counts
 /// as having somewhere to go, for the purpose of bounding the tool's speed
 /// on the way: under it the joint is where it was sent.
-const STREAM_ARRIVED_RAD: f64 = 1e-3;
+pub(crate) const STREAM_ARRIVED_RAD: f64 = 1e-3;
 
 // The speed a placement's hold is dropped at is what sets the standoff's
 // error budget: IDLE only damps, so whatever the arm still carries it
@@ -1766,7 +1766,7 @@ pub(crate) struct CartStream {
 /// In twentieths, rounded down: the geometry under a held control changes
 /// all the time, and a fraction that followed it exactly would turn every
 /// datagram of a steady jog into a new command.
-fn tool_speed_fraction(
+pub(crate) fn tool_speed_fraction(
     kin: &mut crate::kin::CartKin,
     ceiling_m_s: f64,
     q: &[f64; MAX_JOINTS],

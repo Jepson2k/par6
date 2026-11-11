@@ -68,8 +68,11 @@ fn a_move_into_something_undeclared_stops_backs_off_and_waits_for_reset() {
         "the arm stopped at the post, not before it and not through it: {furthest:.1} deg"
     );
 
-    let held = rig.wait_status("the hold after the retreat", |s| {
-        s.speeds.iter().all(|v| v.abs() < 0.05)
+    // The arm may have been pressed against the post, at rest, for a
+    // moment before it read the contact: what is waited for is the hold
+    // it ends in, off the post.
+    let held = rig.wait_status("the arm to back off the post and hold", |s| {
+        s.angles[0] < furthest - 0.5 && s.speeds.iter().all(|v| v.abs() < 0.05)
     });
     assert!(
         held.enabled && held.homed,
@@ -79,11 +82,6 @@ fn a_move_into_something_undeclared_stops_backs_off_and_waits_for_reset() {
         held.error.as_ref().map(|e| e.code),
         Some(ErrorCode::SysContact as u16),
         "the contact stands in STATUS until it is reset"
-    );
-    assert!(
-        held.angles[0] < furthest - 0.5,
-        "the arm backed off the post: furthest {furthest:.2}, holding at {:.2} deg",
-        held.angles[0]
     );
 
     let readout = contact(&mut c);

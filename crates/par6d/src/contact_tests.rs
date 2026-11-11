@@ -247,6 +247,9 @@ fn a_reporting_arm_warns_and_keeps_moving() {
     let start = reach();
     let mut rig = SimRig::boot_with(0.004, start, |robot| {
         robot.contact.reaction = ContactReaction::Warn;
+        // The rig streams at full rate, underneath what slows motion to
+        // the tool-speed ceiling.
+        robot.limits.tcp_speed_max_m_s = 0.0;
     });
     rig.hold();
     let mut target = start;

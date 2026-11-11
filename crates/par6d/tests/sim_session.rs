@@ -2260,7 +2260,11 @@ fn the_rt_jog_latch_greys_the_enablement_flag() {
 /// `mono_time_ns`), not the test's.
 #[test]
 fn stream_speed_and_accel_fractions_reach_the_arm() {
-    let rig = Rig::boot(common::shipped_config());
+    let shipped_dt = par6_config::RobotConfig::load(&common::shipped_config())
+        .expect("shipped config")
+        .robot
+        .tick_dt_s;
+    let rig = Rig::boot(common::uncapped_config("stream-fractions", shipped_dt));
     let mut c = Client::new(rig.addr());
 
     /// How far the arm travels in `window` of runtime time while

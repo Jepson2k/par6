@@ -654,12 +654,20 @@ pub struct RtCore<B: DriverBus> {
     /// a pose to difference against.
     tcp_last: [f64; 3],
     tcp_scratch: [f64; 6],
-    /// The measured poses of the last `[contact] retreat_s`, oldest
-    /// overwritten: where a stopped arm retreats to is somewhere it has
-    /// just been. Empty when the config asks for no retreat.
+    /// The measured poses of the last `[contact] retreat_s` of travel,
+    /// oldest overwritten: where a stopped arm retreats to is somewhere it
+    /// has just been. Empty when the config asks for no retreat.
     trail: Vec<[f64; MAX_JOINTS]>,
     trail_next: usize,
     trail_len: usize,
+    /// How far the arm has to have moved since the last pose on the trail
+    /// for the next one to be taken \[rad\]. An arm that crept into
+    /// something, or has been pressed against it for a while, has spent
+    /// the whole of `retreat_s` in one place: a trail kept by the clock
+    /// alone would hold that place and nothing else, and the retreat would
+    /// go nowhere. Spaced so a full trail always reaches back at least
+    /// half of `retreat_max_rad`.
+    trail_step_rad: f64,
     retreat_max_rad: f64,
     reflex_timeout_ticks: u32,
     /// `[motion] settle_tolerance_rad`: how far from its commanded pose
@@ -941,6 +949,8 @@ impl<B: DriverBus> RtCore<B> {
             trail: vec![[0.0; MAX_JOINTS]; robot.ticks(robot.contact.retreat_s) as usize],
             trail_next: 0,
             trail_len: 0,
+            trail_step_rad: robot.contact.retreat_max_rad
+                / (2.0 * f64::from(robot.ticks(robot.contact.retreat_s).max(1))),
             retreat_max_rad: robot.contact.retreat_max_rad,
             reflex_timeout_ticks: robot.ticks(robot.contact.retreat_timeout_s).max(1),
             settle_tolerance_rad: robot.motion.settle_tolerance_rad,
@@ -1527,11 +1537,7 @@ impl<B: DriverBus> RtCore<B> {
             self.observer
                 .update(self.gravity.as_mut(), &self.q, &self.qd, &self.tau, &self.g);
             self.tau_ext = *self.observer.estimate();
-            if !self.trail.is_empty() {
-                self.trail[self.trail_next] = self.q;
-                self.trail_next = (self.trail_next + 1) % self.trail.len();
-                self.trail_len = (self.trail_len + 1).min(self.trail.len());
-            }
+            self.record_trail();
         }
         lap(&mut mark, &mut laps, 5);
 
@@ -2187,6 +2193,30 @@ impl<B: DriverBus> RtCore<B> {
         self.exec.activate(&at);
         self.hb_silence = 0;
         self.mode = Mode::Exec;
+    }
+
+    /// Add the measured pose to the retreat trail, once the arm has moved
+    /// on from the last one there.
+    fn record_trail(&mut self) {
+        let n = self.trail.len();
+        if n == 0 {
+            return;
+        }
+        if self.trail_len > 0 {
+            let last = &self.trail[(self.trail_next + n - 1) % n];
+            let moved = self
+                .q
+                .iter()
+                .zip(last)
+                .map(|(now, then)| (now - then).abs())
+                .fold(0.0, f64::max);
+            if moved < self.trail_step_rad {
+                return;
+            }
+        }
+        self.trail[self.trail_next] = self.q;
+        self.trail_next = (self.trail_next + 1) % n;
+        self.trail_len = (self.trail_len + 1).min(n);
     }
 
     /// Take the arm off whatever was driving it: stop it, and with

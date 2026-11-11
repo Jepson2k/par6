@@ -154,6 +154,21 @@ pub fn retimed_config(tag: &str, dt: f64) -> PathBuf {
     dst
 }
 
+/// [`retimed_config`] with `[limits] tcp_speed_max_m_s` off, for a test
+/// whose numbers are what the joints' own limits allow: a profile's
+/// minimum time, how far a speed fraction carries the arm, how an arm at
+/// full jog speed is stopped short of a keep-out. The ceiling is on in
+/// every other rig, as shipped, and has tests of its own.
+pub fn uncapped_config(tag: &str, dt: f64) -> PathBuf {
+    let config = retimed_config(&format!("{tag}-uncapped"), dt);
+    let text = std::fs::read_to_string(&config).expect("read the re-timed config");
+    write_atomic(
+        &config,
+        set_scalar(&text, "tcp_speed_max_m_s", "0.0").as_bytes(),
+    );
+    config
+}
+
 /// The shipped config re-timed to `dt` AND pointed at `iface`, for the
 /// hardware-mode startup checks that must refuse before any interface is
 /// opened.
