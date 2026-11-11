@@ -604,6 +604,84 @@ A gravity model without inertia (a test stand-in) still produces the estimate, w
 every acceleration of the arm in it; anything that would read a contact from the
 estimate stands down in that case.
 
+### Contact stop
+
+`[contact]` reads a contact out of that estimate, per joint, on two channels:
+
+- **sustained** — the estimate beyond `sustained_nm` for `sustained_window_s`: the
+  arm pressing into something.
+- **impact** — the estimate against its own slow average (`impact_highpass_s`)
+  beyond `impact_nm` for `impact_window_s`: a bump. A standing offset, such as a
+  gravity error, does not count against it.
+
+Before either channel sees it, each joint's estimate loses what the arm could have
+produced by itself: its Coulomb friction while it is not sliding
+(`stiction_speed_rad_s`), a share of its own inertial effort while it accelerates
+hard (`inertia_slack`, `inertia_hold_s` — a soft drivetrain winds up), and the
+[declared payload](#payload-and-gravity)'s weight in the direction of not holding it.
+A window only counts samples that push the same way, and never fewer than two.
+
+What happens next is `reaction`:
+
+| `reaction` | A joint crosses a threshold while the arm is being driven | …while it rests on its target |
+|---|---|---|
+| `"stop"` (shipped) | The arm stops, backs off and holds. `SysContact` stands until `reset`. | `SysContact` is reported as a warning. |
+| `"warn"` | `SysContact` is reported as a warning; the move carries on. | The same. |
+| `"off"` | Nothing. | Nothing. |
+
+The stop, in order, all inside the tick that read the contact:
+
+1. The planned queue is abandoned and any stream is cut off; setpoints that arrive
+   afterwards are discarded.
+2. The arm retreats to where it measured itself `retreat_s` earlier, no joint
+   further than `retreat_max_rad`. That is a pose it occupied a moment ago, so the
+   retreat needs no collision check; a joint that was outside its soft window is left
+   where it is rather than dragged to the limit.
+3. At rest, or after `retreat_timeout_s`, it holds position under power.
+
+A contact is **protective**, a third class beside hard errors and warnings. The arm
+stays ENABLED and homed, and gravity compensation never drops. The move in flight
+completes with `SysContact`, everything queued behind it is discarded, and every
+motion command is refused with the same error until `reset()` — which clears it on the
+next tick, because nothing on the drives needs clearing. Nothing resumes by itself.
+
+Detection is armed only while the arm is homed, enabled, modelled with inertia and
+being driven (EXEC, JOG or STREAM with a commanded velocity, or still short of its
+target). It stands down while the arm floats in freedrive, while homing, during the
+retreat itself, and for one estimate after any change of reference (homing completing,
+a simulator teleport).
+
+**Payloads.** A load the runtime was not told about is indistinguishable from a
+contact, so a program declares what it lifts: `set_payload` once the jaws have closed
+on it and before it leaves the table, and again (mass 0) after it is put down. From
+declaration to clearing, each joint may read anything between holding that weight and
+not holding it. The cost is sensitivity: with a payload declared, a contact that
+*supports* the arm goes unread until it exceeds the payload's weight.
+
+A load of unknown weight is handled the same way: declare an upper bound before
+lifting it, lift, then `estimate_payload()` — whose wrist swings carry the same
+undeclared difference — replaces the bound with what it measured.
+
+**Tuning.** The shipped thresholds are a reference arm's. The `CONTACT` query
+(`client.contact()`) answers the thresholds, the live signal on both channels, the
+peak of each since the last reset while the arm was moving, the trip count and the
+joint and channel of the last trip. Run your own programs with nothing near the arm,
+read the peaks, and set each threshold at roughly twice its peak in the arm's
+[local overlay](#local-overlay) — with `reaction = "warn"` first if you would rather
+watch before it stops anything.
+
+To try it without an arm, give the simulator something the runtime does not know
+about (see [`docs/simulation-scenarios.md`](docs/simulation-scenarios.md)):
+
+```bash
+cat > post.toml <<'TOML'
+[obstacle]
+size_m = [0.06, 0.06, 0.4]
+pose = [0.3204, 0.185, 0.2, 0.0, 0.0, 0.0]
+TOML
+pixi run cargo run -p par6d -- --sim --sim-scenario post.toml
+```
+
 ## The Pinocchio shim
 
 `cpp/` is one C-ABI shim over the C++ dependencies the Rust crates link:

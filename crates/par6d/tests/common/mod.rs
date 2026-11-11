@@ -376,14 +376,24 @@ impl Rig {
 
     /// The same, surfacing the startup error instead of panicking.
     pub fn try_boot_at_status_rate(config: PathBuf, hz: u32) -> Result<Rig, String> {
-        Rig::try_boot_opts(config, Some(hz))
+        Rig::try_boot_opts(config, Some(hz), None)
+    }
+
+    /// Boot the simulator with a scenario file, as `--sim-scenario` does:
+    /// what the physics holds that the runtime was never told about.
+    pub fn boot_in_scenario(config: PathBuf, scenario: PathBuf) -> Rig {
+        Rig::try_boot_opts(config, None, Some(scenario)).expect("daemon boots in the scenario")
     }
 
     fn boot_opts(config: PathBuf, status_rate_hz: Option<u32>) -> Rig {
-        Rig::try_boot_opts(config, status_rate_hz).expect("daemon boots in sim mode")
+        Rig::try_boot_opts(config, status_rate_hz, None).expect("daemon boots in sim mode")
     }
 
-    fn try_boot_opts(config: PathBuf, status_rate_hz: Option<u32>) -> Result<Rig, String> {
+    fn try_boot_opts(
+        config: PathBuf,
+        status_rate_hz: Option<u32>,
+        sim_scenario: Option<PathBuf>,
+    ) -> Result<Rig, String> {
         init_test_logging();
         let slot = RT_SLOT.lock().unwrap_or_else(|e| e.into_inner());
         redirect_bus_grant();
@@ -393,6 +403,7 @@ impl Rig {
             .expect("timeout");
         let opts = Options {
             status_rate_hz,
+            sim_scenario,
             ..sim_options(config, status_rx.local_addr().unwrap().port())
         };
         let daemon = Daemon::start(&opts).map_err(|e| e.to_string())?;

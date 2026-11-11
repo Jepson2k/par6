@@ -1200,6 +1200,12 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         widen it when the wrist has room and the result reads noisy.
         *ridge* holds back parameters the poses did not measure.
 
+        Contact detection stays armed while the wrist swings, and a load
+        the runtime was not told about reads as a contact.  For a part of
+        unknown weight, ``set_payload`` an upper bound before lifting it:
+        anything up to the declared weight is allowed for, and a declared
+        result then replaces the bound.
+
         Raises ``RuntimeError`` if the wrist has no room to swing, or if
         *declare* is set and the poses did not actually measure a mass.
 

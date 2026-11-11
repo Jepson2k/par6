@@ -3,7 +3,9 @@
 import numpy as np
 import pytest
 
+from par6.client import RobotError
 from par6.client.dry_run_client import DryRunRobotClient
+from par6.protocol import ErrorCode
 from par6.robot import Robot
 
 
@@ -22,3 +24,28 @@ def test_physics_replays_the_programs_initial_tcp():
     assert (client.angles(), client.tcp_offset()) == before
     repeated = client.simulate(2)
     assert repeated.digest == ticks.digest
+
+
+def test_a_push_in_the_scenario_ends_the_replayed_move_as_a_contact():
+    """The replay runs the runtime's own contact detection: a torque against
+    a joint in motion ends that move the way it would on the arm, short of
+    its target, and the same program with nothing in the way runs clean."""
+    client = DryRunRobotClient()
+    start = client.angles()
+    target = list(start)
+    target[0] += 60.0
+    client.move_j(target, speed=0.5)
+
+    clean = client.simulate(10)
+    assert clean.stop == "completed" and clean.blocks[-1].error is None
+    assert np.degrees(clean.joints_rad[-1, 0]) == pytest.approx(target[0], abs=1.0)
+
+    pushed = client.simulate(
+        10,
+        scenario={
+            "joint_push": {"at_s": 0.4, "duration_s": 2.0, "node": 0, "nm": -3.0}
+        },
+    )
+    error = pushed.blocks[-1].error
+    assert isinstance(error, RobotError) and error.code == ErrorCode.SYS_CONTACT
+    assert np.degrees(pushed.joints_rad[-1, 0]) < target[0] - 5.0

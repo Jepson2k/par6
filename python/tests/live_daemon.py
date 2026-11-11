@@ -206,12 +206,20 @@ class LiveDaemon:
         workdir: Path,
         status_transport: str = "unicast",
         config_patch: Callable[[str], str] | None = None,
+        scenario: str | None = None,
     ) -> "LiveDaemon":
+        """*scenario* is the TOML ``--sim-scenario`` reads: what the physics
+        holds that the runtime was never told about."""
         binary = par6d_binary()
         if binary is None:
             raise RuntimeError("par6d binary not available")
         workdir.mkdir(parents=True, exist_ok=True)
         config = sim_config(workdir / "config", config_patch)
+        scenario_args: list[str] = []
+        if scenario is not None:
+            scenario_path = workdir / "scenario.toml"
+            scenario_path.write_text(scenario)
+            scenario_args = ["--sim-scenario", str(scenario_path)]
         status_port = free_udp_port()
         shm_dir = Path(tempfile.mkdtemp(prefix="shm-", dir=workdir))
         log_path = workdir / "par6d.log"
@@ -236,6 +244,7 @@ class LiveDaemon:
                 # leave a daemon holding its ports and grant.
                 "--parent-pid",
                 str(os.getpid()),
+                *scenario_args,
             ],
             stdout=subprocess.PIPE,
             stderr=log,

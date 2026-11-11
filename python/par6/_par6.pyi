@@ -95,6 +95,7 @@ class ErrorCode(IntEnum):
     SYS_LINK_ERROR_PASSIVE = 62
     SYS_TORQUE_ENVELOPE = 63
     SYS_STREAM_FAULT = 64
+    SYS_CONTACT = 65
 
 class Frame(IntEnum):
     """Reference frame a Cartesian target is expressed in."""
