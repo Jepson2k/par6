@@ -79,15 +79,23 @@ fn sweep(rig: &mut SimRig, from: [f64; MAX_JOINTS], to: [f64; MAX_JOINTS]) -> Ve
     run
 }
 
+/// Speed above which a joint is sliding rather than about to stick
+/// \[rad/s\].
+const SLIDING_RAD_S: f64 = 0.05;
+
 /// A fast move with nothing in its way reads as nothing in its way: the
 /// friction and the acceleration the arm spends on itself are the
-/// model's, not an external torque. Measured against what the estimate
-/// was before it knew either — the motor torque left over after gravity.
+/// model's, not an external torque. While a joint slides that is
+/// measured against what the estimate was before it knew either — the
+/// motor torque left over after gravity. Where a joint comes to rest it
+/// sticks somewhere inside its Coulomb band, with its drive still leaning
+/// on it; that band is all the estimate may show there.
 #[test]
 fn the_arms_own_motion_is_not_read_as_contact() {
     let from = reach();
     let to = [50.0_f64, -95.0, 250.0, 60.0, -30.0, 250.0].map(f64::to_radians);
     let mut rig = SimRig::boot(0.004, from);
+    let friction = coulomb(&rig);
     rig.hold();
     let run = sweep(&mut rig, from, to);
     assert!(
@@ -101,14 +109,28 @@ fn the_arms_own_motion_is_not_read_as_contact() {
         "every joint moved: {travelled:.2?}"
     );
 
-    let estimate = peaks(&run, |s, j| s.tau_ext[j]);
-    let gravity_only = peaks(&run, |s, j| s.tau_filtered[j] - s.gravity_torque_nm[j]);
+    let sliding = |s: &StateSnapshot, j: usize| s.qd[j].abs() > SLIDING_RAD_S;
+    let estimate = peaks(&run, |s, j| if sliding(s, j) { s.tau_ext[j] } else { 0.0 });
+    let gravity_only = peaks(&run, |s, j| {
+        if sliding(s, j) {
+            s.tau_filtered[j] - s.gravity_torque_nm[j]
+        } else {
+            0.0
+        }
+    });
+    let stuck = peaks(&run, |s, j| if sliding(s, j) { 0.0 } else { s.tau_ext[j] });
     for j in 0..MAX_JOINTS {
         assert!(
-            estimate[j] < 0.6 * gravity_only[j],
-            "J{j}: the estimate peaked at {:.3} Nm where gravity alone leaves {:.3} Nm",
+            estimate[j] < 0.5 * gravity_only[j],
+            "J{j} sliding: the estimate peaked at {:.3} Nm where gravity alone leaves {:.3} Nm",
             estimate[j],
             gravity_only[j]
+        );
+        assert!(
+            stuck[j] <= 1.5 * friction[j] + 0.05,
+            "J{j} at rest: the estimate reached {:.3} Nm against {:.3} Nm of Coulomb friction",
+            stuck[j],
+            friction[j]
         );
     }
 }

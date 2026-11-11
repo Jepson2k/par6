@@ -627,6 +627,27 @@ transmission_stiffness_nm_rad = [230.0, 4000.0, 1300.0, 70.0, 50.0, 150.0]
 # 548-585 mA, ripple 97 vs 102-109 mA, hardware captures 2026-10-01).
 transmission_damping_ratio = 0.5
 
+[dynamics]
+# What the controller knows about the arm beyond its rigid-body model: the
+# terms the external-torque observer subtracts so the arm's own motion does
+# not read as something pushing on it. [sim] is the plant the simulator
+# stands in with; this is the arm the runtime drives. Shipped as the same
+# reference arm, so an arm calibrated on its own gearboxes overrides these
+# in its local overlay.
+#
+# Coulomb and viscous friction per joint, joint side.
+friction_coulomb_nm = [0.29, 0.95, 0.64, 0.066, 0.045, 0.079]
+friction_viscous_nm_s = [0.29, 1.0, 0.34, 0.047, 0.023, 0.022]
+# Below this speed a joint's direction of sliding is not trusted: the Coulomb
+# term fades in across it instead of flipping sign on encoder noise at rest.
+friction_stick_rad_s = 0.02
+# Rotor inertia reflected to the joint, G^2 * Jm with [sim]'s motor inertias
+# and each joint's dynamics gear ratio. The rigid-body model has the links only.
+rotor_inertia_kg_m2 = [4.18e-4, 4.08e-3, 1.87e-3, 9.12e-5, 9.12e-5, 1.5e-4]
+# Bandwidth of the external-torque observer: how fast a contact shows in the
+# estimate, against how much of the velocity signal's noise does.
+observer_hz = 10.0
+
 [stream]
 command_timeout_s = 0.04
 lowpass_cutoff_hz = 0.0
