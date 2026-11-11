@@ -649,6 +649,22 @@ fn torque_envelope_latches_only_when_configured_and_sustained() {
     );
     rig.ready();
 
+    // A floating arm is not policed: there the estimate is the hand that
+    // is guiding it, and a push held well past the window must not fault.
+    assert!(rig.snap().gravity_comp, "a ready arm floats under G(q)");
+    rig.current_ma[2] = cur;
+    rig.tick_n(window_ticks + 20);
+    assert!(
+        !has_error(&mut rig, ErrorCode::TorqueEnvelope, Some(2)),
+        "a guiding hand must not trip the envelope"
+    );
+    rig.current_ma[2] = 0;
+    rig.tick_n(60);
+
+    // Held on its drives, the arm is.
+    rig.cmd(RtCommand::SetGravityComp(false));
+    assert!(!rig.snap().gravity_comp, "the arm holds instead of floating");
+
     // A transient shorter than the window stays green: the counter never
     // reaches the window before the load disappears and resets it.
     rig.current_ma[2] = cur;

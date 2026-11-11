@@ -819,11 +819,12 @@ impl Default for DynamicsSection {
 #[serde(deny_unknown_fields, default)]
 pub struct LimitsSection {
     /// External-torque envelope margin \[Nm\]: hard fault when a joint's
-    /// external torque estimate (measured minus model, minus the active
-    /// motion's feed-forward) stays beyond this for the window below.
+    /// external torque estimate (measured minus the arm's modelled
+    /// dynamics) stays beyond this for the window below, on an arm its
+    /// drives are holding or moving — a floating arm is not policed.
     /// 0 disables the envelope — the shipped default, because the
-    /// estimate is only as good as the torque constants and the gravity
-    /// model; hardware opts in with a calibrated margin.
+    /// estimate is only as good as the torque constants and the model;
+    /// hardware opts in with a calibrated margin.
     pub tau_ext_margin_nm: f64,
     /// How long a joint must stay beyond the margin before the fault
     /// latches \[s\] — rides out measurement transients and filter lag.

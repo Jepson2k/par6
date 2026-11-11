@@ -704,10 +704,11 @@ singularity_sigma_min = 0.0001     # ... or its smallest singular value drops un
 
 [limits]
 # External-torque envelope: hard fault when a joint's external-torque
-# estimate (measured minus the gravity model, minus the active motion's
-# feed-forward) stays beyond the margin for the window. 0 disables —
-# the shipped default, because the estimate is only as good as the
-# torque constants and the gravity model; calibrate before opting in.
+# estimate (measured minus the arm's modelled dynamics, see [dynamics])
+# stays beyond the margin for the window, on an arm its drives are
+# holding or moving; a floating arm is not policed. 0 disables — the
+# shipped default, because the estimate is only as good as the torque
+# constants and the model; calibrate before opting in.
 tau_ext_margin_nm = 0.0
 tau_ext_window_s = 0.1
 
