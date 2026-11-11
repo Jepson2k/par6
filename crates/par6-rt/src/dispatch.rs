@@ -9,7 +9,7 @@
 //! | Mode | pos | vel | trq |
 //! |---|---|---|---|
 //! | BOOTING | — | 0 | 0 |
-//! | IDLE (homed ∧ enabled ∧ grav-on) | — | — | G(q) |
+//! | IDLE (homed ∧ enabled ∧ grav-on) | the floating law — see [`crate::freedrive`] |
 //! | IDLE otherwise | — | 0 | 0 |
 //! | ACTIVE_ERROR | — | 0 | 0 | (active zero-velocity hold)
 //! | SAFETY_STOP | — | — | 0 Nm | (fully limp)
@@ -72,16 +72,11 @@ pub fn law_booting(out: &mut [JointSetpoint; MAX_JOINTS]) {
     out.fill(JointSetpoint::zero_velocity());
 }
 
-/// IDLE: torque-only gravity hold when `homed ∧ enabled ∧ grav-on` — NO
-/// position hold — otherwise active zero-velocity.
-pub fn law_idle(gravity_hold: bool, g: &[f64; MAX_JOINTS], out: &mut [JointSetpoint; MAX_JOINTS]) {
-    if gravity_hold {
-        for i in 0..MAX_JOINTS {
-            out[i] = JointSetpoint::torque_only(g[i]);
-        }
-    } else {
-        out.fill(JointSetpoint::zero_velocity());
-    }
+/// IDLE on an arm that may not float (not homed, not enabled, or gravity
+/// compensation off): active zero-velocity. The floating arm's law is
+/// [`crate::freedrive::Freedrive::law`].
+pub fn law_idle(out: &mut [JointSetpoint; MAX_JOINTS]) {
+    out.fill(JointSetpoint::zero_velocity());
 }
 
 /// ACTIVE_ERROR: active zero-velocity hold (e-stop lands here — motors

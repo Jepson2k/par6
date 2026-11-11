@@ -118,6 +118,21 @@ pub enum RtCommand {
     /// Enable/disable the gravity-compensation feedforward (G(q) is still
     /// computed and published every tick regardless).
     SetGravityComp(bool),
+    /// A floating arm has been guided into a keep-out: back it out the way
+    /// it came and hold it there until it is reset. The collision world
+    /// lives off the RT thread, so this is how its verdict arrives; an arm
+    /// that has stopped floating by the time it does ignores it.
+    KeepOutCatch,
+    /// Replace what the arm does on contact and the per-joint thresholds
+    /// it reads one at \[Nm\], from the next tick. Validated upstream.
+    SetContactLimits {
+        /// What a contact does from now on.
+        reaction: par6_config::ContactReaction,
+        /// Sustained-channel thresholds.
+        sustained_nm: [f64; MAX_JOINTS],
+        /// Impact-channel thresholds.
+        impact_nm: [f64; MAX_JOINTS],
+    },
     /// Replace the runtime payload in the gravity model (mass \[kg\],
     /// COM \[m\] ee-frame, inertia about the COM or `None` for a point
     /// mass). Plain data into the tick loop — the model updates between

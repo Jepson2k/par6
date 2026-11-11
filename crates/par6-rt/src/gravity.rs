@@ -5,7 +5,8 @@
 //! enabled` — that gating lives in the tick loop. This module only
 //! defines where the torques come from:
 //!
-//! - [`GravityModel`]: the per-tick contract (`q` → `τ`), allocation-free.
+//! - [`GravityModel`]: the per-tick contract (`q` → `τ`), allocation-free,
+//!   and the arm's inertial torques for the external-torque observer.
 //! - [`ZeroGravity`]: the no-model fallback (all zeros) used in tests and
 //!   when no dynamics stack is wired.
 //!
@@ -32,6 +33,40 @@ pub trait GravityModel: Send {
     /// so here, in one line, deliberately.
     fn set_payload(&mut self, mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>);
 
+    /// Write the declared payload's share of G(q) \[Nm\] into `out` — what
+    /// `gravity` answers with the payload, less what it would answer
+    /// without. Must not allocate and must not block.
+    ///
+    /// A payload is declared before it is picked up and stays declared
+    /// until after it is put down, so for part of every pick and place the
+    /// arm is compensating a load it does not hold. Contact detection
+    /// allows the estimate that much, in that direction, and no more.
+    ///
+    /// No default body: a model that inherited "no payload" while its
+    /// `gravity` carried one would read every pick-up as a contact.
+    fn payload_gravity(&mut self, q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]);
+
+    /// Write the torque the arm's own motion takes, `M(q)·a + C(q, v)·v`
+    /// \[Nm\] — inverse dynamics with the gravity term left out — into
+    /// `out`, and say whether this model describes the arm's inertia at
+    /// all. Must not allocate and must not block: the external-torque
+    /// observer calls it every tick.
+    ///
+    /// A model of gravity alone writes zeros and returns `false`, and the
+    /// observer's estimate then carries every acceleration the arm makes;
+    /// what reads a contact into that estimate stands down on the answer.
+    ///
+    /// No default body, for the reason `set_payload` has none: a model
+    /// that inherited "no inertia" would switch contact detection off
+    /// without anyone having decided that it should.
+    fn dynamics(
+        &mut self,
+        q: &[f64; MAX_JOINTS],
+        v: &[f64; MAX_JOINTS],
+        a: &[f64; MAX_JOINTS],
+        out: &mut [f64; MAX_JOINTS],
+    ) -> bool;
+
     /// Whether `gravity` describes the arm at all. Checks that compare
     /// measured holding torque against G(q) (the post-homing reference
     /// check) are meaningless against a placeholder and skip themselves.
@@ -56,4 +91,20 @@ impl GravityModel for ZeroGravity {
     /// Nothing to carry it: this model compensates no gravity at all, so
     /// a payload changes nothing rather than being quietly lost.
     fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
+
+    fn payload_gravity(&mut self, _q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
+        out.fill(0.0);
+    }
+
+    /// No arm behind it, so no inertia either.
+    fn dynamics(
+        &mut self,
+        _q: &[f64; MAX_JOINTS],
+        _v: &[f64; MAX_JOINTS],
+        _a: &[f64; MAX_JOINTS],
+        out: &mut [f64; MAX_JOINTS],
+    ) -> bool {
+        out.fill(0.0);
+        false
+    }
 }

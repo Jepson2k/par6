@@ -280,10 +280,15 @@ fn distance_mm(a: [f64; 3], b: [f64; 3]) -> f64 {
         .sqrt()
 }
 
-/// `tool` is what the runtime runs: STATUS names it, puts the TCP where
-/// its own model does, and implies its gravity — filtered torque minus
-/// external torque is the model's G(q).
-fn assert_fitted(rig: &Rig, bundle: &par6_config::ConfigBundle, tool: &str) -> Status {
+/// `tool` is what the runtime runs: STATUS names it and puts the TCP where
+/// its own model does, and the gravity the runtime's model holds is that
+/// tool's.
+fn assert_fitted(
+    rig: &Rig,
+    c: &mut Client,
+    bundle: &par6_config::ConfigBundle,
+    tool: &str,
+) -> Status {
     rig.drain_status();
     rig.wait_status("the tool reaches STATUS", |s| {
         s.tool_status
@@ -293,15 +298,16 @@ fn assert_fitted(rig: &Rig, bundle: &par6_config::ConfigBundle, tool: &str) -> S
     // The swap lands inside one tick; the frame it lands in can still
     // carry that tick's pre-swap pose.
     let s = frames_later(rig, 2);
-    let (tcp, g) = tool_model(bundle, tool, &s.angles);
+    let (tcp, _) = tool_model(bundle, tool, &s.angles);
     let at = [s.pose[3], s.pose[7], s.pose[11]];
     let off = distance_mm(tcp, at);
     assert!(
         off < 0.05,
         "{tool}: STATUS puts the TCP {off:.3} mm from its model's ({at:?} vs {tcp:?})"
     );
-    for (j, want) in g.iter().enumerate() {
-        let got = s.torques[j] - s.torques_ext[j];
+    let (angles, runs) = c.model_gravity();
+    let (_, g) = tool_model(bundle, tool, &angles);
+    for (j, (got, want)) in runs.iter().zip(g).enumerate() {
         assert!(
             (got - want).abs() < 1e-3,
             "{tool}: J{j} runs gravity {got:.4} Nm, its model says {want:.4}"
@@ -487,6 +493,56 @@ fn full_sim_session_over_protocol_v3() {
         );
     }
 
+    rig.shutdown();
+}
+
+/// A stop that arrives as a move is accepted cancels it before it has been
+/// planned. The move is reported cancelled, and it must stay cancelled:
+/// its plan must not reach the arm then, nor wait in the ring to be played
+/// ahead of whatever is sent next.
+#[test]
+fn a_move_stopped_as_it_is_accepted_never_runs() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    rig.wait_status("enabled", |s| s.enabled);
+    let park = park_deg();
+    common::teleport_home(&rig, &mut c, park);
+
+    let far = with_j0(park, 40.0);
+    let cancelled = c.ok_index(&move_j(5001, far, 3.0));
+    c.ok(&Command::Stop(Stop { clear_queue: true }));
+    let (ok, detail) = c.wait_complete(cancelled);
+    assert!(
+        !ok && detail.is_some_and(|e| e.code == ErrorCode::MotnCancelled as u16),
+        "the stopped move reports its cancellation"
+    );
+    let after_stop = rig.collect_status(Duration::from_millis(1500));
+    let strayed = after_stop
+        .iter()
+        .map(|s| (s.angles[0] - park[0]).abs())
+        .fold(0.0, f64::max);
+    assert!(
+        strayed < 1.0,
+        "a cancelled move ran: the base went {strayed:.2} deg toward its target after the stop"
+    );
+
+    // The next move starts from where the arm is and goes one way.
+    let near = with_j0(park, -10.0);
+    let next = c.ok_index(&move_j(5002, near, 1.0));
+    let run = rig.collect_through(next, BUDGET);
+    let (ok, detail) = c.wait_complete(next);
+    assert!(ok, "the move after the stop must run: {detail:?}");
+    let furthest_wrong_way = run
+        .iter()
+        .map(|s| s.angles[0] - park[0])
+        .fold(0.0, f64::max);
+    assert!(
+        furthest_wrong_way < 1.0,
+        "the next move played the cancelled one first: the base went \
+         {furthest_wrong_way:.2} deg the other way"
+    );
     rig.shutdown();
 }
 
@@ -2204,7 +2260,11 @@ fn the_rt_jog_latch_greys_the_enablement_flag() {
 /// `mono_time_ns`), not the test's.
 #[test]
 fn stream_speed_and_accel_fractions_reach_the_arm() {
-    let rig = Rig::boot(common::shipped_config());
+    let shipped_dt = par6_config::RobotConfig::load(&common::shipped_config())
+        .expect("shipped config")
+        .robot
+        .tick_dt_s;
+    let rig = Rig::boot(common::uncapped_config("stream-fractions", shipped_dt));
     let mut c = Client::new(rig.addr());
 
     /// How far the arm travels in `window` of runtime time while
@@ -2783,12 +2843,13 @@ fn the_shipped_binary_publishes_the_bus_grant_signal_and_takes_it_away() {
 }
 
 /// A teleport references the arm, so the move sent right behind it must
-/// be accepted. The homed gate reads the RT snapshot, which is a tick or
-/// more behind the accepted teleport — a script that teleports and then
-/// moves, as `examples/keepout_preview.py` does, must not race the
+/// be accepted — and must start from where the teleport puts the arm. The
+/// homed gate and the planner both read the RT snapshot, which is a tick
+/// or more behind the accepted teleport — a script that teleports and
+/// then moves, as `examples/keepout_preview.py` does, must not race the
 /// broadcast. A 20 Hz tick leaves 50 ms between snapshots for two
-/// back-to-back datagrams to land in, so the move is gated before any
-/// tick has seen the teleport.
+/// back-to-back datagrams to land in, so the move is gated, and offered
+/// for planning, before any tick has seen the teleport.
 #[test]
 fn a_move_sent_right_behind_a_teleport_is_not_refused_as_unhomed() {
     let config = common::retimed_config("teleport-race", 0.05);
@@ -2808,8 +2869,28 @@ fn a_move_sent_right_behind_a_teleport_is_not_refused_as_unhomed() {
     c.send(&teleport(park));
     // No wait: this is the race. The move goes out in the same breath.
     let index = c.ok_index(&move_j(4101, with_j0(park, 5.0), 0.5));
+    // The move starts where the teleport put the arm, not where the arm
+    // was when the two datagrams arrived: a plan taken before the
+    // teleport landed swings every joint toward the old pose first.
+    let run = rig.collect_through(index, BUDGET);
     let (ok, detail) = c.wait_complete(index);
     assert!(ok, "the move behind a teleport must run, got {detail:?}");
+    let referenced: Vec<&Status> = run.iter().filter(|s| s.homed).collect();
+    assert!(!referenced.is_empty(), "the move was observed");
+    for s in referenced {
+        assert!(
+            (-1.0..=6.0).contains(&s.angles[0]),
+            "the base left its 5 degree move: {:.2} deg",
+            s.angles[0]
+        );
+        for (j, placed) in park.iter().enumerate().skip(1) {
+            assert!(
+                (s.angles[j] - placed).abs() < 1.0,
+                "J{j} strayed {:+.2} deg from where it was placed, during a base-only move",
+                s.angles[j] - placed
+            );
+        }
+    }
 
     rig.shutdown();
 }
@@ -2840,7 +2921,7 @@ fn select_tool_fits_a_different_tool() {
     rig.wait_status("enabled", |s| s.enabled);
 
     // Booted on the key: the prefix rule would have fitted the flange.
-    let s = assert_fitted(&rig, &bundle, KEYED_TOOL);
+    let s = assert_fitted(&rig, &mut c, &bundle, KEYED_TOOL);
     let (keyed_tcp, keyed_g) = tool_model(&bundle, KEYED_TOOL, &s.angles);
     let (flange_tcp, flange_g) = tool_model(&bundle, "Flange", &s.angles);
     assert!(
@@ -2866,7 +2947,7 @@ fn select_tool_fits_a_different_tool() {
         ok,
         "selecting the bare flange must complete, got {detail:?}"
     );
-    assert_fitted(&rig, &bundle, "Flange");
+    assert_fitted(&rig, &mut c, &bundle, "Flange");
     // The jaw's drive came off with it: what it last reported is no
     // reading of anything on the arm now.
     let node = usize::from(bundle.robot.bus.gripper_node);
@@ -2892,7 +2973,7 @@ fn select_tool_fits_a_different_tool() {
         ok,
         "selecting the keyed tool back must complete, got {detail:?}"
     );
-    assert_fitted(&rig, &bundle, KEYED_TOOL);
+    assert_fitted(&rig, &mut c, &bundle, KEYED_TOOL);
     let i = c.ok_index(&tool_action(7005, KEYED_TOOL, "calibrate", &[]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "the driven tool's jaw must work again, got {detail:?}");
@@ -2908,7 +2989,7 @@ fn select_tool_fits_a_different_tool() {
         ok,
         "selecting another driven tool must complete, got {detail:?}"
     );
-    assert_fitted(&rig, &bundle, &other);
+    assert_fitted(&rig, &mut c, &bundle, &other);
     let i = c.ok_index(&tool_action(7007, &other, "calibrate", &[]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "the second driven tool's jaw must work, got {detail:?}");

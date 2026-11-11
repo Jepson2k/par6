@@ -315,7 +315,20 @@ impl Daemon {
             fk: fk_hook,
             samples: consumer,
         };
-        let (core, handles) = RtCore::new(&bundle, bus, hooks)?;
+        let (mut core, handles) = RtCore::new(&bundle, bus, hooks)?;
+        if let Some(path) = &opts.sim_scenario {
+            let scenario = load_sim_scenario(path)?;
+            core.bus_mut()
+                .sim_mut()
+                .ok_or_else(|| {
+                    DaemonError::ConfigPath("--sim-scenario needs the simulator (--sim)".into())
+                })?
+                .set_scenario(&scenario)
+                .map_err(|e| {
+                    DaemonError::ConfigPath(format!("sim scenario {}: {e}", path.display()))
+                })?;
+            log::info!("sim scenario {} active: {scenario:?}", path.display());
+        }
 
         // The RT snapshot channel is single-reader; the tee fans it out.
         let (srv_w, srv_r) = snapshot_channel::<StateSnapshot>();
@@ -382,6 +395,8 @@ impl Daemon {
                 snapshots: bridge_snapshots,
                 soft_min: stream_limits.soft_min,
                 soft_max: stream_limits.soft_max,
+                jog_vel: jog_limits.velocity,
+                stream_vel: stream_limits.velocity,
                 gate: stream_gate.clone(),
             },
         );
@@ -1039,6 +1054,16 @@ impl KinSource {
     }
 }
 
+/// Read a simulator scenario file: the scenario's fields as TOML.
+fn load_sim_scenario(
+    path: &std::path::Path,
+) -> Result<par6_bus::sim::SimulationScenario, DaemonError> {
+    let refuse =
+        |e: String| DaemonError::ConfigPath(format!("sim scenario {}: {e}", path.display()));
+    let text = std::fs::read_to_string(path).map_err(|e| refuse(e.to_string()))?;
+    toml::from_str(&text).map_err(|e| refuse(e.to_string()))
+}
+
 pub(crate) fn load_kin_stack(
     opts: &Options,
     config_path: &std::path::Path,
@@ -1047,16 +1072,13 @@ pub(crate) fn load_kin_stack(
 ) -> Result<KinStack, DaemonError> {
     use crate::kin::{KinFk, KinGravity, ToolOffset};
     let src = KinSource::resolve(opts, config_path, robot, active_tool)?;
-    let mut gravity_kin = crate::kin::load_gravity_kin(&src.assets_dir, active_tool)
+    let gravity = KinGravity::load(&src.assets_dir, active_tool, &robot.gravity_correction)
         .map_err(DaemonError::Kinematics)?;
-    gravity_kin
-        .set_gravity_correction(&robot.gravity_correction)
-        .map_err(|e| DaemonError::Kinematics(e.to_string()))?;
     let tool_offset = ToolOffset::new();
     Ok(KinStack {
         source: src.clone(),
         fk: KinFk::new(src.kin()?, tool_offset.clone()),
-        gravity: KinGravity::new(gravity_kin),
+        gravity,
         planner: src.cart_kin(&tool_offset)?,
         bridge: src.cart_kin(&tool_offset)?,
         housekeeping: src.cart_kin(&tool_offset)?,

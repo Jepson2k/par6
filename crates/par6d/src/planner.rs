@@ -463,12 +463,16 @@ impl Par6Planner {
                 source.cart_kin(&self.tool_offset)?,
                 source.collision()?,
                 source.collision()?,
-                crate::kin::load_gravity_kin(source.assets_dir(), Some(gripper))
-                    .map_err(crate::daemon::DaemonError::Kinematics)?,
+                crate::kin::KinGravity::load(
+                    source.assets_dir(),
+                    Some(gripper),
+                    &self.bundle.robot.gravity_correction,
+                )
+                .map_err(crate::daemon::DaemonError::Kinematics)?,
                 source.kin_fk(&self.tool_offset)?,
             ))
         })();
-        let (mut planner, bridge, housekeeping, mut collision, gate_collision, mut gravity, fk) =
+        let (mut planner, bridge, housekeeping, mut collision, gate_collision, gravity, fk) =
             rebuilt.map_err(|e| refused(format!("cannot load tool '{name}': {e}")))?;
         // The declared payload is held in the new tool's jaws as it was in
         // the old one's (the RT puts its own copy on its new model).
@@ -479,9 +483,6 @@ impl Par6Planner {
         collision
             .adopt_layers(&self.collision)
             .map_err(|e| refused(format!("tool '{name}': the keep-outs do not apply: {e}")))?;
-        gravity
-            .set_gravity_correction(&self.bundle.robot.gravity_correction)
-            .map_err(|e| refused(format!("tool '{name}': gravity correction refused: {e}")))?;
         // The offsets the new tool declares, for the joints whose home
         // reference is tool-dependent.
         let mut offsets: Vec<(usize, f64)> = Vec::new();
@@ -502,7 +503,7 @@ impl Par6Planner {
         let applied = Arc::new(AtomicBool::new(false));
         let raised = Arc::clone(&applied);
         self.link.op(Box::new(move |core| {
-            core.set_gravity(Box::new(crate::kin::KinGravity::new(gravity)));
+            core.set_gravity(Box::new(gravity));
             core.set_fk(Box::new(fk));
             // The jaw is part of the tool: its limits, its pinion and the
             // reference it homed against all belong to the one that just
@@ -858,6 +859,7 @@ impl Par6Planner {
         samples: Vec<[f64; 3 * MAX_JOINTS]>,
         seen_exec: bool,
     ) -> Result<InFlightKind, WireError> {
+        let samples = self.within_tool_speed(&start_q, samples);
         par6_motion::gate::check_commanded_accel(
             samples.iter().map(|qqa| {
                 let mut qd = [0.0; MAX_JOINTS];
@@ -948,6 +950,41 @@ impl Par6Planner {
             cursor: 0,
             seen_exec,
         })
+    }
+
+    /// `samples` — a plan leaving `start_q` — slowed until the tool stays
+    /// under `[limits] tcp_speed_max_m_s`; untouched when it already does,
+    /// or when there is no ceiling. See [`crate::tool_speed`].
+    ///
+    /// A plan whose tool path cannot be read (the model refused a pose)
+    /// is passed through: the RT measures the tool against the same
+    /// ceiling as it moves.
+    fn within_tool_speed(
+        &mut self,
+        start_q: &[f64; MAX_JOINTS],
+        samples: Vec<[f64; 3 * MAX_JOINTS]>,
+    ) -> Vec<[f64; 3 * MAX_JOINTS]> {
+        let ceiling = self.bundle.robot.limits.tcp_speed_max_m_s;
+        if ceiling <= 0.0 || samples.is_empty() {
+            return samples;
+        }
+        let mut points = Vec::with_capacity(samples.len() + 1);
+        let poses = std::iter::once(&start_q[..]).chain(samples.iter().map(|s| &s[..MAX_JOINTS]));
+        for q in poses {
+            let mut at = [0.0; NQ];
+            at.copy_from_slice(&q[..NQ]);
+            match self.kin.fk(&at) {
+                Ok(pose) => points.push([pose[3], pose[7], pose[11]]),
+                Err(e) => {
+                    log::warn!("tool speed not checked for this plan: {e}");
+                    return samples;
+                }
+            }
+        }
+        if crate::tool_speed::peak_speed(&points, self.dt) <= ceiling {
+            return samples;
+        }
+        crate::tool_speed::held_under(start_q, &samples, &points, ceiling, self.dt)
     }
 
     /// Plan a joint-space move from the measured pose in `snap` to
@@ -1988,7 +2025,9 @@ impl Par6Planner {
         fl: &mut InFlight,
         snap: &StateSnapshot,
     ) -> Option<Result<Option<u8>, WireError>> {
-        if snap.error_active {
+        // A protective stop ends the command it stopped the same way a
+        // fault does: the RT has already taken the arm off its path.
+        if snap.error_active || snap.protective_active {
             return Some(Err(rt_error(snap)));
         }
         match &mut fl.kind {
@@ -2596,11 +2635,11 @@ impl Planner for Par6Planner {
     }
 
     fn cancel(&mut self, halt_tool: bool) {
-        // Only this planner's own state — and the jaws. The RT half of a
-        // cancelled motion — braking the program and flushing the ring —
-        // is the server's `RtCommands::discard_exec`, because it has to be
-        // ordered against the stream that may be replacing this motion,
-        // and an answer arriving from another thread cannot be.
+        // This planner's own state, the jaws, and its own fill of the
+        // ring. Braking the program is the server's
+        // `RtCommands::discard_exec`, because it has to be ordered against
+        // the stream that may be replacing this motion, and an answer
+        // arriving from another thread cannot be.
         let inflight = self.inflight.take();
         if halt_tool
             && matches!(
@@ -2614,6 +2653,24 @@ impl Planner for Par6Planner {
             // Halt in place rather than release: a cancellation must never
             // drop whatever the jaws are holding.
             self.link.send(RtCommand::GripperStop);
+        }
+        if matches!(
+            inflight,
+            Some(InFlight {
+                kind: InFlightKind::Exec { .. },
+                ..
+            })
+        ) {
+            // The server's flush is marked when the stop arrives, and this
+            // thread may only have got round to planning the move after
+            // that: its samples then went into the ring under a newer
+            // generation than the mark, where no flush reaches them, and
+            // the cancelled move would run in full the next time EXEC
+            // played. Only the producer knows what it pushed, so it marks
+            // its own fill. A second stop behind the server's is harmless:
+            // it brakes a clock already at rest and flushes.
+            self.producer.flush_marker().mark();
+            self.link.send(RtCommand::ExecStop);
         }
         self.near_singularity = None;
     }
@@ -2809,6 +2866,7 @@ impl Planner for Par6Planner {
                     if let Ok(samples) =
                         self.joint_move_samples(&from, &target, p.duration, p.speed, p.accel)
                     {
+                        let samples = self.within_tool_speed(&from, samples);
                         total += samples.len() as f64 * self.dt;
                     }
                     from = target;

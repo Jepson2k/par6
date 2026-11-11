@@ -60,6 +60,16 @@ def _row_rate_tick(toml: str) -> str:
     return toml
 
 
+def _joint_limited(toml: str) -> str:
+    """:func:`_row_rate_tick`, with the tool-speed ceiling off: a plan timed
+    by nothing but the joints' own limits, for a test that holds it to them."""
+    ceiling = "tcp_speed_max_m_s = 0.25"
+    toml = _row_rate_tick(toml)
+    if ceiling not in toml:
+        raise RuntimeError(f"PAR6.toml patch point {ceiling!r} missing")
+    return toml.replace(ceiling, "tcp_speed_max_m_s = 0.0")
+
+
 class _Block:
     """One command's motion, read off the commanded record.
 
@@ -242,7 +252,7 @@ class TestPlannedMotion:
         Driven through the dry-run client — the plan under test is the one
         the runtime's own planner produces — with the config as the oracle.
         """
-        config_path = sim_config(tmp_path / "config", config_patch=_row_rate_tick)
+        config_path = sim_config(tmp_path / "config", config_patch=_joint_limited)
         # The host may have a commissioned overlay; this preview uses the
         # isolated test config, so its limits must be the oracle too.
         cfg = _cfg.Config(str(config_path))

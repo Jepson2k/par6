@@ -154,6 +154,21 @@ pub fn retimed_config(tag: &str, dt: f64) -> PathBuf {
     dst
 }
 
+/// [`retimed_config`] with `[limits] tcp_speed_max_m_s` off, for a test
+/// whose numbers are what the joints' own limits allow: a profile's
+/// minimum time, how far a speed fraction carries the arm, how an arm at
+/// full jog speed is stopped short of a keep-out. The ceiling is on in
+/// every other rig, as shipped, and has tests of its own.
+pub fn uncapped_config(tag: &str, dt: f64) -> PathBuf {
+    let config = retimed_config(&format!("{tag}-uncapped"), dt);
+    let text = std::fs::read_to_string(&config).expect("read the re-timed config");
+    write_atomic(
+        &config,
+        set_scalar(&text, "tcp_speed_max_m_s", "0.0").as_bytes(),
+    );
+    config
+}
+
 /// The shipped config re-timed to `dt` AND pointed at `iface`, for the
 /// hardware-mode startup checks that must refuse before any interface is
 /// opened.
@@ -232,9 +247,20 @@ pub fn sim_options(config: PathBuf, status_port: u16) -> Options {
 /// loopback, for a test that listens with a real `par6_client::Client`
 /// instead of the rig's own socket.
 pub fn boot_for_client(config: PathBuf, status_port: u16) -> Result<Daemon, String> {
+    boot_for_client_in(config, status_port, None)
+}
+
+/// As [`boot_for_client`], with a scenario file when the physics is to
+/// hold something the runtime was never told about.
+pub fn boot_for_client_in(
+    config: PathBuf,
+    status_port: u16,
+    sim_scenario: Option<PathBuf>,
+) -> Result<Daemon, String> {
     init_test_logging();
     redirect_bus_grant();
     let opts = Options {
+        sim_scenario,
         ..sim_options(config, status_port)
     };
     Daemon::start(&opts).map_err(|e| e.to_string())
@@ -376,14 +402,24 @@ impl Rig {
 
     /// The same, surfacing the startup error instead of panicking.
     pub fn try_boot_at_status_rate(config: PathBuf, hz: u32) -> Result<Rig, String> {
-        Rig::try_boot_opts(config, Some(hz))
+        Rig::try_boot_opts(config, Some(hz), None)
+    }
+
+    /// Boot the simulator with a scenario file, as `--sim-scenario` does:
+    /// what the physics holds that the runtime was never told about.
+    pub fn boot_in_scenario(config: PathBuf, scenario: PathBuf) -> Rig {
+        Rig::try_boot_opts(config, None, Some(scenario)).expect("daemon boots in the scenario")
     }
 
     fn boot_opts(config: PathBuf, status_rate_hz: Option<u32>) -> Rig {
-        Rig::try_boot_opts(config, status_rate_hz).expect("daemon boots in sim mode")
+        Rig::try_boot_opts(config, status_rate_hz, None).expect("daemon boots in sim mode")
     }
 
-    fn try_boot_opts(config: PathBuf, status_rate_hz: Option<u32>) -> Result<Rig, String> {
+    fn try_boot_opts(
+        config: PathBuf,
+        status_rate_hz: Option<u32>,
+        sim_scenario: Option<PathBuf>,
+    ) -> Result<Rig, String> {
         init_test_logging();
         let slot = RT_SLOT.lock().unwrap_or_else(|e| e.into_inner());
         redirect_bus_grant();
@@ -393,6 +429,7 @@ impl Rig {
             .expect("timeout");
         let opts = Options {
             status_rate_hz,
+            sim_scenario,
             ..sim_options(config, status_rx.local_addr().unwrap().port())
         };
         let daemon = Daemon::start(&opts).map_err(|e| e.to_string())?;
@@ -607,6 +644,17 @@ impl Client {
         match self.request(cmd) {
             Reply::Response { result, .. } => result,
             other => panic!("expected RESPONSE, got {other:?}"),
+        }
+    }
+
+    /// The gravity torque the runtime's own model holds \[Nm\], and the
+    /// joint angles \[deg\] it was evaluated at: the contact readout
+    /// carries both from one tick, so the pair is exact whatever the arm
+    /// is doing.
+    pub fn model_gravity(&mut self) -> ([f64; NUM_JOINTS], [f64; NUM_JOINTS]) {
+        match self.query(&Command::Contact) {
+            QueryResult::Contact(c) => (c.angles, c.gravity_nm),
+            other => panic!("unexpected {other:?}"),
         }
     }
 

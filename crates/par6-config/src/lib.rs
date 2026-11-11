@@ -41,13 +41,14 @@ pub use homing::{
 pub use io::{IoConfig, IoLine, MAX_IO_LINES};
 pub use overlay::{
     config_fingerprint, effective_robot_toml, effective_tool_tomls, fitted_robot_toml,
-    local_overlay, LOCAL_CONFIG_ENV, LOCAL_CONFIG_NAME,
+    local_overlay, overlay_with_contact, LOCAL_CONFIG_ENV, LOCAL_CONFIG_NAME,
 };
 pub use robot::{
-    BusConfig, ControlMode, DriverType, Gains, JogDefaults, JogProfile, JointConfig, JointLimits,
-    KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits, MotionConfig, ProtocolConfig,
-    ResolvedLimits, RippleHarmonic, RobotConfig, RobotSection, ScanConfig, SimConfig,
-    StreamDefaults, TimingConfig, WatchdogAction, MAX_OPEN_RETRY_S, MAX_RIPPLE_HARMONICS,
+    BusConfig, ContactReaction, ContactSection, ControlMode, DriverType, DynamicsSection,
+    FreedriveSection, Gains, JogDefaults, JogProfile, JointConfig, JointLimits, KtFetchConfig,
+    KtSource, LimitMode, LimitsSection, ModeLimits, MotionConfig, ProtocolConfig, ResolvedLimits,
+    RippleHarmonic, RobotConfig, RobotSection, ScanConfig, SimConfig, StreamDefaults, TimingConfig,
+    WatchdogAction, MAX_OPEN_RETRY_S, MAX_RIPPLE_HARMONICS,
 };
 
 use std::path::Path;

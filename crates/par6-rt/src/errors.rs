@@ -88,6 +88,20 @@ impl ErrorManager {
         self.list.any_hard()
     }
 
+    /// Whether a protective stop is latched.
+    pub fn any_protective(&self) -> bool {
+        self.list.any_protective()
+    }
+
+    /// Drop the protective stops at once. Nothing on the drives latched
+    /// with them, so there is no clear to send and nothing to wait out.
+    pub fn clear_protective(&mut self) {
+        if self.list.any_protective() {
+            self.list.clear_protective();
+            log::info!("protective stop cleared");
+        }
+    }
+
     /// The current latch list (for the snapshot).
     pub fn list(&self) -> &ErrorList {
         &self.list

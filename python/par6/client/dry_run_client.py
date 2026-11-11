@@ -23,7 +23,7 @@ import copy
 import hashlib
 import logging
 import math
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import Callable, Coroutine, Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -1093,6 +1093,61 @@ class DryRunRobotClient(RobotOwner):
     def loop_stats(self) -> LoopStatsResult | None:
         """None: a preview runs no control loop to report on."""
         return None
+
+    def contact(self) -> None:
+        """None: a preview measures no motor torque to read a contact from."""
+        return None
+
+    def set_contact_limits(
+        self,
+        *,
+        reaction: str,
+        sustained_nm: Sequence[float],
+        impact_nm: Sequence[float],
+    ) -> int:
+        """Planned as the runtime takes it; a simulated run of the program
+        reads contacts with these limits from here on."""
+        return self._system(
+            {
+                "type": "set_contact_limits",
+                "reaction": str(reaction),
+                "sustained_nm": [float(v) for v in sustained_nm],
+                "impact_nm": [float(v) for v in impact_nm],
+            },
+            "set_contact_limits",
+        )
+
+    def calibrate_contact(
+        self,
+        spread: float = 0.5,
+        speed: float = 1.0,
+        margin: float = 2.0,
+        apply: bool = True,
+        save_to: object = None,
+    ) -> None:
+        """Queue the swings a contact calibration makes; measure nothing.
+
+        A dry run has no torque to read, so there are no peaks, no
+        thresholds, and nothing is applied or saved.  The MOTION is the
+        live routine's: each joint swung either way from here and back,
+        then all of them at once, at its speed — planned against the same
+        keep-outs, and refused where a joint has no room to swing.  Each
+        move is a block of the program, under this method's name.
+        """
+        del margin, apply, save_to
+        for q in self._preview.contact_swings(float(spread)):
+            self._submit(
+                {
+                    "type": "move_j",
+                    "angles": np.degrees(np.asarray(q, dtype=np.float64)).tolist(),
+                    "duration": None,
+                    "speed": float(speed),
+                    "accel": 1.0,
+                    "blend_radius": None,
+                    "rel": False,
+                },
+                "calibrate_contact",
+            )
 
     def reset_loop_stats(self, **kwargs: Any) -> int:
         """A preview runs no control loop."""

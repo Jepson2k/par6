@@ -37,9 +37,11 @@ use par6_bus::{
 };
 use par6_config::{ConfigBundle, ControlMode, KtSource, LimitMode, MAX_IO_LINES};
 
+use crate::contact::{ContactDetector, ContactWatch};
 use crate::dispatch::{self, CommandMirror, JointSetpoint};
 use crate::errors::ErrorManager;
 use crate::exec::{ExecPlayback, ExecTick};
+use crate::freedrive::Freedrive;
 use crate::gpio::{Debouncer, DigitalIo, EstopGpio, EstopMonitor};
 use crate::gravity::GravityModel;
 use crate::gripper_gate::GripperGate;
@@ -48,6 +50,7 @@ use crate::homing::{HomingSystem, SeqStatus};
 use crate::hooks::{
     CommandSource, FlashMarker, ForwardKin, JogEngine, RtCommand, SettlePolicy, StreamTracker,
 };
+use crate::observer::TorqueObserver;
 use crate::ring::SampleConsumer;
 use crate::snapshot::{snapshot_channel, SnapshotReader, SnapshotWriter};
 use crate::state::{
@@ -78,6 +81,12 @@ struct BootConfig {
 /// equality test there leaves STREAM open forever on an arm that has
 /// visibly stopped.
 const STREAM_REST_RAD_S: f64 = 1e-9;
+
+/// How far over `[limits] tcp_speed_max_m_s` the measured tool speed has
+/// to be before the arm stops for it. What plans and feeds motion aims at
+/// the ceiling itself; the margin is what tracking error and a measured
+/// speed's own noise are allowed on top.
+const TCP_SPEED_TRIP_MARGIN: f64 = 1.2;
 /// How far a joint may wander and still count as stopped for a released
 /// JOG or STREAM to hand over to IDLE \[rad\], and how long it must stay
 /// inside that band \[s\].
@@ -302,6 +311,9 @@ pub enum GateRefusal {
     /// The mode's output law is not implemented yet (HAND_GUIDING,
     /// IMPEDANCE) — explicit refusal, never a silent no-op mode.
     NotImplemented,
+    /// A protective stop is latched: the arm stopped itself and stays
+    /// put, neither moved nor let go, until that is cleared.
+    ProtectiveStop,
 }
 
 /// The latch key one drive fault bit is held under.
@@ -488,6 +500,7 @@ pub struct RtHandles {
 pub struct RtCore<B: DriverBus> {
     dt: f64,
     tick: u64,
+    placements: u32,
     bus: B,
     bus_state: BusState,
 
@@ -619,10 +632,11 @@ pub struct RtCore<B: DriverBus> {
     q_filt: [f64; MAX_JOINTS],
     qd_filt: [f64; MAX_JOINTS],
     tau_filt: [f64; MAX_JOINTS],
-    /// External torque estimate \[Nm\]: filtered measured torque minus
-    /// the model's gravity torque. What a hand pushing the arm looks
-    /// like in the torque domain.
+    /// External torque estimate \[Nm\], measured minus model: the
+    /// observer's output. What a hand pushing the arm looks like in the
+    /// torque domain.
     tau_ext: [f64; MAX_JOINTS],
+    observer: TorqueObserver,
     filters_seeded: bool,
     /// `[limits] tau_ext_margin_nm`; 0 disables the envelope.
     tau_env_margin_nm: f64,
@@ -630,9 +644,44 @@ pub struct RtCore<B: DriverBus> {
     tau_env_window_ticks: u32,
     /// Per-joint consecutive over-margin tick counters.
     tau_env_over: [u32; MAX_JOINTS],
+    contact: ContactDetector,
+    freedrive: Freedrive,
+    /// `[limits] tcp_speed_max_m_s` with its trip margin on, 0 = off.
+    tcp_speed_trip_m_s: f64,
+    tcp_speed_window_ticks: u32,
+    tcp_speed_over: u32,
+    /// Where the tool was measured last tick, NaN when that is no longer
+    /// a pose to difference against.
+    tcp_last: [f64; 3],
+    tcp_scratch: [f64; 6],
+    /// The measured poses of the last `[contact] retreat_s` of travel,
+    /// oldest overwritten: where a stopped arm retreats to is somewhere it
+    /// has just been. Empty when the config asks for no retreat.
+    trail: Vec<[f64; MAX_JOINTS]>,
+    trail_next: usize,
+    trail_len: usize,
+    /// How far the arm has to have moved since the last pose on the trail
+    /// for the next one to be taken \[rad\]. An arm that crept into
+    /// something, or has been pressed against it for a while, has spent
+    /// the whole of `retreat_s` in one place: a trail kept by the clock
+    /// alone would hold that place and nothing else, and the retreat would
+    /// go nowhere. Spaced so a full trail always reaches back at least
+    /// half of `retreat_max_rad`.
+    trail_step_rad: f64,
+    retreat_max_rad: f64,
+    reflex_timeout_ticks: u32,
+    /// `[motion] settle_tolerance_rad`: how far from its commanded pose
+    /// an arm still counts as having arrived.
+    settle_tolerance_rad: f64,
+    /// The tick a running reflex gives up and holds where the arm is;
+    /// `None` when no reflex has the arm. While it runs the reflex owns
+    /// the stream tracker and nothing else may retarget it.
+    reflex_deadline: Option<u64>,
 
     // Per-tick compute buffers.
     g: [f64; MAX_JOINTS],
+    /// The declared payload's share of `g`.
+    g_payload: [f64; MAX_JOINTS],
     setpoints: [JointSetpoint; MAX_JOINTS],
     cmds: [JointCommand; MAX_JOINTS],
     mirror: CommandMirror,
@@ -785,6 +834,7 @@ impl<B: DriverBus> RtCore<B> {
         let core = Self {
             dt,
             tick: 0,
+            placements: 0,
             bus,
             bus_state: BusState::new(),
             conv,
@@ -884,11 +934,29 @@ impl<B: DriverBus> RtCore<B> {
             qd_filt: [0.0; MAX_JOINTS],
             tau_filt: [0.0; MAX_JOINTS],
             tau_ext: [0.0; MAX_JOINTS],
+            observer: TorqueObserver::new(robot),
             filters_seeded: false,
             tau_env_margin_nm: robot.limits.tau_ext_margin_nm,
             tau_env_window_ticks: robot.ticks(robot.limits.tau_ext_window_s).max(1),
             tau_env_over: [0; MAX_JOINTS],
+            contact: ContactDetector::new(robot),
+            freedrive: Freedrive::new(robot),
+            tcp_speed_trip_m_s: TCP_SPEED_TRIP_MARGIN * robot.limits.tcp_speed_max_m_s,
+            tcp_speed_window_ticks: robot.ticks(robot.limits.tcp_speed_window_s).max(1),
+            tcp_speed_over: 0,
+            tcp_last: [f64::NAN; 3],
+            tcp_scratch: [f64::NAN; 6],
+            trail: vec![[0.0; MAX_JOINTS]; robot.ticks(robot.contact.retreat_s) as usize],
+            trail_next: 0,
+            trail_len: 0,
+            trail_step_rad: robot.contact.retreat_max_rad
+                / (2.0 * f64::from(robot.ticks(robot.contact.retreat_s).max(1))),
+            retreat_max_rad: robot.contact.retreat_max_rad,
+            reflex_timeout_ticks: robot.ticks(robot.contact.retreat_timeout_s).max(1),
+            settle_tolerance_rad: robot.motion.settle_tolerance_rad,
+            reflex_deadline: None,
             g: [0.0; MAX_JOINTS],
+            g_payload: [0.0; MAX_JOINTS],
             setpoints: [JointSetpoint::zero_velocity(); MAX_JOINTS],
             cmds: [JointCommand::idle(); MAX_JOINTS],
             mirror: CommandMirror::default(),
@@ -1126,6 +1194,25 @@ impl<B: DriverBus> RtCore<B> {
         self.qd[joint] = 0.0;
         self.q_filt[joint] = joint_rad;
         self.qd_filt[joint] = 0.0;
+        self.forget_external_torque();
+    }
+
+    /// The angles have just come to mean something else — a reference
+    /// latched, a simulated arm placed elsewhere — so what was estimated
+    /// at the old ones, and where the arm was on the way, are void.
+    fn forget_external_torque(&mut self) {
+        self.observer.reset();
+        self.contact.reseed();
+        self.tau_ext = [0.0; MAX_JOINTS];
+        self.trail_len = 0;
+        self.trail_next = 0;
+        self.tcp_last = [f64::NAN; 3];
+    }
+
+    /// Count a teleport as over, whether it landed or was refused: the
+    /// next snapshot is the first that describes the arm after it.
+    pub fn note_placement(&mut self) {
+        self.placements = self.placements.wrapping_add(1);
     }
 
     /// Adopt `q` \[rad\] as the pose the plant was just re-seeded to.
@@ -1163,8 +1250,15 @@ impl<B: DriverBus> RtCore<B> {
     /// The gravity feedforward at the current `q`, scaled per joint.
     fn refresh_gravity(&mut self) {
         self.gravity.gravity(&self.q, &mut self.g);
-        for (g, scale) in self.g.iter_mut().zip(self.gravity_scale) {
+        self.gravity.payload_gravity(&self.q, &mut self.g_payload);
+        for ((g, share), scale) in self
+            .g
+            .iter_mut()
+            .zip(&mut self.g_payload)
+            .zip(self.gravity_scale)
+        {
             *g *= scale;
+            *share *= scale;
         }
     }
 
@@ -1183,6 +1277,7 @@ impl<B: DriverBus> RtCore<B> {
         // clamp, which moves the arm the whole way there in one tick.
         let _ = self.stream_rx.take();
         let q = self.q;
+        self.forget_external_torque();
         self.exec.reseed_hold(&q);
         self.stream.activate(&q);
         self.stream_shaped.activate(&q);
@@ -1433,11 +1528,16 @@ impl<B: DriverBus> RtCore<B> {
         // Gravity: computed every tick, published always.
         self.refresh_gravity();
 
-        // External torque: what the measured (filtered) torque carries
-        // beyond the model's gravity — a contact, a payload the model
-        // does not know, a hand on the arm.
-        for i in 0..MAX_JOINTS {
-            self.tau_ext[i] = self.tau_filt[i] - self.g[i];
+        // External torque: what the measured torque carries beyond the
+        // arm's own dynamics — a contact, a payload the model does not
+        // know, a hand on the arm. Fed the raw measurement: the observer
+        // is its own filter, and a second one in front would only add
+        // lag to the acceleration it differences.
+        if self.filters_seeded {
+            self.observer
+                .update(self.gravity.as_mut(), &self.q, &self.qd, &self.tau, &self.g);
+            self.tau_ext = *self.observer.estimate();
+            self.record_trail();
         }
         lap(&mut mark, &mut laps, 5);
 
@@ -1751,6 +1851,14 @@ impl<B: DriverBus> RtCore<B> {
             RtCommand::SetMode(Mode::Idle) if self.tool_hold => {
                 log::warn!("mode request Idle refused: waiting for the gripper drive's tool");
             }
+            // The reflex ends in a hold by itself. A request that was
+            // queued before its sender heard of the contact must not cut
+            // the retreat short, or hand the arm to a law that lets go.
+            RtCommand::SetMode(target)
+                if self.reflex_deadline.is_some() && target != Mode::SafetyStop =>
+            {
+                log::info!("mode request {target:?} ignored: a contact reflex has the arm");
+            }
             RtCommand::SetMode(target) => {
                 if let Err(e) = self.request_mode(target) {
                     log::warn!("mode request {target:?} refused: {e:?}");
@@ -1798,7 +1906,7 @@ impl<B: DriverBus> RtCore<B> {
                 self.jog_joints = 0;
             }
             RtCommand::StreamRelease => {
-                if self.mode == Mode::Stream {
+                if self.mode == Mode::Stream && self.reflex_deadline.is_none() {
                     if self.stream_is_shaped {
                         self.stream_shaped.release();
                     } else {
@@ -1835,7 +1943,9 @@ impl<B: DriverBus> RtCore<B> {
             },
             RtCommand::Hold => match self.mode {
                 Mode::Jog => self.rest_into_hold(self.q_target),
-                Mode::Stream => self.rest_into_hold(self.stream_commanded),
+                Mode::Stream if self.reflex_deadline.is_none() => {
+                    self.rest_into_hold(self.stream_commanded)
+                }
                 _ => {}
             },
             RtCommand::Gripper(fw) => {
@@ -1878,6 +1988,17 @@ impl<B: DriverBus> RtCore<B> {
                     }
                 }
             }
+            RtCommand::KeepOutCatch => {
+                if self.mode == Mode::Idle && self.gravity_applied() {
+                    self.errors.latch(ErrorCode::KeepOut, None);
+                    self.begin_reflex(true);
+                }
+            }
+            RtCommand::SetContactLimits {
+                reaction,
+                sustained_nm,
+                impact_nm,
+            } => self.contact.set_limits(reaction, sustained_nm, impact_nm),
             RtCommand::SetPayload { mass, com, inertia } => {
                 self.payload = (mass, com, inertia);
                 self.gravity.set_payload(mass, com, inertia);
@@ -1980,8 +2101,9 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     /// Mode transition request with the gates applied in order:
-    /// maintenance park assertion, SAFETY_STOP/IDLE unconditional
-    /// reachability, then enabled ∧ no-errors ∧ homed-if-motion.
+    /// maintenance park assertion, SAFETY_STOP's unconditional
+    /// reachability, IDLE unless a protective stop stands, then
+    /// enabled ∧ no-errors ∧ homed-if-motion.
     fn request_mode(&mut self, target: Mode) -> Result<(), GateRefusal> {
         if target == self.mode {
             // A STREAM request while STREAM is braking to rest resumes
@@ -2019,8 +2141,16 @@ impl<B: DriverBus> RtCore<B> {
             return Err(GateRefusal::InvalidTransition);
         }
         match target {
-            // →IDLE always allowed; SAFETY_STOP always reachable, no checks.
-            Mode::Idle | Mode::SafetyStop => {}
+            // SAFETY_STOP is always reachable, no checks.
+            Mode::SafetyStop => {}
+            // IDLE is where an arm floats, and one that stopped itself
+            // holds where it stopped until it is reset — whatever asks
+            // for IDLE in the meantime.
+            Mode::Idle => {
+                if self.errors.any_protective() {
+                    return Err(GateRefusal::ProtectiveStop);
+                }
+            }
             // Maintenance exemption: FLASHING skips enabled/errors/homed,
             // gated ONLY on the human park assertion.
             Mode::Flashing => {
@@ -2034,6 +2164,9 @@ impl<B: DriverBus> RtCore<B> {
                 }
                 if self.errors.any_hard() {
                     return Err(GateRefusal::ErrorsActive);
+                }
+                if self.errors.any_protective() {
+                    return Err(GateRefusal::ProtectiveStop);
                 }
                 // JOG is deliberately absent: an arm can need jogging clear
                 // of an obstruction before it can be homed at all, and a
@@ -2071,6 +2204,70 @@ impl<B: DriverBus> RtCore<B> {
         self.exec.activate(&at);
         self.hb_silence = 0;
         self.mode = Mode::Exec;
+    }
+
+    /// Add the measured pose to the retreat trail, once the arm has moved
+    /// on from the last one there.
+    fn record_trail(&mut self) {
+        let n = self.trail.len();
+        if n == 0 {
+            return;
+        }
+        if self.trail_len > 0 {
+            let last = &self.trail[(self.trail_next + n - 1) % n];
+            let moved = self
+                .q
+                .iter()
+                .zip(last)
+                .map(|(now, then)| (now - then).abs())
+                .fold(0.0, f64::max);
+            if moved < self.trail_step_rad {
+                return;
+            }
+        }
+        self.trail[self.trail_next] = self.q;
+        self.trail_next = (self.trail_next + 1) % n;
+        self.trail_len = (self.trail_len + 1).min(n);
+    }
+
+    /// Take the arm off whatever was driving it: stop it, and with
+    /// `retreat` send it back to where it measured itself
+    /// `[contact] retreat_s` ago, no joint further than
+    /// `retreat_max_rad`. That pose is one the arm has just been in, so
+    /// the way back to it is the way it came.
+    ///
+    /// The reflex runs on the stream tracker from the measured pose. A
+    /// tracker started at rest under an arm that is still travelling
+    /// asks its drives to stop where they are, which is as hard a brake
+    /// as they have; the retreat follows on the tracker's own limits. It
+    /// ends in a hold, by itself, at rest or at its deadline.
+    fn begin_reflex(&mut self, retreat: bool) {
+        let mut target = self.q;
+        if retreat && self.trail_len > 0 {
+            let oldest = if self.trail_len == self.trail.len() {
+                self.trail[self.trail_next]
+            } else {
+                self.trail[0]
+            };
+            for (target, was) in target.iter_mut().zip(oldest) {
+                *target += (was - *target).clamp(-self.retreat_max_rad, self.retreat_max_rad);
+            }
+        }
+        self.exec.abandon();
+        self.enter_mode(Mode::Stream);
+        self.stream.set_scale(1.0, 1.0);
+        self.stream_scale = (1.0, 1.0);
+        // The tracker clamps what it is asked for into the soft window,
+        // which would walk a joint standing outside that window all the
+        // way back into it. The reflex's target is bounded by where the
+        // arm is, not by where it is allowed to be.
+        self.stream.set_bounds(
+            &[f64::NEG_INFINITY; MAX_JOINTS],
+            &[f64::INFINITY; MAX_JOINTS],
+        );
+        self.stream.set_target(&target);
+        self.q_target = target;
+        self.reflex_deadline = Some(self.tick + u64::from(self.reflex_timeout_ticks));
     }
 
     fn enter_mode(&mut self, target: Mode) {
@@ -2171,6 +2368,10 @@ impl<B: DriverBus> RtCore<B> {
                 // first tick toward an abandoned pose — one the admission
                 // gate never re-checked against the current world.
                 let _ = self.stream_rx.take();
+                if self.reflex_deadline.take().is_some() {
+                    let (min, max) = self.park.soft_bounds;
+                    self.stream.set_bounds(&min, &max);
+                }
             }
             _ => {}
         }
@@ -2184,7 +2385,19 @@ impl<B: DriverBus> RtCore<B> {
     /// faulted node (+ gripper), stale per-type flags zeroed, lost
     /// latches reset, then the settle countdown that outlasts the poll
     /// cycle before the latch wipes.
+    ///
+    /// A protective stop with nothing hard beside it is not a drive
+    /// fault: no node latched anything, so it goes at once, and the
+    /// peaks the next run is judged by start from nothing.
     fn begin_clear(&mut self) {
+        if self.errors.any_protective() && !self.errors.any_hard() {
+            // No motion was admitted while the stop stood, so anything
+            // that reached the ring since is the stopped motion's too.
+            self.exec.abandon();
+            self.errors.clear_protective();
+            self.contact.reset_peaks();
+            return;
+        }
         // Once per NODE, not once per error entry: a node with several
         // latched fault types would otherwise get a triple apiece, and a
         // full error list can run to ~99 frames in a single tick — past
@@ -2221,6 +2434,7 @@ impl<B: DriverBus> RtCore<B> {
         // countdown even finishes.
         self.homing.clear_faults();
         self.errors.begin_clear();
+        self.contact.reset_peaks();
     }
 
     // ------------------------------------------------------------ state
@@ -2398,26 +2612,22 @@ impl<B: DriverBus> RtCore<B> {
         // where the estimate is meaningful: homed (the gravity model
         // needs referenced angles), enabled, and in a mode whose drives
         // actively bear the load — a limp or protective-hold arm reads
-        // `-g(q)` as "external" torque and would re-latch forever. The
-        // EXEC feed-forward is subtracted so planned acceleration does
-        // not count against the margin (one tick stale, matching the
-        // measurement's own lag). Only IDLE and the working modes are
-        // policed: the protective laws, BOOTING and FLASHING command no
-        // torque of their own, so there is nothing to compare against.
+        // `-g(q)` as "external" torque and would re-latch forever. Only
+        // IDLE and the working modes are policed: the protective laws,
+        // BOOTING and FLASHING command no torque of their own, so there
+        // is nothing to compare against. A floating arm is not policed
+        // either: there the estimate is the hand that is guiding it.
         if self.tau_env_margin_nm > 0.0 {
+            let floating = self.mode == Mode::Idle && self.gravity_applied();
             let enforce = self.homed
                 && self.state == ArmState::Enabled
+                && !floating
                 && matches!(
                     self.mode,
                     Mode::Idle | Mode::Jog | Mode::Stream | Mode::Exec
                 );
             for i in 0..MAX_JOINTS {
-                let ff = if self.mode == Mode::Exec {
-                    self.scratch_tau[i]
-                } else {
-                    0.0
-                };
-                if enforce && (self.tau_ext[i] - ff).abs() > self.tau_env_margin_nm {
+                if enforce && self.tau_ext[i].abs() > self.tau_env_margin_nm {
                     self.tau_env_over[i] = self.tau_env_over[i].saturating_add(1);
                     if self.tau_env_over[i] >= self.tau_env_window_ticks {
                         self.errors.latch(ErrorCode::TorqueEnvelope, Some(i as u8));
@@ -2426,6 +2636,42 @@ impl<B: DriverBus> RtCore<B> {
                     self.tau_env_over[i] = 0;
                 }
             }
+        }
+
+        // A floating arm goes where a hand takes it, at a hand's speed.
+        // Faster than that it is falling or was thrown: stop it where it
+        // is and hold, as for a contact but with nowhere to back off to.
+        if self.mode == Mode::Idle && self.gravity_applied() {
+            if let Some(joint) = self.freedrive.overspeed(&self.qd) {
+                self.errors.latch(ErrorCode::FreedriveCatch, Some(joint));
+                self.begin_reflex(false);
+            }
+        } else {
+            self.freedrive.reset();
+        }
+
+        self.check_tcp_speed();
+
+        // Contact: a moving arm that reads one stops for it in this
+        // tick and latches until the operator has dealt with it; a
+        // resting one reports.
+        let watch = self.contact_watch();
+        if let Some(trip) = self.contact.update(
+            &self.tau_ext,
+            &self.qd,
+            self.observer.effort(),
+            &self.g_payload,
+            watch,
+        ) {
+            self.errors.latch(ErrorCode::Contact, Some(trip.joint));
+            self.begin_reflex(true);
+        }
+        for i in 0..MAX_JOINTS {
+            self.errors.condition(
+                ErrorCode::ContactWarning,
+                Some(i as u8),
+                self.contact.warning(i),
+            );
         }
 
         if !self.bus.is_silent() {
@@ -2507,8 +2753,10 @@ impl<B: DriverBus> RtCore<B> {
         // discards incoming setpoints by design, so `stream_last_rx_tick`
         // cannot advance, and a brake that outlasts the timeout would
         // latch a link fault on a stream the daemon itself told to stop.
+        // A reflex is the core's own stream, fed by nobody.
         if self.mode == Mode::Stream
             && !self.stream_released
+            && self.reflex_deadline.is_none()
             && self.tick.saturating_sub(self.stream_last_rx_tick)
                 >= u64::from(self.stream_timeout_ticks)
         {
@@ -2552,6 +2800,88 @@ impl<B: DriverBus> RtCore<B> {
             // Auto-recovery once the latch is clean (state stays DISABLED
             // until the user re-enables).
             self.enter_mode(Mode::Idle);
+        }
+    }
+
+    /// What a threshold crossing would mean this tick.
+    ///
+    /// Nothing is read where the estimate is not a contact's to explain:
+    /// an unreferenced or disabled arm, a model with no inertia in it, a
+    /// floating arm (there it is the hand guiding it), and an arm already
+    /// stopped for a contact. Otherwise an arm is moving while its drives
+    /// are being told to go somewhere — or have been, and it has not got
+    /// there: an arm held short of its target is still pushing for it,
+    /// and what is in its way is what it has to stop for. One settled on
+    /// its target is resting, and a push on it is somebody else's.
+    /// The backstop behind the tool-speed ceiling. What plans and feeds
+    /// motion already keeps the tool under `[limits] tcp_speed_max_m_s`;
+    /// this measures it, and stops an arm found over the margin for the
+    /// window — a stream that was never slowed, a move that overshot.
+    fn check_tcp_speed(&mut self) {
+        let driven = self.homed
+            && self.state == ArmState::Enabled
+            && matches!(self.mode, Mode::Jog | Mode::Stream | Mode::Exec)
+            && self.reflex_deadline.is_none()
+            && !self.errors.any_protective();
+        if self.tcp_speed_trip_m_s <= 0.0 || !driven {
+            self.tcp_last = [f64::NAN; 3];
+            self.tcp_speed_over = 0;
+            return;
+        }
+        self.fk.tcp(&self.q, &mut self.tcp_scratch);
+        let at = [
+            self.tcp_scratch[0],
+            self.tcp_scratch[1],
+            self.tcp_scratch[2],
+        ];
+        let travelled = at
+            .iter()
+            .zip(&self.tcp_last)
+            .map(|(now, before)| (now - before) * (now - before))
+            .sum::<f64>()
+            .sqrt();
+        self.tcp_last = at;
+        // NaN — no pose last tick, or none now — is not a speed.
+        if travelled / self.dt > self.tcp_speed_trip_m_s {
+            self.tcp_speed_over = self.tcp_speed_over.saturating_add(1);
+        } else {
+            self.tcp_speed_over = 0;
+        }
+        if self.tcp_speed_over >= self.tcp_speed_window_ticks {
+            self.tcp_speed_over = 0;
+            self.errors.latch(ErrorCode::SpeedLimit, None);
+            self.begin_reflex(false);
+        }
+    }
+
+    fn contact_watch(&self) -> ContactWatch {
+        let readable = self.homed
+            && self.state == ArmState::Enabled
+            && self.filters_seeded
+            && self.observer.inertial()
+            && self.reflex_deadline.is_none()
+            && !self.errors.any_protective()
+            && !(self.mode == Mode::Idle && self.gravity_applied());
+        if !readable {
+            return ContactWatch::Suspended;
+        }
+        match self.mode {
+            Mode::Jog | Mode::Stream | Mode::Exec => {
+                let driven = self.mirror.qd.iter().any(|v| v.abs() > 0.0);
+                let short = self
+                    .mirror
+                    .q
+                    .iter()
+                    .zip(&self.q)
+                    .any(|(want, at)| (want - at).abs() > self.settle_tolerance_rad);
+                if driven || short {
+                    ContactWatch::Moving
+                } else {
+                    ContactWatch::Resting
+                }
+            }
+            Mode::Idle => ContactWatch::Resting,
+            _ => ContactWatch::Suspended,
         }
     }
 
@@ -2660,8 +2990,11 @@ impl<B: DriverBus> RtCore<B> {
             let _ = self.bus.poll_step();
             match status {
                 SeqStatus::Checking => {
-                    for (sum, ext) in self.ref_check_sum.iter_mut().zip(self.tau_ext) {
-                        *sum += ext;
+                    // The holding residual against gravity alone: the
+                    // arm is at rest on its drives' loops, and the
+                    // check's bounds were set against this quantity.
+                    for i in 0..MAX_JOINTS {
+                        self.ref_check_sum[i] += self.tau_filt[i] - self.g[i];
                     }
                     self.ref_check_n += 1;
                 }
@@ -2680,6 +3013,7 @@ impl<B: DriverBus> RtCore<B> {
                         log::info!("homing sequence complete");
                         self.homed = true;
                         self.not_homed_refused = false;
+                        self.forget_external_torque();
                     } else if refused {
                         log::warn!("homing sequence FAILED the reference check");
                         self.homed = false;
@@ -2718,7 +3052,20 @@ impl<B: DriverBus> RtCore<B> {
 
         match self.mode {
             Mode::Booting => dispatch::law_booting(&mut self.setpoints),
-            Mode::Idle => dispatch::law_idle(self.gravity_applied(), &self.g, &mut self.setpoints),
+            Mode::Idle if self.gravity_applied() => {
+                // The floating law reads the hand out of the estimate, and
+                // without the arm's inertia in the model the estimate is
+                // every acceleration the arm makes: nothing to read.
+                const NOTHING: [f64; MAX_JOINTS] = [0.0; MAX_JOINTS];
+                let signal = if self.observer.inertial() {
+                    &self.contact.status().signal
+                } else {
+                    &NOTHING
+                };
+                self.freedrive
+                    .law(&self.q, &self.qd, &self.g, signal, &mut self.setpoints);
+            }
+            Mode::Idle => dispatch::law_idle(&mut self.setpoints),
             Mode::ActiveError => dispatch::law_active_error(&mut self.setpoints),
             Mode::SafetyStop => dispatch::law_safety_stop(&mut self.setpoints),
             Mode::Jog => {
@@ -2749,12 +3096,25 @@ impl<B: DriverBus> RtCore<B> {
                 }
             }
             Mode::Exec => {
-                let outcome = self.exec.tick(
-                    &self.q,
-                    &mut self.scratch_q,
-                    &mut self.scratch_qd,
-                    &mut self.scratch_tau,
-                );
+                let outcome = if self.errors.any_protective() {
+                    // Stopped for something: the arm holds where the
+                    // reflex left it. Whatever is still in the ring
+                    // belongs to the motion that was stopped, and is not
+                    // played while the stop stands.
+                    self.exec.hold(
+                        &mut self.scratch_q,
+                        &mut self.scratch_qd,
+                        &mut self.scratch_tau,
+                    );
+                    ExecTick::Ok
+                } else {
+                    self.exec.tick(
+                        &self.q,
+                        &mut self.scratch_q,
+                        &mut self.scratch_qd,
+                        &mut self.scratch_tau,
+                    )
+                };
                 if let ExecTick::Fault {
                     joint,
                     residual_rad,
@@ -2782,8 +3142,10 @@ impl<B: DriverBus> RtCore<B> {
                 // A releasing stream is braking to rest and must not be
                 // retargeted: a setpoint still in flight when the gate
                 // refused would otherwise re-accelerate the arm toward
-                // the very configuration the refusal was about.
-                if self.stream_released {
+                // the very configuration the refusal was about. A reflex
+                // is the same: its client has not heard of the contact
+                // yet and is still asking for the far side of it.
+                if self.stream_released || self.reflex_deadline.is_some() {
                     let _ = self.stream_rx.take();
                 } else if let Some(sp) = self.stream_rx.take() {
                     if sp.shaped != self.stream_is_shaped {
@@ -2876,6 +3238,16 @@ impl<B: DriverBus> RtCore<B> {
                     && self.at_measured_rest()
                 {
                     self.rest_into_hold(self.scratch_q);
+                }
+                // A reflex ends the same way, or at its deadline: an arm
+                // something is still pushing on never measures at rest,
+                // and it is not left on a tracker nobody feeds.
+                if let Some(deadline) = self.reflex_deadline {
+                    let arrived = self.scratch_qd.iter().all(|v| v.abs() <= STREAM_REST_RAD_S)
+                        && self.at_measured_rest();
+                    if arrived || self.tick >= deadline {
+                        self.rest_into_hold(self.scratch_q);
+                    }
                 }
             }
             // HAND_GUIDING/IMPEDANCE are refused at the gate; HOMING and
@@ -3007,6 +3379,7 @@ impl<B: DriverBus> RtCore<B> {
         let gravity_applied = self.gravity_applied();
         let s = &mut self.snap;
         s.tick = self.tick;
+        s.placements = self.placements;
         s.mode = self.mode;
         s.state = self.state;
         s.enabled_request_id = self.enabled_request_id;
@@ -3043,6 +3416,8 @@ impl<B: DriverBus> RtCore<B> {
         s.homing = self.homing.status();
         s.errors = *self.errors.list();
         s.error_active = self.errors.any_hard();
+        s.protective_active = self.errors.any_protective();
+        s.contact = *self.contact.status();
         s.loop_stats = self.timing.stats();
         s.loop_stats.rt_fifo = self.rt_fifo;
         s.loop_stats.rt_pinned = self.rt_pinned;

@@ -111,9 +111,9 @@ def open_display(cfg: PanelConfig) -> Display:
     if cfg.display.driver == "none":
         return NullDisplay()
     try:
-        import board  # ty: ignore[unresolved-import]
-        import busio  # ty: ignore[unresolved-import]
-        from adafruit_ssd1306 import SSD1306_I2C  # ty: ignore[unresolved-import]
+        import board  # ty: ignore[import-not-found]
+        import busio  # ty: ignore[import-not-found]
+        from adafruit_ssd1306 import SSD1306_I2C  # ty: ignore[import-not-found]
     except ImportError as exc:
         log.error("OLED libraries missing (%s); running without a display", exc)
         return NullDisplay()
@@ -152,7 +152,7 @@ class NullLed:
 
 def open_leds(cfg: PanelConfig) -> tuple[Any, Any]:
     try:
-        from gpiozero import LED  # ty: ignore[unresolved-import]
+        from gpiozero import LED  # ty: ignore[import-not-found]
     except ImportError:
         log.error("gpiozero missing; LEDs disabled")
         return NullLed(), NullLed()
@@ -179,7 +179,7 @@ def open_leds(cfg: PanelConfig) -> tuple[Any, Any]:
 
 def open_buttons(cfg: PanelConfig) -> tuple[Callable[[], bool], Callable[[], bool]]:
     try:
-        from gpiozero import Button  # ty: ignore[unresolved-import]
+        from gpiozero import Button  # ty: ignore[import-not-found]
     except ImportError:
         log.error("gpiozero missing; buttons disabled")
         return (lambda: False), (lambda: False)

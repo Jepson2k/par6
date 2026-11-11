@@ -774,20 +774,196 @@ impl Default for MotionConfig {
     }
 }
 
+/// `[dynamics]`: what the controller knows about the arm beyond its
+/// rigid-body model — the terms the external-torque observer subtracts
+/// so that the arm's own motion does not read as something pushing on it.
+///
+/// These describe the arm the runtime is driving, where `[sim]` describes
+/// the plant the simulator stands in for it with; the shipped values are
+/// the same reference arm, and a per-arm calibration belongs here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DynamicsSection {
+    /// Coulomb friction per joint \[Nm, joint side\].
+    pub friction_coulomb_nm: Vec<f64>,
+    /// Viscous friction per joint \[Nm·s/rad, joint side\].
+    pub friction_viscous_nm_s: Vec<f64>,
+    /// Speed below which a joint's direction of sliding is not trusted
+    /// \[rad/s\]: the Coulomb term fades in across it rather than
+    /// flipping sign on encoder noise around rest.
+    pub friction_stick_rad_s: f64,
+    /// Rotor inertia per joint, reflected through the gearbox
+    /// \[kg·m², joint side\] — `G²·Jm`. The rigid-body model carries the
+    /// links only.
+    pub rotor_inertia_kg_m2: Vec<f64>,
+    /// Bandwidth of the external-torque observer \[Hz\]: how fast a
+    /// contact shows in the estimate, against how much of the velocity
+    /// signal's noise does.
+    pub observer_hz: f64,
+}
+
+impl Default for DynamicsSection {
+    fn default() -> Self {
+        Self {
+            friction_coulomb_nm: vec![0.29, 0.95, 0.64, 0.066, 0.045, 0.079],
+            friction_viscous_nm_s: vec![0.29, 1.0, 0.34, 0.047, 0.023, 0.022],
+            friction_stick_rad_s: 0.02,
+            rotor_inertia_kg_m2: vec![4.18e-4, 4.08e-3, 1.87e-3, 9.12e-5, 9.12e-5, 1.5e-4],
+            observer_hz: 10.0,
+        }
+    }
+}
+
+/// What the arm does when it reads a contact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContactReaction {
+    /// A moving arm stops, backs off and holds until it is reset; a
+    /// resting one reports.
+    #[default]
+    Stop,
+    /// Report only: nothing stops.
+    Warn,
+    /// Nothing is read into the estimate at all.
+    Off,
+}
+
+/// `[contact]`: reading something in the arm's way out of the
+/// external-torque estimate, and what the arm does about it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ContactSection {
+    /// What a contact does.
+    pub reaction: ContactReaction,
+    /// Per joint: the contact signal held beyond this \[Nm\] for
+    /// `sustained_window_s` is a contact — something being pressed into.
+    /// It has to sit above whatever a load the model does not know, or
+    /// the gravity model's own error, leaves standing on the joint.
+    pub sustained_nm: Vec<f64>,
+    /// How long the signal must stay beyond `sustained_nm` \[s\].
+    pub sustained_window_s: f64,
+    /// Per joint: the contact signal jumping this far \[Nm\] from its own
+    /// slow average for `impact_window_s` is a contact — a bump. A
+    /// standing offset does not count against it.
+    pub impact_nm: Vec<f64>,
+    /// How long the jump must last \[s\].
+    pub impact_window_s: f64,
+    /// Time constant of the slow average the impact channel measures
+    /// against \[s\]: a signal that drifts slower than this is level, not
+    /// impact.
+    pub impact_highpass_s: f64,
+    /// Speed below which a joint's Coulomb friction is taken out of its
+    /// signal \[rad/s\]: a joint that is stopped or about to be shows up
+    /// to that much torque with nothing touching it.
+    pub stiction_speed_rad_s: f64,
+    /// Per joint: the share of the inertial torque the model is charging
+    /// to the arm's own motion that may go unexplained. The model is
+    /// rigid; a joint whose drivetrain winds up lets its motor run ahead
+    /// of its link under a hard change of acceleration, and for that
+    /// moment part of the charge is not real. 0 trusts the model
+    /// outright, 1 allows for all of it being wrong.
+    pub inertia_slack: Vec<f64>,
+    /// How long that allowance is held after the effort that earned it
+    /// \[s\], while the drivetrain rings down.
+    pub inertia_hold_s: f64,
+    /// How long a contact warning stands after the signal last crossed a
+    /// threshold \[s\], so one hovering at its threshold does not flicker.
+    pub warning_hold_s: f64,
+    /// How far back along its own track a stopped arm retreats \[s\]: it
+    /// returns to where it measured itself this long before the contact.
+    /// 0 stops it where it is.
+    pub retreat_s: f64,
+    /// The most any joint moves in a retreat \[rad\].
+    pub retreat_max_rad: f64,
+    /// When a retreat that has not come to rest is abandoned for a hold
+    /// where the arm is \[s\].
+    pub retreat_timeout_s: f64,
+}
+
+impl Default for ContactSection {
+    fn default() -> Self {
+        Self {
+            reaction: ContactReaction::Stop,
+            sustained_nm: vec![1.2, 2.0, 1.7, 0.5, 0.5, 0.3],
+            sustained_window_s: 0.08,
+            impact_nm: vec![1.1, 1.0, 0.9, 0.3, 0.3, 0.2],
+            impact_window_s: 0.016,
+            impact_highpass_s: 0.5,
+            stiction_speed_rad_s: 0.05,
+            inertia_slack: vec![1.0, 0.5, 0.5, 0.5, 0.5, 0.5],
+            inertia_hold_s: 0.2,
+            warning_hold_s: 1.0,
+            retreat_s: 0.15,
+            retreat_max_rad: 0.1,
+            retreat_timeout_s: 1.0,
+        }
+    }
+}
+
+/// `[freedrive]`: the floating arm — IDLE with gravity compensation on,
+/// where the drives carry the arm's weight and a hand moves it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FreedriveSection {
+    /// How much of the hand's push the drives add to it: the torque the
+    /// external-torque estimate reads on a floating joint, beyond its
+    /// stiction, is applied again times this. 0 is a plain gravity float,
+    /// which the arm's low gearing already lets a hand move; 1 halves
+    /// what the hand has to supply. It amplifies whatever the estimate
+    /// reads, a gravity error included.
+    pub push_assist: f64,
+    /// Corner of the low-pass the assist follows the push through \[Hz\].
+    /// Below the arm's drivetrain resonances, which the estimate does not
+    /// model and the assist must not chase.
+    pub push_assist_hz: f64,
+    /// Per joint: a joint held at a soft limit is let go when the contact
+    /// signal shows this much torque pushing it back in \[Nm\].
+    pub limit_release_nm: Vec<f64>,
+    /// Per joint: a joint faster than this for `catch_window_s` is falling
+    /// or was thrown, not guided \[rad/s\]. The arm stops where it is and
+    /// holds until it is reset.
+    pub catch_speed_rad_s: Vec<f64>,
+    /// How long a joint must stay above `catch_speed_rad_s` \[s\].
+    pub catch_window_s: f64,
+}
+
+impl Default for FreedriveSection {
+    fn default() -> Self {
+        Self {
+            push_assist: 0.0,
+            push_assist_hz: 2.0,
+            limit_release_nm: vec![0.6, 1.0, 0.85, 0.25, 0.25, 0.15],
+            catch_speed_rad_s: vec![1.6, 1.6, 1.6, 3.0, 3.0, 3.0],
+            catch_window_s: 0.05,
+        }
+    }
+}
+
 /// `[limits]`: safety-envelope enforcement thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct LimitsSection {
     /// External-torque envelope margin \[Nm\]: hard fault when a joint's
-    /// external torque estimate (measured minus model, minus the active
-    /// motion's feed-forward) stays beyond this for the window below.
+    /// external torque estimate (measured minus the arm's modelled
+    /// dynamics) stays beyond this for the window below, on an arm its
+    /// drives are holding or moving — a floating arm is not policed.
     /// 0 disables the envelope — the shipped default, because the
-    /// estimate is only as good as the torque constants and the gravity
-    /// model; hardware opts in with a calibrated margin.
+    /// estimate is only as good as the torque constants and the model;
+    /// hardware opts in with a calibrated margin.
     pub tau_ext_margin_nm: f64,
     /// How long a joint must stay beyond the margin before the fault
     /// latches \[s\] — rides out measurement transients and filter lag.
     pub tau_ext_window_s: f64,
+    /// Ceiling on the tool's linear speed \[m/s\], whatever is driving the
+    /// arm. Planned moves are slowed wherever the tool would be over it, jogs and
+    /// streamed joint targets are slowed to it, and an arm measured more
+    /// than a fifth over it for `tcp_speed_window_s` stops itself. 0
+    /// disables it. It does not apply to a floating arm, which a hand is
+    /// moving.
+    pub tcp_speed_max_m_s: f64,
+    /// How long the measured tool speed must stay over the ceiling's
+    /// margin before the arm stops \[s\].
+    pub tcp_speed_window_s: f64,
 }
 
 impl Default for LimitsSection {
@@ -795,6 +971,8 @@ impl Default for LimitsSection {
         Self {
             tau_ext_margin_nm: 0.0,
             tau_ext_window_s: 0.1,
+            tcp_speed_max_m_s: 0.25,
+            tcp_speed_window_s: 0.1,
         }
     }
 }
@@ -895,6 +1073,17 @@ pub struct RobotConfig {
     /// Torque-level sim plant parameters. Omitted = the vendor table.
     #[serde(default)]
     pub sim: SimConfig,
+    /// The controller's friction and rotor model. Omitted = the
+    /// reference arm's.
+    #[serde(default)]
+    pub dynamics: DynamicsSection,
+    /// Contact detection and the stop that follows. Omitted = the
+    /// reference arm's thresholds, stopping.
+    #[serde(default)]
+    pub contact: ContactSection,
+    /// The floating arm's law. Omitted = the reference arm's.
+    #[serde(default)]
+    pub freedrive: FreedriveSection,
     /// This installation's standing collision restrictions — the floor,
     /// cage walls, the table, fixtures. Enforced from boot in the
     /// planner's gate, the streaming gate and the simulator's scene;
@@ -1040,6 +1229,9 @@ impl RobotConfig {
         self.validate_motion()?;
         self.validate_shutdown()?;
         self.validate_sim()?;
+        self.validate_dynamics()?;
+        self.validate_contact()?;
+        self.validate_freedrive()?;
         Ok(())
     }
 
@@ -1546,6 +1738,115 @@ impl RobotConfig {
         Ok(())
     }
 
+    fn validate_dynamics(&self) -> Result<(), ConfigError> {
+        let d = &self.dynamics;
+        for (values, name) in [
+            (&d.friction_coulomb_nm, "dynamics.friction_coulomb_nm"),
+            (&d.friction_viscous_nm_s, "dynamics.friction_viscous_nm_s"),
+            (&d.rotor_inertia_kg_m2, "dynamics.rotor_inertia_kg_m2"),
+        ] {
+            if values.len() != self.joints.len() {
+                return Err(invalid(name, "must carry one entry per joint"));
+            }
+            for (j, v) in values.iter().enumerate() {
+                if !(v.is_finite() && *v >= 0.0) {
+                    return Err(invalid(name, format!("entry {j} must be finite and >= 0")));
+                }
+            }
+        }
+        for (v, name) in [
+            (d.friction_stick_rad_s, "dynamics.friction_stick_rad_s"),
+            (d.observer_hz, "dynamics.observer_hz"),
+        ] {
+            if !is_positive(v) || !v.is_finite() {
+                return Err(invalid(name, "must be > 0 and finite"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_contact(&self) -> Result<(), ConfigError> {
+        let c = &self.contact;
+        for (values, name) in [
+            (&c.sustained_nm, "contact.sustained_nm"),
+            (&c.impact_nm, "contact.impact_nm"),
+        ] {
+            if values.len() != self.joints.len() {
+                return Err(invalid(name, "must carry one entry per joint"));
+            }
+            for (j, v) in values.iter().enumerate() {
+                if !is_positive(*v) || !v.is_finite() {
+                    return Err(invalid(name, format!("entry {j} must be > 0 and finite")));
+                }
+            }
+        }
+        for (v, name) in [
+            (c.sustained_window_s, "contact.sustained_window_s"),
+            (c.impact_window_s, "contact.impact_window_s"),
+            (c.impact_highpass_s, "contact.impact_highpass_s"),
+            (c.stiction_speed_rad_s, "contact.stiction_speed_rad_s"),
+            (c.inertia_hold_s, "contact.inertia_hold_s"),
+            (c.warning_hold_s, "contact.warning_hold_s"),
+            (c.retreat_timeout_s, "contact.retreat_timeout_s"),
+        ] {
+            if !is_positive(v) || !v.is_finite() {
+                return Err(invalid(name, "must be > 0 and finite"));
+            }
+        }
+        if c.inertia_slack.len() != self.joints.len()
+            || c.inertia_slack
+                .iter()
+                .any(|v| !(v.is_finite() && (0.0..=1.0).contains(v)))
+        {
+            return Err(invalid(
+                "contact.inertia_slack",
+                "must carry one share in [0, 1] per joint",
+            ));
+        }
+        for (v, name) in [
+            (c.retreat_s, "contact.retreat_s"),
+            (c.retreat_max_rad, "contact.retreat_max_rad"),
+        ] {
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(invalid(name, "must be finite and >= 0"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_freedrive(&self) -> Result<(), ConfigError> {
+        let f = &self.freedrive;
+        if !(f.push_assist.is_finite() && (0.0..=2.0).contains(&f.push_assist)) {
+            return Err(invalid("freedrive.push_assist", "must be in [0, 2]"));
+        }
+        if !is_positive(f.push_assist_hz) || !f.push_assist_hz.is_finite() {
+            return Err(invalid(
+                "freedrive.push_assist_hz",
+                "must be > 0 and finite",
+            ));
+        }
+        for (values, name) in [
+            (&f.limit_release_nm, "freedrive.limit_release_nm"),
+            (&f.catch_speed_rad_s, "freedrive.catch_speed_rad_s"),
+        ] {
+            if values.len() != self.joints.len() {
+                return Err(invalid(name, "must carry one entry per joint"));
+            }
+            for (j, v) in values.iter().enumerate() {
+                if !is_positive(*v) || !v.is_finite() {
+                    return Err(invalid(name, format!("entry {j} must be > 0 and finite")));
+                }
+            }
+        }
+        if !is_positive(f.catch_window_s) || !f.catch_window_s.is_finite() {
+            return Err(invalid(
+                "freedrive.catch_window_s",
+                "must be > 0 and finite",
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_limits(&self) -> Result<(), ConfigError> {
         let l = &self.limits;
         if l.tau_ext_margin_nm < 0.0 || !l.tau_ext_margin_nm.is_finite() {
@@ -1556,6 +1857,24 @@ impl RobotConfig {
         }
         if !is_positive(l.tau_ext_window_s) || !l.tau_ext_window_s.is_finite() {
             return Err(invalid("limits.tau_ext_window_s", "must be > 0"));
+        }
+        if l.tcp_speed_max_m_s < 0.0 || !l.tcp_speed_max_m_s.is_finite() {
+            return Err(invalid(
+                "limits.tcp_speed_max_m_s",
+                "must be >= 0 (0 disables the ceiling)",
+            ));
+        }
+        if !is_positive(l.tcp_speed_window_s) || !l.tcp_speed_window_s.is_finite() {
+            return Err(invalid("limits.tcp_speed_window_s", "must be > 0"));
+        }
+        // Planned moves are slowed to the ceiling whatever they asked for;
+        // a cartesian stream runs at its own, so the two have to agree.
+        if l.tcp_speed_max_m_s > 0.0 && self.motion.jog_l_linear_max_m_s > l.tcp_speed_max_m_s {
+            return Err(invalid(
+                "limits.tcp_speed_max_m_s",
+                "is below motion.jog_l_linear_max_m_s, which cartesian jogs and servos run \
+                 up to: lower that as well",
+            ));
         }
         Ok(())
     }

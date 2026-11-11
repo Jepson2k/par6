@@ -29,14 +29,25 @@ mod braking_tests;
 mod bridge;
 pub mod calibrate;
 pub mod collision_world;
+#[cfg(test)]
+mod contact_tests;
 pub mod daemon;
 mod execution_path;
+#[cfg(test)]
+mod freedrive_tests;
 mod grant;
 pub mod kin;
 pub mod logging;
+#[cfg(test)]
+mod observer_tests;
 pub mod options;
 mod planner;
 pub mod preview;
+#[cfg(test)]
+mod sim_rig;
+mod tool_speed;
+#[cfg(test)]
+mod tool_speed_tests;
 pub mod vitals;
 
 pub use bridge::{held_jog_travel, stream_stopping_travel};

@@ -348,6 +348,45 @@ pub fn fitted_robot_toml(robot_toml: &str, tool: &str) -> Option<String> {
     Some(doc.to_string())
 }
 
+/// `local` — an overlay file's text, empty for one that does not exist yet
+/// — with `[contact]` carrying this reaction and these thresholds, and
+/// everything else in it, comments included, as it was written.
+pub fn overlay_with_contact(
+    local: &str,
+    reaction: crate::ContactReaction,
+    sustained_nm: &[f64],
+    impact_nm: &[f64],
+) -> Result<String, ConfigError> {
+    let positive = |field: &str, values: &[f64]| {
+        if values.is_empty() || values.iter().any(|v| !(v.is_finite() && *v > 0.0)) {
+            return Err(crate::invalid(
+                format!("contact.{field}"),
+                "every threshold must be finite and above zero",
+            ));
+        }
+        Ok(toml_edit::Array::from_iter(values.iter().copied()))
+    };
+    let sustained = positive("sustained_nm", sustained_nm)?;
+    let impact = positive("impact_nm", impact_nm)?;
+    let mut doc = local
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| crate::invalid("local overlay", e.to_string()))?;
+    let contact = doc
+        .entry("contact")
+        .or_insert_with(toml_edit::table)
+        .as_table_like_mut()
+        .ok_or_else(|| crate::invalid("contact", "the overlay's `contact` is not a table"))?;
+    let reaction = match reaction {
+        crate::ContactReaction::Stop => "stop",
+        crate::ContactReaction::Warn => "warn",
+        crate::ContactReaction::Off => "off",
+    };
+    contact.insert("reaction", toml_edit::value(reaction));
+    contact.insert("sustained_nm", toml_edit::value(sustained));
+    contact.insert("impact_nm", toml_edit::value(impact));
+    Ok(doc.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,5 +500,83 @@ mod tests {
         // A named file that is missing is refused, not skipped.
         assert!(local_overlay_from(&robot, Some(&dir.join("missing.toml")), None).is_err());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What a calibration saves is what the runtime loads: the fitted
+    /// thresholds are in force, the keys the overlay did not name are the
+    /// shipped ones, and everything else the file held is still there.
+    #[test]
+    fn saved_contact_thresholds_load_over_the_shipped_file_and_keep_the_rest() {
+        let dir = std::env::temp_dir().join(format!("par6-contact-overlay-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shipped = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+        let local = dir.join("bench.toml");
+        let written = "# this arm, bench 3\n[limits]\ntcp_speed_max_m_s = 0.2 # slower here\n\n\
+                       [contact]\nretreat_s = 0.2\nsustained_nm = [9.0, 9.0, 9.0, 9.0, 9.0, 9.0]\n";
+        let sustained = [1.5, 2.5, 2.0, 0.6, 0.6, 0.4];
+        let impact = [0.9, 0.8, 0.7, 0.2, 0.2, 0.1];
+        let saved =
+            overlay_with_contact(written, crate::ContactReaction::Warn, &sustained, &impact)
+                .unwrap();
+        assert!(
+            saved.contains("# this arm, bench 3") && saved.contains("# slower here"),
+            "the overlay's own comments must survive:\n{saved}"
+        );
+        std::fs::write(&local, &saved).unwrap();
+        let robot = crate::ConfigBundle::load_with(&shipped, Some(&local), None)
+            .unwrap()
+            .robot;
+        assert_eq!(robot.contact.reaction, crate::ContactReaction::Warn);
+        assert_eq!(robot.contact.sustained_nm, sustained);
+        assert_eq!(robot.contact.impact_nm, impact);
+        assert_eq!(robot.contact.retreat_s, 0.2);
+        assert_eq!(robot.limits.tcp_speed_max_m_s, 0.2);
+        let untouched = crate::ConfigBundle::load_with(&shipped, None, None)
+            .unwrap()
+            .robot;
+        assert_eq!(
+            robot.contact.impact_window_s,
+            untouched.contact.impact_window_s
+        );
+
+        // An arm with no overlay yet gets one holding the table alone.
+        let fresh =
+            overlay_with_contact("", crate::ContactReaction::Stop, &sustained, &impact).unwrap();
+        std::fs::write(&local, &fresh).unwrap();
+        let robot = crate::ConfigBundle::load_with(&shipped, Some(&local), None)
+            .unwrap()
+            .robot;
+        assert_eq!(robot.contact.sustained_nm, sustained);
+        assert_eq!(
+            robot.limits.tcp_speed_max_m_s,
+            untouched.limits.tcp_speed_max_m_s
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            let mut wrong = sustained;
+            wrong[2] = bad;
+            assert!(
+                overlay_with_contact("", crate::ContactReaction::Stop, &wrong, &impact).is_err(),
+                "a threshold of {bad} must be refused"
+            );
+        }
+        assert!(
+            overlay_with_contact(
+                "[contact",
+                crate::ContactReaction::Stop,
+                &sustained,
+                &impact
+            )
+            .is_err(),
+            "a file that is not TOML must be refused, not overwritten"
+        );
+        assert!(overlay_with_contact(
+            "contact = 3\n",
+            crate::ContactReaction::Stop,
+            &sustained,
+            &impact
+        )
+        .is_err());
     }
 }

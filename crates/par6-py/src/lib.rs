@@ -86,6 +86,32 @@ fn make_wire_error(
     Ok(convert::wire_error_tuple(py, &e))
 }
 
+/// `local` — a local overlay file's text, empty for one not written yet —
+/// with its `[contact]` table carrying this reaction and these
+/// thresholds, and everything else in it as it was. `ValueError` for text
+/// that is not TOML, a reaction that is not one, or a threshold that is
+/// not above zero.
+#[pyfunction]
+fn overlay_with_contact(
+    local: &str,
+    reaction: &str,
+    sustained_nm: Vec<f64>,
+    impact_nm: Vec<f64>,
+) -> PyResult<String> {
+    let reaction = match reaction {
+        "stop" => par6_config::ContactReaction::Stop,
+        "warn" => par6_config::ContactReaction::Warn,
+        "off" => par6_config::ContactReaction::Off,
+        other => {
+            return Err(PyValueError::new_err(format!(
+                "contact reaction must be \"stop\", \"warn\" or \"off\", got {other:?}"
+            )))
+        }
+    };
+    par6_config::overlay_with_contact(local, reaction, &sustained_nm, &impact_nm)
+        .map_err(|e| PyValueError::new_err(e.to_string()))
+}
+
 #[pymodule]
 fn _par6(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<client::CoreClient>()?;
@@ -95,6 +121,7 @@ fn _par6(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<config::Config>()?;
     m.add_function(wrap_pyfunction!(ping_blocking, m)?)?;
     m.add_function(wrap_pyfunction!(make_wire_error, m)?)?;
+    m.add_function(wrap_pyfunction!(overlay_with_contact, m)?)?;
     m.add_function(wrap_pyfunction!(kinematics::matrix_to_xyzrpy_py, m)?)?;
     m.add_function(wrap_pyfunction!(kinematics::pose_matrix_py, m)?)?;
     m.add_function(wrap_pyfunction!(kinematics::compose_tool_frame, m)?)?;

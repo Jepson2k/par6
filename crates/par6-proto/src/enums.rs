@@ -143,6 +143,11 @@ wire_enum! {
         /// and `force` rule as SET_CAN_ID. The drive reports the id in its
         /// device info from then on, and the runtime fits that tool at boot.
         SetToolId = 33,
+        /// Replace what the arm does on contact and the per-joint
+        /// thresholds it reads one at, live — for tuning against the
+        /// arm's own programs. Lives until the runtime restarts; the
+        /// config is where the values are kept.
+        SetContactLimits = 34,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -199,6 +204,11 @@ wire_enum! {
         StatusRate = 62,
         /// Fresh queued-execution timing readback.
         ExecutionSpeed = 63,
+        /// Contact detection readout: the thresholds in force, each
+        /// joint's signal against them, the peaks since the last reset or
+        /// change of limits, the stops so far — and the gravity torque
+        /// the model holds at the pose the readout was taken in.
+        Contact = 64,
 
         // -- FIRE_AND_FORGET: no reply --
         /// Streaming joint position target (degrees).
@@ -309,6 +319,30 @@ wire_enum! {
         ExecutionSpeed = 25,
         /// See [`CmdType::CommandCompletion`].
         CommandCompletion = 26,
+        /// See [`CmdType::Contact`].
+        Contact = 27,
+    }
+}
+
+wire_enum! {
+    /// What the arm does when it reads a contact.
+    ContactReaction: u8 {
+        /// Nothing is read into the external-torque estimate.
+        Off = 0,
+        /// Report only: nothing stops.
+        Warn = 1,
+        /// A moving arm stops, backs off and holds until it is reset.
+        Stop = 2,
+    }
+}
+
+wire_enum! {
+    /// Which detection channel read a contact.
+    ContactChannel: u8 {
+        /// The signal stayed beyond its threshold: pressing.
+        Sustained = 1,
+        /// The signal jumped against its own average: a bump.
+        Impact = 2,
     }
 }
 
@@ -469,6 +503,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SetCanId
         | C::SaveConfig
         | C::SetToolId
+        | C::SetContactLimits
         | C::SetExecutionSpeed
         | C::SetStatusRate
         | C::Teleport => CommandClass::System,
@@ -498,7 +533,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::ConfigBundle
         | C::BusScan
         | C::StatusRate
-        | C::CommandCompletion => CommandClass::Query,
+        | C::CommandCompletion
+        | C::Contact => CommandClass::Query,
 
         C::ServoJ | C::ServoJPose | C::ServoL | C::JogJ | C::JogL | C::ResetLoopStats => {
             CommandClass::FireAndForget

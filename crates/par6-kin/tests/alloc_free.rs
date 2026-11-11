@@ -1,7 +1,7 @@
-//! RT contract: after `Kin` construction, fk/tcp/jacobian/gravity
-//! allocate nothing on the calling thread (CLAUDE.md: the RT tick path
-//! allocates NOTHING after init) — gravity with an installed arm
-//! correction included, since that is how a calibrated arm runs it.
+//! RT contract: after `Kin` construction, fk/tcp/jacobian/gravity and the
+//! inverse dynamics allocate nothing on the calling thread (CLAUDE.md: the
+//! RT tick path allocates NOTHING after init) — gravity with an installed
+//! arm correction included, since that is how a calibrated arm runs it.
 //!
 //! The counting allocator sees every Rust-side allocation; C++-side
 //! allocations bypass it, but the shim preallocates its whole workspace in
@@ -71,9 +71,15 @@ fn kinematics_calls_are_allocation_free_after_init() {
         .collect();
     kin.set_gravity_correction(&correction).unwrap();
 
+    // The external-torque observer runs the arm's inverse dynamics on the
+    // RT thread every tick.
+    let qd = [0.4, -0.2, 0.3, 1.1, -0.9, 0.6];
+    let qdd = [1.5, 2.0, -1.0, 4.0, 3.0, -2.0];
+
     // Warm-up outside the measured window (lazy TLS/locale/etc. one-shots).
     kin.fk(&q, &mut pose).unwrap();
     kin.gravity(&q, &mut tau).unwrap();
+    kin.dyn_feedforward(&q, &qd, &qdd, &mut tau).unwrap();
 
     let allocs = allocations_during(|| {
         for _ in 0..10 {
@@ -81,6 +87,7 @@ fn kinematics_calls_are_allocation_free_after_init() {
             kin.tcp(&q, &mut tcp);
             kin.jacobian(&q, &mut jac).unwrap();
             kin.gravity(&q, &mut tau).unwrap();
+            kin.dyn_feedforward(&q, &qd, &qdd, &mut tau).unwrap();
         }
     });
     assert_eq!(allocs, 0, "kinematics calls allocated {allocs} times");

@@ -95,6 +95,44 @@ wire_enum! {
         /// sustained interval (hard latch — the stream was silently
         /// holding, not tracking).
         SysStreamFault = 64,
+        /// A joint read a contact. As the standing error it is a
+        /// protective stop: a moving arm stopped for it, backed off and
+        /// holds, enabled and referenced, refusing motion until `Reset`.
+        /// As a warning it is a contact the arm does not stop for — one
+        /// at rest, or one configured to report.
+        SysContact = 65,
+        /// A floating (freedrive) joint moved faster than a hand moves it
+        /// — the arm was falling or thrown. Protective stop: the arm was
+        /// stopped where it was and holds, enabled and referenced,
+        /// refusing motion until `Reset`.
+        SysFreedriveCatch = 66,
+        /// The tool was measured over `[limits] tcp_speed_max_m_s` on a
+        /// driven arm. Protective stop: the arm was stopped where it was
+        /// and holds, enabled and referenced, refusing motion until
+        /// `Reset`.
+        SysSpeedLimit = 67,
+        /// A floating (freedrive) arm was guided into a keep-out.
+        /// Protective stop: the arm backed out the way it came and holds,
+        /// enabled and referenced, refusing motion until `Reset`. STATUS
+        /// names the keep-out in its collision fields.
+        SysKeepOut = 68,
+    }
+}
+
+impl ErrorCode {
+    /// Whether this code, standing in STATUS, is a protective stop: the
+    /// arm stopped itself and holds under power, still ENABLED and
+    /// referenced, and refuses motion until `Reset`. A client tells that
+    /// apart from a failed command's error — which also stands on an
+    /// enabled controller, and needs no reset — by this.
+    pub const fn is_protective(self) -> bool {
+        matches!(
+            self,
+            ErrorCode::SysContact
+                | ErrorCode::SysFreedriveCatch
+                | ErrorCode::SysSpeedLimit
+                | ErrorCode::SysKeepOut
+        )
     }
 }
 
@@ -367,6 +405,37 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
             cause: "Joint {joint}'s external torque stayed beyond the configured margin.",
             effect: "Controller DISABLED; error latched.",
             remedy: "Remove the obstruction or update the payload model, then send reset.",
+        },
+        E::SysContact => ErrorTemplate {
+            title: "Contact detected",
+            cause: "Joint {joint}'s external torque went beyond its contact threshold.",
+            effect: "Standing: motion stopped, backed off and refused; controller stays \
+                     ENABLED. Warning: reported only.",
+            remedy: "Clear what the arm touched, then send reset.",
+        },
+        E::SysFreedriveCatch => ErrorTemplate {
+            title: "Freedrive catch",
+            cause: "Joint {joint} moved faster than its freedrive catch speed while floating.",
+            effect: "The arm was stopped where it was and holds; motion and freedrive are \
+                     refused; controller stays ENABLED.",
+            remedy: "Check the declared payload and tool, then send reset and ask for \
+                     freedrive again.",
+        },
+        E::SysSpeedLimit => ErrorTemplate {
+            title: "Tool speed limit exceeded",
+            cause: "The tool was measured moving faster than the configured speed ceiling.",
+            effect: "The arm was stopped where it was and holds; motion is refused; \
+                     controller stays ENABLED.",
+            remedy: "Send reset. Slow the stream that drove it, or raise \
+                     [limits] tcp_speed_max_m_s if the ceiling is wrong for this cell.",
+        },
+        E::SysKeepOut => ErrorTemplate {
+            title: "Keep-out reached",
+            cause: "The arm was guided into a keep-out while floating.",
+            effect: "The arm backed out the way it came and holds; motion and freedrive \
+                     are refused; controller stays ENABLED.",
+            remedy: "Send reset and ask for freedrive again; guide the arm clear of the \
+                     keep-out, or move the keep-out if it is wrong for this cell.",
         },
         E::MotnHomingFailed => ErrorTemplate {
             title: "Homing failed",

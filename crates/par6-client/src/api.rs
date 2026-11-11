@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use par6_proto::command as cmd;
 use par6_proto::{
-    Command, CompletionPolicy, Frame, LoopStatsResult, QueryResult, Shape, Status, ToolStatusWire,
-    WireError, NUM_JOINTS,
+    Command, CompletionPolicy, ContactResult, Frame, LoopStatsResult, QueryResult, Shape, Status,
+    ToolStatusWire, WireError, NUM_JOINTS,
 };
 
 use crate::core::{Ack, Client};
@@ -110,6 +110,13 @@ impl Client {
     /// The standing error, if any.
     pub async fn error(&self) -> Result<Option<WireError>, ClientError> {
         unwrap_query!(self, Command::Error, QueryResult::Error { error } => error)
+    }
+
+    /// The contact detection readout: thresholds, signals, peaks since
+    /// the last reset or change of limits, stops so far, and the model's
+    /// gravity torque at the pose it was taken in.
+    pub async fn contact(&self) -> Result<ContactResult, ClientError> {
+        unwrap_query!(self, Command::Contact, QueryResult::Contact(c) => c)
     }
 
     /// TCP linear speed \[mm/s\].
@@ -392,6 +399,15 @@ impl Client {
     /// like a boot pass and persist across that node's reconnect resends.
     pub async fn set_pid_gains(&self, gains: cmd::SetPidGains) -> Result<Ack, ClientError> {
         self.system(Command::SetPidGains(gains)).await
+    }
+
+    /// Replace what the arm does on contact and the thresholds it reads
+    /// one at, until the runtime restarts.
+    pub async fn set_contact_limits(
+        &self,
+        limits: cmd::SetContactLimits,
+    ) -> Result<Ack, ClientError> {
+        self.system(Command::SetContactLimits(limits)).await
     }
 
     /// Commissioning: rename drive `node` to `new_id` (`SET_CAN_ID`).
@@ -798,4 +814,16 @@ pub struct MotionWait {
 /// floats only while IDLE, referenced, enabled and gravity-compensated.
 pub fn freedrive(s: &Status) -> bool {
     s.mode == par6_proto::ControllerMode::Idle && s.homed && s.enabled && s.gravity_comp
+}
+
+/// Whether the arm has stopped itself and holds, still enabled, refusing
+/// motion until `reset` — read off a STATUS frame. A failed command's
+/// error also stands on an enabled controller, and needs no reset; the
+/// standing code is what tells the two apart.
+pub fn protective_stop(s: &Status) -> bool {
+    s.enabled
+        && s.error.as_ref().is_some_and(|e| {
+            par6_proto::ErrorCode::from_wire(i64::from(e.code))
+                .is_some_and(par6_proto::ErrorCode::is_protective)
+        })
 }

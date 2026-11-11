@@ -42,22 +42,26 @@
 //!   latch list, homing/exec/jog/stream status, loop stats).
 
 pub mod adapters;
+pub mod contact;
 pub mod core;
 pub mod dispatch;
 pub mod errors;
 pub mod exec;
+pub mod freedrive;
 pub mod gpio;
 pub mod gravity;
 mod gripper_gate;
 pub mod gripper_settle;
 pub mod homing;
 pub mod hooks;
+pub mod observer;
 pub mod ring;
 pub mod rt;
 pub mod snapshot;
 pub mod state;
 pub mod timing;
 
+pub use crate::contact::{ContactChannel, ContactStatus, ContactTrip};
 pub use crate::core::{
     CoreError, ExecHeartbeat, GateRefusal, RtCore, RtHandles, RtHooks, StreamInput, StreamSetpoint,
     EXEC_HEARTBEAT_TIMEOUT_S,
@@ -71,6 +75,7 @@ pub use hooks::{
     CommandSource, CompletionPolicy, FlashMarker, ForwardKin, JogEngine, NoCommands, NoFk,
     RtCommand, SettlePolicy, SharedFlashMarker, SpecSettle, StreamTracker,
 };
+pub use observer::{Friction, TorqueObserver};
 pub use par6_bus::{Freshness, LinkHealth, LinkState, NodeState};
 pub use ring::{
     sample_ring, FlushMarker, Sample, SampleConsumer, SampleMeta, SampleProducer, SampleStart,

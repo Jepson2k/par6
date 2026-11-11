@@ -475,7 +475,7 @@ fn the_preview_runs_the_cartesian_pipeline() {
 /// what the end of a program leaves behind.
 #[test]
 fn blended_moves_hold_fold_and_flush_as_the_queue_does() {
-    let config = test_config();
+    let config = common::uncapped_config("preview-blends", 0.02);
     let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     let park = park_deg();
     preview.place_rad(to_rad(&park));
@@ -944,7 +944,7 @@ fn a_jog_re_pressed_during_its_ramp_down_never_comes_to_rest() {
 /// it — measured on the same executor and clamp the RT core ticks.
 #[test]
 fn the_servo_preview_runs_the_limiter_from_the_virtual_pose() {
-    let config = test_config();
+    let config = common::uncapped_config("preview-servo", 0.02);
     let robot = par6_config::RobotConfig::load(&config).expect("config");
     let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview");
     let lim = &robot.joints[0].limits;
@@ -1256,12 +1256,13 @@ fn the_servo_l_preview_draws_the_line_the_runtime_drives() {
 /// on the plan's tick grid, so it may run up to one tick long.
 #[test]
 fn each_profile_plans_its_own_minimum_time_shape() {
+    let config = common::uncapped_config("preview-profiles", 0.02);
     let mut preview =
-        Preview::new(Some(&test_config()), Some(&assets()), None).expect("the preview boots");
+        Preview::new(Some(&config), Some(&assets()), None).expect("the preview boots");
     preview.set_homed(true);
     let start = wrist_clear_deg();
     preview.teleport_rad(to_rad(&start));
-    let robot = par6_config::RobotConfig::load(&test_config()).expect("config");
+    let robot = par6_config::RobotConfig::load(&config).expect("config");
     let dt = robot.robot.tick_dt_s;
     let l = robot.joints[0]
         .limits

@@ -41,8 +41,8 @@ pub mod server;
 pub mod session;
 
 pub use config::{ConfigInfoData, ServerConfig, StatusTransport, TunableNode};
-pub use faults::{gripper_fault_code, rt_standing_error};
-pub use gating::{check_gate, gate, Gate, GateContext};
+pub use faults::{gripper_fault_code, rt_protective_stop, rt_standing_error};
+pub use gating::{check_gate, gate, Gate, GateContext, ProtectiveStop};
 pub use plane::{
     planner_plane, OwnedPlanContext, OwnedQueued, PlanEvent, PlanReport, PlanRequest,
     PlannerHandle, ReplyTag,

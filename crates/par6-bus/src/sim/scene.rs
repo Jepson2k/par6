@@ -321,6 +321,39 @@ pub fn inject_world(spec: &mut MjSpec, world: &World) -> Result<(), SceneError> 
     Ok(())
 }
 
+/// Contact bit the arm's own links answer on. Nothing but a scenario
+/// obstacle carries it, so the arm passes through the declared world as
+/// it always has (the collision checker is what keeps it out of that)
+/// and touches only what the runtime was never told about.
+const OBSTACLE_BIT: i32 = 2;
+
+/// Geom name of the scenario obstacle.
+pub const OBSTACLE_NAME: &str = "par6/obstacle";
+
+/// Add a scenario obstacle to `spec`: a static box every link of the arm
+/// collides with, as do the jaws and any free world object.
+pub fn inject_obstacle(spec: &mut MjSpec, obstacle: &super::scenario::Obstacle) {
+    for geom in spec.geom_iter_mut() {
+        let name = geom.meshname();
+        if name.is_empty() {
+            continue;
+        }
+        let jaw = matches!(name, "jaw1" | "jaw2");
+        geom.set_conaffinity(i32::from(jaw) | OBSTACLE_BIT);
+    }
+    let [sx, sy, sz] = obstacle.size_m;
+    let [x, y, z, rx, ry, rz] = obstacle.pose;
+    let geom = spec.world_body_mut().add_geom();
+    geom.with_name(OBSTACLE_NAME);
+    geom.with_type(MjtGeom::mjGEOM_BOX);
+    geom.with_size([sx / 2.0, sy / 2.0, sz / 2.0]);
+    geom.with_pos([x, y, z]);
+    geom.with_quat(quat_from_rpy(rx, ry, rz));
+    geom.with_rgba([0.8, 0.2, 0.2, 1.0]);
+    geom.set_contype(OBSTACLE_BIT | 1);
+    geom.set_conaffinity(1);
+}
+
 /// A world shape resolved to a MuJoCo geom.
 struct WorldGeom {
     kind: MjtGeom,

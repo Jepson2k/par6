@@ -21,7 +21,7 @@
 //!   are configuration, validated in the server layer (the codec performs no
 //!   process-global lookups).
 
-use crate::enums::{CmdType, CompletionPolicy, FlashingAssertion, Frame};
+use crate::enums::{CmdType, CompletionPolicy, ContactReaction, FlashingAssertion, Frame};
 use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
 use crate::{DecodeError, NUM_JOINTS};
 
@@ -477,6 +477,19 @@ pub struct SetShapes {
     pub shapes: Vec<Shape>,
 }
 
+/// SET_CONTACT_LIMITS: replace what the arm does on contact and the
+/// thresholds it reads one at.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetContactLimits {
+    /// What a contact does from now on.
+    pub reaction: ContactReaction,
+    /// Sustained-channel thresholds \[Nm\], one per joint, each > 0.
+    pub sustained_nm: [f64; NUM_JOINTS],
+    /// Impact-channel thresholds \[Nm\], one per joint, each > 0.
+    pub impact_nm: [f64; NUM_JOINTS],
+}
+
 /// SET_COMPLETION_POLICY: select the controller-side completion policy.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -839,6 +852,7 @@ pub enum Command {
     SetCanId(SetCanId),
     SaveConfig(SaveConfig),
     SetToolId(SetToolId),
+    SetContactLimits(SetContactLimits),
     SetStatusRate(SetStatusRate),
     // QUERY
     Ping,
@@ -859,6 +873,8 @@ pub enum Command {
     TcpTransform,
     /// Read controller-owned execution timing.
     ExecutionSpeed,
+    /// Read the contact detection readout.
+    Contact,
     /// How queued command `index` finished — what its COMPLETE push
     /// carried, for a client whose push never arrived.
     CommandCompletion {
@@ -922,6 +938,7 @@ impl Command {
             C::SetCanId(_) => CmdType::SetCanId,
             C::SaveConfig(_) => CmdType::SaveConfig,
             C::SetToolId(_) => CmdType::SetToolId,
+            C::SetContactLimits(_) => CmdType::SetContactLimits,
             C::SetStatusRate(_) => CmdType::SetStatusRate,
             C::Ping => CmdType::Ping,
             C::Status => CmdType::Status,
@@ -941,6 +958,7 @@ impl Command {
             C::TcpTransform => CmdType::TcpTransform,
             C::CommandCompletion { .. } => CmdType::CommandCompletion,
             C::ExecutionSpeed => CmdType::ExecutionSpeed,
+            C::Contact => CmdType::Contact,
             C::ToolStatus => CmdType::ToolStatus,
             C::IsSimulator => CmdType::IsSimulator,
             C::Shapes => CmdType::Shapes,
@@ -1021,6 +1039,7 @@ impl Command {
             | C::TcpSpeed
             | C::TcpOffset
             | C::ExecutionSpeed
+            | C::Contact
             | C::TcpTransform
             | C::CommandCompletion { .. }
             | C::ToolStatus
@@ -1054,6 +1073,20 @@ impl Command {
                 "set_tool_id.node",
                 "must be a CAN node id (0..=15)",
             ),
+            C::SetContactLimits(p) => {
+                finite_all("set_contact_limits.sustained_nm", &p.sustained_nm)?;
+                finite_all("set_contact_limits.impact_nm", &p.impact_nm)?;
+                check(
+                    p.sustained_nm.iter().all(|v| *v > 0.0),
+                    "set_contact_limits.sustained_nm",
+                    "every threshold must be > 0",
+                )?;
+                check(
+                    p.impact_nm.iter().all(|v| *v > 0.0),
+                    "set_contact_limits.impact_nm",
+                    "every threshold must be > 0",
+                )
+            }
             C::SaveConfig(p) => check(
                 p.node <= 15,
                 "save_config.node",
@@ -1401,6 +1434,7 @@ fn arity(tag: CmdType) -> usize {
         | T::TcpSpeed
         | T::TcpOffset
         | T::ExecutionSpeed
+        | T::Contact
         | T::TcpTransform
         | T::ToolStatus
         | T::IsSimulator
@@ -1429,6 +1463,7 @@ fn arity(tag: CmdType) -> usize {
         T::SetCanId => 5,
         T::SaveConfig => 4,
         T::SetToolId => 5,
+        T::SetContactLimits => 5,
         T::SetStatusRate | T::SetExecutionSpeed => 3,
         T::ServoJ | T::ServoJPose | T::ServoL => 5,
         T::JogJ => 5,
@@ -1522,6 +1557,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         | C::TcpSpeed
         | C::TcpOffset
         | C::ExecutionSpeed
+        | C::Contact
         | C::TcpTransform
         | C::ToolStatus
         | C::IsSimulator
@@ -1544,6 +1580,11 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
             w_uint(buf, u64::from(p.node));
             w_uint(buf, u64::from(p.tool_id));
             w_bool(buf, p.force);
+        }
+        C::SetContactLimits(p) => {
+            w_uint(buf, u64::from(p.reaction as u8));
+            w_fixed(buf, &p.sustained_nm);
+            w_fixed(buf, &p.impact_nm);
         }
         C::SetStatusRate(p) => w_f64(buf, p.hz),
         C::Stop(p) => w_bool(buf, p.clear_queue),
@@ -2085,6 +2126,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         T::TcpTransform => Command::TcpTransform,
         T::CommandCompletion => Command::CommandCompletion { index: r.uint()? },
         T::ExecutionSpeed => Command::ExecutionSpeed,
+        T::Contact => Command::Contact,
         T::ToolStatus => Command::ToolStatus,
         T::IsSimulator => Command::IsSimulator,
         T::Shapes => Command::Shapes,
@@ -2110,6 +2152,19 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             })?,
             force: r.bool()?,
         }),
+        T::SetContactLimits => {
+            let v = r.uint()?;
+            let reaction =
+                ContactReaction::from_wire(v as i64).ok_or(DecodeError::InvalidEnum {
+                    what: "contact reaction",
+                    value: v as i64,
+                })?;
+            Command::SetContactLimits(SetContactLimits {
+                reaction,
+                sustained_nm: r_fixed6(&mut r, "set_contact_limits.sustained_nm")?,
+                impact_nm: r_fixed6(&mut r, "set_contact_limits.impact_nm")?,
+            })
+        }
         T::SetStatusRate => Command::SetStatusRate(SetStatusRate { hz: r.f64()? }),
         T::ServoJ => Command::ServoJ(ServoJ {
             angles: r_fixed6(&mut r, "servo_j.angles")?,

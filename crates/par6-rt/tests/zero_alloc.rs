@@ -9,12 +9,42 @@ use std::sync::mpsc;
 
 use par6_bus::sim::scene::{Scene, Tool};
 use par6_bus::sim::SimBus;
+use par6_kin::{GripperVariant, Kin};
 use par6_rt::adapters::{MotionJog, MotionStream};
 use par6_rt::hooks::ClampStream;
 use par6_rt::{
-    sample_ring, CompletionPolicy, Mode, NoFk, RtCommand, RtCore, RtHooks, Sample, SampleMeta,
-    SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity, MAX_JOINTS,
+    sample_ring, CompletionPolicy, GravityModel, Mode, NoFk, RtCommand, RtCore, RtHooks, Sample,
+    SampleMeta, SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle, MAX_JOINTS,
 };
+
+/// The arm's own model behind the gravity seam, as par6d wires it: the
+/// tick is measured with the external-torque observer running the
+/// inverse dynamics, not standing down for want of a model.
+struct ArmModel(Kin);
+
+impl GravityModel for ArmModel {
+    fn gravity(&mut self, q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
+        self.0.gravity(q, out).expect("gravity");
+    }
+
+    /// Nothing in this test declares a payload.
+    fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
+
+    fn payload_gravity(&mut self, _q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
+        out.fill(0.0);
+    }
+
+    fn dynamics(
+        &mut self,
+        q: &[f64; MAX_JOINTS],
+        v: &[f64; MAX_JOINTS],
+        a: &[f64; MAX_JOINTS],
+        out: &mut [f64; MAX_JOINTS],
+    ) -> bool {
+        self.0.dyn_feedforward(q, v, a, out).expect("dynamics");
+        true
+    }
+}
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 
@@ -77,8 +107,12 @@ fn steady_state_ticks_allocate_nothing() {
     let (marker, _flash) = SharedFlashMarker::new();
     let (io, _io_lines) = SharedDigitalIo::new(robot.io.inputs.len(), robot.io.outputs.len());
     let (mut producer, consumer) = sample_ring(4096);
+    let assets =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/par6_description");
     let hooks = RtHooks {
-        gravity: Box::new(ZeroGravity),
+        gravity: Box::new(ArmModel(
+            Kin::load(&assets, GripperVariant::Flange).expect("arm model"),
+        )),
         jog: Box::new(MotionJog::from_config(robot).expect("jog engine")),
         stream: Box::new(MotionStream::from_config(robot).expect("stream limiter")),
         stream_shaped: Box::new(ClampStream::new(robot)),
@@ -94,8 +128,7 @@ fn steady_state_ticks_allocate_nothing() {
     // and the plant is part of what must not.
     let scene = Scene {
         tool: Tool::Flange,
-        assets: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../assets/par6_description"),
+        assets,
     };
     let (mut core, mut handles) = RtCore::new(&bundle, SimBus::new(scene), hooks).expect("core");
 
@@ -148,7 +181,15 @@ fn steady_state_ticks_allocate_nothing() {
     // transitions below run through it too; the ring was filled BEFORE
     // the window (try_push is allocation-free, but the measurement
     // isolates the tick itself).
-    core.set_homed(true);
+    // Referenced where it stands, mid-travel: the arm's model then
+    // describes the arm, so contact detection — on, as shipped — watches
+    // the program run rather than reading a contact into angles the
+    // model was never given.
+    let landed = [0.0, -1.2, 3.6, 0.0, 0.5, 2.0];
+    core.bus_mut()
+        .teleport_joint_rad(&landed)
+        .expect("teleport");
+    core.adopt_landed_pose(robot, &landed);
     tx.send(RtCommand::Enable(0)).unwrap();
     core.tick(dt, false);
     tx.send(RtCommand::SetMode(Mode::Exec)).unwrap();
@@ -159,14 +200,14 @@ fn steady_state_ticks_allocate_nothing() {
         .limits
         .for_mode(par6_config::LimitMode::Exec)
         .acceleration_rad_s2;
-    let omega = 2.5;
+    let omega = 4.0;
     let (q0, amplitude) = (q[0], 1.5 * a_lim / (omega * omega));
     let mut qd = [0.0; MAX_JOINTS];
     let pushed = 3500;
     for k in 0..pushed {
         let t = k as f64 * dt;
-        q[0] = q0 + amplitude * (omega * t).sin();
-        qd[0] = amplitude * omega * (omega * t).cos();
+        q[0] = q0 + amplitude * (1.0 - (omega * t).cos());
+        qd[0] = amplitude * omega * (omega * t).sin();
         let s = Sample {
             q,
             qd,
@@ -214,6 +255,47 @@ fn steady_state_ticks_allocate_nothing() {
             "the transition ran: scale {applied} against {expected_scale}"
         );
     }
+
+    // A contact, and everything the core does about it on its own: the
+    // stop, the retreat on the stream tracker and the hold it ends in.
+    // The program is still swinging the base when something leans on it.
+    let base = &robot.joints[0];
+    let lean_ma = 2.5
+        * par6_bus::spectral::torque_to_ma_factor(
+            base.gear_ratio,
+            base.gear_efficiency,
+            base.kt_nm_a,
+            base.dir,
+        );
+    assert!(
+        handles.snapshots.latest().exec.samples_remaining > 0,
+        "the program is still running"
+    );
+    core.bus_mut().set_joint_load_ma(base.node_id, lean_ma);
+    assert_no_allocs(
+        || {
+            for _ in 0..robot.ticks(1.5) {
+                hb.feed();
+                core.tick(dt, false);
+            }
+        },
+        "contact stop, retreat and hold",
+    );
+    let stopped = handles.snapshots.latest();
+    assert!(
+        stopped.protective_active && stopped.mode == Mode::Exec,
+        "the contact stopped the program into a hold: {:?} in {:?}",
+        stopped.errors.as_slice(),
+        stopped.mode
+    );
+    assert_eq!(
+        stopped.exec.samples_remaining, 0,
+        "what was left of the program went with the stop"
+    );
+    core.bus_mut().set_joint_load_ma(base.node_id, 0.0);
+    tx.send(RtCommand::ClearErrors).unwrap();
+    core.tick(dt, false);
+    assert!(!handles.snapshots.latest().protective_active);
 
     // HOMING window: mid-approach of step 1 (pre-moves are 4 s = 1000
     // ticks; J0's approach runs for several seconds after that). The FSM

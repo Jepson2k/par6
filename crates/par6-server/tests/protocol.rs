@@ -253,6 +253,8 @@ impl RtCommands for TestRt {
         self.push(RtEvent::SetToolId { node, tool_id });
     }
 
+    fn set_contact_limits(&mut self, _limits: &par6_proto::command::SetContactLimits) {}
+
     fn rescan_bus(&mut self) {
         self.push(RtEvent::RescanBus);
     }

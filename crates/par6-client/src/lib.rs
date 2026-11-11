@@ -12,7 +12,7 @@ mod error;
 mod sockets;
 mod sync;
 
-pub use crate::api::{freedrive, MotionWait};
+pub use crate::api::{freedrive, protective_stop, MotionWait};
 pub use crate::core::{
     Ack, Client, ClientConfig, Completion, ReceivedStatus, StatusTransport, MIN_MTU,
 };

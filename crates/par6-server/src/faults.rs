@@ -11,6 +11,8 @@
 //! an operator cannot work around.
 
 use par6_proto::{make_error, ErrorCode, WireError, UNATTRIBUTED};
+
+use crate::gating::ProtectiveStop;
 use par6_rt::{ErrorCode as RtCode, HomingPhase as RtHomingPhase, StateSnapshot, MAX_JOINTS};
 
 /// The gripper's fault bitfield as the wire spells it: bit 0 temperature,
@@ -29,9 +31,10 @@ pub fn gripper_fault_code(snap: &StateSnapshot) -> i32 {
     }
 }
 
-/// The standing wire error for the RT's own latch, or `None` when no HARD
-/// key is latched (warning keys track live conditions, self-clear, and
-/// never disable the arm).
+/// The standing wire error for the RT's own latch, or `None` when nothing
+/// that refuses motion is latched (warning keys track live conditions,
+/// self-clear, and stop nothing). A hard key outranks a protective stop:
+/// the fault is what the operator has to deal with first.
 ///
 /// Exactly one entry is chosen — a client renders a single standing error
 /// — ordered by what the operator has to deal with first: the safety
@@ -40,7 +43,7 @@ pub fn gripper_fault_code(snap: &StateSnapshot) -> i32 {
 /// the client already knows how to render.
 pub fn rt_standing_error(snap: &StateSnapshot) -> Option<WireError> {
     if !snap.error_active {
-        return None;
+        return rt_protective_stop(snap).map(|stop| stop.error());
     }
     let errs = snap.errors.as_slice();
     let has = |c: RtCode| errs.iter().any(|e| e.code == c);
@@ -79,7 +82,7 @@ pub fn rt_standing_error(snap: &StateSnapshot) -> Option<WireError> {
         )
     } else if let Some(e) = errs
         .iter()
-        .find(|e| !e.code.is_warning() && e.joint.is_some_and(|j| usize::from(j) < MAX_JOINTS))
+        .find(|e| e.code.is_hard() && e.joint.is_some_and(|j| usize::from(j) < MAX_JOINTS))
     {
         make_error(
             ErrorCode::SysJointFault,
@@ -94,7 +97,7 @@ pub fn rt_standing_error(snap: &StateSnapshot) -> Option<WireError> {
         // better than reporting nothing.
         let names: Vec<String> = errs
             .iter()
-            .filter(|e| !e.code.is_warning())
+            .filter(|e| e.code.is_hard())
             .map(|e| format!("{:?}", e.code))
             .collect();
         make_error(
@@ -107,6 +110,29 @@ pub fn rt_standing_error(snap: &StateSnapshot) -> Option<WireError> {
         )
     };
     Some(err)
+}
+
+/// The protective stop the RT has latched: the arm stopped for something,
+/// is still enabled and referenced, and refuses motion until it is reset.
+/// One value feeds STATUS and the admission gate, so a motion command
+/// refused in the meantime reads the way the standing error does.
+pub fn rt_protective_stop(snap: &StateSnapshot) -> Option<ProtectiveStop> {
+    if !snap.protective_active {
+        return None;
+    }
+    snap.errors.as_slice().iter().find_map(|e| {
+        let code = match e.code {
+            RtCode::Contact => ErrorCode::SysContact,
+            RtCode::FreedriveCatch => ErrorCode::SysFreedriveCatch,
+            RtCode::SpeedLimit => ErrorCode::SysSpeedLimit,
+            RtCode::KeepOut => ErrorCode::SysKeepOut,
+            _ => return None,
+        };
+        Some(ProtectiveStop {
+            code,
+            joint: e.joint,
+        })
+    })
 }
 
 /// The RT latch's warning-class entries as wire errors — the STATUS
@@ -140,6 +166,9 @@ pub fn wire_warning(e: &par6_rt::ErrorEntry, snap: &StateSnapshot) -> Option<Wir
         RtCode::LoopDegraded => make_error(ErrorCode::SysLoopDegraded, UNATTRIBUTED, &[]),
         RtCode::NotHomed => make_error(ErrorCode::MotnNotHomed, UNATTRIBUTED, &[]),
         RtCode::LinkErrorPassive => make_error(ErrorCode::SysLinkErrorPassive, UNATTRIBUTED, &[]),
+        RtCode::ContactWarning => {
+            make_error(ErrorCode::SysContact, UNATTRIBUTED, &[("joint", &joint)])
+        }
         RtCode::HomingFailed => {
             let phase = e
                 .joint
@@ -170,9 +199,44 @@ mod tests {
         }
         StateSnapshot {
             error_active: list.any_hard(),
+            protective_active: list.any_protective(),
             errors: list,
             ..StateSnapshot::default()
         }
+    }
+
+    /// A contact the arm stopped for stands as its own error on an arm
+    /// that is not faulted; a fault beside it is what the operator hears
+    /// about first; and the same contact on an arm that only reports is a
+    /// warning, never a standing error.
+    #[test]
+    fn a_contact_stands_as_a_protective_stop_and_reports_as_a_warning() {
+        let stopped = snap_with(&[(RtCode::Contact, Some(3))]);
+        assert!(!stopped.error_active, "a contact is not a fault");
+        let e = rt_standing_error(&stopped).expect("a protective stop stands");
+        assert_eq!(e.code, ErrorCode::SysContact as u16);
+        assert!(e.cause.contains("Joint 3"), "{}", e.cause);
+        assert!(rt_warnings(&stopped).is_empty(), "a stop is not a warning");
+
+        let faulted = snap_with(&[(RtCode::Contact, Some(3)), (RtCode::Encoder, Some(1))]);
+        let e = rt_standing_error(&faulted).expect("standing");
+        assert_eq!(e.code, ErrorCode::SysJointFault as u16);
+        assert!(
+            e.cause.contains('1'),
+            "the faulted joint is named: {}",
+            e.cause
+        );
+
+        let reported = snap_with(&[(RtCode::ContactWarning, Some(0))]);
+        assert!(rt_standing_error(&reported).is_none());
+        let warnings = rt_warnings(&reported);
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, ErrorCode::SysContact as u16);
+        assert!(
+            warnings[0].cause.contains("Joint 0"),
+            "{}",
+            warnings[0].cause
+        );
     }
 
     /// The latch a bricked arm shows must arrive as a catalog code, and a

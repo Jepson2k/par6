@@ -590,26 +590,8 @@ impl CoreClient {
                 Ok(_) => None,
                 Err(e) => return Err(PyRuntimeError::new_err(format!("tools: {e}"))),
             };
-            let key = format!("{config:?}|{assets:?}|{package_dir:?}|{tool:?}");
             let mut slot = cache.lock().await;
-            if !matches!(&*slot, Some((k, _)) if *k == key) {
-                // Off the async thread: this parses the URDF and builds the
-                // collision meshes, which would otherwise hold the Python
-                // event loop for as long as it takes.
-                let model = tokio::task::spawn_blocking(move || {
-                    par6d::kin::estimation_model(
-                        config.as_deref().map(std::path::Path::new),
-                        assets.as_deref().map(std::path::Path::new),
-                        package_dir.as_deref().map(std::path::Path::new),
-                        tool.as_deref(),
-                    )
-                })
-                .await
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
-                .map_err(PyRuntimeError::new_err)?;
-                *slot = Some((key, model));
-            }
-            let (_, model) = slot.as_mut().expect("just filled");
+            let model = estimation_model(&mut slot, config, assets, package_dir, tool).await?;
             let report = par6d::calibrate::estimate(&client, model, spread, ridge, declare)
                 .await
                 .map_err(PyRuntimeError::new_err)?;
@@ -621,6 +603,60 @@ impl CoreClient {
                 d.set_item("rms_nm", report.fit.rms_nm)?;
                 d.set_item("rms_unloaded_nm", report.fit.rms_unloaded_nm)?;
                 d.set_item("poses", report.samples.len())?;
+                Ok(d.unbind())
+            })
+        })
+    }
+
+    /// Fit the contact thresholds to this arm from swings with nothing in
+    /// its way, and optionally leave the runtime running on them. The
+    /// swings, the report-only window they run in and the restoring of
+    /// what the session had are `par6d::calibrate::contact`'s; this only
+    /// carries paths and results.
+    #[pyo3(signature = (config=None, assets=None, package_dir=None, spread=0.5, speed=1.0, margin=2.0, apply=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn calibrate_contact<'py>(
+        &self,
+        py: Python<'py>,
+        config: Option<String>,
+        assets: Option<String>,
+        package_dir: Option<String>,
+        spread: f64,
+        speed: f64,
+        margin: f64,
+        apply: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        let cache = Arc::clone(&self.estimation);
+        future_into_py(py, async move {
+            let tool = match client.tools().await {
+                Ok(par6_proto::QueryResult::Tools { tool, .. }) if !tool.is_empty() => Some(tool),
+                Ok(_) => None,
+                Err(e) => return Err(PyRuntimeError::new_err(format!("tools: {e}"))),
+            };
+            let mut slot = cache.lock().await;
+            let model = estimation_model(&mut slot, config, assets, package_dir, tool).await?;
+            let protocol = par6d::calibrate::ContactProtocol {
+                spread,
+                speed,
+                margin,
+                ..Default::default()
+            };
+            let report = par6d::calibrate::contact(&client, model, &protocol, apply)
+                .await
+                .map_err(PyRuntimeError::new_err)?;
+            Python::with_gil(|py| {
+                let d = PyDict::new(py);
+                d.set_item(
+                    "reaction",
+                    crate::convert::contact_reaction_name(report.reaction),
+                )?;
+                d.set_item("peak_signal", report.peak_signal.to_vec())?;
+                d.set_item("peak_impact", report.peak_impact.to_vec())?;
+                d.set_item("sustained_nm", report.sustained_nm.to_vec())?;
+                d.set_item("impact_nm", report.impact_nm.to_vec())?;
+                d.set_item("swings", report.swings)?;
+                d.set_item("applied", report.applied)?;
                 Ok(d.unbind())
             })
         })
@@ -717,6 +753,38 @@ impl CoreClient {
 
     fn execution_speed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         query_future(py, self.rt(), Command::ExecutionSpeed)
+    }
+
+    fn contact<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        query_future(py, self.rt(), Command::Contact)
+    }
+
+    fn set_contact_limits<'py>(
+        &self,
+        py: Python<'py>,
+        reaction: &str,
+        sustained_nm: [f64; par6_proto::NUM_JOINTS],
+        impact_nm: [f64; par6_proto::NUM_JOINTS],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let reaction = match reaction {
+            "off" => par6_proto::ContactReaction::Off,
+            "warn" => par6_proto::ContactReaction::Warn,
+            "stop" => par6_proto::ContactReaction::Stop,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "contact reaction must be \"stop\", \"warn\" or \"off\", got {other:?}"
+                )))
+            }
+        };
+        sys_future(
+            py,
+            self.rt(),
+            Command::SetContactLimits(cmd::SetContactLimits {
+                reaction,
+                sustained_nm,
+                impact_nm,
+            }),
+        )
     }
 
     fn set_execution_speed<'py>(&self, py: Python<'py>, scale: f64) -> PyResult<Bound<'py, PyAny>> {
@@ -1225,4 +1293,34 @@ impl CoreClient {
     fn reset_loop_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         fire_future(py, self.rt(), Command::ResetLoopStats)
     }
+}
+
+/// The arm the runtime models now — its config with the tool it has fitted
+/// — as a measurement routine plans and predicts against it. Loaded once
+/// per config and tool and kept in `slot`: it parses the URDF and builds
+/// the collision meshes, so the load runs off the async thread, which
+/// would otherwise hold the Python event loop for as long as it takes.
+async fn estimation_model(
+    slot: &mut Option<(String, par6d::calibrate::EstimationModel)>,
+    config: Option<String>,
+    assets: Option<String>,
+    package_dir: Option<String>,
+    tool: Option<String>,
+) -> PyResult<&mut par6d::calibrate::EstimationModel> {
+    let key = format!("{config:?}|{assets:?}|{package_dir:?}|{tool:?}");
+    if !matches!(&*slot, Some((k, _)) if *k == key) {
+        let model = tokio::task::spawn_blocking(move || {
+            par6d::kin::estimation_model(
+                config.as_deref().map(std::path::Path::new),
+                assets.as_deref().map(std::path::Path::new),
+                package_dir.as_deref().map(std::path::Path::new),
+                tool.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+        .map_err(PyRuntimeError::new_err)?;
+        *slot = Some((key, model));
+    }
+    Ok(&mut slot.as_mut().expect("just filled").1)
 }

@@ -543,11 +543,107 @@ fn the_simulated_run_lands_where_the_plan_says_and_shows_the_tracking_error() {
 fn a_run_grasps_lifts_and_drops_a_world_object() {
     // A light block and one ten times heavier: the drivetrains give under
     // the extra load, and the grip and the lift must carry it all the same.
-    grasps_lifts_and_drops(0.05);
-    grasps_lifts_and_drops(0.5);
+    // The light one is within what the arm takes for its own model error;
+    // the heavy one is a load, and a program says so before it lifts it.
+    grasps_lifts_and_drops(0.05, false);
+    grasps_lifts_and_drops(0.5, true);
 }
 
-fn grasps_lifts_and_drops(mass: f64) {
+/// The same lift with nothing declared is the arm meeting half a kilo it
+/// was not told about, which is what a contact is: the run stops there,
+/// with the block barely off its stand, instead of carrying on.
+#[test]
+fn a_run_stops_for_a_load_the_program_never_declared() {
+    let (batch, lift) = grasp_and_lift(0.5, false);
+    let lift = &batch.commands[lift];
+    assert_eq!(
+        lift.error.as_ref().map(|e| e.code),
+        Some(par6_proto::ErrorCode::SysContact as u16),
+        "an undeclared 0.5 kg lift must end as a contact: {:?}",
+        batch.commands
+    );
+    let block = batch
+        .objects
+        .iter()
+        .find(|t| t.name == "block")
+        .expect("the block has a track");
+    let highest = block
+        .poses
+        .iter()
+        .map(|p| f64::from(p[2]))
+        .fold(f64::MIN, f64::max);
+    assert!(
+        highest < 0.04 + 0.05,
+        "the arm kept lifting after the contact: the block reached z {highest}"
+    );
+}
+
+fn grasps_lifts_and_drops(mass: f64, declared: bool) {
+    let (batch, lift) = grasp_and_lift(mass, declared);
+    assert!(
+        batch.commands.iter().all(|c| c.error.is_none()),
+        "the grasp program was refused: {:?}",
+        batch.commands
+    );
+
+    let block = batch
+        .objects
+        .iter()
+        .find(|t| t.name == "block")
+        .expect("the block has a track");
+    assert!(
+        block.poses.len() > 1,
+        "a block that gets picked up and dropped is not a still object"
+    );
+    assert!(
+        !batch.objects.iter().any(|t| t.name == "stand"),
+        "a massless shape is a fixture welded into the world, not a body \
+             with a pose to track: {:?}",
+        batch.objects.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+
+    let z = |row: usize| f64::from(block.poses[row][2]);
+    let close = &batch.commands[0];
+    let lift = &batch.commands[lift];
+    let close_end = close.start_row + close.rows;
+    let lift_end = lift.start_row + lift.rows;
+    let held = z(close_end - 1);
+    let raised = z(lift_end - 1);
+    let dropped = z(block.poses.len() - 1);
+    assert!(
+        (held - 0.04).abs() < 0.01,
+        "the block stayed on its stand while the jaws closed: z {held}"
+    );
+    assert!(
+        raised > held + 0.05,
+        "friction against the closed jaws must carry the {mass} kg block up: {held} -> {raised}"
+    );
+    assert!(
+        dropped < raised - 0.05,
+        "opening the jaws must drop the {mass} kg block: held at {raised}, ended at {dropped}"
+    );
+
+    // The jaws report the hold themselves, and the contact solver has
+    // something to say for the whole time they do.
+    let gripping = lift.start_row..lift_end;
+    assert!(
+        gripping.clone().any(|r| batch.tool_gripping[r]),
+        "the gripper never reported an object between its jaws"
+    );
+    assert!(
+        gripping
+            .clone()
+            .any(|r| batch.contact_starts[r + 1] > batch.contact_starts[r]),
+        "a block held between two pads has contacts"
+    );
+}
+
+/// Close on a `mass` kg block, swing the shoulder back to raise it, open.
+/// Returns the run and the index of the lift. A `declared` block is
+/// announced as the payload once the jaws have it and before it leaves the
+/// stand: declared any earlier, the arm would be pushing up against a
+/// weight it does not hold yet and close its jaws above the block.
+fn grasp_and_lift(mass: f64, declared: bool) -> (par6d::preview::record::TickBatch, usize) {
     let config = test_config();
     let mut session = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     session.set_gripper_calibrated(true);
@@ -596,71 +692,25 @@ fn grasps_lifts_and_drops(mass: f64) {
             ],
         })
     };
-    // Close on the block, swing the shoulder back to raise the TCP, open.
     let mut lifted = grasp_pose;
     lifted[1] -= 0.3;
-    let cmds = [
-        tool_move(9001, 1.0),
+    let mut cmds = vec![tool_move(9001, 1.0)];
+    if declared {
+        cmds.push(Command::SetPayload(par6_proto::command::SetPayload {
+            mass,
+            com: [0.0; 3],
+            inertia: None,
+        }));
+    }
+    let lift = cmds.len();
+    cmds.extend([
         move_j_cmd(std::array::from_fn(|i| lifted[i].to_degrees()), 9002, 0.5),
         tool_move(9003, 0.0),
-    ];
+    ]);
     let batch = session
         .run(&cmds, RunLimits::default())
         .expect("the run completes");
-    assert!(
-        batch.commands.iter().all(|c| c.error.is_none()),
-        "the grasp program was refused: {:?}",
-        batch.commands
-    );
-
-    let block = batch
-        .objects
-        .iter()
-        .find(|t| t.name == "block")
-        .expect("the block has a track");
-    assert!(
-        block.poses.len() > 1,
-        "a block that gets picked up and dropped is not a still object"
-    );
-    assert!(
-        !batch.objects.iter().any(|t| t.name == "stand"),
-        "a massless shape is a fixture welded into the world, not a body \
-             with a pose to track: {:?}",
-        batch.objects.iter().map(|t| &t.name).collect::<Vec<_>>()
-    );
-
-    let z = |row: usize| f64::from(block.poses[row][2]);
-    let close_end = batch.commands[0].start_row + batch.commands[0].rows;
-    let lift_end = batch.commands[1].start_row + batch.commands[1].rows;
-    let held = z(close_end - 1);
-    let raised = z(lift_end - 1);
-    let dropped = z(block.poses.len() - 1);
-    assert!(
-        (held - 0.04).abs() < 0.01,
-        "the block stayed on its stand while the jaws closed: z {held}"
-    );
-    assert!(
-        raised > held + 0.05,
-        "friction against the closed jaws must carry the {mass} kg block up: {held} -> {raised}"
-    );
-    assert!(
-        dropped < raised - 0.05,
-        "opening the jaws must drop the {mass} kg block: held at {raised}, ended at {dropped}"
-    );
-
-    // The jaws report the hold themselves, and the contact solver has
-    // something to say for the whole time they do.
-    let gripping = batch.commands[1].start_row..lift_end;
-    assert!(
-        gripping.clone().any(|r| batch.tool_gripping[r]),
-        "the gripper never reported an object between its jaws"
-    );
-    assert!(
-        gripping
-            .clone()
-            .any(|r| batch.contact_starts[r + 1] > batch.contact_starts[r]),
-        "a block held between two pads has contacts"
-    );
+    (batch, lift)
 }
 
 /// Programs write outputs and stop themselves in ordinary use (WC's

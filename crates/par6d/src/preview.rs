@@ -186,6 +186,12 @@ pub struct Preview {
     /// STREAM joint envelope, which a cartesian jog holds its per-tick
     /// step to.
     stream_limits: MotionLimits,
+    /// Per-joint JOG velocity limits \[rad/s\]: what a jog fraction of ±1
+    /// commands, before the tool-speed ceiling slows it.
+    jog_vel: [f64; MAX_JOINTS],
+    /// `[limits] tcp_speed_max_m_s`, which the runtime slows jogs and
+    /// servo targets to.
+    tool_speed_ceiling: f64,
     soft_max: [f64; MAX_JOINTS],
     snap: StateSnapshot,
     snap_w: SnapshotWriter<StateSnapshot>,
@@ -220,6 +226,8 @@ pub struct Preview {
     tcp_rotation_deg: [f64; 3],
     policy: CompletionPolicy,
     payload: PayloadSpec,
+    /// Contact limits the program set, which a run of it boots with.
+    contact_limits: Option<par6_proto::command::SetContactLimits>,
     io_levels: Vec<u8>,
     io_inputs: usize,
     /// Commanded jaw position 0 = open … 1 = closed.
@@ -355,6 +363,8 @@ impl Preview {
             jog,
             cart: stack.cart,
             stream_limits,
+            jog_vel: jog_limits.velocity,
+            tool_speed_ceiling: robot.limits.tcp_speed_max_m_s,
             soft_min: stream_limits.soft_min,
             soft_max: stream_limits.soft_max,
             snap,
@@ -375,6 +385,7 @@ impl Preview {
             tcp_rotation_deg: [0.0; 3],
             policy: CompletionPolicy::Settled,
             payload: PayloadSpec::default(),
+            contact_limits: None,
             io_levels: vec![0; cfg.digital_outputs.len()],
             io_inputs: robot.io.inputs.len(),
             tool_position: 0.0,
@@ -691,6 +702,7 @@ impl Preview {
             &GateContext {
                 estop_latched: self.latches.estop_latched,
                 enabled: !self.flashing,
+                protective: None,
                 homed: self.snap.homed,
                 simulator: self.simulator,
             },
@@ -711,8 +723,8 @@ impl Preview {
         accel: Option<f64>,
     ) -> ServoPreview {
         let hold = hold_ticks.max(1);
-        self.stream
-            .set_scale(speed.unwrap_or(1.0), accel.unwrap_or(1.0));
+        let (speed, accel) = (speed.unwrap_or(1.0), accel.unwrap_or(1.0));
+        self.stream.set_scale(speed, accel);
         self.stream.activate(&self.snap.q);
         let mut out = ServoPreview {
             q: Vec::with_capacity(targets.len() * hold),
@@ -723,6 +735,24 @@ impl Preview {
         };
         let last = targets.len().saturating_sub(1);
         for (i, target) in targets.iter().enumerate() {
+            // Each datagram's speed is slowed to the tool-speed ceiling
+            // at the pose the arm is in, as the bridge slows it.
+            let at = self.snap.q;
+            let toward = std::array::from_fn(|j| {
+                let to_go = target[j] - at[j];
+                if to_go.abs() > crate::bridge::STREAM_ARRIVED_RAD {
+                    to_go.signum() * speed * self.stream_limits.velocity[j]
+                } else {
+                    0.0
+                }
+            });
+            let keep = crate::bridge::tool_speed_fraction(
+                &mut self.cart,
+                self.tool_speed_ceiling,
+                &at,
+                &toward,
+            );
+            self.stream.set_scale(speed * keep, accel);
             self.stream.set_target(target);
             for _ in 0..hold {
                 let mut q = [0.0; MAX_JOINTS];
@@ -785,6 +815,20 @@ impl Preview {
             &poses,
             protocol.approach_rad,
         ))
+    }
+
+    /// The joint targets `calibrate::contact` would drive through from
+    /// this pose, in order, ending where the arm stands. Measures nothing
+    /// — a preview has no torque. Refused where the live routine would
+    /// be: a joint with no room to swing.
+    pub fn contact_swings(&mut self, spread: f64) -> Result<Vec<[f64; NQ]>, String> {
+        let mut start = [0.0; NQ];
+        start.copy_from_slice(&self.snap.q[..NQ]);
+        let window: [(f64, f64); NQ] =
+            std::array::from_fn(|j| (self.soft_min[j], self.soft_max[j]));
+        let swings =
+            crate::calibrate::plan_swings(self.gate.collision_mut(), &start, &window, spread)?;
+        Ok(crate::calibrate::swing_order(&start, &swings))
     }
 
     /// The joint-move speed fraction the estimation protocol drives at.
@@ -1178,6 +1222,7 @@ impl Preview {
                 };
                 self.sync_planner();
             }
+            Command::SetContactLimits(p) => self.contact_limits = Some(p),
             Command::SetShapes(p) => {
                 if let Err(e) = self.set_shapes(ShapeLayer::Program, &p.shapes) {
                     return self.refuse(e);
@@ -1252,6 +1297,17 @@ impl Preview {
         }
         let mut fractions = [0.0; MAX_JOINTS];
         fractions[..NUM_JOINTS].copy_from_slice(&speeds);
+        // The arm is driven at what the tool-speed ceiling leaves of the
+        // jog at this pose; the gate judges the jog that was asked for.
+        // Both as the bridge has them.
+        let asked = std::array::from_fn(|j| fractions[j] * self.jog_vel[j]);
+        let keep = crate::bridge::tool_speed_fraction(
+            &mut self.cart,
+            self.tool_speed_ceiling,
+            &self.snap.q,
+            &asked,
+        );
+        let driven = fractions.map(|fraction| fraction * keep);
         // The runtime admits a jog only if where it will be one lookahead
         // horizon ahead clears the world (`RtBridge`'s jog admission).
         let scale = accel.unwrap_or(1.0);
@@ -1268,7 +1324,7 @@ impl Preview {
             self.jog.activate(&self.snap.q);
             self.jog_streaming = true;
         }
-        self.jog.command(&fractions);
+        self.jog.command(&driven);
         let ticks = ((duration_s / self.dt).round() as usize).max(1);
         let mut q = self.snap.q;
         let mut trajectory = Vec::with_capacity(ticks);

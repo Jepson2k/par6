@@ -331,19 +331,43 @@ impl ForwardKin for KinFk {
 /// G(q) behind the RT [`GravityModel`] seam. A model failure must not
 /// kill the RT thread: hold the last good value (gravity is a
 /// feedforward, not a safety path).
+///
+/// Two copies of the arm: the one the payload is declared on, and one
+/// that never carries any, so the payload's own share of G(q) is their
+/// difference at whatever pose the arm is in.
 pub(crate) struct KinGravity {
     kin: Kin,
+    unloaded: Kin,
+    carrying: bool,
     scratch: [f64; MAX_JOINTS],
     last_good: [f64; MAX_JOINTS],
+    last_good_dynamics: [f64; MAX_JOINTS],
+    last_good_payload: [f64; MAX_JOINTS],
 }
 
 impl KinGravity {
-    pub(crate) fn new(kin: Kin) -> Self {
-        Self {
-            kin,
+    /// The arm with `gripper` fitted and `correction` installed
+    /// (`[gravity_correction]`, empty for none).
+    pub(crate) fn load(
+        assets_dir: &Path,
+        gripper: Option<&par6_config::ToolConfig>,
+        correction: &[f64],
+    ) -> Result<Self, String> {
+        let corrected = || {
+            let mut kin = load_gravity_kin(assets_dir, gripper)?;
+            kin.set_gravity_correction(correction)
+                .map_err(|e| format!("gravity correction refused: {e}"))?;
+            Ok::<_, String>(kin)
+        };
+        Ok(Self {
+            kin: corrected()?,
+            unloaded: corrected()?,
+            carrying: false,
             scratch: [0.0; MAX_JOINTS],
             last_good: [0.0; MAX_JOINTS],
-        }
+            last_good_dynamics: [0.0; MAX_JOINTS],
+            last_good_payload: [0.0; MAX_JOINTS],
+        })
     }
 }
 
@@ -358,9 +382,45 @@ impl GravityModel for KinGravity {
     fn set_payload(&mut self, mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>) {
         // Wire-validated before it gets here; a refusal now is a model
         // fault worth shouting about, not silently absorbing.
-        if let Err(e) = self.kin.set_tool(mass, com, inertia) {
-            log::error!("gravity payload update refused: {e}");
+        match self.kin.set_tool(mass, com, inertia) {
+            Ok(()) => self.carrying = mass > 0.0,
+            Err(e) => log::error!("gravity payload update refused: {e}"),
         }
+    }
+
+    fn payload_gravity(&mut self, q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
+        if !self.carrying {
+            out.fill(0.0);
+            return;
+        }
+        let mut unloaded = [0.0; MAX_JOINTS];
+        if self.kin.gravity(q, &mut self.scratch).is_ok()
+            && self.unloaded.gravity(q, &mut unloaded).is_ok()
+        {
+            for ((share, with), without) in self
+                .last_good_payload
+                .iter_mut()
+                .zip(&self.scratch)
+                .zip(&unloaded)
+            {
+                *share = with - without;
+            }
+        }
+        *out = self.last_good_payload;
+    }
+
+    fn dynamics(
+        &mut self,
+        q: &[f64; MAX_JOINTS],
+        v: &[f64; MAX_JOINTS],
+        a: &[f64; MAX_JOINTS],
+        out: &mut [f64; MAX_JOINTS],
+    ) -> bool {
+        if self.kin.dyn_feedforward(q, v, a, &mut self.scratch).is_ok() {
+            self.last_good_dynamics = self.scratch;
+        }
+        *out = self.last_good_dynamics;
+        true
     }
 }
 
@@ -442,6 +502,22 @@ impl CartKin {
         let mut pose = self.fk_model(q)?;
         pose = mat_mul(&pose, &self.offset.get());
         Ok(pose)
+    }
+
+    /// How fast the offset TCP moves \[m/s\] while the joints move at
+    /// `qd` \[rad/s\] through `q`: a short step along `qd`, read off the
+    /// FK everything else reports the tool with, so the commanded offset
+    /// is in it.
+    pub(crate) fn tool_speed(&mut self, q: &[f64; NQ], qd: &[f64; NQ]) -> Result<f64, String> {
+        const STEP_S: f64 = 1e-3;
+        let here = self.fk(q)?;
+        let ahead: [f64; NQ] = std::array::from_fn(|j| q[j] + qd[j] * STEP_S);
+        let there = self.fk(&ahead)?;
+        let travelled: f64 = [3, 7, 11]
+            .iter()
+            .map(|k| (there[*k] - here[*k]).powi(2))
+            .sum();
+        Ok(travelled.sqrt() / STEP_S)
     }
 
     /// Replace the runtime payload in this model (inertial only — FK,

@@ -1771,6 +1771,164 @@ fn scenarios_perturb_observations_and_power_without_changing_the_local_servo_fee
     }
 }
 
+/// A scenario's push acts on its joint's link, in the direction it names,
+/// for its window and no longer; a push or an obstacle that describes
+/// nothing physical is refused before it reaches the plant.
+#[test]
+fn a_scenario_push_acts_for_its_window_and_bad_scenarios_are_refused() {
+    use par6_bus::sim::scenario::{JointPush, Obstacle, SimulationScenario};
+    let robot = par6();
+    let q0 = calibration_pose(&robot);
+    let base = robot.joints[0].node_id;
+    for nm in [1.5, -1.5] {
+        let mut rig = Rig::boot(&robot, None, Some(&q0));
+        // The base turns about the vertical: with its drive commanding no
+        // current, the push is the only torque on it besides friction.
+        let mut cmds = rig.idle_cmds();
+        cmds[0] = JointCommand::current(0);
+        for _ in 0..robot.ticks(0.2) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        let rest = rig.bus.true_joint_rad()[0];
+        rig.bus
+            .set_scenario(&SimulationScenario {
+                joint_push: Some(JointPush {
+                    at_s: 0.2,
+                    duration_s: 0.2,
+                    node: base,
+                    nm,
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        for _ in 0..robot.ticks(0.18) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        let before = rig.bus.true_joint_rad()[0] - rest;
+        assert!(
+            before.abs() < 1e-4,
+            "the base moved {before:+.5} rad before its push began"
+        );
+        for _ in 0..robot.ticks(0.3) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        let pushed = rig.bus.true_joint_rad()[0] - rest;
+        assert!(
+            pushed * nm.signum() > 0.01,
+            "a {nm:+.1} Nm push moved the base {pushed:+.5} rad"
+        );
+        // Long after the window friction has stopped it, and nothing
+        // starts it again.
+        for _ in 0..robot.ticks(2.0) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        let settled = rig.bus.true_joint_rad()[0];
+        for _ in 0..robot.ticks(0.5) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        let later = rig.bus.true_joint_rad()[0];
+        assert!(
+            (later - settled).abs() < 1e-4,
+            "the base is still moving {:+.5} rad per half second after its push ended",
+            later - settled
+        );
+    }
+
+    let mut rig = Rig::boot(&robot, None, Some(&q0));
+    let push = JointPush {
+        at_s: 0.0,
+        duration_s: 0.1,
+        node: base,
+        nm: 1.0,
+    };
+    let unconfigured = (0..16u8)
+        .find(|n| *n != robot.bus.gripper_node && robot.joints.iter().all(|j| j.node_id != *n))
+        .expect("a node id no joint uses");
+    for bad in [
+        JointPush {
+            duration_s: 0.0,
+            ..push
+        },
+        JointPush {
+            duration_s: f64::NAN,
+            ..push
+        },
+        JointPush { at_s: -1.0, ..push },
+        JointPush {
+            nm: f64::NAN,
+            ..push
+        },
+        JointPush {
+            nm: f64::INFINITY,
+            ..push
+        },
+        JointPush { nm: 500.0, ..push },
+        JointPush { node: 16, ..push },
+        JointPush {
+            node: unconfigured,
+            ..push
+        },
+        JointPush {
+            node: robot.bus.gripper_node,
+            ..push
+        },
+    ] {
+        assert!(
+            rig.bus
+                .set_scenario(&SimulationScenario {
+                    joint_push: Some(bad),
+                    ..Default::default()
+                })
+                .is_err(),
+            "{bad:?} was accepted"
+        );
+    }
+    let block = Obstacle {
+        size_m: [0.1, 0.1, 0.1],
+        pose: [0.4, 0.0, 0.3, 0.0, 0.0, 0.0],
+    };
+    for bad in [
+        Obstacle {
+            size_m: [0.1, 0.0, 0.1],
+            ..block
+        },
+        Obstacle {
+            size_m: [0.1, -0.1, 0.1],
+            ..block
+        },
+        Obstacle {
+            size_m: [f64::NAN, 0.1, 0.1],
+            ..block
+        },
+        Obstacle {
+            size_m: [0.1, 0.1, f64::INFINITY],
+            ..block
+        },
+        Obstacle {
+            pose: [0.4, f64::NAN, 0.3, 0.0, 0.0, 0.0],
+            ..block
+        },
+        Obstacle {
+            pose: [0.4, 0.0, 0.3, 0.0, f64::INFINITY, 0.0],
+            ..block
+        },
+        Obstacle {
+            pose: [40.0, 0.0, 0.3, 0.0, 0.0, 0.0],
+            ..block
+        },
+    ] {
+        assert!(
+            rig.bus
+                .set_scenario(&SimulationScenario {
+                    obstacle: Some(bad),
+                    ..Default::default()
+                })
+                .is_err(),
+            "{bad:?} was accepted"
+        );
+    }
+}
+
 #[test]
 fn declared_attachment_uses_the_flange_in_the_mujoco_model() {
     use mujoco_rs::prelude::{MjData, MjtObj};

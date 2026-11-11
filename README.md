@@ -25,6 +25,7 @@ below works on a laptop and in CI.
 - [Collision world](#collision-world)
 - [Kinematics and tools](#kinematics-and-tools)
 - [Payload and gravity](#payload-and-gravity)
+- [Collaborative behaviour](#collaborative-behaviour)
 - [The Pinocchio shim](#the-pinocchio-shim)
 - [Ports and environment variables](#ports-and-environment-variables)
 - [Development setup](#development-setup)
@@ -337,10 +338,11 @@ One tick, in order:
 2. **State** — update positions, velocities, currents, temperatures, error latches.
 3. **Gravity compensation** — `G(q)` from Pinocchio on the arm-only chain, with the
    active tool's inertials attached from its gripper config so tool mass has exactly
-   one source.
+   one source. The same model then feeds the external-torque observer (see
+   [Collaborative behaviour](#collaborative-behaviour)).
 4. **Mode dispatch** — one of IDLE / HOMING / JOG / STREAM / EXEC / SAFETY_STOP /
    FLASHING produces this tick's setpoints. IDLE on a homed, enabled arm with
-   gravity comp on is freedrive: torque-only `G(q)`, no position hold.
+   gravity comp on is [freedrive](#freedrive): `G(q)` and no position hold.
 5. **CAN TX** — one motion pack per joint, plus any queued control frame.
 6. **Snapshot** — publish state to the command plane's reader slot.
 
@@ -563,6 +565,229 @@ good residual. Anything that physically changes a link needs new nominal data,
 not a measurement.
 
 Worked example: [`examples/payload_estimate.py`](examples/payload_estimate.py).
+
+## Collaborative behaviour
+
+par6 reads what the arm touches from the motor currents its drives already report.
+**None of this is a safety-rated function.** The arm has no brakes, the sensing is
+single-channel and the controller is a general-purpose computer: it makes working
+beside the arm pleasant, and it is not what makes that safe.
+
+### External-torque estimate
+
+Every tick the runtime estimates, per joint, the motor torque its own model does
+not account for:
+
+```
+measured − ( G(q) + C(q,q̇)·q̇ + (M(q) + B)·q̈ + friction )
+```
+
+`G`, `C` and `M` come from the Pinocchio model gravity compensation already runs,
+declared payload included. `B` — rotor inertia reflected through the gearbox — and
+the Coulomb and viscous friction come from `[dynamics]`. Acceleration is the
+tick-to-tick change of the velocity the drives report, and the result is low-passed
+at `observer_hz`: the generalized-momentum observer in its discrete form. Nothing in
+it depends on what was commanded, so the estimate means the same thing in a planned
+move, a jog, a hold and a floating arm.
+
+It is published as STATUS `torques_ext`, signed measured-minus-model: a joint that
+has to push harder than its dynamics call for reads positive in its direction of
+effort, so a hand pressing a held joint one way reads the other.
+
+Two things bound what it can see. A joint at rest sits anywhere inside its stiction
+band, so a push smaller than its Coulomb friction is carried by the gearbox and never
+reaches the motor current. And the estimate is exactly as good as the model:
+`[dynamics]` ships the reference arm's friction, and an arm calibrated on its own
+gearboxes puts its own figures in its [local overlay](#local-overlay).
+
+A gravity model without inertia (a test stand-in) still produces the estimate, with
+every acceleration of the arm in it; anything that would read a contact from the
+estimate stands down in that case.
+
+### Contact stop
+
+`[contact]` reads a contact out of that estimate, per joint, on two channels:
+
+- **sustained** — the estimate beyond `sustained_nm` for `sustained_window_s`: the
+  arm pressing into something.
+- **impact** — the estimate against its own slow average (`impact_highpass_s`)
+  beyond `impact_nm` for `impact_window_s`: a bump. A standing offset, such as a
+  gravity error, does not count against it.
+
+Before either channel sees it, each joint's estimate loses what the arm could have
+produced by itself: its Coulomb friction while it is not sliding
+(`stiction_speed_rad_s`), a share of its own inertial effort while it accelerates
+hard (`inertia_slack`, `inertia_hold_s` — a soft drivetrain winds up), and the
+[declared payload](#payload-and-gravity)'s weight in the direction of not holding it.
+A window only counts samples that push the same way, and never fewer than two.
+
+What happens next is `reaction`:
+
+| `reaction` | A joint crosses a threshold while the arm is being driven | …while it rests on its target |
+|---|---|---|
+| `"stop"` (shipped) | The arm stops, backs off and holds. `SysContact` stands until `reset`. | `SysContact` is reported as a warning. |
+| `"warn"` | `SysContact` is reported as a warning; the move carries on. | The same. |
+| `"off"` | Nothing. | Nothing. |
+
+The stop, in order, all inside the tick that read the contact:
+
+1. The planned queue is abandoned and any stream is cut off; setpoints that arrive
+   afterwards are discarded.
+2. The arm retreats along its own track to where it measured itself `retreat_s` of
+   travel earlier, no joint further than `retreat_max_rad`. That is a pose it occupied
+   a moment ago, so the retreat needs no collision check; a joint that was outside its
+   soft window is left where it is rather than dragged to the limit. The track is
+   kept by distance as well as by time: an arm that crept in, or had already stalled
+   against what it touched, still backs off, by at least half of `retreat_max_rad`.
+3. At rest, or after `retreat_timeout_s`, it holds position under power.
+
+A contact is **protective**, a third class beside hard errors and warnings. The arm
+stays ENABLED and homed, and gravity compensation never drops. The move in flight
+completes with `SysContact`, everything queued behind it is discarded, and every
+motion command is refused with the same error until `reset()` — which clears it on the
+next tick, because nothing on the drives needs clearing. Nothing resumes by itself.
+
+A failed move's error also stands in STATUS on an enabled controller, and needs no
+reset. What tells a client the two apart is the code: the clients answer it as
+`protective_stop` (`par6_client::protective_stop`, `StatusBuffer.protective_stop`).
+
+Detection is armed only while the arm is homed, enabled, modelled with inertia and
+being driven (EXEC, JOG or STREAM with a commanded velocity, or still short of its
+target). It stands down while the arm floats in freedrive, while homing, during the
+retreat itself, and for one estimate after any change of reference (homing completing,
+a simulator teleport).
+
+**Payloads.** A load the runtime was not told about is indistinguishable from a
+contact, so a program declares what it lifts: `set_payload` once the jaws have closed
+on it and before it leaves the table, and again (mass 0) after it is put down. From
+declaration to clearing, each joint may read anything between holding that weight and
+not holding it. The cost is sensitivity: with a payload declared, a contact that
+*supports* the arm goes unread until it exceeds the payload's weight.
+
+A load of unknown weight is handled the same way: declare an upper bound before
+lifting it, lift, then `estimate_payload()` — whose wrist swings carry the same
+undeclared difference — replaces the bound with what it measured.
+
+**Calibration.** The shipped thresholds are a reference arm's; an arm is fitted its
+own as part of bringing it up, with nothing near it:
+
+```bash
+par6 calibrate-contact --save /etc/par6/local.toml
+```
+
+```python
+fitted = rbt.calibrate_contact(save_to="/etc/par6/local.toml")
+```
+
+From where the arm stands it swings each joint `spread` (0.5 rad) either way and back,
+then all of them at once, at `speed` (1.0); reads the largest signal the arm's own
+motion put on each joint, on both channels; and sets each threshold at `margin` (2)
+times that, never under 0.05 Nm. A swing that would leave the joint window or meet a
+keep-out is left out, and a joint with no swing left is an error, not a guess. The
+runtime runs on the result at once, and `--save` / `save_to` writes it into the
+`[contact]` table of the arm's [local overlay](#local-overlay) — the rest of that file
+left as it is — so it is still there after a restart.
+
+The swings run with contacts reported and not stopped for: thresholds that do not fit
+the arm yet would stop the run that fits them. That is why nothing may be near the
+arm, and it is the only time the routine changes the reaction — what the runtime had
+is back when it returns, on every path. The thresholds answer for motion up to the
+speed and around the pose they were fitted at, so start from the middle of where the
+arm works, and run it again after a change of tool.
+
+**Reading it by hand.** The `CONTACT` query (`client.contact()`) answers the
+thresholds, the live signal on both channels, the peak of each while the arm was
+moving, the trip count and the joint and channel of the last trip. The peaks start
+over at `reset()` and whenever the limits are set.
+`set_contact_limits(reaction=…, sustained_nm=…, impact_nm=…)` applies a reaction and
+thresholds to the running arm; what it sets lives until the runtime restarts. In Waldo
+Commander the **Contact** tab (`par6.gui.contact`, a `waldoctl.panels` plugin beside
+Drives) is those two with the numbers in front of you: each joint's signal and peak
+against its limit on both channels, the limits editable in place, "Set from peaks",
+and the `[contact]` table for the overlay ready to copy — for checking a program
+against the fitted thresholds, or setting `reaction = "warn"` to watch before anything
+stops. A simulated run of a program honours the limits the program set.
+
+To try it without an arm, give the simulator something the runtime does not know
+about (see [`docs/simulation-scenarios.md`](docs/simulation-scenarios.md)):
+
+```bash
+cat > post.toml <<'TOML'
+[obstacle]
+size_m = [0.06, 0.06, 0.4]
+pose = [0.3204, 0.185, 0.2, 0.0, 0.0, 0.0]
+TOML
+pixi run cargo run -p par6d -- --sim --sim-scenario post.toml
+```
+
+### Freedrive
+
+`freedrive(True)` floats the arm: IDLE with gravity compensation on, where the drives
+carry the arm's weight, nothing holds its position, and a hand moves it. `[freedrive]`
+is what else the drives do while it floats, per joint:
+
+- **Push assist**, off as shipped (`push_assist = 0`): the PAR6's gearing is low
+  enough that a hand moves a floating joint as it is. Turned on, the torque a hand
+  puts on a joint — what the [external-torque estimate](#external-torque-estimate)
+  reads on a floating arm — is applied again by the drive, times `push_assist`,
+  through a `push_assist_hz` low-pass: the hand feels a lighter arm, and with nothing
+  pushing there is nothing to add to, so the joint stops as it always did. It does
+  nothing for a joint at rest — breaking it loose still takes its full stiction,
+  because a push that small never reaches the motor current — and it amplifies
+  whatever the estimate reads, a gravity error included: raise it in small steps on
+  the arm itself, and back it off if a joint creeps or hums.
+- **Soft limits.** A joint that reaches a soft limit moving outward is held there by
+  its drive — that joint alone, the rest of the arm goes on floating — until the
+  contact signal shows `limit_release_nm` pushing it back in.
+- **The catch.** A joint faster than `catch_speed_rad_s` for `catch_window_s` is not
+  being guided: it is falling under a payload the model was not told about, or it was
+  thrown. The arm stops where it is and holds, and `SysFreedriveCatch` stands as a
+  protective stop: `reset()`, then ask for freedrive again.
+- **Keep-outs.** A hand can take the arm where no planned move would go, so the
+  runtime watches a floating arm against the [collision world](#collision-world).
+  When it comes inside a keep-out's clearance the arm goes back the way it came —
+  along the poses it has just been through, against the hand if the hand is still
+  pushing — and holds clear of the keep-out under `SysKeepOut`, a protective stop,
+  with the keep-out named in STATUS's collision fields: `reset()`, then ask for
+  freedrive again. A keep-out the arm was already inside when it began to float, or
+  that was put over it while it floated, has no way it came: the arm is left to be
+  guided out of that one, and is caught if it is then taken back in.
+
+Every one of these stops is the drive's own position loop, and nothing in the floating
+law feeds a joint's velocity back to it — no speed ceiling short of the catch, no damping toward
+a limit, no paying a joint's friction for it. A torque computed from velocity on the
+runtime's side of the bus is a loop closed at the tick rate around a rotor that
+weighs almost nothing, and at any gain worth having it shakes the drivetrain.
+
+Contact detection is not armed while the arm floats — contact is the point — and a
+protective stop of any kind refuses `freedrive(True)` until it is reset: an arm that
+stopped itself stays where it stopped.
+
+The gravity model is all that holds a floating arm up. A wrong payload or tool mass
+makes it drift, toward the floor or the ceiling; the limits and the catch bound how
+far and how fast, and neither is a reason to float an arm over something it must not
+land on.
+
+### Tool-speed limit
+
+`[limits] tcp_speed_max_m_s` (shipped 0.25, 0 = off) is a ceiling on the tool's linear
+speed, whatever is driving the arm:
+
+| What moves the arm | How it is held to the ceiling |
+|---|---|
+| Planned moves (`move_j`, `move_l`, …, blends) | The plan is the same path, played back slower wherever the tool would otherwise be over the ceiling and at its own pace everywhere else. A joint move at reach is where this bites — joint limits alone let the base swing the tool at several times any cartesian speed. The preview plans with the same planner, so it reports the same duration. |
+| `jog_j` | The requested speeds are scaled, at the pose the arm is in, until the tool is at the ceiling. |
+| `servo_j`, `servo_j_pose` | The stream's speed fraction is scaled the same way, taking every joint with somewhere to go at its stream limit. |
+| `jog_l`, `servo_l` | Already limited in cartesian space by `[motion] jog_l_linear_max_m_s`, which the config refuses to load above the ceiling. |
+| Anything, measured | The RT measures the tool every tick. More than a fifth over the ceiling for `tcp_speed_window_s` and the arm stops where it is and holds under `SysSpeedLimit`, a protective stop: `reset()`. This is the backstop — nothing above should ever reach it. |
+
+A floating arm is a hand's to move and is not held to the ceiling; its own
+[catch](#freedrive) is what bounds it.
+
+Force is bounded where it always was: by each drive's own `ilim_ma`, enforced in the
+drive. The ceiling bounds the energy behind a contact, and
+[contact detection](#contact-stop) how long it lasts; neither replaces choosing
+current limits for the work the arm shares.
 
 ## The Pinocchio shim
 

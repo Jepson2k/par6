@@ -32,6 +32,20 @@ simulated seconds and are validated before activation:
   velocity, current, and estop.
 - `supply_loss`: `{ "at_s": 0.2, "decay_s": 0.5 }` linearly reduces assumed
   supply availability to zero. A zero decay means immediate loss.
+- `joint_push`: `{ "at_s": 0.5, "duration_s": 0.3, "node": 1, "nm": 3.0 }` applies
+  a torque to that drive's link for the window, positive along the joint's
+  positive direction: a hand, or something in the way. `nm` is finite and
+  `duration_s` positive.
+- `obstacle`: `{ "size_m": [0.06, 0.06, 0.4], "pose": [x, y, z, rx, ry, rz] }` adds
+  one static box (full side lengths in metres; pose in metres and radians,
+  `R = Rz·Ry·Rx`) that exists in the physics and nowhere in the collision world.
+  Nothing plans around it; the arm finds it by running into it. Every arm link,
+  the jaws and free world objects collide with it.
+
+Both are how [contact detection](../README.md#contact-stop) is exercised without an
+arm. A live simulator takes the same inputs from a TOML file:
+`par6d --sim --sim-scenario <file>` (or `PAR6_SIM_SCENARIO`), with the keys above as
+tables (`[obstacle]`, `[joint_push]`).
 
 Other event times must be finite in `[0, 3600]`; dropout duration must be
 positive. Unknown fields and unconfigured fault nodes are rejected. Delayed

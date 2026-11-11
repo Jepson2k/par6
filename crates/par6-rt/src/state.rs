@@ -5,6 +5,7 @@
 use par6_bus::{Freshness, GripperState, LinkHealth, NodeState};
 use par6_config::MAX_IO_LINES;
 
+use crate::contact::ContactStatus;
 use crate::gripper_settle::ToolStatus;
 use crate::{MAX_JOINTS, NUM_NODES};
 
@@ -106,6 +107,21 @@ pub enum ErrorCode {
     /// Per-joint: external-torque estimate beyond the configured
     /// envelope margin for the configured window (hard latch).
     TorqueEnvelope,
+    /// Per-joint: a moving arm read a contact and stopped for it
+    /// (protective latch — the arm stays enabled and referenced).
+    Contact,
+    /// Per-joint: a contact read on an arm that does not stop for it —
+    /// one at rest, or one configured to report (warning, self-clears).
+    ContactWarning,
+    /// Per-joint: a floating arm moved faster than a hand moves it and
+    /// was stopped and held (protective latch).
+    FreedriveCatch,
+    /// The tool was measured over its speed ceiling on a driven arm and
+    /// the arm was stopped and held (protective latch).
+    SpeedLimit,
+    /// A floating arm was guided into a keep-out, backed out the way it
+    /// came and was held (protective latch).
+    KeepOut,
 }
 
 impl ErrorCode {
@@ -119,7 +135,27 @@ impl ErrorCode {
                 | ErrorCode::NotHomed
                 | ErrorCode::LoopDegraded
                 | ErrorCode::LinkErrorPassive
+                | ErrorCode::ContactWarning
         )
+    }
+
+    /// Protective stops latch like a hard error and refuse motion until
+    /// the user clears them, but they are the arm working as intended,
+    /// not a fault: it stays enabled and referenced, and nothing on the
+    /// drives needs clearing.
+    pub fn is_protective(self) -> bool {
+        matches!(
+            self,
+            ErrorCode::Contact
+                | ErrorCode::FreedriveCatch
+                | ErrorCode::SpeedLimit
+                | ErrorCode::KeepOut
+        )
+    }
+
+    /// Hard errors disable the arm and set `error_active`.
+    pub fn is_hard(self) -> bool {
+        !self.is_warning() && !self.is_protective()
     }
 }
 
@@ -187,10 +223,28 @@ impl ErrorList {
         self.as_slice().contains(&entry)
     }
 
-    /// Whether any NON-warning (latching) entry is present — drives
-    /// `error_active` / the DISABLED reaction.
+    /// Whether any hard entry is present — drives `error_active` / the
+    /// DISABLED reaction.
     pub fn any_hard(&self) -> bool {
-        self.as_slice().iter().any(|e| !e.code.is_warning())
+        self.as_slice().iter().any(|e| e.code.is_hard())
+    }
+
+    /// Whether a protective stop is latched — motion is refused, the arm
+    /// is not disabled.
+    pub fn any_protective(&self) -> bool {
+        self.as_slice().iter().any(|e| e.code.is_protective())
+    }
+
+    /// Remove every protective entry, leaving the rest.
+    pub fn clear_protective(&mut self) {
+        let mut kept = 0;
+        for i in 0..usize::from(self.len) {
+            if !self.entries[i].code.is_protective() {
+                self.entries[kept] = self.entries[i];
+                kept += 1;
+            }
+        }
+        self.len = kept as u8;
     }
 
     /// Remove every entry (user clear path; real faults re-latch on the
@@ -448,6 +502,11 @@ pub struct StreamStatus {
 pub struct StateSnapshot {
     /// Tick this snapshot was produced at.
     pub tick: u64,
+    /// Teleports the simulated arm has been through, landed or refused.
+    /// A snapshot that counts one more than the count a teleport was
+    /// sent under describes the arm after it — which is what anything
+    /// planning from "where the arm is" has to wait for.
+    pub placements: u32,
     /// Operating mode.
     pub mode: Mode,
     /// Enabled/disabled.
@@ -494,8 +553,9 @@ pub struct StateSnapshot {
     /// Gravity torque G(q) \[Nm\] — computed and published every tick,
     /// applied only when the mode allows.
     pub gravity_torque_nm: [f64; MAX_JOINTS],
-    /// External torque estimate \[Nm\]: filtered measured torque minus
-    /// the model's gravity torque.
+    /// External torque estimate \[Nm\], measured minus model: the motor
+    /// torque that gravity, friction and the arm's own acceleration do
+    /// not account for.
     pub tau_ext: [f64; MAX_JOINTS],
     /// Per-node motor telemetry: arm joints 0..MAX_JOINTS, gripper last.
     pub nodes: [NodeState; NUM_NODES],
@@ -515,6 +575,11 @@ pub struct StateSnapshot {
     pub errors: ErrorList,
     /// Whether any hard (latching) error is active.
     pub error_active: bool,
+    /// Whether a protective stop is latched: the arm stopped for
+    /// something, stays enabled, and refuses motion until it is cleared.
+    pub protective_active: bool,
+    /// Contact detection readout.
+    pub contact: ContactStatus,
     /// Loop timing statistics.
     pub loop_stats: LoopStats,
     /// Motor-bus link health as the backend reports it (kernel link
@@ -569,6 +634,7 @@ impl Default for StateSnapshot {
     fn default() -> Self {
         Self {
             tick: 0,
+            placements: 0,
             mode: Mode::default(),
             state: ArmState::default(),
             enabled_request_id: 0,
@@ -598,6 +664,8 @@ impl Default for StateSnapshot {
             homing: HomingStatus::default(),
             errors: ErrorList::new(),
             error_active: false,
+            protective_active: false,
+            contact: ContactStatus::default(),
             loop_stats: LoopStats::default(),
             link: LinkHealth::default(),
             exec: ExecStatus::default(),

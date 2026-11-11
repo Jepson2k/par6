@@ -443,6 +443,10 @@ pub trait RtCommands: Send {
     /// and have it saved (`SET_TOOL_ID`). Gated like `set_can_id`.
     fn set_tool_id(&mut self, node: u8, tool_id: u8);
 
+    /// Replace the contact reaction and thresholds the RT reads a contact
+    /// with (`SET_CONTACT_LIMITS`), from the next tick.
+    fn set_contact_limits(&mut self, limits: &par6_proto::command::SetContactLimits);
+
     /// Kick a bus rescan; the snapshot's `bus_scan_epoch` advances once
     /// every id has been pinged and the answers have landed.
     fn rescan_bus(&mut self);

@@ -240,6 +240,11 @@ pub fn held_jog_travel(
 /// settling on a held target and the projection would be noise.
 const STREAM_MOVING_RAD_S: f64 = 0.01;
 
+/// How far a joint has to be from a servo target \[rad\] before it counts
+/// as having somewhere to go, for the purpose of bounding the tool's speed
+/// on the way: under it the joint is where it was sent.
+pub(crate) const STREAM_ARRIVED_RAD: f64 = 1e-3;
+
 // The speed a placement's hold is dropped at is what sets the standoff's
 // error budget: IDLE only damps, so whatever the arm still carries it
 // coasts. [`STREAM_MOVING_RAD_S`] answers a different question — has
@@ -1193,6 +1198,87 @@ impl StreamGate {
     }
 }
 
+/// How far a floating arm moves between looks at the keep-outs \[rad\]:
+/// well over what its encoders report at rest, so an arm left alone costs
+/// nothing to watch, and a few millimetres at the tool at full reach.
+const FLOAT_GUARD_STEP_RAD: f64 = 0.002;
+
+/// Watches a floating arm against the keep-outs.
+///
+/// Nothing plans where a hand takes the arm, so the gate that refuses a
+/// jog has nothing to refuse: the arm is already there. What this reports
+/// is the arm coming inside a keep-out's clearance, for the RT to back it
+/// out the way it came.
+///
+/// A keep-out the arm was inside when it began to float, or that was put
+/// over it while it floated, is not reported — there is no way it came,
+/// and floating is how it gets out. Once the arm has left one, going back
+/// in is reported like any other.
+pub(crate) struct FloatGuard {
+    floating: bool,
+    epoch: u64,
+    judged: [f64; MAX_JOINTS],
+    standing: Vec<(String, String)>,
+}
+
+impl FloatGuard {
+    pub(crate) fn new() -> Self {
+        Self {
+            floating: false,
+            epoch: 0,
+            judged: [0.0; MAX_JOINTS],
+            standing: Vec::new(),
+        }
+    }
+
+    /// The keep-outs the floating arm in `snap` has just come inside.
+    pub(crate) fn entered(
+        &mut self,
+        gate: &mut StreamGate,
+        snap: &StateSnapshot,
+    ) -> Option<Vec<(String, String)>> {
+        let floating = snap.mode == Mode::Idle
+            && snap.gravity_comp
+            && snap.homed
+            && snap.state == ArmState::Enabled;
+        if !floating {
+            self.floating = false;
+            return None;
+        }
+        let epoch = gate.epoch();
+        let begun = !self.floating || epoch != self.epoch;
+        let moved = snap
+            .q
+            .iter()
+            .zip(&self.judged)
+            .any(|(now, then)| (now - then).abs() >= FLOAT_GUARD_STEP_RAD);
+        if !begun && !moved {
+            return None;
+        }
+        let inside = match gate.world_offenders(&snap.q) {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                log::error!("freedrive: the keep-outs could not be checked: {e:?}");
+                return None;
+            }
+        };
+        self.floating = true;
+        self.epoch = epoch;
+        self.judged = snap.q;
+        if begun {
+            self.standing = inside;
+            return None;
+        }
+        let entered: Vec<_> = inside
+            .iter()
+            .filter(|pair| !self.standing.contains(pair))
+            .cloned()
+            .collect();
+        self.standing.retain(|pair| inside.contains(pair));
+        (!entered.is_empty()).then_some(entered)
+    }
+}
+
 /// A collision-world query the shim refused (a broken model, never a
 /// well-formed configuration).
 fn gate_error(e: par6_kin::KinError) -> WireError {
@@ -1745,7 +1831,43 @@ pub(crate) struct CartStream {
     pub(crate) snapshots: SnapshotReader<StateSnapshot>,
     pub(crate) soft_min: [f64; MAX_JOINTS],
     pub(crate) soft_max: [f64; MAX_JOINTS],
+    /// Per-joint JOG velocity limits \[rad/s\]: what a jog fraction of ±1
+    /// commands.
+    pub(crate) jog_vel: [f64; MAX_JOINTS],
+    /// Per-joint STREAM velocity limits \[rad/s\]: what a servo at full
+    /// speed fraction tracks its target at.
+    pub(crate) stream_vel: [f64; MAX_JOINTS],
     pub(crate) gate: Arc<Mutex<StreamGate>>,
+}
+
+/// What `[limits] tcp_speed_max_m_s` leaves of the joint velocity `qd`
+/// \[rad/s\] at the pose `q`: the fraction to slow it to, 1 when the tool
+/// stays under the ceiling anyway or there is none.
+///
+/// In twentieths, rounded down: the geometry under a held control changes
+/// all the time, and a fraction that followed it exactly would turn every
+/// datagram of a steady jog into a new command.
+pub(crate) fn tool_speed_fraction(
+    kin: &mut crate::kin::CartKin,
+    ceiling_m_s: f64,
+    q: &[f64; MAX_JOINTS],
+    qd: &[f64; MAX_JOINTS],
+) -> f64 {
+    if ceiling_m_s <= 0.0 {
+        return 1.0;
+    }
+    let (mut at, mut rate) = ([0.0; NQ], [0.0; NQ]);
+    at.copy_from_slice(&q[..NQ]);
+    rate.copy_from_slice(&qd[..NQ]);
+    match kin.tool_speed(&at, &rate) {
+        Ok(speed) if speed > ceiling_m_s => ((ceiling_m_s / speed) * 20.0).floor().max(1.0) / 20.0,
+        Ok(_) => 1.0,
+        Err(e) => {
+            // The RT measures the tool against the same ceiling.
+            log::warn!("tool speed not bounded for this setpoint: {e}");
+            1.0
+        }
+    }
 }
 
 /// The `RtCommands` implementation `par6d` hands to the server.
@@ -1893,6 +2015,48 @@ impl RtBridge {
     }
 }
 
+/// `SET_CONTACT_LIMITS` as the RT takes it.
+pub(crate) fn contact_limits_command(limits: &par6_proto::command::SetContactLimits) -> RtCommand {
+    use par6_config::ContactReaction as Configured;
+    use par6_proto::ContactReaction as Wire;
+    RtCommand::SetContactLimits {
+        reaction: match limits.reaction {
+            Wire::Off => Configured::Off,
+            Wire::Warn => Configured::Warn,
+            Wire::Stop => Configured::Stop,
+        },
+        sustained_nm: limits.sustained_nm,
+        impact_nm: limits.impact_nm,
+    }
+}
+
+/// The RT half of a teleport: re-seed the simulated plant at `q` and have
+/// the core adopt the landed pose.
+fn place(
+    core: &mut RtCore<RuntimeBus>,
+    robot: &par6_config::RobotConfig,
+    q: &[f64; MAX_JOINTS],
+    tool_closed: Option<f64>,
+) {
+    let Some(bus) = core.bus_mut().sim_mut() else {
+        log::error!("teleport reached a hardware bus; dropped");
+        return;
+    };
+    // Re-seed, not a bus reboot: the drivers keep running, so the arm is
+    // still held the tick after it lands.
+    if let Err(e) = bus.teleport_joint_rad(&q[..robot.joints.len()]) {
+        log::error!("teleport: sim re-seed failed: {e}");
+        return;
+    }
+    if let Some(closed) = tool_closed {
+        if let Err(e) = bus.teleport_gripper(closed) {
+            log::error!("teleport: sim tool re-seed failed: {e}");
+        }
+    }
+    core.adopt_landed_pose(robot, q);
+    log::info!("teleport applied: {q:?} rad, homed=true");
+}
+
 impl RtCommands for RtBridge {
     fn stream(&mut self, cmd: &Command) -> Result<(), WireError> {
         self.adopt_tool();
@@ -1903,6 +2067,25 @@ impl RtCommands for RtBridge {
                     *out = *v;
                 }
                 let moving = speeds.iter().any(|v| *v != 0.0);
+                // What the tool-speed ceiling leaves of the jog at this
+                // pose. The arm is driven at that; the collision gate
+                // below goes on judging the jog that was asked for, whose
+                // reach is what its rules were built on — a jog slowed to
+                // a crawl gains too little ground for the way out of a
+                // keep-out to register, and would be refused with every
+                // other direction.
+                let keep = if moving {
+                    let q = self.cart.snapshots.latest().q;
+                    let qd = std::array::from_fn(|j| speeds[j] * self.cart.jog_vel[j]);
+                    tool_speed_fraction(
+                        &mut self.cart.kin,
+                        self.bundle.robot.limits.tcp_speed_max_m_s,
+                        &q,
+                        &qd,
+                    )
+                } else {
+                    1.0
+                };
                 let mut sh = self.shared.lock().unwrap();
                 // Admission gate: where this jog comes to rest if it is
                 // released at once must not collide (or, from inside a
@@ -2023,14 +2206,14 @@ impl RtCommands for RtBridge {
                 // datagram, and the release is never more than a couple of
                 // entries deep. The datagram still refreshes the watchdog
                 // deadline below either way.
-                let accel_changed = sh
+                let scale_changed = sh
                     .stream
                     .as_ref()
-                    .is_some_and(|a| a.scale.1 != p.accel.unwrap_or(1.0));
-                if speeds != active || (moving && accel_changed) {
+                    .is_some_and(|a| a.scale != (keep, p.accel.unwrap_or(1.0)));
+                if speeds != active || (moving && scale_changed) {
                     if moving {
                         self.link.send(RtCommand::Jog {
-                            speeds,
+                            speeds: speeds.map(|v| v * keep),
                             accel: p.accel.unwrap_or(1.0),
                         });
                     } else {
@@ -2052,9 +2235,10 @@ impl RtCommands for RtBridge {
                     still_tick: 0,
                     stepped_tick: 0,
                     // JOG runs on the RT jog engine, not the streaming
-                    // executor; its accel rides `RtCommand::Jog`. Kept
-                    // here so a change of accel alone still resends.
-                    scale: (1.0, p.accel.unwrap_or(1.0)),
+                    // executor; the tool-speed fraction and the accel
+                    // ride `RtCommand::Jog`. Kept here so a change of
+                    // either alone still resends.
+                    scale: (keep, p.accel.unwrap_or(1.0)),
                 });
             }
             Command::ServoJ(p) => {
@@ -2112,7 +2296,28 @@ impl RtCommands for RtBridge {
                 // rig at anywhere from 2.7 mm to 24 mm from a keep-out
                 // whose standoff is 5 mm. Instead the arm is stopped and
                 // then placed ON the standoff; housekeeping runs that.
-                let scale = (p.speed.unwrap_or(1.0), p.accel.unwrap_or(1.0));
+                // Every joint with somewhere to go heads there at its
+                // stream limit, so that is the velocity the tool is held
+                // to the ceiling under.
+                let scale = {
+                    let speed = p.speed.unwrap_or(1.0);
+                    let q = self.cart.snapshots.latest().q;
+                    let toward = std::array::from_fn(|j| {
+                        let to_go = target[j] - q[j];
+                        if to_go.abs() > STREAM_ARRIVED_RAD {
+                            to_go.signum() * speed * self.cart.stream_vel[j]
+                        } else {
+                            0.0
+                        }
+                    });
+                    let keep = tool_speed_fraction(
+                        &mut self.cart.kin,
+                        self.bundle.robot.limits.tcp_speed_max_m_s,
+                        &q,
+                        &toward,
+                    );
+                    (speed * keep, p.accel.unwrap_or(1.0))
+                };
                 let (refusal, world_epoch) = {
                     let snap = self.cart.snapshots.latest();
                     let mut gate = self.cart.gate.lock().unwrap();
@@ -2737,6 +2942,10 @@ impl RtCommands for RtBridge {
         self.link.send(RtCommand::SetToolId { node, tool_id });
     }
 
+    fn set_contact_limits(&mut self, limits: &par6_proto::command::SetContactLimits) {
+        self.link.send(contact_limits_command(limits));
+    }
+
     fn rescan_bus(&mut self) {
         self.link.send(RtCommand::RescanBus);
     }
@@ -2789,24 +2998,10 @@ impl RtCommands for RtBridge {
             *out = deg.to_radians();
         }
         self.link.op(Box::new(move |core| {
-            let robot = &bundle.robot;
-            let Some(bus) = core.bus_mut().sim_mut() else {
-                log::error!("teleport reached a hardware bus; dropped");
-                return;
-            };
-            // Re-seed, not a bus reboot: the drivers keep running, so the
-            // arm is still held the tick after it lands.
-            if let Err(e) = bus.teleport_joint_rad(&q[..robot.joints.len()]) {
-                log::error!("teleport: sim re-seed failed: {e}");
-                return;
-            }
-            if let Some(closed) = tool_closed {
-                if let Err(e) = bus.teleport_gripper(closed) {
-                    log::error!("teleport: sim tool re-seed failed: {e}");
-                }
-            }
-            core.adopt_landed_pose(robot, &q);
-            log::info!("teleport applied: {q:?} rad, homed=true");
+            place(core, &bundle.robot, &q, tool_closed);
+            // Counted either way: what waits on a teleport is waiting
+            // for it to be over, not for it to have worked.
+            core.note_placement();
         }));
     }
 
@@ -3176,6 +3371,7 @@ pub(crate) fn housekeeping_loop(
         link.send(RtCommand::StreamRelease);
     };
     let mut profile_logged = Instant::now();
+    let mut float_guard = FloatGuard::new();
     'housekeeping: while !shutdown.load(Ordering::SeqCst) {
         // One pass per RT tick, paced at the TOP because the arms below
         // return here with `continue`: with the wait at the bottom every
@@ -3196,6 +3392,20 @@ pub(crate) fn housekeeping_loop(
         }
         let now = Instant::now();
         let snap = snapshots.latest();
+        let entered = float_guard.entered(&mut gate.lock().unwrap(), &snap);
+        if let Some(pairs) = entered {
+            log::warn!(
+                "freedrive: guided into a keep-out; backing the arm out: {}",
+                pairs
+                    .iter()
+                    .map(|(a, b)| format!("[{a}, {b}]"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            // Latched for STATUS, which is where the keep-out is named.
+            gate.lock().unwrap().refuse(pairs);
+            link.send(RtCommand::KeepOutCatch);
+        }
         if now.duration_since(profile_logged) >= Duration::from_secs(1) {
             profile_logged = now;
             let p = &snap.tick_profile;
@@ -4564,6 +4774,7 @@ mod tests {
                 &par6_server::gating::GateContext {
                     estop_latched: false,
                     enabled: ready.state == ArmState::Enabled,
+                    protective: None,
                     homed: ready.homed,
                     simulator: true,
                 }

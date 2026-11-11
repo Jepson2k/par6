@@ -11,9 +11,10 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import os
 import threading
 import weakref
-from collections.abc import Callable, Coroutine, Iterable
+from collections.abc import Callable, Coroutine, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from waldoctl.execution import ExecutionSpeed
@@ -34,6 +35,8 @@ from ..protocol import CompletionPolicy
 from ..protocol.wire import StatusBuffer
 from .async_client import (
     AsyncRobotClient,
+    ContactCalibration,
+    ContactReadout,
     LoopStatsResult,
     QueueResult,
     ReachableResult,
@@ -721,6 +724,39 @@ class RobotClient:
     def loop_stats(self) -> LoopStatsResult | None:
         """Control-loop runtime metrics."""
         return _run(self._inner.loop_stats())
+
+    def contact(self) -> ContactReadout | None:
+        """Contact detection readout: thresholds, signals, peaks, stops."""
+        return _run(self._inner.contact())
+
+    def set_contact_limits(
+        self,
+        *,
+        reaction: str,
+        sustained_nm: Sequence[float],
+        impact_nm: Sequence[float],
+    ) -> int:
+        """Replace the contact reaction and per-joint thresholds, live
+        (all three required — the frame replaces the whole set)."""
+        return _run(
+            self._inner.set_contact_limits(
+                reaction=reaction, sustained_nm=sustained_nm, impact_nm=impact_nm
+            )
+        )
+
+    def calibrate_contact(
+        self,
+        spread: float = 0.5,
+        speed: float = 1.0,
+        margin: float = 2.0,
+        apply: bool = True,
+        save_to: str | os.PathLike[str] | None = None,
+    ) -> ContactCalibration:
+        """Fit the contact thresholds to this arm from swings with nothing
+        in its way — see ``AsyncRobotClient.calibrate_contact``."""
+        return _run(
+            self._inner.calibrate_contact(spread, speed, margin, apply, save_to)
+        )
 
     def shapes(self) -> ShapeWorld | None:
         """The collision world the runtime is enforcing, by layer."""

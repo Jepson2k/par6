@@ -171,6 +171,7 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     d.set_item("mode", s.mode as u8)?;
     d.set_item("enabled", s.enabled)?;
     d.set_item("gravity_comp", s.gravity_comp)?;
+    d.set_item("protective_stop", par6_client::protective_stop(s))?;
     let warnings = PyList::empty(py);
     for w in &s.warnings {
         warnings.append(wire_error_tuple(py, w))?;
@@ -338,6 +339,26 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("target_scale", *target_scale)?;
             d.set_item("applied_scale", *applied_scale)?;
             d.set_item("resume_scale", *resume_scale)?;
+        }
+        QueryResult::Contact(c) => {
+            d.set_item("reaction", contact_reaction_name(c.reaction))?;
+            d.set_item("sustained_nm", c.sustained_nm.to_vec())?;
+            d.set_item("impact_nm", c.impact_nm.to_vec())?;
+            d.set_item("signal", c.signal.to_vec())?;
+            d.set_item("impact", c.impact.to_vec())?;
+            d.set_item("peak_signal", c.peak_signal.to_vec())?;
+            d.set_item("peak_impact", c.peak_impact.to_vec())?;
+            d.set_item("trips", c.trips)?;
+            d.set_item("last_trip_joint", c.last_trip.map(|(joint, _)| joint))?;
+            d.set_item(
+                "last_trip_channel",
+                c.last_trip.map(|(_, channel)| match channel {
+                    par6_proto::ContactChannel::Sustained => "sustained",
+                    par6_proto::ContactChannel::Impact => "impact",
+                }),
+            )?;
+            d.set_item("angles", c.angles.to_vec())?;
+            d.set_item("gravity_nm", c.gravity_nm.to_vec())?;
         }
         QueryResult::Payload { mass, com, inertia } => {
             fill_payload(&d, *mass, *com, *inertia)?;
@@ -545,4 +566,13 @@ pub(crate) fn motion_dict<'py>(
         }
     }
     Ok(m)
+}
+
+/// A contact reaction as the Python client and the config file spell it.
+pub(crate) fn contact_reaction_name(reaction: par6_proto::ContactReaction) -> &'static str {
+    match reaction {
+        par6_proto::ContactReaction::Off => "off",
+        par6_proto::ContactReaction::Warn => "warn",
+        par6_proto::ContactReaction::Stop => "stop",
+    }
 }

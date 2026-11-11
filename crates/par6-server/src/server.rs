@@ -69,7 +69,7 @@ use tokio::sync::Notify;
 use tokio::time::MissedTickBehavior;
 
 use crate::config::ServerConfig;
-use crate::faults::{gripper_fault_code, rt_standing_error};
+use crate::faults::{gripper_fault_code, rt_protective_stop, rt_standing_error};
 use crate::gating::{check_gate, gate, is_stream, GateContext};
 use crate::link::BroadcastLink;
 use crate::plane::{OwnedPlanContext, OwnedQueued, PlanEvent, PlanRequest, ReplyTag};
@@ -358,12 +358,14 @@ struct Core<R: RtCommands> {
     standing_error: Option<WireError>,
     action_state: ActionState,
     estop_latched: bool,
-    /// A teleport was accepted and the RT has not published the snapshot
-    /// yet. Teleporting references the arm, so the homed gate must open
-    /// for the command right behind it — a client sends a teleport and
-    /// its first move in the same breath, and the snapshot is a tick or
-    /// more behind.
-    teleport_homed: bool,
+    /// A teleport was accepted and the RT has not published a snapshot
+    /// from after it yet: the placement count the teleport was sent
+    /// under. A client sends a teleport and its first move in the same
+    /// breath, and the snapshot is a tick or more behind. Teleporting
+    /// references the arm, so the homed gate opens for that move — and
+    /// the move is not planned until the teleport is over, because a
+    /// plan taken before then starts from where the arm no longer is.
+    teleport_pending: Option<u32>,
     active_stream: Option<CmdType>,
     /// Datagrams a preemption drain took off the socket without being
     /// entitled to discard them; dispatched by the run loop, in order.
@@ -390,6 +392,11 @@ struct Core<R: RtCommands> {
     tcp_rotation_deg: [f64; 3],
     /// The commanded runtime payload — served back by the PAYLOAD query.
     payload: PayloadSpec,
+    /// The contact limits last set over the wire, if any. The RT takes
+    /// them a tick or two after the ack, and a client that reads back what
+    /// it has just written must see it: until the snapshot carries them,
+    /// and from then on identically, this is what the readout answers.
+    contact_limits: Option<par6_proto::command::SetContactLimits>,
     shapes: Vec<par6_proto::Shape>,
     attachment_epoch: u64,
     attachment_stop_pending: bool,
@@ -479,7 +486,7 @@ impl<R: RtCommands> Core<R> {
             standing_error: None,
             action_state: ActionState::Idle,
             estop_latched: false,
-            teleport_homed: false,
+            teleport_pending: None,
             active_stream: None,
             deferred: VecDeque::new(),
             drainbuf: vec![0u8; 65535],
@@ -492,6 +499,7 @@ impl<R: RtCommands> Core<R> {
             tcp_offset_mm: [0.0; 3],
             tcp_rotation_deg: [0.0; 3],
             payload: PayloadSpec::default(),
+            contact_limits: None,
             shapes: Vec::new(),
             attachment_epoch: RandomState::new()
                 .hash_one((std::process::id(), std::time::SystemTime::now()))
@@ -662,6 +670,7 @@ impl<R: RtCommands> Core<R> {
         self.refresh_snapshot();
         self.emit_status_on_tick().await;
         self.stop_invalid_attachments().await;
+        self.end_stream_on_protective_stop();
         self.log_rt_latch_edges();
         self.answer_scans().await;
         self.request_boot_enable();
@@ -670,6 +679,17 @@ impl<R: RtCommands> Core<R> {
         self.settle_bus().await;
         self.expire_chunks().await;
         self.pump().await;
+    }
+
+    /// A protective stop took the arm off whatever was moving it. Queued
+    /// motion ends through the planner, which fails the command that was
+    /// in flight with the stop itself; a stream has no command to fail,
+    /// so its session is ended here. The gate refuses a new one until the
+    /// stop is cleared.
+    fn end_stream_on_protective_stop(&mut self) {
+        if self.snap.protective_active && self.active_stream.take().is_some() {
+            self.runtime.rt.cancel_stream();
+        }
     }
 
     /// The RT's own latch, on its edges: latched (with the catalog's
@@ -1037,7 +1057,7 @@ impl<R: RtCommands> Core<R> {
                     self.runtime
                         .rt
                         .teleport(&p.angles, p.tool_positions.as_deref());
-                    self.teleport_homed = true;
+                    self.teleport_pending = Some(self.snap.placements);
                     self.on_motion_accepted();
                     Ok(())
                 }
@@ -1091,6 +1111,11 @@ impl<R: RtCommands> Core<R> {
             C::SaveConfig(p) => self
                 .commissioning_gate(p.node, p.force, "save_config")
                 .map(|()| self.runtime.rt.save_config(p.node)),
+            C::SetContactLimits(p) => {
+                self.runtime.rt.set_contact_limits(p);
+                self.contact_limits = Some(p.clone());
+                Ok(())
+            }
             C::SetToolId(p) => self
                 .commissioning_gate(p.node, p.force, "set_tool_id")
                 .and_then(|()| {
@@ -1625,7 +1650,8 @@ impl<R: RtCommands> Core<R> {
         let ctx = GateContext {
             estop_latched: self.estop_latched,
             enabled: self.snap.state == ArmState::Enabled,
-            homed: self.snap.homed || self.teleport_homed,
+            protective: rt_protective_stop(&self.snap),
+            homed: self.snap.homed || self.teleport_pending.is_some(),
             simulator: self.simulator,
         };
         check_gate(tag, &ctx)
@@ -1706,8 +1732,10 @@ impl<R: RtCommands> Core<R> {
         // A planned move is planned from the pose the arm is at when it
         // starts, so it waits out a brake: a stop decelerates along the old
         // path and a released jog or stream ramps down, and a plan taken
-        // mid-brake would start from where the arm no longer is.
-        if waits_for_rest(head.cmd.tag()) && self.arm_braking() {
+        // mid-brake would start from where the arm no longer is. A
+        // teleport still on its way to the RT is the same, more so.
+        if waits_for_rest(head.cmd.tag()) && (self.arm_braking() || self.teleport_pending.is_some())
+        {
             return;
         }
         if self.holding_for_blend() {
@@ -2197,8 +2225,11 @@ impl<R: RtCommands> Core<R> {
         if let Some(s) = self.runtime.snapshots.take() {
             self.snap = s;
             self.last_fresh = Some(Instant::now());
-            if self.snap.homed {
-                self.teleport_homed = false;
+            if self
+                .teleport_pending
+                .is_some_and(|sent_under| self.snap.placements != sent_under)
+            {
+                self.teleport_pending = None;
             }
         }
     }
@@ -2956,6 +2987,46 @@ impl<R: RtCommands> Core<R> {
                 applied_scale: self.snap.exec.applied_scale,
                 resume_scale: self.snap.exec.resume_scale,
             },
+            C::Contact => {
+                let c = &self.snap.contact;
+                let (reaction, sustained_nm, impact_nm) = match &self.contact_limits {
+                    Some(set) => (set.reaction, set.sustained_nm, set.impact_nm),
+                    None => (
+                        match c.reaction {
+                            par6_config::ContactReaction::Off => par6_proto::ContactReaction::Off,
+                            par6_config::ContactReaction::Warn => par6_proto::ContactReaction::Warn,
+                            par6_config::ContactReaction::Stop => par6_proto::ContactReaction::Stop,
+                        },
+                        c.sustained_nm,
+                        c.impact_nm,
+                    ),
+                };
+                QueryResult::Contact(par6_proto::ContactResult {
+                    reaction,
+                    sustained_nm,
+                    impact_nm,
+                    signal: c.signal,
+                    impact: c.impact,
+                    peak_signal: c.peak_signal,
+                    peak_impact: c.peak_impact,
+                    trips: c.trips,
+                    last_trip: c.last_trip.map(|t| {
+                        (
+                            t.joint,
+                            match t.channel {
+                                par6_rt::ContactChannel::Sustained => {
+                                    par6_proto::ContactChannel::Sustained
+                                }
+                                par6_rt::ContactChannel::Impact => {
+                                    par6_proto::ContactChannel::Impact
+                                }
+                            },
+                        )
+                    }),
+                    angles: self.angles_deg(),
+                    gravity_nm: self.snap.gravity_torque_nm,
+                })
+            }
             C::TcpTransform => QueryResult::TcpTransform {
                 values: tcp_transform_values(self.tcp_offset_mm, self.tcp_rotation_deg),
             },
@@ -3463,6 +3534,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::Pause => "pause",
         T::SetExecutionSpeed => "set_execution_speed",
         T::ExecutionSpeed => "execution_speed",
+        T::Contact => "contact",
         T::Stop => "stop",
         T::WriteIo => "write_io",
         T::Simulator => "simulator",
@@ -3480,6 +3552,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::SetCanId => "set_can_id",
         T::SaveConfig => "save_config",
         T::SetToolId => "set_tool_id",
+        T::SetContactLimits => "set_contact_limits",
         T::SetStatusRate => "set_status_rate",
         T::StatusRate => "status_rate",
         T::BusScan => "bus_scan",
