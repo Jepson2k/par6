@@ -80,9 +80,16 @@ pub struct TorqueObserver {
     dynamic: [f64; MAX_JOINTS],
     estimate: [f64; MAX_JOINTS],
     effort: [f64; MAX_JOINTS],
-    seeded: bool,
+    /// Updates still to pass before a balance is struck.
+    seeding: u8,
     inertial: bool,
 }
+
+/// Updates a fresh estimate waits out. The sample that arrives first was
+/// already on the bus when the estimate was started over, taken under the
+/// angles that have just stopped meaning anything; the second is the first
+/// one worth differencing against.
+const SEED_UPDATES: u8 = 2;
 
 impl TorqueObserver {
     /// From `[dynamics]`, at the robot's tick period.
@@ -101,7 +108,7 @@ impl TorqueObserver {
             dynamic: [0.0; MAX_JOINTS],
             estimate: [0.0; MAX_JOINTS],
             effort: [0.0; MAX_JOINTS],
-            seeded: false,
+            seeding: SEED_UPDATES,
             inertial: false,
         }
     }
@@ -109,8 +116,8 @@ impl TorqueObserver {
     /// One tick: fold this tick's measurement into the estimate.
     ///
     /// `g` is the gravity torque the tick already computed at `q`, with
-    /// whatever correction the runtime applies to it. The first call only
-    /// takes `qd` as the velocity to difference against.
+    /// whatever correction the runtime applies to it. The first calls
+    /// after a start only take the sample to difference against.
     pub fn update(
         &mut self,
         model: &mut dyn GravityModel,
@@ -119,10 +126,10 @@ impl TorqueObserver {
         tau: &[f64; MAX_JOINTS],
         g: &[f64; MAX_JOINTS],
     ) {
-        if !self.seeded {
+        if self.seeding > 0 {
             self.qd_prev = *qd;
             self.tau_prev = *tau;
-            self.seeded = true;
+            self.seeding -= 1;
             return;
         }
         // The balance is struck over the tick that just ended: the
@@ -148,7 +155,7 @@ impl TorqueObserver {
         self.tau_prev = *tau;
     }
 
-    /// Start over: the next update only takes its velocity reference.
+    /// Start over: the next updates only take their reference sample.
     /// For when the angles the model is evaluated at stop meaning what
     /// they did — a reference latched, a simulated arm placed somewhere
     /// else. What the estimate had settled to described the old angles,
@@ -157,7 +164,7 @@ impl TorqueObserver {
     pub fn reset(&mut self) {
         self.estimate = [0.0; MAX_JOINTS];
         self.effort = [0.0; MAX_JOINTS];
-        self.seeded = false;
+        self.seeding = SEED_UPDATES;
     }
 
     /// The external-torque estimate \[Nm\], measured minus model.

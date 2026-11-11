@@ -176,3 +176,37 @@ fn a_push_on_a_floating_arm_is_read_back() {
         "a {push:+.2} Nm push on the floating base read as {read:+.3} Nm"
     );
 }
+
+/// Placing the arm somewhere else changes what every angle means, and the
+/// torque sample already on its way was taken under the old ones. Read
+/// against the new pose it is a torque nothing applied — as much as the
+/// two poses' gravity differs — so it must not reach the estimate, held or
+/// floating, at either tick.
+#[test]
+fn landing_somewhere_else_leaves_nothing_in_the_estimate() {
+    let low = [-40.0_f64, -20.0, 235.0, 0.0, 15.0, 180.0].map(f64::to_radians);
+    for dt in [0.004, 0.02] {
+        for held in [false, true] {
+            let mut rig = SimRig::boot(dt, reach());
+            if held {
+                rig.hold();
+            }
+            let friction = coulomb(&rig);
+            rig.land(low);
+            let mut worst = [0.0_f64; MAX_JOINTS];
+            for _ in 0..rig.ticks(0.3) {
+                let s = if held { rig.stream(low) } else { rig.tick() };
+                for (worst, read) in worst.iter_mut().zip(s.tau_ext) {
+                    *worst = worst.max(read.abs());
+                }
+            }
+            for j in 0..MAX_JOINTS {
+                assert!(
+                    worst[j] <= 1.5 * friction[j] + 0.1,
+                    "dt {dt}, held {held}: J{j} read {:.3} Nm after the landing",
+                    worst[j]
+                );
+            }
+        }
+    }
+}

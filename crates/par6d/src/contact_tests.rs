@@ -131,50 +131,53 @@ fn a_moving_arm_stops_for_what_it_runs_into_backs_off_and_holds() {
 }
 
 /// Every joint, flat out, there and back with nothing in the way: no
-/// stop, and the peaks the run leaves behind sit under the thresholds the
-/// arm ships with.
+/// stop, and the peaks the run leaves behind are under half the thresholds
+/// the arm ships with — at the shipped tick, and at the coarse one the
+/// daemon's own test rigs run at.
 #[test]
 fn nothing_in_the_way_is_never_a_contact() {
     let from = reach();
     let to = [50.0_f64, -95.0, 250.0, 60.0, -30.0, 250.0].map(f64::to_radians);
-    let mut rig = SimRig::boot(0.004, from);
-    assert_eq!(
-        rig.bundle.robot.contact.reaction,
-        ContactReaction::Stop,
-        "the shipped arm stops for a contact"
-    );
-    rig.hold();
-    let mut last = rig.tick();
-    for target in [to, from, to, from] {
-        for _ in 0..rig.ticks(3.0) {
-            last = rig.stream(target);
+    for dt in [0.004, 0.02] {
+        let mut rig = SimRig::boot(dt, from);
+        assert_eq!(
+            rig.bundle.robot.contact.reaction,
+            ContactReaction::Stop,
+            "the shipped arm stops for a contact"
+        );
+        let at = rig.hold();
+        let mut last = rig.stream(at);
+        for target in [to, from, to, from] {
+            for _ in 0..rig.ticks(3.0) {
+                last = rig.stream(target);
+                assert!(
+                    !last.protective_active && last.mode == Mode::Stream,
+                    "dt {dt}: a free move stopped: {:?}",
+                    last.errors.as_slice()
+                );
+            }
+        }
+        let c = last.contact;
+        assert_eq!(c.trips, 0);
+        for j in 0..MAX_JOINTS {
             assert!(
-                !last.protective_active && last.mode == Mode::Stream,
-                "a free move stopped: {:?}",
-                last.errors.as_slice()
+                c.peak_signal[j] > 0.0,
+                "dt {dt}, J{j}: the run was watched (peak {:.4} Nm)",
+                c.peak_signal[j]
+            );
+            assert!(
+                c.peak_signal[j] < 0.5 * c.sustained_nm[j],
+                "dt {dt}, J{j}: free motion peaked at {:.3} Nm against a {:.3} Nm threshold",
+                c.peak_signal[j],
+                c.sustained_nm[j]
+            );
+            assert!(
+                c.peak_impact[j] < 0.5 * c.impact_nm[j],
+                "dt {dt}, J{j}: free motion bumped {:.3} Nm against a {:.3} Nm threshold",
+                c.peak_impact[j],
+                c.impact_nm[j]
             );
         }
-    }
-    let c = last.contact;
-    assert_eq!(c.trips, 0);
-    for j in 0..MAX_JOINTS {
-        assert!(
-            c.peak_signal[j] > 0.0,
-            "J{j}: the run was watched (peak {:.4} Nm)",
-            c.peak_signal[j]
-        );
-        assert!(
-            c.peak_signal[j] < 0.75 * c.sustained_nm[j],
-            "J{j}: free motion peaked at {:.3} Nm against a {:.3} Nm threshold",
-            c.peak_signal[j],
-            c.sustained_nm[j]
-        );
-        assert!(
-            c.peak_impact[j] < 0.75 * c.impact_nm[j],
-            "J{j}: free motion bumped {:.3} Nm against a {:.3} Nm threshold",
-            c.peak_impact[j],
-            c.impact_nm[j]
-        );
     }
 }
 
