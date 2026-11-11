@@ -300,3 +300,95 @@ fn a_jog_streams_rows_and_owns_its_ramp_down() {
         );
     }
 }
+
+/// A joint move is timed against joint limits, and out at reach that
+/// carries the tool several times faster than any cartesian move may. The
+/// plan is the same path slowed until the tool stays under `[limits]
+/// tcp_speed_max_m_s`, a run of it follows that plan without tripping the
+/// ceiling it was planned to, and with the ceiling off the same move is
+/// the fast one it was.
+#[test]
+fn a_fast_joint_move_is_slowed_until_its_tool_is_under_the_speed_ceiling() {
+    let reach = [0.0_f64, -60.0, 220.0, 0.0, 30.0, 180.0];
+    let mut swung = reach;
+    swung[0] = 90.0;
+    let fastest = |batch: &TickBatch| {
+        (1..batch.rows)
+            .map(|r| {
+                let (a, b) = (&batch.tcp[(r - 1) * 6..], &batch.tcp[r * 6..]);
+                let d: f64 = (0..3).map(|k| f64::from(b[k] - a[k]).powi(2)).sum();
+                d.sqrt() / batch.row_dt_s
+            })
+            .fold(0.0, f64::max)
+    };
+    let planned = |ceiling: f64| {
+        let config = common::retimed_config(&format!("tool-speed-{ceiling}"), 0.02);
+        let text = std::fs::read_to_string(&config).expect("read config");
+        let patched = text.replace(
+            "tcp_speed_max_m_s = 0.25",
+            &format!("tcp_speed_max_m_s = {ceiling}"),
+        );
+        assert!(
+            ceiling == 0.25 || patched != text,
+            "tcp_speed_max_m_s patch point must exist"
+        );
+        std::fs::write(&config, patched).expect("write config");
+        let mut session =
+            Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
+        session.teleport_rad(reach.map(f64::to_radians));
+        session.begin_program();
+        let cmd = Command::MoveJ(MoveJ {
+            key: 1,
+            angles: swung,
+            duration: None,
+            speed: Some(1.0),
+            accel: None,
+            blend_radius: None,
+            rel: false,
+        });
+        let result = session.submit(cmd.clone());
+        assert!(result.error.is_none(), "the swing was refused: {result:?}");
+        let plan = session.plan_record(None);
+        assert_eq!(plan.stop, StopReason::Completed);
+        let run = session
+            .run(&[cmd], RunLimits::default())
+            .expect("the run completes");
+        (plan, run)
+    };
+
+    let (free, _) = planned(0.0);
+    let (held, run) = planned(0.25);
+    let (free_peak, held_peak) = (fastest(&free), fastest(&held));
+    assert!(
+        free_peak > 0.5,
+        "with no ceiling this swing is a fast one: {free_peak:.3} m/s"
+    );
+    assert!(
+        held_peak <= 0.25 * 1.02 && held_peak > 0.25 * 0.9,
+        "the plan must be slowed to its ceiling, no further: {held_peak:.3} m/s"
+    );
+    let stretch = held.rows as f64 / free.rows as f64;
+    assert!(
+        (stretch - free_peak / 0.25).abs() < 0.15 * stretch,
+        "the whole plan is slowed by the one factor its fastest instant needs: \
+         {} rows became {}, for {free_peak:.3} m/s over a 0.25 m/s ceiling",
+        free.rows,
+        held.rows
+    );
+    assert_eq!(
+        last_row(&held, 0),
+        last_row(&free, 0),
+        "slower, and to the same place"
+    );
+
+    assert!(
+        run.commands.iter().all(|c| c.error.is_none()) && run.stop == StopReason::Completed,
+        "the arm following the slowed plan must not trip its own ceiling: {:?}",
+        run.commands
+    );
+    let ran = fastest(&run);
+    assert!(
+        ran < 0.25 * 1.2,
+        "the run's tool reached {ran:.3} m/s under a 0.25 m/s ceiling"
+    );
+}

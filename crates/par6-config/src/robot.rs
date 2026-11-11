@@ -953,6 +953,16 @@ pub struct LimitsSection {
     /// How long a joint must stay beyond the margin before the fault
     /// latches \[s\] — rides out measurement transients and filter lag.
     pub tau_ext_window_s: f64,
+    /// Ceiling on the tool's linear speed \[m/s\], whatever is driving the
+    /// arm. Planned moves are stretched in time to stay under it, jogs and
+    /// streamed joint targets are slowed to it, and an arm measured more
+    /// than a fifth over it for `tcp_speed_window_s` stops itself. 0
+    /// disables it. It does not apply to a floating arm, which a hand is
+    /// moving.
+    pub tcp_speed_max_m_s: f64,
+    /// How long the measured tool speed must stay over the ceiling's
+    /// margin before the arm stops \[s\].
+    pub tcp_speed_window_s: f64,
 }
 
 impl Default for LimitsSection {
@@ -960,6 +970,8 @@ impl Default for LimitsSection {
         Self {
             tau_ext_margin_nm: 0.0,
             tau_ext_window_s: 0.1,
+            tcp_speed_max_m_s: 0.25,
+            tcp_speed_window_s: 0.1,
         }
     }
 }
@@ -1844,6 +1856,24 @@ impl RobotConfig {
         }
         if !is_positive(l.tau_ext_window_s) || !l.tau_ext_window_s.is_finite() {
             return Err(invalid("limits.tau_ext_window_s", "must be > 0"));
+        }
+        if l.tcp_speed_max_m_s < 0.0 || !l.tcp_speed_max_m_s.is_finite() {
+            return Err(invalid(
+                "limits.tcp_speed_max_m_s",
+                "must be >= 0 (0 disables the ceiling)",
+            ));
+        }
+        if !is_positive(l.tcp_speed_window_s) || !l.tcp_speed_window_s.is_finite() {
+            return Err(invalid("limits.tcp_speed_window_s", "must be > 0"));
+        }
+        // Planned moves are slowed to the ceiling whatever they asked for;
+        // a cartesian stream runs at its own, so the two have to agree.
+        if l.tcp_speed_max_m_s > 0.0 && self.motion.jog_l_linear_max_m_s > l.tcp_speed_max_m_s {
+            return Err(invalid(
+                "limits.tcp_speed_max_m_s",
+                "is below motion.jog_l_linear_max_m_s, which cartesian jogs and servos run \
+                 up to: lower that as well",
+            ));
         }
         Ok(())
     }

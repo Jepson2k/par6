@@ -106,6 +106,11 @@ wire_enum! {
         /// stopped where it was and holds, enabled and referenced,
         /// refusing motion until `Reset`.
         SysFreedriveCatch = 66,
+        /// The tool was measured over `[limits] tcp_speed_max_m_s` on a
+        /// driven arm. Protective stop: the arm was stopped where it was
+        /// and holds, enabled and referenced, refusing motion until
+        /// `Reset`.
+        SysSpeedLimit = 67,
     }
 }
 
@@ -116,7 +121,10 @@ impl ErrorCode {
     /// apart from a failed command's error — which also stands on an
     /// enabled controller, and needs no reset — by this.
     pub const fn is_protective(self) -> bool {
-        matches!(self, ErrorCode::SysContact | ErrorCode::SysFreedriveCatch)
+        matches!(
+            self,
+            ErrorCode::SysContact | ErrorCode::SysFreedriveCatch | ErrorCode::SysSpeedLimit
+        )
     }
 }
 
@@ -404,6 +412,14 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
                      refused; controller stays ENABLED.",
             remedy: "Check the declared payload and tool, then send reset and ask for \
                      freedrive again.",
+        },
+        E::SysSpeedLimit => ErrorTemplate {
+            title: "Tool speed limit exceeded",
+            cause: "The tool was measured moving faster than the configured speed ceiling.",
+            effect: "The arm was stopped where it was and holds; motion is refused; \
+                     controller stays ENABLED.",
+            remedy: "Send reset. Slow the stream that drove it, or raise \
+                     [limits] tcp_speed_max_m_s if the ceiling is wrong for this cell.",
         },
         E::MotnHomingFailed => ErrorTemplate {
             title: "Homing failed",

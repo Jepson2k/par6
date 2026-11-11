@@ -116,6 +116,9 @@ pub enum ErrorCode {
     /// Per-joint: a floating arm moved faster than a hand moves it and
     /// was stopped and held (protective latch).
     FreedriveCatch,
+    /// The tool was measured over its speed ceiling on a driven arm and
+    /// the arm was stopped and held (protective latch).
+    SpeedLimit,
 }
 
 impl ErrorCode {
@@ -138,7 +141,10 @@ impl ErrorCode {
     /// not a fault: it stays enabled and referenced, and nothing on the
     /// drives needs clearing.
     pub fn is_protective(self) -> bool {
-        matches!(self, ErrorCode::Contact | ErrorCode::FreedriveCatch)
+        matches!(
+            self,
+            ErrorCode::Contact | ErrorCode::FreedriveCatch | ErrorCode::SpeedLimit
+        )
     }
 
     /// Hard errors disable the arm and set `error_active`.

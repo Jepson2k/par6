@@ -240,6 +240,11 @@ pub fn held_jog_travel(
 /// settling on a held target and the projection would be noise.
 const STREAM_MOVING_RAD_S: f64 = 0.01;
 
+/// How far a joint has to be from a servo target \[rad\] before it counts
+/// as having somewhere to go, for the purpose of bounding the tool's speed
+/// on the way: under it the joint is where it was sent.
+const STREAM_ARRIVED_RAD: f64 = 1e-3;
+
 // The speed a placement's hold is dropped at is what sets the standoff's
 // error budget: IDLE only damps, so whatever the arm still carries it
 // coasts. [`STREAM_MOVING_RAD_S`] answers a different question — has
@@ -1745,7 +1750,43 @@ pub(crate) struct CartStream {
     pub(crate) snapshots: SnapshotReader<StateSnapshot>,
     pub(crate) soft_min: [f64; MAX_JOINTS],
     pub(crate) soft_max: [f64; MAX_JOINTS],
+    /// Per-joint JOG velocity limits \[rad/s\]: what a jog fraction of ±1
+    /// commands.
+    pub(crate) jog_vel: [f64; MAX_JOINTS],
+    /// Per-joint STREAM velocity limits \[rad/s\]: what a servo at full
+    /// speed fraction tracks its target at.
+    pub(crate) stream_vel: [f64; MAX_JOINTS],
     pub(crate) gate: Arc<Mutex<StreamGate>>,
+}
+
+/// What `[limits] tcp_speed_max_m_s` leaves of the joint velocity `qd`
+/// \[rad/s\] at the pose `q`: the fraction to slow it to, 1 when the tool
+/// stays under the ceiling anyway or there is none.
+///
+/// In twentieths, rounded down: the geometry under a held control changes
+/// all the time, and a fraction that followed it exactly would turn every
+/// datagram of a steady jog into a new command.
+fn tool_speed_fraction(
+    kin: &mut crate::kin::CartKin,
+    ceiling_m_s: f64,
+    q: &[f64; MAX_JOINTS],
+    qd: &[f64; MAX_JOINTS],
+) -> f64 {
+    if ceiling_m_s <= 0.0 {
+        return 1.0;
+    }
+    let (mut at, mut rate) = ([0.0; NQ], [0.0; NQ]);
+    at.copy_from_slice(&q[..NQ]);
+    rate.copy_from_slice(&qd[..NQ]);
+    match kin.tool_speed(&at, &rate) {
+        Ok(speed) if speed > ceiling_m_s => ((ceiling_m_s / speed) * 20.0).floor().max(1.0) / 20.0,
+        Ok(_) => 1.0,
+        Err(e) => {
+            // The RT measures the tool against the same ceiling.
+            log::warn!("tool speed not bounded for this setpoint: {e}");
+            1.0
+        }
+    }
 }
 
 /// The `RtCommands` implementation `par6d` hands to the server.
@@ -1930,6 +1971,19 @@ impl RtCommands for RtBridge {
                     *out = *v;
                 }
                 let moving = speeds.iter().any(|v| *v != 0.0);
+                if moving {
+                    let q = self.cart.snapshots.latest().q;
+                    let qd = std::array::from_fn(|j| speeds[j] * self.cart.jog_vel[j]);
+                    let keep = tool_speed_fraction(
+                        &mut self.cart.kin,
+                        self.bundle.robot.limits.tcp_speed_max_m_s,
+                        &q,
+                        &qd,
+                    );
+                    for speed in speeds.iter_mut() {
+                        *speed *= keep;
+                    }
+                }
                 let mut sh = self.shared.lock().unwrap();
                 // Admission gate: where this jog comes to rest if it is
                 // released at once must not collide (or, from inside a
@@ -2139,7 +2193,28 @@ impl RtCommands for RtBridge {
                 // rig at anywhere from 2.7 mm to 24 mm from a keep-out
                 // whose standoff is 5 mm. Instead the arm is stopped and
                 // then placed ON the standoff; housekeeping runs that.
-                let scale = (p.speed.unwrap_or(1.0), p.accel.unwrap_or(1.0));
+                // Every joint with somewhere to go heads there at its
+                // stream limit, so that is the velocity the tool is held
+                // to the ceiling under.
+                let scale = {
+                    let speed = p.speed.unwrap_or(1.0);
+                    let q = self.cart.snapshots.latest().q;
+                    let toward = std::array::from_fn(|j| {
+                        let to_go = target[j] - q[j];
+                        if to_go.abs() > STREAM_ARRIVED_RAD {
+                            to_go.signum() * speed * self.cart.stream_vel[j]
+                        } else {
+                            0.0
+                        }
+                    });
+                    let keep = tool_speed_fraction(
+                        &mut self.cart.kin,
+                        self.bundle.robot.limits.tcp_speed_max_m_s,
+                        &q,
+                        &toward,
+                    );
+                    (speed * keep, p.accel.unwrap_or(1.0))
+                };
                 let (refusal, world_epoch) = {
                     let snap = self.cart.snapshots.latest();
                     let mut gate = self.cart.gate.lock().unwrap();

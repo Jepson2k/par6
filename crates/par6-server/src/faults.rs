@@ -124,6 +124,7 @@ pub fn rt_protective_stop(snap: &StateSnapshot) -> Option<ProtectiveStop> {
         let code = match e.code {
             RtCode::Contact => ErrorCode::SysContact,
             RtCode::FreedriveCatch => ErrorCode::SysFreedriveCatch,
+            RtCode::SpeedLimit => ErrorCode::SysSpeedLimit,
             _ => return None,
         };
         Some(ProtectiveStop {

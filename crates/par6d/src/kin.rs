@@ -504,6 +504,22 @@ impl CartKin {
         Ok(pose)
     }
 
+    /// How fast the offset TCP moves \[m/s\] while the joints move at
+    /// `qd` \[rad/s\] through `q`: a short step along `qd`, read off the
+    /// FK everything else reports the tool with, so the commanded offset
+    /// is in it.
+    pub(crate) fn tool_speed(&mut self, q: &[f64; NQ], qd: &[f64; NQ]) -> Result<f64, String> {
+        const STEP_S: f64 = 1e-3;
+        let here = self.fk(q)?;
+        let ahead: [f64; NQ] = std::array::from_fn(|j| q[j] + qd[j] * STEP_S);
+        let there = self.fk(&ahead)?;
+        let travelled: f64 = [3, 7, 11]
+            .iter()
+            .map(|k| (there[*k] - here[*k]).powi(2))
+            .sum();
+        Ok(travelled.sqrt() / STEP_S)
+    }
+
     /// Replace the runtime payload in this model (inertial only — FK,
     /// jacobian and the soft window are untouched). Wire-validated
     /// upstream.

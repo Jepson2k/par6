@@ -81,6 +81,12 @@ struct BootConfig {
 /// equality test there leaves STREAM open forever on an arm that has
 /// visibly stopped.
 const STREAM_REST_RAD_S: f64 = 1e-9;
+
+/// How far over `[limits] tcp_speed_max_m_s` the measured tool speed has
+/// to be before the arm stops for it. What plans and feeds motion aims at
+/// the ceiling itself; the margin is what tracking error and a measured
+/// speed's own noise are allowed on top.
+const TCP_SPEED_TRIP_MARGIN: f64 = 1.2;
 /// How far a joint may wander and still count as stopped for a released
 /// JOG or STREAM to hand over to IDLE \[rad\], and how long it must stay
 /// inside that band \[s\].
@@ -640,6 +646,14 @@ pub struct RtCore<B: DriverBus> {
     tau_env_over: [u32; MAX_JOINTS],
     contact: ContactDetector,
     freedrive: Freedrive,
+    /// `[limits] tcp_speed_max_m_s` with its trip margin on, 0 = off.
+    tcp_speed_trip_m_s: f64,
+    tcp_speed_window_ticks: u32,
+    tcp_speed_over: u32,
+    /// Where the tool was measured last tick, NaN when that is no longer
+    /// a pose to difference against.
+    tcp_last: [f64; 3],
+    tcp_scratch: [f64; 6],
     /// The measured poses of the last `[contact] retreat_s`, oldest
     /// overwritten: where a stopped arm retreats to is somewhere it has
     /// just been. Empty when the config asks for no retreat.
@@ -919,6 +933,11 @@ impl<B: DriverBus> RtCore<B> {
             tau_env_over: [0; MAX_JOINTS],
             contact: ContactDetector::new(robot),
             freedrive: Freedrive::new(robot),
+            tcp_speed_trip_m_s: TCP_SPEED_TRIP_MARGIN * robot.limits.tcp_speed_max_m_s,
+            tcp_speed_window_ticks: robot.ticks(robot.limits.tcp_speed_window_s).max(1),
+            tcp_speed_over: 0,
+            tcp_last: [f64::NAN; 3],
+            tcp_scratch: [f64::NAN; 6],
             trail: vec![[0.0; MAX_JOINTS]; robot.ticks(robot.contact.retreat_s) as usize],
             trail_next: 0,
             trail_len: 0,
@@ -1177,6 +1196,7 @@ impl<B: DriverBus> RtCore<B> {
         self.tau_ext = [0.0; MAX_JOINTS];
         self.trail_len = 0;
         self.trail_next = 0;
+        self.tcp_last = [f64::NAN; 3];
     }
 
     /// Count a teleport as over, whether it landed or was refused: the
@@ -2589,6 +2609,8 @@ impl<B: DriverBus> RtCore<B> {
             self.freedrive.reset();
         }
 
+        self.check_tcp_speed();
+
         // Contact: a moving arm that reads one stops for it in this
         // tick and latches until the operator has dealt with it; a
         // resting one reports.
@@ -2750,6 +2772,47 @@ impl<B: DriverBus> RtCore<B> {
     /// there: an arm held short of its target is still pushing for it,
     /// and what is in its way is what it has to stop for. One settled on
     /// its target is resting, and a push on it is somebody else's.
+    /// The backstop behind the tool-speed ceiling. What plans and feeds
+    /// motion already keeps the tool under `[limits] tcp_speed_max_m_s`;
+    /// this measures it, and stops an arm found over the margin for the
+    /// window — a stream that was never slowed, a move that overshot.
+    fn check_tcp_speed(&mut self) {
+        let driven = self.homed
+            && self.state == ArmState::Enabled
+            && matches!(self.mode, Mode::Jog | Mode::Stream | Mode::Exec)
+            && self.reflex_deadline.is_none()
+            && !self.errors.any_protective();
+        if self.tcp_speed_trip_m_s <= 0.0 || !driven {
+            self.tcp_last = [f64::NAN; 3];
+            self.tcp_speed_over = 0;
+            return;
+        }
+        self.fk.tcp(&self.q, &mut self.tcp_scratch);
+        let at = [
+            self.tcp_scratch[0],
+            self.tcp_scratch[1],
+            self.tcp_scratch[2],
+        ];
+        let travelled = at
+            .iter()
+            .zip(&self.tcp_last)
+            .map(|(now, before)| (now - before) * (now - before))
+            .sum::<f64>()
+            .sqrt();
+        self.tcp_last = at;
+        // NaN — no pose last tick, or none now — is not a speed.
+        if travelled / self.dt > self.tcp_speed_trip_m_s {
+            self.tcp_speed_over = self.tcp_speed_over.saturating_add(1);
+        } else {
+            self.tcp_speed_over = 0;
+        }
+        if self.tcp_speed_over >= self.tcp_speed_window_ticks {
+            self.tcp_speed_over = 0;
+            self.errors.latch(ErrorCode::SpeedLimit, None);
+            self.begin_reflex(false);
+        }
+    }
+
     fn contact_watch(&self) -> ContactWatch {
         let readable = self.homed
             && self.state == ArmState::Enabled

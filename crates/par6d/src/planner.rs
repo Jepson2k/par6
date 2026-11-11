@@ -859,6 +859,7 @@ impl Par6Planner {
         samples: Vec<[f64; 3 * MAX_JOINTS]>,
         seen_exec: bool,
     ) -> Result<InFlightKind, WireError> {
+        let samples = self.within_tool_speed(&start_q, samples);
         par6_motion::gate::check_commanded_accel(
             samples.iter().map(|qqa| {
                 let mut qd = [0.0; MAX_JOINTS];
@@ -949,6 +950,42 @@ impl Par6Planner {
             cursor: 0,
             seen_exec,
         })
+    }
+
+    /// `samples` — a plan leaving `start_q` — slowed until the tool stays
+    /// under `[limits] tcp_speed_max_m_s`; untouched when it already does,
+    /// or when there is no ceiling. See [`crate::tool_speed`].
+    ///
+    /// A plan whose tool path cannot be read (the model refused a pose)
+    /// is passed through: the RT measures the tool against the same
+    /// ceiling as it moves.
+    fn within_tool_speed(
+        &mut self,
+        start_q: &[f64; MAX_JOINTS],
+        samples: Vec<[f64; 3 * MAX_JOINTS]>,
+    ) -> Vec<[f64; 3 * MAX_JOINTS]> {
+        let ceiling = self.bundle.robot.limits.tcp_speed_max_m_s;
+        if ceiling <= 0.0 || samples.is_empty() {
+            return samples;
+        }
+        let mut points = Vec::with_capacity(samples.len() + 1);
+        let poses = std::iter::once(&start_q[..]).chain(samples.iter().map(|s| &s[..MAX_JOINTS]));
+        for q in poses {
+            let mut at = [0.0; NQ];
+            at.copy_from_slice(&q[..NQ]);
+            match self.kin.fk(&at) {
+                Ok(pose) => points.push([pose[3], pose[7], pose[11]]),
+                Err(e) => {
+                    log::warn!("tool speed not checked for this plan: {e}");
+                    return samples;
+                }
+            }
+        }
+        let peak = crate::tool_speed::peak_speed(&points, self.dt);
+        if peak <= ceiling {
+            return samples;
+        }
+        crate::tool_speed::stretched(start_q, &samples, peak / ceiling, self.dt)
     }
 
     /// Plan a joint-space move from the measured pose in `snap` to
@@ -2812,6 +2849,7 @@ impl Planner for Par6Planner {
                     if let Ok(samples) =
                         self.joint_move_samples(&from, &target, p.duration, p.speed, p.accel)
                     {
+                        let samples = self.within_tool_speed(&from, samples);
                         total += samples.len() as f64 * self.dt;
                     }
                     from = target;

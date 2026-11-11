@@ -783,6 +783,14 @@ singularity_sigma_min = 0.0001     # ... or its smallest singular value drops un
 # constants and the model; calibrate before opting in.
 tau_ext_margin_nm = 0.0
 tau_ext_window_s = 0.1
+# Tool-speed ceiling [m/s], whatever is driving the arm. Planned moves are
+# stretched in time to stay under it - a joint move at reach otherwise
+# swings the tool several times faster than any cartesian move may - jogs
+# and streamed joint targets are slowed to it, and an arm measured a fifth
+# over it for the window stops itself and holds until reset. A floating arm
+# is a hand's to move and is not held to it. 0 disables.
+tcp_speed_max_m_s = 0.25
+tcp_speed_window_s = 0.1
 
 # ============================================= installation keep-outs (issue #19)
 # Standing collision restrictions of THIS installation — cage walls, the

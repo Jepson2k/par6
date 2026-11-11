@@ -45,6 +45,9 @@ mod planner;
 pub mod preview;
 #[cfg(test)]
 mod sim_rig;
+mod tool_speed;
+#[cfg(test)]
+mod tool_speed_tests;
 pub mod vitals;
 
 pub use bridge::{held_jog_travel, stream_stopping_travel};

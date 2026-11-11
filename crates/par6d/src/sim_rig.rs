@@ -20,13 +20,16 @@ pub(crate) struct SimRig {
 }
 
 impl SimRig {
-    /// Booted, enabled and referenced at `q` on the shipped config.
+    /// Booted, enabled and referenced at `q` on the shipped config, less
+    /// its tool-speed ceiling: the rig feeds the RT core directly,
+    /// underneath the planner and bridge that slow motion to the ceiling,
+    /// so its full-rate streams are not what the ceiling would let through.
     pub fn boot(dt: f64, q: [f64; MAX_JOINTS]) -> Self {
-        Self::boot_with(dt, q, |_| {})
+        Self::boot_with(dt, q, |robot| robot.limits.tcp_speed_max_m_s = 0.0)
     }
 
-    /// As [`boot`](Self::boot), on the shipped config after `tune` has
-    /// edited it.
+    /// As [`boot`](Self::boot), on the shipped config — ceiling included —
+    /// after `tune` has edited it.
     pub fn boot_with(dt: f64, q: [f64; MAX_JOINTS], tune: impl FnOnce(&mut RobotConfig)) -> Self {
         let path =
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");

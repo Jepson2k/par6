@@ -395,6 +395,8 @@ impl Daemon {
                 snapshots: bridge_snapshots,
                 soft_min: stream_limits.soft_min,
                 soft_max: stream_limits.soft_max,
+                jog_vel: jog_limits.velocity,
+                stream_vel: stream_limits.velocity,
                 gate: stream_gate.clone(),
             },
         );

@@ -723,6 +723,27 @@ makes it drift, toward the floor or the ceiling; the limits and the catch bound 
 far and how fast, and neither is a reason to float an arm over something it must not
 land on.
 
+### Tool-speed limit
+
+`[limits] tcp_speed_max_m_s` (shipped 0.25, 0 = off) is a ceiling on the tool's linear
+speed, whatever is driving the arm:
+
+| What moves the arm | How it is held to the ceiling |
+|---|---|
+| Planned moves (`move_j`, `move_l`, …, blends) | The plan is the same path played back slower: the whole of it by the one factor that brings its fastest instant down to the ceiling. A joint move at reach is where this bites — joint limits alone let the base swing the tool at several times any cartesian speed. The preview plans with the same planner, so it reports the same duration. |
+| `jog_j` | The requested speeds are scaled, at the pose the arm is in, until the tool is at the ceiling. |
+| `servo_j`, `servo_j_pose` | The stream's speed fraction is scaled the same way, taking every joint with somewhere to go at its stream limit. |
+| `jog_l`, `servo_l` | Already limited in cartesian space by `[motion] jog_l_linear_max_m_s`, which the config refuses to load above the ceiling. |
+| Anything, measured | The RT measures the tool every tick. More than a fifth over the ceiling for `tcp_speed_window_s` and the arm stops where it is and holds under `SysSpeedLimit`, a protective stop: `reset()`. This is the backstop — nothing above should ever reach it. |
+
+A floating arm is a hand's to move and is not held to the ceiling; its own
+[catch](#freedrive) is what bounds it.
+
+Force is bounded where it always was: by each drive's own `ilim_ma`, enforced in the
+drive. The ceiling bounds the energy behind a contact, and
+[contact detection](#contact-stop) how long it lasts; neither replaces choosing
+current limits for the work the arm shares.
+
 ## The Pinocchio shim
 
 `cpp/` is one C-ABI shim over the C++ dependencies the Rust crates link:
