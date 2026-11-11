@@ -98,6 +98,7 @@ class ErrorCode(IntEnum):
     SYS_CONTACT = 65
     SYS_FREEDRIVE_CATCH = 66
     SYS_SPEED_LIMIT = 67
+    SYS_KEEP_OUT = 68
 
 class Frame(IntEnum):
     """Reference frame a Cartesian target is expressed in."""

@@ -658,12 +658,7 @@ pub fn plan_swings(
             }
         }
         if !found {
-            return Err(format!(
-                "joint {} has no room to swing {:.0} degrees either way from here — move the \
-                 arm somewhere with room around it, or narrow the spread",
-                j + 1,
-                spread.to_degrees()
-            ));
+            return Err(no_room(j, spread));
         }
     }
     if clear(&together)? {
@@ -706,6 +701,50 @@ async fn set_contact(
     }
 }
 
+/// Out to `q` and back to `start`. `false` when the runtime would not plan
+/// the way out: it enforces keep-outs and a clearance the planning on this
+/// side has not been told, and a move it refuses that way never starts.
+async fn swing(
+    client: &Client,
+    q: &[f64; NQ],
+    start: &[f64; NQ],
+    protocol: &Protocol,
+) -> Result<bool, String> {
+    let collides = |e: &par6_client::ClientError| {
+        matches!(e, par6_client::ClientError::Robot(wire)
+            if wire.code == par6_proto::ErrorCode::SysSelfCollision as u16)
+    };
+    let index = match client
+        .move_j(to_deg(q), None, Some(protocol.speed), None, None, false)
+        .await
+    {
+        Ok(Some(index)) => index,
+        Ok(None) => return Err("move_j went unconfirmed".into()),
+        Err(e) if collides(&e) => return Ok(false),
+        Err(e) => return Err(format!("move_j: {e}")),
+    };
+    match client.wait_command(index, protocol.pose_timeout).await {
+        Ok(true) => {}
+        Err(e) if collides(&e) => return Ok(false),
+        Ok(false) => {
+            let late = Err(format!("move_j {index} did not complete in time"));
+            return stopped(client, late).await;
+        }
+        Err(e) => return stopped(client, Err(format!("move_j {index}: {e}"))).await,
+    }
+    move_to(client, start, protocol).await?;
+    Ok(true)
+}
+
+fn no_room(joint: usize, spread: f64) -> String {
+    format!(
+        "joint {} has no room to swing {:.0} degrees either way from here — move the arm \
+         somewhere with room around it, or narrow the spread",
+        joint + 1,
+        spread.to_degrees()
+    )
+}
+
 /// Fit the contact thresholds to this arm: swing every joint with nothing
 /// in the way, read what its own motion puts on the contact signal, and
 /// set each threshold a margin above that.
@@ -738,7 +777,7 @@ pub async fn contact(
         .map_err(|e| format!("contact: {e}"))?;
     let angles = client.angles().await.map_err(|e| format!("angles: {e}"))?;
     let start: [f64; NQ] = std::array::from_fn(|j| angles[j].to_radians());
-    let swings = plan_swings(&mut model.collision, &start, &model.window, protocol.spread)?;
+    let planned = plan_swings(&mut model.collision, &start, &model.window, protocol.spread)?;
 
     // Setting the limits starts the peaks over, so what is read back
     // after the swings is the swings' own.
@@ -755,16 +794,39 @@ pub async fn contact(
         ..Protocol::default()
     };
     let run = async {
-        for (i, q) in swing_order(&start, &swings).iter().enumerate() {
-            if i % 2 == 0 {
-                log::info!("swing {}/{}", i / 2 + 1, swings.len());
+        let mut swings = 0;
+        let mut together = start;
+        for j in 0..NQ {
+            let mut swung = false;
+            let alone = planned
+                .iter()
+                .filter(|q| (0..NQ).all(|k| (q[k] != start[k]) == (k == j)));
+            for q in alone {
+                if swing(client, q, &start, &moves).await? {
+                    if !swung {
+                        together[j] = q[j];
+                    }
+                    swung = true;
+                    swings += 1;
+                    log::info!("swing {swings}: joint {}", j + 1);
+                }
             }
-            move_to(client, q, &moves).await?;
+            if !swung {
+                return Err(no_room(j, protocol.spread));
+            }
         }
-        client.contact().await.map_err(|e| format!("contact: {e}"))
+        if swing(client, &together, &start, &moves).await? {
+            swings += 1;
+            log::info!("swing {swings}: every joint");
+        }
+        let after = client
+            .contact()
+            .await
+            .map_err(|e| format!("contact: {e}"))?;
+        Ok((after, swings))
     };
     let measured = run.await;
-    let fitted = measured.as_ref().ok().map(|after| {
+    let fitted = measured.as_ref().ok().map(|(after, _)| {
         (
             thresholds_from(&after.peak_signal, protocol.margin),
             thresholds_from(&after.peak_impact, protocol.margin),
@@ -784,8 +846,8 @@ pub async fn contact(
             .await
         }
     };
-    let after = match (measured, restored) {
-        (Ok(after), Ok(())) => after,
+    let (after, swings) = match (measured, restored) {
+        (Ok(run), Ok(())) => run,
         (Err(e), Ok(())) => return Err(e),
         (Ok(_), Err(restore)) => return Err(restore),
         (Err(e), Err(restore)) => {
@@ -799,7 +861,7 @@ pub async fn contact(
         peak_impact: after.peak_impact,
         sustained_nm,
         impact_nm,
-        swings: swings.len(),
+        swings,
         applied: apply,
     })
 }

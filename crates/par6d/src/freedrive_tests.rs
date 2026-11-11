@@ -301,7 +301,9 @@ fn a_floating_arm_guided_into_a_keep_out_backs_out_the_way_it_came_and_is_held()
     let (caught, pairs) = guide_until_caught(&mut rig, &mut gate, &mut guard, 0.8, 8.0)
         .expect("a push toward the post must carry the arm into its clearance");
     assert!(
-        pairs.iter().any(|(a, b)| a == "shape:post" || b == "shape:post"),
+        pairs
+            .iter()
+            .any(|(a, b)| a == "shape:post" || b == "shape:post"),
         "the keep-out it entered is the one named: {pairs:?}"
     );
     assert!(

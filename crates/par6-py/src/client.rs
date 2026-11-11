@@ -647,7 +647,10 @@ impl CoreClient {
                 .map_err(PyRuntimeError::new_err)?;
             Python::with_gil(|py| {
                 let d = PyDict::new(py);
-                d.set_item("reaction", crate::convert::contact_reaction_name(report.reaction))?;
+                d.set_item(
+                    "reaction",
+                    crate::convert::contact_reaction_name(report.reaction),
+                )?;
                 d.set_item("peak_signal", report.peak_signal.to_vec())?;
                 d.set_item("peak_impact", report.peak_impact.to_vec())?;
                 d.set_item("sustained_nm", report.sustained_nm.to_vec())?;

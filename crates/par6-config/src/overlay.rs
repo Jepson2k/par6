@@ -534,7 +534,10 @@ mod tests {
         let untouched = crate::ConfigBundle::load_with(&shipped, None, None)
             .unwrap()
             .robot;
-        assert_eq!(robot.contact.impact_window_s, untouched.contact.impact_window_s);
+        assert_eq!(
+            robot.contact.impact_window_s,
+            untouched.contact.impact_window_s
+        );
 
         // An arm with no overlay yet gets one holding the table alone.
         let fresh =
@@ -544,7 +547,10 @@ mod tests {
             .unwrap()
             .robot;
         assert_eq!(robot.contact.sustained_nm, sustained);
-        assert_eq!(robot.limits.tcp_speed_max_m_s, untouched.limits.tcp_speed_max_m_s);
+        assert_eq!(
+            robot.limits.tcp_speed_max_m_s,
+            untouched.limits.tcp_speed_max_m_s
+        );
         let _ = std::fs::remove_dir_all(&dir);
 
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
@@ -556,13 +562,21 @@ mod tests {
             );
         }
         assert!(
-            overlay_with_contact("[contact", crate::ContactReaction::Stop, &sustained, &impact)
-                .is_err(),
+            overlay_with_contact(
+                "[contact",
+                crate::ContactReaction::Stop,
+                &sustained,
+                &impact
+            )
+            .is_err(),
             "a file that is not TOML must be refused, not overwritten"
         );
-        assert!(
-            overlay_with_contact("contact = 3\n", crate::ContactReaction::Stop, &sustained, &impact)
-                .is_err()
-        );
+        assert!(overlay_with_contact(
+            "contact = 3\n",
+            crate::ContactReaction::Stop,
+            &sustained,
+            &impact
+        )
+        .is_err());
     }
 }

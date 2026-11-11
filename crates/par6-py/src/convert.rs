@@ -341,10 +341,7 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("resume_scale", *resume_scale)?;
         }
         QueryResult::Contact(c) => {
-            d.set_item(
-                "reaction",
-contact_reaction_name(c.reaction),
-            )?;
+            d.set_item("reaction", contact_reaction_name(c.reaction))?;
             d.set_item("sustained_nm", c.sustained_nm.to_vec())?;
             d.set_item("impact_nm", c.impact_nm.to_vec())?;
             d.set_item("signal", c.signal.to_vec())?;

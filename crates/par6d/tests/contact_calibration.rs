@@ -146,7 +146,11 @@ fn fitted_thresholds_pass_the_arms_own_motion_and_still_stop_for_a_post() {
             "the thresholds are this arm's now, not the reference arm's"
         );
         let fitted = client.contact().await.expect("contact reads");
-        assert_eq!(fitted.reaction, ContactReaction::Stop, "the reaction is back");
+        assert_eq!(
+            fitted.reaction,
+            ContactReaction::Stop,
+            "the reaction is back"
+        );
         assert_eq!(fitted.sustained_nm, report.sustained_nm);
         assert_eq!(fitted.impact_nm, report.impact_nm);
         let ended = client.angles().await.expect("angles");
@@ -189,12 +193,12 @@ fn fitted_thresholds_pass_the_arms_own_motion_and_still_stop_for_a_post() {
         .expect("the daemon's threads exit cleanly");
 }
 
-/// A swing the runtime refuses part-way through — here into a keep-out
-/// the program declared, which the calibration's own model has not heard
-/// of — ends the run with the session's reaction and thresholds as they
-/// were, not left reporting-only.
+/// Keep-outs the program declared stand either side of the arm, and the
+/// calibration's own model has not heard of them: the runtime refuses the
+/// base both ways, the run ends naming the joint, and the session's
+/// reaction and thresholds are as they were — not left reporting-only.
 #[test]
-fn a_calibration_that_fails_part_way_puts_the_contact_settings_back() {
+fn a_calibration_the_runtime_leaves_no_swing_for_puts_the_contact_settings_back() {
     let _one = ONE_DAEMON.lock().unwrap_or_else(|e| e.into_inner());
     let config = common::retimed_config("contact-calibration-restore", 0.004);
     let model_config = config.clone();
@@ -205,22 +209,23 @@ fn a_calibration_that_fails_part_way_puts_the_contact_settings_back() {
 
     rt.block_on(async {
         let client = connect(cmd, status_port).await;
-        stand_at_reach(&client).await;
+        let reach = stand_at_reach(&client).await;
         let before = client.contact().await.expect("contact reads");
         assert_eq!(before.reaction, ContactReaction::Stop);
+        let post = |name: &str, y: f64| par6_proto::Shape {
+            kind: "box".into(),
+            params: vec![0.06, 0.06, 0.4],
+            pose: vec![0.3204, y, 0.2, 0.0, 0.0, 0.0],
+            collision: true,
+            margin: None,
+            name: name.into(),
+            physics: None,
+            attachment: None,
+        };
         client
-            .set_shapes(vec![par6_proto::Shape {
-                kind: "box".into(),
-                params: vec![0.06, 0.06, 0.4],
-                pose: vec![0.3204, -0.185, 0.2, 0.0, 0.0, 0.0],
-                collision: true,
-                margin: None,
-                name: "post".into(),
-                physics: None,
-                attachment: None,
-            }])
+            .set_shapes(vec![post("left", 0.185), post("right", -0.185)])
             .await
-            .expect("the keep-out is accepted");
+            .expect("the keep-outs are accepted");
         let mut model =
             par6d::kin::estimation_model(Some(&model_config), Some(&assets_dir()), None, None)
                 .expect("model");
@@ -231,8 +236,11 @@ fn a_calibration_that_fails_part_way_puts_the_contact_settings_back() {
         };
         let error = calibrate::contact(&client, &mut model, &protocol, true)
             .await
-            .expect_err("a swing into a keep-out must end the run");
-        assert!(error.contains("move_j"), "the refused swing is named: {error}");
+            .expect_err("a joint the runtime will not swing must end the run");
+        assert!(
+            error.contains("joint 1 has no room"),
+            "the joint is named: {error}"
+        );
 
         let after = client.contact().await.expect("contact reads");
         assert_eq!(
@@ -242,6 +250,11 @@ fn a_calibration_that_fails_part_way_puts_the_contact_settings_back() {
         );
         assert_eq!(after.sustained_nm, before.sustained_nm);
         assert_eq!(after.impact_nm, before.impact_nm);
+        let ended = client.angles().await.expect("angles");
+        assert!(
+            common::max_deg_error(&ended, &reach) < 0.5,
+            "a refused swing never starts: the arm is where it stood, {ended:?}"
+        );
         client.close_joined().await;
     });
     daemon
@@ -264,9 +277,7 @@ fn swings_stay_inside_the_window_and_a_joint_without_room_is_named() {
         calibrate::plan_swings(&mut model.collision, &start, &window, 0.2).expect("swings");
     for j in 0..NUM_JOINTS {
         assert!(
-            swings
-                .iter()
-                .any(|q| (q[j] - start[j]).abs() > 0.19),
+            swings.iter().any(|q| (q[j] - start[j]).abs() > 0.19),
             "J{} is never swung",
             j + 1
         );
