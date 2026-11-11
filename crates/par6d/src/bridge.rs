@@ -986,7 +986,7 @@ impl StreamGate {
     /// [`Self::jog_lookahead`]).
     ///
     /// From inside a keep-out the verdict is on the ground the jog asks
-    /// for, held at the full jog rate in its direction, instead. Inside, a move has to earn
+    /// for, held at its own speed, instead. Inside, a move has to earn
     /// measurable distance (see [`Self::blocked`]), and an arm at rest
     /// stops a few milliradians on: every direction, the way out
     /// included, reads as no farther, and the refusal's placement takes
@@ -1004,19 +1004,7 @@ impl StreamGate {
         if pairs.is_none() || !self.inside_world(q)? {
             return Ok((la, pairs));
         }
-        // Which way the jog is asking to go, not how fast. Inside, a move
-        // is admitted for the distance it gains, and a slow jog gains
-        // almost none in the reach it projects: read at its own speed the
-        // way out is refused with every other direction, and the arm is
-        // trapped by having been jogged gently — which is how every jog
-        // arrives once the tool-speed ceiling has slowed it.
-        let largest = speeds.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
-        let direction = if largest > 0.0 {
-            speeds.map(|v| v / largest)
-        } else {
-            *speeds
-        };
-        let held = self.held_jog_lookahead(q, &direction, accel);
+        let held = self.held_jog_lookahead(q, speeds, accel);
         let pairs = self.blocked(q, &held)?;
         Ok((held, pairs))
     }
@@ -1998,19 +1986,25 @@ impl RtCommands for RtBridge {
                     *out = *v;
                 }
                 let moving = speeds.iter().any(|v| *v != 0.0);
-                if moving {
+                // What the tool-speed ceiling leaves of the jog at this
+                // pose. The arm is driven at that; the collision gate
+                // below goes on judging the jog that was asked for, whose
+                // reach is what its rules were built on — a jog slowed to
+                // a crawl gains too little ground for the way out of a
+                // keep-out to register, and would be refused with every
+                // other direction.
+                let keep = if moving {
                     let q = self.cart.snapshots.latest().q;
                     let qd = std::array::from_fn(|j| speeds[j] * self.cart.jog_vel[j]);
-                    let keep = tool_speed_fraction(
+                    tool_speed_fraction(
                         &mut self.cart.kin,
                         self.bundle.robot.limits.tcp_speed_max_m_s,
                         &q,
                         &qd,
-                    );
-                    for speed in speeds.iter_mut() {
-                        *speed *= keep;
-                    }
-                }
+                    )
+                } else {
+                    1.0
+                };
                 let mut sh = self.shared.lock().unwrap();
                 // Admission gate: where this jog comes to rest if it is
                 // released at once must not collide (or, from inside a
@@ -2131,14 +2125,14 @@ impl RtCommands for RtBridge {
                 // datagram, and the release is never more than a couple of
                 // entries deep. The datagram still refreshes the watchdog
                 // deadline below either way.
-                let accel_changed = sh
+                let scale_changed = sh
                     .stream
                     .as_ref()
-                    .is_some_and(|a| a.scale.1 != p.accel.unwrap_or(1.0));
-                if speeds != active || (moving && accel_changed) {
+                    .is_some_and(|a| a.scale != (keep, p.accel.unwrap_or(1.0)));
+                if speeds != active || (moving && scale_changed) {
                     if moving {
                         self.link.send(RtCommand::Jog {
-                            speeds,
+                            speeds: speeds.map(|v| v * keep),
                             accel: p.accel.unwrap_or(1.0),
                         });
                     } else {
@@ -2160,9 +2154,10 @@ impl RtCommands for RtBridge {
                     still_tick: 0,
                     stepped_tick: 0,
                     // JOG runs on the RT jog engine, not the streaming
-                    // executor; its accel rides `RtCommand::Jog`. Kept
-                    // here so a change of accel alone still resends.
-                    scale: (1.0, p.accel.unwrap_or(1.0)),
+                    // executor; the tool-speed fraction and the accel
+                    // ride `RtCommand::Jog`. Kept here so a change of
+                    // either alone still resends.
+                    scale: (keep, p.accel.unwrap_or(1.0)),
                 });
             }
             Command::ServoJ(p) => {

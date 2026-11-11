@@ -1283,8 +1283,9 @@ impl Preview {
         }
         let mut fractions = [0.0; MAX_JOINTS];
         fractions[..NUM_JOINTS].copy_from_slice(&speeds);
-        // Slowed to the tool-speed ceiling at the pose the arm is in, as
-        // the bridge slows it before anything else sees the jog.
+        // The arm is driven at what the tool-speed ceiling leaves of the
+        // jog at this pose; the gate judges the jog that was asked for.
+        // Both as the bridge has them.
         let asked = std::array::from_fn(|j| fractions[j] * self.jog_vel[j]);
         let keep = crate::bridge::tool_speed_fraction(
             &mut self.cart,
@@ -1292,9 +1293,7 @@ impl Preview {
             &self.snap.q,
             &asked,
         );
-        for fraction in fractions.iter_mut() {
-            *fraction *= keep;
-        }
+        let driven = fractions.map(|fraction| fraction * keep);
         // The runtime admits a jog only if where it will be one lookahead
         // horizon ahead clears the world (`RtBridge`'s jog admission).
         let scale = accel.unwrap_or(1.0);
@@ -1311,7 +1310,7 @@ impl Preview {
             self.jog.activate(&self.snap.q);
             self.jog_streaming = true;
         }
-        self.jog.command(&fractions);
+        self.jog.command(&driven);
         let ticks = ((duration_s / self.dt).round() as usize).max(1);
         let mut q = self.snap.q;
         let mut trajectory = Vec::with_capacity(ticks);
