@@ -91,6 +91,29 @@ impl SimRig {
         rig
     }
 
+    /// A collision gate over the rig's arm, built as the daemon builds
+    /// the one its housekeeping thread judges poses with.
+    pub fn gate(&self) -> crate::bridge::StreamGate {
+        let path =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+        let robot = &self.bundle.robot;
+        let opts = crate::Options {
+            sim: true,
+            config: Some(path.clone()),
+            ..Default::default()
+        };
+        let stack = crate::daemon::load_kin_stack(&opts, &path, robot, self.bundle.active_tool())
+            .expect("kinematics");
+        let limits = MotionLimits::from_config(robot, LimitMode::Jog).expect("limits");
+        crate::bridge::StreamGate::new(
+            stack.gate_collision,
+            &limits,
+            &robot.jog,
+            crate::daemon::position_loop_gains(robot),
+            robot.robot.tick_dt_s,
+        )
+    }
+
     /// Place the arm at `q`, referenced there, as a teleport does.
     pub fn land(&mut self, q: [f64; MAX_JOINTS]) {
         self.core

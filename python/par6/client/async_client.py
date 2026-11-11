@@ -20,6 +20,7 @@ import contextlib
 import copy
 import logging
 import math
+import os
 import time
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
@@ -51,6 +52,7 @@ from .. import config as _cfg
 from ..config import canonical_tool_key, io_line_names
 from ..protocol import CompletionPolicy
 from ..protocol.wire import StatusBuffer, update_status_from_dict
+from ..tuning import contact_overlay, save_contact_overlay
 from ._robot import RobotOwner
 from ._wire import (
     blend as _blend,
@@ -137,7 +139,7 @@ class ContactReadout:
     """The signal against its own slow average now."""
     peak_signal: list[float]
     """Largest ``|signal|`` while the arm was being driven, since the last
-    ``reset()``."""
+    ``reset()`` or the last time the limits were set."""
     peak_impact: list[float]
     """Largest ``|impact|`` likewise."""
     trips: int
@@ -150,6 +152,34 @@ class ContactReadout:
     """Joint angles (degrees) the readout was taken at."""
     gravity_nm: list[float]
     """The gravity torque the runtime's model holds at those angles."""
+
+
+@dataclass
+class ContactCalibration:
+    """What a contact calibration measured, and the thresholds it calls for.
+
+    Torques are Nm per joint.
+    """
+
+    reaction: str
+    """What the arm does on contact — unchanged by the calibration."""
+    peak_signal: list[float]
+    """Largest contact signal the arm's own swings put on each joint."""
+    peak_impact: list[float]
+    """Largest impact-channel signal likewise."""
+    sustained_nm: list[float]
+    """Sustained thresholds those peaks call for: the margin times each."""
+    impact_nm: list[float]
+    """Impact thresholds likewise."""
+    swings: int
+    """Swings driven, each there and back."""
+    applied: bool
+    """Whether the runtime now runs on these thresholds."""
+
+    def overlay(self) -> str:
+        """The ``[contact]`` table the arm's ``local.toml`` takes for these
+        thresholds."""
+        return contact_overlay(self.reaction, self.sustained_nm, self.impact_nm)
 
 
 @dataclass
@@ -1353,12 +1383,14 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         position term, so a homed and enabled arm floats and can be pushed
         by hand. Freedrive here is therefore exactly that switch.
 
-        While it floats the runtime adds to the hand's push
-        (``[freedrive] push_assist``), holds a joint that reaches a soft
-        limit until it is pushed back in, and catches an arm that moves
-        faster than a hand moves it: that stops it where it is under
-        ``SYS_FREEDRIVE_CATCH``, a protective stop.  Any protective stop
-        refuses this call until ``reset()``.
+        While it floats the runtime holds a joint that reaches a soft
+        limit until it is pushed back in; catches an arm that moves faster
+        than a hand moves it, stopping it where it is under
+        ``SYS_FREEDRIVE_CATCH``; and backs an arm guided into a keep-out
+        out the way it came, under ``SYS_KEEP_OUT``.  Both are protective
+        stops, and any protective stop refuses this call until
+        ``reset()``.  ``[freedrive] push_assist`` (off as shipped) makes
+        the drives add to the hand's push.
 
         Category: Control
 
@@ -2015,10 +2047,11 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
     async def contact(self) -> ContactReadout | None:
         """Contact detection readout: thresholds, signals, peaks, stops.
 
-        The peaks restart at every ``reset()``, so the tuning loop is
-        ``reset()``, run the program with nothing in the way, read
-        ``contact().peak_signal`` and ``peak_impact``.  Returns None if
-        unreachable.
+        The peaks restart at every ``reset()`` and whenever the limits
+        are set, so tuning by hand is: ``reset()``, run the program with
+        nothing in the way, read ``contact().peak_signal`` and
+        ``peak_impact``.  :meth:`calibrate_contact` is that loop as one
+        call.  Returns None if unreachable.
 
         Category: Query
 
@@ -2050,6 +2083,7 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
 
         What is set lives until the runtime restarts.  The arm's
         ``local.toml`` ``[contact]`` table is where the values are kept.
+        Setting the limits starts the recorded peaks over.
 
         Category: Configuration
 
@@ -2067,6 +2101,74 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
                 [float(v) for v in impact_nm],
             )
         )
+
+    async def calibrate_contact(
+        self,
+        spread: float = 0.5,
+        speed: float = 1.0,
+        margin: float = 2.0,
+        apply: bool = True,
+        save_to: str | os.PathLike[str] | None = None,
+    ) -> ContactCalibration:
+        """Fit the contact thresholds to this arm.
+
+        The shipped thresholds are a reference arm's.  This swings each
+        joint *spread* radians either way from where the arm stands, then
+        all of them at once, at *speed*, reads what the arm's own motion
+        put on the contact signal, and sets each threshold at *margin*
+        times that — the README's tuning loop, run as one call.  A swing
+        that would leave the joint window or meet a keep-out is left out;
+        a joint with no swing left is an error.
+
+        **Nothing may be near the arm.**  The swings run with contacts
+        reported and not stopped for, because thresholds that do not fit
+        the arm yet would stop the run that fits them.  The reaction the
+        runtime had is back when this returns, on every path.
+
+        The thresholds answer for motion up to *speed* around this pose.
+        Start from the middle of where the arm works; a program that
+        reaches further or runs a heavier tool can still be checked
+        against them on the Contact panel.
+
+        With *apply* the runtime runs on the result from here on, until
+        it restarts.  *save_to* names the arm's local overlay
+        (``/etc/par6/local.toml`` on the control box): the thresholds are
+        written into its ``[contact]`` table, the rest of the file left
+        as it is, so they are still there after a restart.
+
+        Raises ``RuntimeError`` if a joint has no room to swing or a
+        swing is refused.
+
+        Category: Configuration
+
+        Example:
+            fitted = rbt.calibrate_contact(save_to="/etc/par6/local.toml")
+            print(fitted.sustained_nm)
+        """
+        core = await self._ensure_core()
+        if self._estimation_config is None:
+            config = _cfg.data_root() / "config" / "PAR6.toml"
+            bundle = await self.config_bundle()
+            if bundle:
+                config = _cfg.materialize_bundle(bundle)
+            self._estimation_config = str(config)
+        raw = await self._call(
+            core.calibrate_contact(
+                self._estimation_config,
+                str(_cfg.data_root()),
+                str(_cfg.package_search_dir()),
+                float(spread),
+                float(speed),
+                float(margin),
+                bool(apply),
+            )
+        )
+        fitted = ContactCalibration(**raw)
+        if save_to is not None:
+            save_contact_overlay(
+                save_to, fitted.reaction, fitted.sustained_nm, fitted.impact_nm
+            )
+        return fitted
 
     async def shapes(self) -> ShapeWorld | None:
         """The collision world the runtime is currently enforcing, by layer.
@@ -2149,6 +2251,7 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
 # Re-exported for callers that type against the concrete buffer.
 __all__ = [
     "AsyncRobotClient",
+    "ContactCalibration",
     "ContactReadout",
     "LoopStatsResult",
     "QueueResult",

@@ -817,6 +817,20 @@ impl Preview {
         ))
     }
 
+    /// The joint targets `calibrate::contact` would drive through from
+    /// this pose, in order, ending where the arm stands. Measures nothing
+    /// — a preview has no torque. Refused where the live routine would
+    /// be: a joint with no room to swing.
+    pub fn contact_swings(&mut self, spread: f64) -> Result<Vec<[f64; NQ]>, String> {
+        let mut start = [0.0; NQ];
+        start.copy_from_slice(&self.snap.q[..NQ]);
+        let window: [(f64, f64); NQ] =
+            std::array::from_fn(|j| (self.soft_min[j], self.soft_max[j]));
+        let swings =
+            crate::calibrate::plan_swings(self.gate.collision_mut(), &start, &window, spread)?;
+        Ok(crate::calibrate::swing_order(&start, &swings))
+    }
+
     /// The joint-move speed fraction the estimation protocol drives at.
     pub fn estimation_speed() -> f64 {
         crate::calibrate::Protocol::default().speed

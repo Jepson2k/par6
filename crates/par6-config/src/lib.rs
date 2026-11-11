@@ -41,7 +41,7 @@ pub use homing::{
 pub use io::{IoConfig, IoLine, MAX_IO_LINES};
 pub use overlay::{
     config_fingerprint, effective_robot_toml, effective_tool_tomls, fitted_robot_toml,
-    local_overlay, LOCAL_CONFIG_ENV, LOCAL_CONFIG_NAME,
+    local_overlay, overlay_with_contact, LOCAL_CONFIG_ENV, LOCAL_CONFIG_NAME,
 };
 pub use robot::{
     BusConfig, ContactReaction, ContactSection, ControlMode, DriverType, DynamicsSection,

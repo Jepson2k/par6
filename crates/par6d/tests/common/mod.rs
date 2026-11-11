@@ -247,9 +247,20 @@ pub fn sim_options(config: PathBuf, status_port: u16) -> Options {
 /// loopback, for a test that listens with a real `par6_client::Client`
 /// instead of the rig's own socket.
 pub fn boot_for_client(config: PathBuf, status_port: u16) -> Result<Daemon, String> {
+    boot_for_client_in(config, status_port, None)
+}
+
+/// As [`boot_for_client`], with a scenario file when the physics is to
+/// hold something the runtime was never told about.
+pub fn boot_for_client_in(
+    config: PathBuf,
+    status_port: u16,
+    sim_scenario: Option<PathBuf>,
+) -> Result<Daemon, String> {
     init_test_logging();
     redirect_bus_grant();
     let opts = Options {
+        sim_scenario,
         ..sim_options(config, status_port)
     };
     Daemon::start(&opts).map_err(|e| e.to_string())

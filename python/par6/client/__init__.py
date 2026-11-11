@@ -2,6 +2,7 @@
 
 from .async_client import (
     AsyncRobotClient,
+    ContactCalibration,
     ContactReadout,
     LoopStatsResult,
     QueueResult,
@@ -14,6 +15,7 @@ from .sync_client import RobotClient
 
 __all__ = [
     "AsyncRobotClient",
+    "ContactCalibration",
     "ContactReadout",
     "LoopStatsResult",
     "QueueResult",

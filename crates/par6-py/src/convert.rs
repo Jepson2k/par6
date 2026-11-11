@@ -343,11 +343,7 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
         QueryResult::Contact(c) => {
             d.set_item(
                 "reaction",
-                match c.reaction {
-                    par6_proto::ContactReaction::Off => "off",
-                    par6_proto::ContactReaction::Warn => "warn",
-                    par6_proto::ContactReaction::Stop => "stop",
-                },
+contact_reaction_name(c.reaction),
             )?;
             d.set_item("sustained_nm", c.sustained_nm.to_vec())?;
             d.set_item("impact_nm", c.impact_nm.to_vec())?;
@@ -573,4 +569,13 @@ pub(crate) fn motion_dict<'py>(
         }
     }
     Ok(m)
+}
+
+/// A contact reaction as the Python client and the config file spell it.
+pub(crate) fn contact_reaction_name(reaction: par6_proto::ContactReaction) -> &'static str {
+    match reaction {
+        par6_proto::ContactReaction::Off => "off",
+        par6_proto::ContactReaction::Warn => "warn",
+        par6_proto::ContactReaction::Stop => "stop",
+    }
 }

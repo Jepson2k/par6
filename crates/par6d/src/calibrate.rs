@@ -1,13 +1,19 @@
-//! Payload identification from paired slow, opposite-direction sweeps.
-//! Moving measurements separate gravity from symmetric gearbox friction;
+//! What one arm measures about itself.
+//!
+//! Payload identification, from paired slow, opposite-direction sweeps:
+//! moving measurements separate gravity from symmetric gearbox friction;
 //! a stopped position hold can conceal gravity error inside static friction.
+//!
+//! Contact thresholds, from swings with nothing in the arm's way: what its
+//! own motion reads on the contact signal is what a contact has to exceed.
 
 use std::time::Duration;
 
 use par6_client::{Ack, Client};
 use par6_kin::gravity::{self, GravitySample, PayloadFit};
 use par6_kin::{Collision, Kin, NQ};
-use par6_proto::{CompletionPolicy, ControllerMode};
+use par6_proto::command::SetContactLimits;
+use par6_proto::{CompletionPolicy, ContactReaction, ControllerMode};
 
 /// Joints varied between measurement poses. The opposite-direction
 /// approaches also move the shoulder and elbow by `Protocol::approach_rad`.
@@ -555,4 +561,245 @@ pub async fn estimate(
         Ok((report, false)) => Ok(report),
         Err(e) => Err(e),
     }
+}
+
+/// How a contact calibration exercises the arm and what it makes of the
+/// result.
+#[derive(Debug, Clone, Copy)]
+pub struct ContactProtocol {
+    /// How far each joint swings from where the arm stands \[rad\].
+    pub spread: f64,
+    /// Joint-move speed fraction of the swings. The thresholds answer for
+    /// motion up to this; a program that runs faster reads more.
+    pub speed: f64,
+    /// A threshold is this many times the peak its joint read.
+    pub margin: f64,
+    /// How long one swing may take before the run gives up.
+    pub pose_timeout: Duration,
+}
+
+impl Default for ContactProtocol {
+    fn default() -> Self {
+        Self {
+            spread: 0.5,
+            speed: 1.0,
+            margin: 2.0,
+            pose_timeout: Duration::from_secs(30),
+        }
+    }
+}
+
+/// The least a threshold is set to \[Nm\]: a joint whose swings read
+/// nothing has not shown that nothing is all it ever reads.
+pub const CONTACT_FLOOR_NM: f64 = 0.05;
+
+/// What a contact calibration measured and what follows from it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContactReport {
+    /// What the arm does on contact — as it was before the run, and again
+    /// after it.
+    pub reaction: ContactReaction,
+    /// Largest sustained-channel signal the swings read, per joint \[Nm\].
+    pub peak_signal: [f64; NQ],
+    /// Largest impact-channel signal likewise \[Nm\].
+    pub peak_impact: [f64; NQ],
+    /// Sustained thresholds those peaks call for \[Nm\].
+    pub sustained_nm: [f64; NQ],
+    /// Impact thresholds likewise \[Nm\].
+    pub impact_nm: [f64; NQ],
+    /// Swings driven, each there and back.
+    pub swings: usize,
+    /// Whether the runtime now runs on those thresholds.
+    pub applied: bool,
+}
+
+/// Where the calibration swings to from `start`: each joint alone, either
+/// way, then every joint at once. A swing that leaves the joint window or
+/// meets the collision world anywhere along it is dropped; a joint with no
+/// swing left is an error, since its threshold would be fitted to nothing.
+pub fn plan_swings(
+    collision: &mut Collision,
+    start: &[f64; NQ],
+    window: &[(f64, f64); NQ],
+    spread: f64,
+) -> Result<Vec<[f64; NQ]>, String> {
+    // A joint move is a straight line in joint space, so samples along
+    // that line are the configurations the swing passes through.
+    const SAMPLES: usize = 16;
+    let mut clear = |to: &[f64; NQ]| -> Result<bool, String> {
+        for k in 1..=SAMPLES {
+            let t = k as f64 / SAMPLES as f64;
+            let probe: [f64; NQ] = std::array::from_fn(|j| start[j] + t * (to[j] - start[j]));
+            let inside = (0..NQ).all(|j| probe[j] >= window[j].0 && probe[j] <= window[j].1);
+            if !inside
+                || collision
+                    .check(&probe, true)
+                    .map_err(|e| format!("collision check: {e}"))?
+                    .active()
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    };
+    let mut swings = Vec::new();
+    let mut together = *start;
+    for j in 0..NQ {
+        let mut found = false;
+        for dir in [1.0, -1.0] {
+            let mut q = *start;
+            q[j] += dir * spread;
+            if clear(&q)? {
+                if !found {
+                    together[j] = q[j];
+                }
+                found = true;
+                swings.push(q);
+            }
+        }
+        if !found {
+            return Err(format!(
+                "joint {} has no room to swing {:.0} degrees either way from here — move the \
+                 arm somewhere with room around it, or narrow the spread",
+                j + 1,
+                spread.to_degrees()
+            ));
+        }
+    }
+    if clear(&together)? {
+        swings.push(together);
+    }
+    Ok(swings)
+}
+
+/// Every joint target the calibration drives to, in order: each swing,
+/// then back to `start`. A dry run submits these as the joint moves the
+/// live routine queues.
+pub fn swing_order(start: &[f64; NQ], swings: &[[f64; NQ]]) -> Vec<[f64; NQ]> {
+    swings.iter().flat_map(|q| [*q, *start]).collect()
+}
+
+/// The thresholds a run's peaks call for: `margin` times each, never
+/// under [`CONTACT_FLOOR_NM`], rounded up to the hundredth a config file
+/// carries.
+pub fn thresholds_from(peaks: &[f64; NQ], margin: f64) -> [f64; NQ] {
+    peaks.map(|peak| ((margin * peak).max(CONTACT_FLOOR_NM) * 100.0).ceil() / 100.0)
+}
+
+async fn set_contact(
+    client: &Client,
+    reaction: ContactReaction,
+    sustained_nm: [f64; NQ],
+    impact_nm: [f64; NQ],
+) -> Result<(), String> {
+    match client
+        .set_contact_limits(SetContactLimits {
+            reaction,
+            sustained_nm,
+            impact_nm,
+        })
+        .await
+    {
+        Ok(Ack::Confirmed) => Ok(()),
+        Ok(Ack::Unconfirmed) => Err("set_contact_limits was not acknowledged".into()),
+        Err(e) => Err(format!("set_contact_limits: {e}")),
+    }
+}
+
+/// Fit the contact thresholds to this arm: swing every joint with nothing
+/// in the way, read what its own motion puts on the contact signal, and
+/// set each threshold a margin above that.
+///
+/// The swings run with contacts reported, not stopped for — thresholds
+/// that do not fit the arm yet would otherwise stop the run that fits
+/// them — so the arm's surroundings have to be clear for it. Whatever
+/// the session had is back on every exit: its reaction always, and its
+/// thresholds unless `apply` replaces them with the fitted ones.
+pub async fn contact(
+    client: &Client,
+    model: &mut EstimationModel,
+    protocol: &ContactProtocol,
+    apply: bool,
+) -> Result<ContactReport, String> {
+    if !(protocol.spread.is_finite() && protocol.spread > 0.0)
+        || !(protocol.speed.is_finite() && protocol.speed > 0.0 && protocol.speed <= 1.0)
+        || !(protocol.margin.is_finite() && protocol.margin >= 1.0)
+        || protocol.pose_timeout.is_zero()
+    {
+        return Err(
+            "contact calibration needs a spread above 0, a speed in (0, 1] and a margin of \
+             at least 1"
+                .into(),
+        );
+    }
+    let before = client
+        .contact()
+        .await
+        .map_err(|e| format!("contact: {e}"))?;
+    let angles = client.angles().await.map_err(|e| format!("angles: {e}"))?;
+    let start: [f64; NQ] = std::array::from_fn(|j| angles[j].to_radians());
+    let swings = plan_swings(&mut model.collision, &start, &model.window, protocol.spread)?;
+
+    // Setting the limits starts the peaks over, so what is read back
+    // after the swings is the swings' own.
+    set_contact(
+        client,
+        ContactReaction::Warn,
+        before.sustained_nm,
+        before.impact_nm,
+    )
+    .await?;
+    let moves = Protocol {
+        speed: protocol.speed,
+        pose_timeout: protocol.pose_timeout,
+        ..Protocol::default()
+    };
+    let run = async {
+        for (i, q) in swing_order(&start, &swings).iter().enumerate() {
+            if i % 2 == 0 {
+                log::info!("swing {}/{}", i / 2 + 1, swings.len());
+            }
+            move_to(client, q, &moves).await?;
+        }
+        client.contact().await.map_err(|e| format!("contact: {e}"))
+    };
+    let measured = run.await;
+    let fitted = measured.as_ref().ok().map(|after| {
+        (
+            thresholds_from(&after.peak_signal, protocol.margin),
+            thresholds_from(&after.peak_impact, protocol.margin),
+        )
+    });
+    let restored = match fitted {
+        Some((sustained_nm, impact_nm)) if apply => {
+            set_contact(client, before.reaction, sustained_nm, impact_nm).await
+        }
+        _ => {
+            set_contact(
+                client,
+                before.reaction,
+                before.sustained_nm,
+                before.impact_nm,
+            )
+            .await
+        }
+    };
+    let after = match (measured, restored) {
+        (Ok(after), Ok(())) => after,
+        (Err(e), Ok(())) => return Err(e),
+        (Ok(_), Err(restore)) => return Err(restore),
+        (Err(e), Err(restore)) => {
+            return Err(format!("{e}; restoring the contact limits: {restore}"))
+        }
+    };
+    let (sustained_nm, impact_nm) = fitted.expect("measured");
+    Ok(ContactReport {
+        reaction: before.reaction,
+        peak_signal: after.peak_signal,
+        peak_impact: after.peak_impact,
+        sustained_nm,
+        impact_nm,
+        swings: swings.len(),
+        applied: apply,
+    })
 }

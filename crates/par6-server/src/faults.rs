@@ -125,6 +125,7 @@ pub fn rt_protective_stop(snap: &StateSnapshot) -> Option<ProtectiveStop> {
             RtCode::Contact => ErrorCode::SysContact,
             RtCode::FreedriveCatch => ErrorCode::SysFreedriveCatch,
             RtCode::SpeedLimit => ErrorCode::SysSpeedLimit,
+            RtCode::KeepOut => ErrorCode::SysKeepOut,
             _ => return None,
         };
         Some(ProtectiveStop {

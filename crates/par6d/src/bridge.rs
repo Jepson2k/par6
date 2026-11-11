@@ -1198,6 +1198,87 @@ impl StreamGate {
     }
 }
 
+/// How far a floating arm moves between looks at the keep-outs \[rad\]:
+/// well over what its encoders report at rest, so an arm left alone costs
+/// nothing to watch, and a few millimetres at the tool at full reach.
+const FLOAT_GUARD_STEP_RAD: f64 = 0.002;
+
+/// Watches a floating arm against the keep-outs.
+///
+/// Nothing plans where a hand takes the arm, so the gate that refuses a
+/// jog has nothing to refuse: the arm is already there. What this reports
+/// is the arm coming inside a keep-out's clearance, for the RT to back it
+/// out the way it came.
+///
+/// A keep-out the arm was inside when it began to float, or that was put
+/// over it while it floated, is not reported — there is no way it came,
+/// and floating is how it gets out. Once the arm has left one, going back
+/// in is reported like any other.
+pub(crate) struct FloatGuard {
+    floating: bool,
+    epoch: u64,
+    judged: [f64; MAX_JOINTS],
+    standing: Vec<(String, String)>,
+}
+
+impl FloatGuard {
+    pub(crate) fn new() -> Self {
+        Self {
+            floating: false,
+            epoch: 0,
+            judged: [0.0; MAX_JOINTS],
+            standing: Vec::new(),
+        }
+    }
+
+    /// The keep-outs the floating arm in `snap` has just come inside.
+    pub(crate) fn entered(
+        &mut self,
+        gate: &mut StreamGate,
+        snap: &StateSnapshot,
+    ) -> Option<Vec<(String, String)>> {
+        let floating = snap.mode == Mode::Idle
+            && snap.gravity_comp
+            && snap.homed
+            && snap.state == ArmState::Enabled;
+        if !floating {
+            self.floating = false;
+            return None;
+        }
+        let epoch = gate.epoch();
+        let begun = !self.floating || epoch != self.epoch;
+        let moved = snap
+            .q
+            .iter()
+            .zip(&self.judged)
+            .any(|(now, then)| (now - then).abs() >= FLOAT_GUARD_STEP_RAD);
+        if !begun && !moved {
+            return None;
+        }
+        let inside = match gate.world_offenders(&snap.q) {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                log::error!("freedrive: the keep-outs could not be checked: {e:?}");
+                return None;
+            }
+        };
+        self.floating = true;
+        self.epoch = epoch;
+        self.judged = snap.q;
+        if begun {
+            self.standing = inside;
+            return None;
+        }
+        let entered: Vec<_> = inside
+            .iter()
+            .filter(|pair| !self.standing.contains(pair))
+            .cloned()
+            .collect();
+        self.standing.retain(|pair| inside.contains(pair));
+        (!entered.is_empty()).then_some(entered)
+    }
+}
+
 /// A collision-world query the shim refused (a broken model, never a
 /// well-formed configuration).
 fn gate_error(e: par6_kin::KinError) -> WireError {
@@ -3290,6 +3371,7 @@ pub(crate) fn housekeeping_loop(
         link.send(RtCommand::StreamRelease);
     };
     let mut profile_logged = Instant::now();
+    let mut float_guard = FloatGuard::new();
     'housekeeping: while !shutdown.load(Ordering::SeqCst) {
         // One pass per RT tick, paced at the TOP because the arms below
         // return here with `continue`: with the wait at the bottom every
@@ -3310,6 +3392,20 @@ pub(crate) fn housekeeping_loop(
         }
         let now = Instant::now();
         let snap = snapshots.latest();
+        let entered = float_guard.entered(&mut gate.lock().unwrap(), &snap);
+        if let Some(pairs) = entered {
+            log::warn!(
+                "freedrive: guided into a keep-out; backing the arm out: {}",
+                pairs
+                    .iter()
+                    .map(|(a, b)| format!("[{a}, {b}]"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            // Latched for STATUS, which is where the keep-out is named.
+            gate.lock().unwrap().refuse(pairs);
+            link.send(RtCommand::KeepOutCatch);
+        }
         if now.duration_since(profile_logged) >= Duration::from_secs(1) {
             profile_logged = now;
             let p = &snap.tick_profile;

@@ -402,6 +402,19 @@ impl Preview {
             .map_err(PyRuntimeError::new_err)
     }
 
+    /// Joint targets \[rad\] a contact calibration's swings drive through
+    /// from the previewed pose, ending back on it. Raises when a joint has
+    /// no room to swing, as the live calibration would.
+    #[pyo3(signature = (spread=0.5))]
+    fn contact_swings(&self, spread: f64) -> PyResult<Vec<Vec<f64>>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .contact_swings(spread)
+            .map(|poses| poses.iter().map(|q| q.to_vec()).collect())
+            .map_err(PyRuntimeError::new_err)
+    }
+
     /// The joint-move speed fraction the estimation protocol drives at.
     #[staticmethod]
     fn estimation_speed() -> f64 {

@@ -1988,6 +1988,12 @@ impl<B: DriverBus> RtCore<B> {
                     }
                 }
             }
+            RtCommand::KeepOutCatch => {
+                if self.mode == Mode::Idle && self.gravity_applied() {
+                    self.errors.latch(ErrorCode::KeepOut, None);
+                    self.begin_reflex(true);
+                }
+            }
             RtCommand::SetContactLimits {
                 reaction,
                 sustained_nm,

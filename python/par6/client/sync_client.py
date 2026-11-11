@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import atexit
 import contextlib
+import os
 import threading
 import weakref
 from collections.abc import Callable, Coroutine, Iterable, Sequence
@@ -34,6 +35,7 @@ from ..protocol import CompletionPolicy
 from ..protocol.wire import StatusBuffer
 from .async_client import (
     AsyncRobotClient,
+    ContactCalibration,
     ContactReadout,
     LoopStatsResult,
     QueueResult,
@@ -740,6 +742,20 @@ class RobotClient:
             self._inner.set_contact_limits(
                 reaction=reaction, sustained_nm=sustained_nm, impact_nm=impact_nm
             )
+        )
+
+    def calibrate_contact(
+        self,
+        spread: float = 0.5,
+        speed: float = 1.0,
+        margin: float = 2.0,
+        apply: bool = True,
+        save_to: str | os.PathLike[str] | None = None,
+    ) -> ContactCalibration:
+        """Fit the contact thresholds to this arm from swings with nothing
+        in its way — see ``AsyncRobotClient.calibrate_contact``."""
+        return _run(
+            self._inner.calibrate_contact(spread, speed, margin, apply, save_to)
         )
 
     def shapes(self) -> ShapeWorld | None:

@@ -1117,6 +1117,38 @@ class DryRunRobotClient(RobotOwner):
             "set_contact_limits",
         )
 
+    def calibrate_contact(
+        self,
+        spread: float = 0.5,
+        speed: float = 1.0,
+        margin: float = 2.0,
+        apply: bool = True,
+        save_to: object = None,
+    ) -> None:
+        """Queue the swings a contact calibration makes; measure nothing.
+
+        A dry run has no torque to read, so there are no peaks, no
+        thresholds, and nothing is applied or saved.  The MOTION is the
+        live routine's: each joint swung either way from here and back,
+        then all of them at once, at its speed — planned against the same
+        keep-outs, and refused where a joint has no room to swing.  Each
+        move is a block of the program, under this method's name.
+        """
+        del margin, apply, save_to
+        for q in self._preview.contact_swings(float(spread)):
+            self._submit(
+                {
+                    "type": "move_j",
+                    "angles": np.degrees(np.asarray(q, dtype=np.float64)).tolist(),
+                    "duration": None,
+                    "speed": float(speed),
+                    "accel": 1.0,
+                    "blend_radius": None,
+                    "rel": False,
+                },
+                "calibrate_contact",
+            )
+
     def reset_loop_stats(self, **kwargs: Any) -> int:
         """A preview runs no control loop."""
         return 1

@@ -116,7 +116,7 @@ pub struct ContactResult {
     /// The signal against its own slow average now \[Nm\].
     pub impact: [f64; NUM_JOINTS],
     /// Largest `|signal|` while the arm was being moved, since the last
-    /// reset \[Nm\].
+    /// reset or the last `SET_CONTACT_LIMITS` \[Nm\].
     pub peak_signal: [f64; NUM_JOINTS],
     /// Largest `|impact|` likewise \[Nm\].
     pub peak_impact: [f64; NUM_JOINTS],

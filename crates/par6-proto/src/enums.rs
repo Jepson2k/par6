@@ -205,9 +205,9 @@ wire_enum! {
         /// Fresh queued-execution timing readback.
         ExecutionSpeed = 63,
         /// Contact detection readout: the thresholds in force, each
-        /// joint's signal against them, the peaks since the last reset,
-        /// the stops so far — and the gravity torque the model holds at
-        /// the pose the readout was taken in.
+        /// joint's signal against them, the peaks since the last reset or
+        /// change of limits, the stops so far — and the gravity torque
+        /// the model holds at the pose the readout was taken in.
         Contact = 64,
 
         // -- FIRE_AND_FORGET: no reply --

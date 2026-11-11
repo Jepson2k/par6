@@ -113,8 +113,8 @@ impl Client {
     }
 
     /// The contact detection readout: thresholds, signals, peaks since
-    /// the last reset, stops so far, and the model's gravity torque at
-    /// the pose it was taken in.
+    /// the last reset or change of limits, stops so far, and the model's
+    /// gravity torque at the pose it was taken in.
     pub async fn contact(&self) -> Result<ContactResult, ClientError> {
         unwrap_query!(self, Command::Contact, QueryResult::Contact(c) => c)
     }

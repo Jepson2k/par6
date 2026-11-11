@@ -709,10 +709,11 @@ retreat_timeout_s = 1.0
 # push_assist: how much of the hand's push the drives add to it. The torque
 # the external-torque estimate reads on a floating joint, beyond its
 # stiction, is applied again times this, through a push_assist_hz low-pass
-# that keeps it off the drivetrain's resonances. 0 is a plain gravity float;
-# 1 halves what the hand has to supply. It amplifies whatever the estimate
-# reads - a gravity error too - so keep it modest.
-push_assist = 0.6
+# that keeps it off the drivetrain's resonances. 0 is a plain gravity float,
+# which this arm's low gearing already lets a hand move; 1 halves what the
+# hand has to supply. It amplifies whatever the estimate reads - a gravity
+# error too - so raise it in small steps on the arm itself.
+push_assist = 0.0
 push_assist_hz = 2.0
 # Per joint. A joint that reaches a soft limit moving outward is held there
 # by its drive, alone, until the contact signal shows this much torque

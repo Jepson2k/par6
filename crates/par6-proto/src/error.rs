@@ -111,6 +111,11 @@ wire_enum! {
         /// and holds, enabled and referenced, refusing motion until
         /// `Reset`.
         SysSpeedLimit = 67,
+        /// A floating (freedrive) arm was guided into a keep-out.
+        /// Protective stop: the arm backed out the way it came and holds,
+        /// enabled and referenced, refusing motion until `Reset`. STATUS
+        /// names the keep-out in its collision fields.
+        SysKeepOut = 68,
     }
 }
 
@@ -123,7 +128,10 @@ impl ErrorCode {
     pub const fn is_protective(self) -> bool {
         matches!(
             self,
-            ErrorCode::SysContact | ErrorCode::SysFreedriveCatch | ErrorCode::SysSpeedLimit
+            ErrorCode::SysContact
+                | ErrorCode::SysFreedriveCatch
+                | ErrorCode::SysSpeedLimit
+                | ErrorCode::SysKeepOut
         )
     }
 }
@@ -420,6 +428,14 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
                      controller stays ENABLED.",
             remedy: "Send reset. Slow the stream that drove it, or raise \
                      [limits] tcp_speed_max_m_s if the ceiling is wrong for this cell.",
+        },
+        E::SysKeepOut => ErrorTemplate {
+            title: "Keep-out reached",
+            cause: "The arm was guided into a keep-out while floating.",
+            effect: "The arm backed out the way it came and holds; motion and freedrive \
+                     are refused; controller stays ENABLED.",
+            remedy: "Send reset and ask for freedrive again; guide the arm clear of the \
+                     keep-out, or move the keep-out if it is wrong for this cell.",
         },
         E::MotnHomingFailed => ErrorTemplate {
             title: "Homing failed",

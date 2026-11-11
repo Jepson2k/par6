@@ -12,7 +12,9 @@ Connection defaults follow the client's own: ``PAR6_HOST`` (127.0.0.1) and
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
+import math
 import sys
 from collections.abc import Sequence
 from typing import Any
@@ -49,6 +51,37 @@ def _emit(value: Any, as_json: bool) -> None:
             print(f"{key}: {val}")
     else:
         print(value)
+
+
+def _cmd_calibrate_contact(client: RobotClient, args: argparse.Namespace) -> int:
+    fitted = client.calibrate_contact(
+        spread=math.radians(args.spread_deg),
+        speed=args.speed,
+        margin=args.margin,
+        apply=not args.measure_only,
+        save_to=args.save,
+    )
+    if args.json:
+        _emit(dataclasses.asdict(fitted), True)
+        return 0
+    print(f"{fitted.swings} swings; a threshold is {args.margin:g}x its peak [Nm]")
+    print("joint   peak  sustained   peak     impact")
+    for j in range(len(fitted.sustained_nm)):
+        print(
+            f"J{j + 1}    {fitted.peak_signal[j]:6.3f}  {fitted.sustained_nm[j]:8.2f}"
+            f"  {fitted.peak_impact[j]:6.3f}  {fitted.impact_nm[j]:8.2f}"
+        )
+    print(
+        "running on these thresholds until the runtime restarts"
+        if fitted.applied
+        else "measured only: the runtime's thresholds are as they were"
+    )
+    if args.save:
+        print(f"saved to {args.save}")
+    else:
+        print("to keep them, put this in the arm's local.toml:")
+        print(fitted.overlay(), end="")
+    return 0
 
 
 def _cmd_ping(client: RobotClient, args: argparse.Namespace) -> int:
@@ -425,6 +458,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--force", action="store_true", help="address an id the config does not list"
     )
     toolid.set_defaults(fn=_cmd_set_tool_id)
+
+    contact = sub.add_parser(
+        "calibrate-contact",
+        help=(
+            "fit the contact thresholds to this arm: swings every joint, so "
+            "NOTHING may be near it"
+        ),
+    )
+    contact.add_argument(
+        "--spread-deg",
+        type=float,
+        default=math.degrees(0.5),
+        help="how far each joint swings either way from where the arm stands",
+    )
+    contact.add_argument(
+        "--speed", type=float, default=1.0, help="speed fraction of the swings"
+    )
+    contact.add_argument(
+        "--margin",
+        type=float,
+        default=2.0,
+        help="a threshold is this many times the peak its joint read",
+    )
+    contact.add_argument(
+        "--measure-only",
+        action="store_true",
+        help="report the thresholds without putting the runtime on them",
+    )
+    contact.add_argument(
+        "--save",
+        metavar="LOCAL_TOML",
+        help=(
+            "write the thresholds into this overlay's [contact] table, e.g. "
+            "/etc/par6/local.toml, so they outlast a restart"
+        ),
+    )
+    contact.set_defaults(fn=_cmd_calibrate_contact)
 
     gains = sub.add_parser(
         "set-pid-gains", help="push one drive's tuning live (every gain required)"

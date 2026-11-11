@@ -119,6 +119,9 @@ pub enum ErrorCode {
     /// The tool was measured over its speed ceiling on a driven arm and
     /// the arm was stopped and held (protective latch).
     SpeedLimit,
+    /// A floating arm was guided into a keep-out, backed out the way it
+    /// came and was held (protective latch).
+    KeepOut,
 }
 
 impl ErrorCode {
@@ -143,7 +146,10 @@ impl ErrorCode {
     pub fn is_protective(self) -> bool {
         matches!(
             self,
-            ErrorCode::Contact | ErrorCode::FreedriveCatch | ErrorCode::SpeedLimit
+            ErrorCode::Contact
+                | ErrorCode::FreedriveCatch
+                | ErrorCode::SpeedLimit
+                | ErrorCode::KeepOut
         )
     }
 

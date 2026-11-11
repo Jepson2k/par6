@@ -22,6 +22,7 @@ from nicegui import ui
 from waldoctl import Commander, Panel, PanelSlot
 
 from par6.client import AsyncRobotClient, ContactReadout
+from par6.tuning import contact_overlay
 
 logger = logging.getLogger(__name__)
 
@@ -45,20 +46,6 @@ def _describe(err: BaseException) -> str:
     if not cause:
         return str(err)
     return f"{getattr(err, 'title', str(err))}: {cause}"
-
-
-def overlay_snippet(reaction: str, sustained: list[float], impact: list[float]) -> str:
-    """The ``[contact]`` table a local overlay takes for these values."""
-
-    def row(values: list[float]) -> str:
-        return "[" + ", ".join(f"{v:g}" for v in values) + "]"
-
-    return (
-        "[contact]\n"
-        f'reaction = "{reaction}"\n'
-        f"sustained_nm = {row(sustained)}\n"
-        f"impact_nm = {row(impact)}\n"
-    )
 
 
 def from_peaks(peaks: list[float]) -> list[float]:
@@ -165,8 +152,8 @@ class ContactPanel(Panel):
             ui.label(
                 "Signals and limits are Nm at the joint. A peak is the largest "
                 "signal seen while the arm was being driven, since the last "
-                "reset(). Applied limits live until the runtime restarts; keep "
-                "them in the arm's local.toml:"
+                "reset() or Apply. Applied limits live until the runtime "
+                "restarts; keep them in the arm's local.toml:"
             ).classes("text-caption text-grey")
             self._snippet = (
                 ui.code("", language="toml").classes("w-full").mark("contact-snippet")
@@ -293,7 +280,7 @@ class ContactPanel(Panel):
     def _edited(self, _event: object = None) -> None:
         fields = self._fields()
         if self._snippet is not None and fields is not None:
-            self._snippet.content = overlay_snippet(*fields)
+            self._snippet.content = contact_overlay(*fields)
         readout = self._readout
         if self._note is None or readout is None or fields is None:
             return

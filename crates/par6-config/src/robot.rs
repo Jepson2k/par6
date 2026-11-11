@@ -907,9 +907,10 @@ impl Default for ContactSection {
 pub struct FreedriveSection {
     /// How much of the hand's push the drives add to it: the torque the
     /// external-torque estimate reads on a floating joint, beyond its
-    /// stiction, is applied again times this. 0 is a plain gravity float;
-    /// 1 halves what the hand has to supply. It amplifies whatever the
-    /// estimate reads, a gravity error included, so it stays modest.
+    /// stiction, is applied again times this. 0 is a plain gravity float,
+    /// which the arm's low gearing already lets a hand move; 1 halves
+    /// what the hand has to supply. It amplifies whatever the estimate
+    /// reads, a gravity error included.
     pub push_assist: f64,
     /// Corner of the low-pass the assist follows the push through \[Hz\].
     /// Below the arm's drivetrain resonances, which the estimate does not
@@ -929,7 +930,7 @@ pub struct FreedriveSection {
 impl Default for FreedriveSection {
     fn default() -> Self {
         Self {
-            push_assist: 0.6,
+            push_assist: 0.0,
             push_assist_hz: 2.0,
             limit_release_nm: vec![0.6, 1.0, 0.85, 0.25, 0.25, 0.15],
             catch_speed_rad_s: vec![1.6, 1.6, 1.6, 3.0, 3.0, 3.0],
