@@ -54,6 +54,13 @@ pub struct Options {
     #[arg(long, value_name = "DIR", env = "PAR6_PACKAGE_DIR")]
     pub package_dir: Option<PathBuf>,
 
+    /// Perturbations for the simulator: a TOML file of scenario fields
+    /// (docs/simulation-scenarios.md) — a push on a joint, an obstacle
+    /// the runtime was never told about, a dropout, a drive fault. Their
+    /// clock starts when the simulated bus boots.
+    #[arg(long, value_name = "PATH", env = "PAR6_SIM_SCENARIO", requires = "sim")]
+    pub sim_scenario: Option<PathBuf>,
+
     /// Profile the RT tick per phase (one clock read per phase) and log
     /// the running maxima and the last overrun's phase times once a second.
     #[arg(

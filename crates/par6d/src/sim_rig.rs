@@ -84,12 +84,20 @@ impl SimRig {
         rig.until("boot", |s| s.mode == Mode::Idle);
         rig.commands.send(RtCommand::Enable(0)).unwrap();
         rig.until("enable", |s| s.state == ArmState::Enabled);
-        rig.core.bus_mut().teleport_joint_rad(&q).expect("teleport");
-        rig.core.adopt_landed_pose(&rig.bundle.robot, &q);
-        // The published snapshot still describes the pose the arm booted
-        // in until a tick has run at the landed one.
-        rig.tick();
+        rig.land(q);
         rig
+    }
+
+    /// Place the arm at `q`, referenced there, as a teleport does.
+    pub fn land(&mut self, q: [f64; MAX_JOINTS]) {
+        self.core
+            .bus_mut()
+            .teleport_joint_rad(&q)
+            .expect("teleport");
+        self.core.adopt_landed_pose(&self.bundle.robot, &q);
+        // The published snapshot still describes the pose the arm was in
+        // until a tick has run at the landed one.
+        self.tick();
     }
 
     pub fn tick(&mut self) -> StateSnapshot {

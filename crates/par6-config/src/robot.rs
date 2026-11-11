@@ -856,6 +856,16 @@ pub struct ContactSection {
     /// signal \[rad/s\]: a joint that is stopped or about to be shows up
     /// to that much torque with nothing touching it.
     pub stiction_speed_rad_s: f64,
+    /// Per joint: the share of the inertial torque the model is charging
+    /// to the arm's own motion that may go unexplained. The model is
+    /// rigid; a joint whose drivetrain winds up lets its motor run ahead
+    /// of its link under a hard change of acceleration, and for that
+    /// moment part of the charge is not real. 0 trusts the model
+    /// outright, 1 allows for all of it being wrong.
+    pub inertia_slack: Vec<f64>,
+    /// How long that allowance is held after the effort that earned it
+    /// \[s\], while the drivetrain rings down.
+    pub inertia_hold_s: f64,
     /// How long a contact warning stands after the signal last crossed a
     /// threshold \[s\], so one hovering at its threshold does not flicker.
     pub warning_hold_s: f64,
@@ -880,6 +890,8 @@ impl Default for ContactSection {
             impact_window_s: 0.016,
             impact_highpass_s: 0.5,
             stiction_speed_rad_s: 0.05,
+            inertia_slack: vec![1.0, 0.5, 0.5, 0.5, 0.5, 0.5],
+            inertia_hold_s: 0.2,
             warning_hold_s: 1.0,
             retreat_s: 0.15,
             retreat_max_rad: 0.1,
@@ -1718,12 +1730,23 @@ impl RobotConfig {
             (c.impact_window_s, "contact.impact_window_s"),
             (c.impact_highpass_s, "contact.impact_highpass_s"),
             (c.stiction_speed_rad_s, "contact.stiction_speed_rad_s"),
+            (c.inertia_hold_s, "contact.inertia_hold_s"),
             (c.warning_hold_s, "contact.warning_hold_s"),
             (c.retreat_timeout_s, "contact.retreat_timeout_s"),
         ] {
             if !is_positive(v) || !v.is_finite() {
                 return Err(invalid(name, "must be > 0 and finite"));
             }
+        }
+        if c.inertia_slack.len() != self.joints.len()
+            || c.inertia_slack
+                .iter()
+                .any(|v| !(v.is_finite() && (0.0..=1.0).contains(v)))
+        {
+            return Err(invalid(
+                "contact.inertia_slack",
+                "must carry one share in [0, 1] per joint",
+            ));
         }
         for (v, name) in [
             (c.retreat_s, "contact.retreat_s"),

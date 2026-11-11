@@ -493,6 +493,7 @@ pub struct RtHandles {
 pub struct RtCore<B: DriverBus> {
     dt: f64,
     tick: u64,
+    placements: u32,
     bus: B,
     bus_state: BusState,
 
@@ -807,6 +808,7 @@ impl<B: DriverBus> RtCore<B> {
         let core = Self {
             dt,
             tick: 0,
+            placements: 0,
             bus,
             bus_state: BusState::new(),
             conv,
@@ -1157,6 +1159,24 @@ impl<B: DriverBus> RtCore<B> {
         self.qd[joint] = 0.0;
         self.q_filt[joint] = joint_rad;
         self.qd_filt[joint] = 0.0;
+        self.forget_external_torque();
+    }
+
+    /// The angles have just come to mean something else — a reference
+    /// latched, a simulated arm placed elsewhere — so what was estimated
+    /// at the old ones, and where the arm was on the way, are void.
+    fn forget_external_torque(&mut self) {
+        self.observer.reset();
+        self.contact.reseed();
+        self.tau_ext = [0.0; MAX_JOINTS];
+        self.trail_len = 0;
+        self.trail_next = 0;
+    }
+
+    /// Count a teleport as over, whether it landed or was refused: the
+    /// next snapshot is the first that describes the arm after it.
+    pub fn note_placement(&mut self) {
+        self.placements = self.placements.wrapping_add(1);
     }
 
     /// Adopt `q` \[rad\] as the pose the plant was just re-seeded to.
@@ -1214,9 +1234,7 @@ impl<B: DriverBus> RtCore<B> {
         // clamp, which moves the arm the whole way there in one tick.
         let _ = self.stream_rx.take();
         let q = self.q;
-        // The arm was never anywhere on the way here to retreat to.
-        self.trail_len = 0;
-        self.trail_next = 0;
+        self.forget_external_torque();
         self.exec.reseed_hold(&q);
         self.stream.activate(&q);
         self.stream_shaped.activate(&q);
@@ -2152,9 +2170,18 @@ impl<B: DriverBus> RtCore<B> {
                 *target += (was - *target).clamp(-self.retreat_max_rad, self.retreat_max_rad);
             }
         }
+        self.exec.abandon();
         self.enter_mode(Mode::Stream);
         self.stream.set_scale(1.0, 1.0);
         self.stream_scale = (1.0, 1.0);
+        // The tracker clamps what it is asked for into the soft window,
+        // which would walk a joint standing outside that window all the
+        // way back into it. The reflex's target is bounded by where the
+        // arm is, not by where it is allowed to be.
+        self.stream.set_bounds(
+            &[f64::NEG_INFINITY; MAX_JOINTS],
+            &[f64::INFINITY; MAX_JOINTS],
+        );
         self.stream.set_target(&target);
         self.q_target = target;
         self.reflex_deadline = Some(self.tick + u64::from(self.reflex_timeout_ticks));
@@ -2258,7 +2285,10 @@ impl<B: DriverBus> RtCore<B> {
                 // first tick toward an abandoned pose — one the admission
                 // gate never re-checked against the current world.
                 let _ = self.stream_rx.take();
-                self.reflex_deadline = None;
+                if self.reflex_deadline.take().is_some() {
+                    let (min, max) = self.park.soft_bounds;
+                    self.stream.set_bounds(&min, &max);
+                }
             }
             _ => {}
         }
@@ -2278,6 +2308,9 @@ impl<B: DriverBus> RtCore<B> {
     /// peaks the next run is judged by start from nothing.
     fn begin_clear(&mut self) {
         if self.errors.any_protective() && !self.errors.any_hard() {
+            // No motion was admitted while the stop stood, so anything
+            // that reached the ring since is the stopped motion's too.
+            self.exec.abandon();
             self.errors.clear_protective();
             self.contact.reset_peaks();
             return;
@@ -2526,7 +2559,10 @@ impl<B: DriverBus> RtCore<B> {
         // tick and latches until the operator has dealt with it; a
         // resting one reports.
         let watch = self.contact_watch();
-        if let Some(trip) = self.contact.update(&self.tau_ext, &self.qd, watch) {
+        if let Some(trip) =
+            self.contact
+                .update(&self.tau_ext, &self.qd, self.observer.effort(), watch)
+        {
             self.errors.latch(ErrorCode::Contact, Some(trip.joint));
             self.begin_reflex(true);
         }
@@ -2836,6 +2872,7 @@ impl<B: DriverBus> RtCore<B> {
                         log::info!("homing sequence complete");
                         self.homed = true;
                         self.not_homed_refused = false;
+                        self.forget_external_torque();
                     } else if refused {
                         log::warn!("homing sequence FAILED the reference check");
                         self.homed = false;
@@ -3188,6 +3225,7 @@ impl<B: DriverBus> RtCore<B> {
         let gravity_applied = self.gravity_applied();
         let s = &mut self.snap;
         s.tick = self.tick;
+        s.placements = self.placements;
         s.mode = self.mode;
         s.state = self.state;
         s.enabled_request_id = self.enabled_request_id;

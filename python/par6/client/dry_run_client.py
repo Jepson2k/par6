@@ -1094,6 +1094,10 @@ class DryRunRobotClient(RobotOwner):
         """None: a preview runs no control loop to report on."""
         return None
 
+    def contact(self) -> None:
+        """None: a preview measures no motor torque to read a contact from."""
+        return None
+
     def reset_loop_stats(self, **kwargs: Any) -> int:
         """A preview runs no control loop."""
         return 1

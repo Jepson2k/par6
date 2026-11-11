@@ -315,7 +315,20 @@ impl Daemon {
             fk: fk_hook,
             samples: consumer,
         };
-        let (core, handles) = RtCore::new(&bundle, bus, hooks)?;
+        let (mut core, handles) = RtCore::new(&bundle, bus, hooks)?;
+        if let Some(path) = &opts.sim_scenario {
+            let scenario = load_sim_scenario(path)?;
+            core.bus_mut()
+                .sim_mut()
+                .ok_or_else(|| {
+                    DaemonError::ConfigPath("--sim-scenario needs the simulator (--sim)".into())
+                })?
+                .set_scenario(&scenario)
+                .map_err(|e| {
+                    DaemonError::ConfigPath(format!("sim scenario {}: {e}", path.display()))
+                })?;
+            log::info!("sim scenario {} active: {scenario:?}", path.display());
+        }
 
         // The RT snapshot channel is single-reader; the tee fans it out.
         let (srv_w, srv_r) = snapshot_channel::<StateSnapshot>();
@@ -1037,6 +1050,16 @@ impl KinSource {
             ))
         })
     }
+}
+
+/// Read a simulator scenario file: the scenario's fields as TOML.
+fn load_sim_scenario(
+    path: &std::path::Path,
+) -> Result<par6_bus::sim::SimulationScenario, DaemonError> {
+    let refuse =
+        |e: String| DaemonError::ConfigPath(format!("sim scenario {}: {e}", path.display()));
+    let text = std::fs::read_to_string(path).map_err(|e| refuse(e.to_string()))?;
+    toml::from_str(&text).map_err(|e| refuse(e.to_string()))
 }
 
 pub(crate) fn load_kin_stack(

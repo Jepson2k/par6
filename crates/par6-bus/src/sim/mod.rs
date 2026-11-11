@@ -149,6 +149,11 @@ pub struct SimBus {
     plant: Option<mujoco::MujocoPlant>,
     maps: Vec<JointMap>,
     loads_ma: Vec<f64>,
+    /// `loads_ma` plus the scenario's push, as this tick's plant step
+    /// takes it.
+    step_loads_ma: Vec<f64>,
+    /// The scenario's obstacle: in the physics, not in `world`.
+    obstacle: Option<scenario::Obstacle>,
     hall_bands: Vec<Option<(f64, f64)>>,
     rx: VecDeque<(u64, CanFrame)>,
     dropped_rx: u64,
@@ -214,6 +219,8 @@ impl SimBus {
             plant: None,
             maps: Vec::new(),
             loads_ma: Vec::new(),
+            step_loads_ma: Vec::new(),
+            obstacle: None,
             hall_bands: Vec::new(),
             rx: VecDeque::new(),
             dropped_rx: 0,
@@ -259,6 +266,18 @@ impl SimBus {
                     fault.node
                 ));
             }
+        }
+        if let Some(push) = scenario.joint_push {
+            if self.node_to_joint[usize::from(push.node)].is_none() {
+                return Err(format!(
+                    "scenario push node {} is not an arm joint",
+                    push.node
+                ));
+            }
+        }
+        if self.obstacle != scenario.obstacle {
+            self.obstacle = scenario.obstacle;
+            self.world_dirty = true;
         }
         self.scenario = scenario::ActiveScenario::new(scenario, self.tick, self.dt);
         Ok(())
@@ -629,6 +648,12 @@ impl SimBus {
             drv.age_watchdog();
         }
         let jaw_drive = self.mj_jaw_drive();
+        self.step_loads_ma.copy_from_slice(&self.loads_ma);
+        if let Some((node, nm)) = self.scenario.push(self.tick) {
+            if let Some(j) = self.node_to_joint[usize::from(node)] {
+                self.step_loads_ma[j] -= nm * self.maps[j].factor_ma_per_nm;
+            }
+        }
         let plant = self
             .plant
             .as_mut()
@@ -636,7 +661,7 @@ impl SimBus {
         plant.step(
             dt,
             &mut self.drivers,
-            &self.loads_ma,
+            &self.step_loads_ma,
             &self.maps,
             jaw_drive,
             mujoco::PowerState {
@@ -1440,6 +1465,7 @@ impl DriverBus for SimBus {
             })
             .collect();
         self.loads_ma = vec![0.0; n];
+        self.step_loads_ma = vec![0.0; n];
         self.hall_bands = robot
             .homing
             .joints
@@ -1756,6 +1782,9 @@ impl SimBus {
         let base = scene::BaseSpec::new(&spec).map_err(|e| e.to_string())?;
         scene::inject_world(&mut spec, &[&self.world[0], &self.world[1]])
             .map_err(|e| e.to_string())?;
+        if let Some(obstacle) = &self.obstacle {
+            scene::inject_obstacle(&mut spec, obstacle);
+        }
         let model = scene::compile(&mut spec)?;
         self.base_spec = Some(base);
         self.world_dirty = false;
@@ -1781,6 +1810,12 @@ impl SimBus {
                 scene::inject_world(&mut spec, &[&self.world[0], &self.world[1]])
                     .map(|()| spec)
                     .map_err(|e| e.to_string())
+            })
+            .map(|mut spec| {
+                if let Some(obstacle) = &self.obstacle {
+                    scene::inject_obstacle(&mut spec, obstacle);
+                }
+                spec
             });
         let result = spec.and_then(|mut spec| {
             self.plant

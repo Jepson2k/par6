@@ -116,6 +116,43 @@ class StatusResult:
 
 
 @dataclass
+class ContactReadout:
+    """CONTACT query snapshot: what the arm stops for, and what it has seen.
+
+    Torques are Nm per joint.  The peaks are what tuning reads: run a
+    program with nothing in the arm's way and set each threshold at roughly
+    twice its peak.
+    """
+
+    reaction: str
+    """``"stop"``, ``"warn"`` or ``"off"``."""
+    sustained_nm: list[float]
+    """Thresholds on the signal itself: something being pressed into."""
+    impact_nm: list[float]
+    """Thresholds on the signal against its own slow average: a bump."""
+    signal: list[float]
+    """The contact signal now: the external-torque estimate less what each
+    joint's stiction accounts for at its speed."""
+    impact: list[float]
+    """The signal against its own slow average now."""
+    peak_signal: list[float]
+    """Largest ``|signal|`` while the arm was being driven, since the last
+    ``reset()``."""
+    peak_impact: list[float]
+    """Largest ``|impact|`` likewise."""
+    trips: int
+    """Contacts the arm has stopped for since the runtime booted."""
+    last_trip_joint: int | None
+    """The joint (0-based) that read the most recent one."""
+    last_trip_channel: str | None
+    """``"sustained"`` or ``"impact"``."""
+    angles: list[float]
+    """Joint angles (degrees) the readout was taken at."""
+    gravity_nm: list[float]
+    """The gravity torque the runtime's model holds at those angles."""
+
+
+@dataclass
 class ReachableResult:
     """Per-joint / per-axis enablement flags (1 = motion allowed)."""
 
@@ -1962,6 +1999,25 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
             return None
         return LoopStatsResult(**result)
 
+    async def contact(self) -> ContactReadout | None:
+        """Contact detection readout: thresholds, signals, peaks, stops.
+
+        The peaks restart at every ``reset()``, so the tuning loop is
+        ``reset()``, run the program with nothing in the way, read
+        ``contact().peak_signal`` and ``peak_impact``.  Returns None if
+        unreachable.
+
+        Category: Query
+
+        Example:
+            peaks = rbt.contact().peak_signal
+        """
+        core = await self._ensure_core()
+        result = await self._call(core.contact())
+        if result is None:
+            return None
+        return ContactReadout(**result)
+
     async def shapes(self) -> ShapeWorld | None:
         """The collision world the runtime is currently enforcing, by layer.
 
@@ -2043,6 +2099,7 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
 # Re-exported for callers that type against the concrete buffer.
 __all__ = [
     "AsyncRobotClient",
+    "ContactReadout",
     "LoopStatsResult",
     "QueueResult",
     "ReachableResult",

@@ -1893,6 +1893,33 @@ impl RtBridge {
     }
 }
 
+/// The RT half of a teleport: re-seed the simulated plant at `q` and have
+/// the core adopt the landed pose.
+fn place(
+    core: &mut RtCore<RuntimeBus>,
+    robot: &par6_config::RobotConfig,
+    q: &[f64; MAX_JOINTS],
+    tool_closed: Option<f64>,
+) {
+    let Some(bus) = core.bus_mut().sim_mut() else {
+        log::error!("teleport reached a hardware bus; dropped");
+        return;
+    };
+    // Re-seed, not a bus reboot: the drivers keep running, so the arm is
+    // still held the tick after it lands.
+    if let Err(e) = bus.teleport_joint_rad(&q[..robot.joints.len()]) {
+        log::error!("teleport: sim re-seed failed: {e}");
+        return;
+    }
+    if let Some(closed) = tool_closed {
+        if let Err(e) = bus.teleport_gripper(closed) {
+            log::error!("teleport: sim tool re-seed failed: {e}");
+        }
+    }
+    core.adopt_landed_pose(robot, q);
+    log::info!("teleport applied: {q:?} rad, homed=true");
+}
+
 impl RtCommands for RtBridge {
     fn stream(&mut self, cmd: &Command) -> Result<(), WireError> {
         self.adopt_tool();
@@ -2789,24 +2816,10 @@ impl RtCommands for RtBridge {
             *out = deg.to_radians();
         }
         self.link.op(Box::new(move |core| {
-            let robot = &bundle.robot;
-            let Some(bus) = core.bus_mut().sim_mut() else {
-                log::error!("teleport reached a hardware bus; dropped");
-                return;
-            };
-            // Re-seed, not a bus reboot: the drivers keep running, so the
-            // arm is still held the tick after it lands.
-            if let Err(e) = bus.teleport_joint_rad(&q[..robot.joints.len()]) {
-                log::error!("teleport: sim re-seed failed: {e}");
-                return;
-            }
-            if let Some(closed) = tool_closed {
-                if let Err(e) = bus.teleport_gripper(closed) {
-                    log::error!("teleport: sim tool re-seed failed: {e}");
-                }
-            }
-            core.adopt_landed_pose(robot, &q);
-            log::info!("teleport applied: {q:?} rad, homed=true");
+            place(core, &bundle.robot, &q, tool_closed);
+            // Counted either way: what waits on a teleport is waiting
+            // for it to be over, not for it to have worked.
+            core.note_placement();
         }));
     }
 

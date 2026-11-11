@@ -298,3 +298,115 @@ fn a_push_on_a_resting_arm_is_reported_not_stopped_for() {
         "and it holds its pose against the push"
     );
 }
+
+/// A joint standing outside its soft window — jogged there before the arm
+/// was referenced, or guided there by hand — stays where it is when
+/// another joint's contact stops the arm. The retreat goes back along the
+/// arm's own track; it is not a move into the window.
+#[test]
+fn a_retreat_leaves_a_joint_outside_its_soft_window_where_it_is() {
+    let mut rig = SimRig::boot(0.004, reach());
+    let wrist = rig.bundle.robot.joints[4].limits;
+    let (_, hard_max) = wrist.travel_rad();
+    let outside = wrist.soft_max_rad + 0.5 * (hard_max - wrist.soft_max_rad);
+    assert!(
+        outside - wrist.soft_max_rad > 0.1,
+        "the wrist has room past its soft window"
+    );
+    let mut start = reach();
+    start[4] = outside;
+    rig.land(start);
+
+    // Jog the base: a jog asks for a direction and a speed, so the wrist
+    // is left where it stands.
+    rig.commands.send(RtCommand::SetMode(Mode::Jog)).unwrap();
+    rig.tick();
+    let mut speeds = [0.0; MAX_JOINTS];
+    speeds[0] = 0.5;
+    rig.commands
+        .send(RtCommand::Jog { speeds, accel: 1.0 })
+        .unwrap();
+    let mut moving = rig.tick();
+    for _ in 0..rig.ticks(2.0) {
+        moving = rig.tick();
+        if moving.qd[0] > 0.4 {
+            break;
+        }
+    }
+    assert!(moving.qd[0] > 0.4, "the base jogs: {:?}", moving.qd);
+    assert!(
+        (moving.q[4] - outside).abs() < 0.01,
+        "the jog left the wrist outside its window"
+    );
+
+    rig.push(0, -2.0);
+    let mut held = moving;
+    for _ in 0..rig.ticks(2.0) {
+        held = rig.tick();
+        if held.protective_active && held.mode == Mode::Exec {
+            break;
+        }
+    }
+    rig.push(0, 0.0);
+    assert!(
+        held.protective_active && held.mode == Mode::Exec,
+        "the contact stopped the jog into a hold: {:?} in {:?}",
+        held.errors.as_slice(),
+        held.mode
+    );
+    for _ in 0..rig.ticks(0.5) {
+        held = rig.tick();
+    }
+    assert!(
+        (held.q[4] - outside).abs() < 0.01,
+        "the retreat moved the wrist {:+.4} rad toward its soft window",
+        held.q[4] - outside
+    );
+}
+
+/// What an arm read before it was referenced is not a level to judge its
+/// first move against. Unreferenced, the model's angles are a guess and
+/// the estimate carries whatever the guess leaves over; the moment the
+/// arm is referenced that is gone, and a move begun right then runs.
+#[test]
+fn a_move_begun_as_the_arm_is_referenced_is_not_a_contact() {
+    let start = reach();
+    let mut rig = SimRig::boot(0.004, start);
+    // Held on its drives rather than floating, so the arm is being read
+    // from the tick it is referenced in.
+    rig.commands.send(RtCommand::SetGravityComp(false)).unwrap();
+    // An unreferenced arm with a standing torque in its estimate: the
+    // elbow's, here, from something leaning on it.
+    rig.core.set_homed(false);
+    rig.push(2, 2.5);
+    let mut leaning = rig.tick();
+    for _ in 0..rig.ticks(1.5) {
+        leaning = rig.tick();
+    }
+    assert!(
+        leaning.tau_ext[2].abs() > 1.0 && !leaning.homed,
+        "the unreferenced elbow's estimate stands at {:+.3} Nm",
+        leaning.tau_ext[2]
+    );
+
+    rig.push(2, 0.0);
+    rig.land(start);
+    rig.hold();
+    let mut target = start;
+    target[0] += 0.6;
+    let mut last = rig.tick();
+    for _ in 0..rig.ticks(2.0) {
+        last = rig.stream(target);
+        assert!(
+            !last.protective_active,
+            "the first move of a freshly referenced arm stopped: {:?} ({:?})",
+            last.errors.as_slice(),
+            last.contact.last_trip
+        );
+    }
+    assert!(
+        (last.q[0] - target[0]).abs() < 0.02,
+        "and it arrived: {:+.4} rad short",
+        target[0] - last.q[0]
+    );
+}

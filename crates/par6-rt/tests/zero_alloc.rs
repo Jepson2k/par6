@@ -177,7 +177,15 @@ fn steady_state_ticks_allocate_nothing() {
     // transitions below run through it too; the ring was filled BEFORE
     // the window (try_push is allocation-free, but the measurement
     // isolates the tick itself).
-    core.set_homed(true);
+    // Referenced where it stands, mid-travel: the arm's model then
+    // describes the arm, so contact detection — on, as shipped — watches
+    // the program run rather than reading a contact into angles the
+    // model was never given.
+    let landed = [0.0, -1.2, 3.6, 0.0, 0.5, 2.0];
+    core.bus_mut()
+        .teleport_joint_rad(&landed)
+        .expect("teleport");
+    core.adopt_landed_pose(robot, &landed);
     tx.send(RtCommand::Enable(0)).unwrap();
     core.tick(dt, false);
     tx.send(RtCommand::SetMode(Mode::Exec)).unwrap();
@@ -188,14 +196,14 @@ fn steady_state_ticks_allocate_nothing() {
         .limits
         .for_mode(par6_config::LimitMode::Exec)
         .acceleration_rad_s2;
-    let omega = 2.5;
+    let omega = 4.0;
     let (q0, amplitude) = (q[0], 1.5 * a_lim / (omega * omega));
     let mut qd = [0.0; MAX_JOINTS];
     let pushed = 3500;
     for k in 0..pushed {
         let t = k as f64 * dt;
-        q[0] = q0 + amplitude * (omega * t).sin();
-        qd[0] = amplitude * omega * (omega * t).cos();
+        q[0] = q0 + amplitude * (1.0 - (omega * t).cos());
+        qd[0] = amplitude * omega * (omega * t).sin();
         let s = Sample {
             q,
             qd,
@@ -243,6 +251,47 @@ fn steady_state_ticks_allocate_nothing() {
             "the transition ran: scale {applied} against {expected_scale}"
         );
     }
+
+    // A contact, and everything the core does about it on its own: the
+    // stop, the retreat on the stream tracker and the hold it ends in.
+    // The program is still swinging the base when something leans on it.
+    let base = &robot.joints[0];
+    let lean_ma = 2.5
+        * par6_bus::spectral::torque_to_ma_factor(
+            base.gear_ratio,
+            base.gear_efficiency,
+            base.kt_nm_a,
+            base.dir,
+        );
+    assert!(
+        handles.snapshots.latest().exec.samples_remaining > 0,
+        "the program is still running"
+    );
+    core.bus_mut().set_joint_load_ma(base.node_id, lean_ma);
+    assert_no_allocs(
+        || {
+            for _ in 0..robot.ticks(1.5) {
+                hb.feed();
+                core.tick(dt, false);
+            }
+        },
+        "contact stop, retreat and hold",
+    );
+    let stopped = handles.snapshots.latest();
+    assert!(
+        stopped.protective_active && stopped.mode == Mode::Exec,
+        "the contact stopped the program into a hold: {:?} in {:?}",
+        stopped.errors.as_slice(),
+        stopped.mode
+    );
+    assert_eq!(
+        stopped.exec.samples_remaining, 0,
+        "what was left of the program went with the stop"
+    );
+    core.bus_mut().set_joint_load_ma(base.node_id, 0.0);
+    tx.send(RtCommand::ClearErrors).unwrap();
+    core.tick(dt, false);
+    assert!(!handles.snapshots.latest().protective_active);
 
     // HOMING window: mid-approach of step 1 (pre-moves are 4 s = 1000
     // ticks; J0's approach runs for several seconds after that). The FSM

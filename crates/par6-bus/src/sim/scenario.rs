@@ -30,6 +30,31 @@ pub struct SupplyLoss {
     pub decay_s: f64,
 }
 
+/// A torque on one joint's link for a while: a hand on the arm, or
+/// something that gives as the arm leans on it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct JointPush {
+    pub at_s: f64,
+    pub duration_s: f64,
+    pub node: u8,
+    /// Torque on the link \[Nm\], positive along the joint's positive
+    /// direction.
+    pub nm: f64,
+}
+
+/// A solid box the runtime was never told about. It exists in the
+/// physics and nowhere in the collision world, so nothing plans around
+/// it: the arm finds it by running into it.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Obstacle {
+    /// Full side lengths \[m\].
+    pub size_m: [f64; 3],
+    /// World pose `[x, y, z, rx, ry, rz]` \[m, rad\], `R = Rz·Ry·Rx`.
+    pub pose: [f64; 6],
+}
+
 /// Offline scenario inputs. No perturbation is active unless requested.
 /// Encoder noise affects host telemetry, never the driver's local feedback.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
@@ -41,6 +66,8 @@ pub struct SimulationScenario {
     pub dropout: Option<Window>,
     pub driver_fault: Option<DriverFault>,
     pub supply_loss: Option<SupplyLoss>,
+    pub joint_push: Option<JointPush>,
+    pub obstacle: Option<Obstacle>,
 }
 
 impl SimulationScenario {
@@ -75,6 +102,31 @@ impl SimulationScenario {
         {
             return Err("supply_loss times must be finite and in [0, 3600]".into());
         }
+        if self.joint_push.is_some_and(|p| {
+            !time(p.at_s)
+                || !time(p.duration_s)
+                || p.duration_s == 0.0
+                || p.node >= 16
+                || !p.nm.is_finite()
+                || p.nm.abs() > 100.0
+        }) {
+            return Err(
+                "joint_push requires a configured joint node in [0, 15], at_s >= 0, \
+                 duration_s > 0, each at most 3600, and a finite torque of at most 100 Nm"
+                    .into(),
+            );
+        }
+        if self.obstacle.is_some_and(|o| {
+            o.size_m
+                .iter()
+                .any(|s| !s.is_finite() || *s <= 0.0 || *s > 10.0)
+                || o.pose.iter().any(|v| !v.is_finite())
+                || o.pose[..3].iter().any(|v| v.abs() > 10.0)
+        }) {
+            return Err(
+                "obstacle requires finite sides in (0, 10] m and a finite pose within 10 m".into(),
+            );
+        }
         Ok(())
     }
 }
@@ -89,6 +141,7 @@ pub(super) struct ActiveScenario {
     dropout: Option<(u64, u64)>,
     fault: Option<(u64, u8, FaultKind)>,
     supply: Option<(u64, u64)>,
+    push: Option<(u64, u64, u8, f64)>,
 }
 
 impl ActiveScenario {
@@ -104,7 +157,18 @@ impl ActiveScenario {
                 .map(|w| (ticks(w.start_s), ticks(w.duration_s).max(1))),
             fault: s.driver_fault.map(|f| (ticks(f.at_s), f.node, f.kind)),
             supply: s.supply_loss.map(|f| (ticks(f.at_s), ticks(f.decay_s))),
+            push: s
+                .joint_push
+                .map(|p| (ticks(p.at_s), ticks(p.duration_s).max(1), p.node, p.nm)),
         }
+    }
+
+    /// The joint being pushed this tick and the torque on its link
+    /// \[Nm\].
+    pub fn push(&self, tick: u64) -> Option<(u8, f64)> {
+        let (start, duration, node, nm) = self.push?;
+        let elapsed = tick.saturating_sub(self.start_tick);
+        (elapsed >= start && elapsed - start < duration).then_some((node, nm))
     }
 
     pub fn supply_scale(&self, tick: u64) -> f64 {

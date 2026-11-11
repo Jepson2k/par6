@@ -76,6 +76,7 @@ pub struct TorqueObserver {
     qdd: [f64; MAX_JOINTS],
     dynamic: [f64; MAX_JOINTS],
     estimate: [f64; MAX_JOINTS],
+    effort: [f64; MAX_JOINTS],
     seeded: bool,
     inertial: bool,
 }
@@ -94,6 +95,7 @@ impl TorqueObserver {
             qdd: [0.0; MAX_JOINTS],
             dynamic: [0.0; MAX_JOINTS],
             estimate: [0.0; MAX_JOINTS],
+            effort: [0.0; MAX_JOINTS],
             seeded: false,
             inertial: false,
         }
@@ -123,18 +125,38 @@ impl TorqueObserver {
         self.qd_prev = *qd;
         self.inertial = model.dynamics(q, qd, &self.qdd, &mut self.dynamic);
         for i in 0..MAX_JOINTS {
-            let unexplained = tau[i]
-                - self.friction.torque(i, qd[i])
-                - g[i]
-                - self.dynamic[i]
-                - self.rotor_kg_m2[i] * self.qdd[i];
+            let inertial = self.dynamic[i] + self.rotor_kg_m2[i] * self.qdd[i];
+            let unexplained = tau[i] - self.friction.torque(i, qd[i]) - g[i] - inertial;
             self.estimate[i] = (self.estimate[i] + self.gain * unexplained) / (1.0 + self.gain);
+            self.effort[i] = (self.effort[i] + self.gain * inertial.abs()) / (1.0 + self.gain);
         }
+    }
+
+    /// Start over: the next update only takes its velocity reference.
+    /// For when the angles the model is evaluated at stop meaning what
+    /// they did — a reference latched, a simulated arm placed somewhere
+    /// else. What the estimate had settled to described the old angles,
+    /// and it would otherwise spend its filter's memory decaying out of
+    /// them in front of everything that reads it.
+    pub fn reset(&mut self) {
+        self.estimate = [0.0; MAX_JOINTS];
+        self.effort = [0.0; MAX_JOINTS];
+        self.seeded = false;
     }
 
     /// The external-torque estimate \[Nm\], measured minus model.
     pub fn estimate(&self) -> &[f64; MAX_JOINTS] {
         &self.estimate
+    }
+
+    /// How much torque the model is charging to the arm's own motion
+    /// \[Nm\]: the magnitude of the inertial terms, through the same
+    /// filter as the estimate. It bounds how wrong the estimate can be on
+    /// the model's account — a rigid-body model of an arm whose
+    /// drivetrains wind up is at its worst exactly when this is large —
+    /// so it is what a reader of the estimate scales its trust by.
+    pub fn effort(&self) -> &[f64; MAX_JOINTS] {
+        &self.effort
     }
 
     /// Whether the model behind the last update described the arm's

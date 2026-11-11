@@ -216,6 +216,24 @@ impl ExecPlayback {
         dropped
     }
 
+    /// Discard every queued sample, marked or not: what a protective
+    /// stop does to the motion it stopped. Whatever is in the ring at
+    /// that moment belongs to that motion; the generation mark is the
+    /// producer's to set once it has heard, and the stop does not wait
+    /// for it. Returns the discard count.
+    pub fn abandon(&mut self) -> usize {
+        self.owe_boundary = None;
+        self.last_meta = None;
+        self.settling = false;
+        self.stopping = false;
+        self.left = Sample {
+            q: self.hold_q,
+            ..Sample::default()
+        };
+        self.phase = 0.0;
+        self.consumer.clear()
+    }
+
     /// Replace the completion policy (takes effect at the next boundary).
     pub fn set_policy(&mut self, policy: Box<dyn SettlePolicy>) {
         self.policy = policy;

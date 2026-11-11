@@ -2789,12 +2789,13 @@ fn the_shipped_binary_publishes_the_bus_grant_signal_and_takes_it_away() {
 }
 
 /// A teleport references the arm, so the move sent right behind it must
-/// be accepted. The homed gate reads the RT snapshot, which is a tick or
-/// more behind the accepted teleport — a script that teleports and then
-/// moves, as `examples/keepout_preview.py` does, must not race the
+/// be accepted — and must start from where the teleport puts the arm. The
+/// homed gate and the planner both read the RT snapshot, which is a tick
+/// or more behind the accepted teleport — a script that teleports and
+/// then moves, as `examples/keepout_preview.py` does, must not race the
 /// broadcast. A 20 Hz tick leaves 50 ms between snapshots for two
-/// back-to-back datagrams to land in, so the move is gated before any
-/// tick has seen the teleport.
+/// back-to-back datagrams to land in, so the move is gated, and offered
+/// for planning, before any tick has seen the teleport.
 #[test]
 fn a_move_sent_right_behind_a_teleport_is_not_refused_as_unhomed() {
     let config = common::retimed_config("teleport-race", 0.05);
@@ -2814,8 +2815,28 @@ fn a_move_sent_right_behind_a_teleport_is_not_refused_as_unhomed() {
     c.send(&teleport(park));
     // No wait: this is the race. The move goes out in the same breath.
     let index = c.ok_index(&move_j(4101, with_j0(park, 5.0), 0.5));
+    // The move starts where the teleport put the arm, not where the arm
+    // was when the two datagrams arrived: a plan taken before the
+    // teleport landed swings every joint toward the old pose first.
+    let run = rig.collect_through(index, BUDGET);
     let (ok, detail) = c.wait_complete(index);
     assert!(ok, "the move behind a teleport must run, got {detail:?}");
+    let referenced: Vec<&Status> = run.iter().filter(|s| s.homed).collect();
+    assert!(!referenced.is_empty(), "the move was observed");
+    for s in referenced {
+        assert!(
+            (-1.0..=6.0).contains(&s.angles[0]),
+            "the base left its 5 degree move: {:.2} deg",
+            s.angles[0]
+        );
+        for (j, placed) in park.iter().enumerate().skip(1) {
+            assert!(
+                (s.angles[j] - placed).abs() < 1.0,
+                "J{j} strayed {:+.2} deg from where it was placed, during a base-only move",
+                s.angles[j] - placed
+            );
+        }
+    }
 
     rig.shutdown();
 }

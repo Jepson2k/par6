@@ -34,6 +34,7 @@ from ..protocol import CompletionPolicy
 from ..protocol.wire import StatusBuffer
 from .async_client import (
     AsyncRobotClient,
+    ContactReadout,
     LoopStatsResult,
     QueueResult,
     ReachableResult,
@@ -721,6 +722,10 @@ class RobotClient:
     def loop_stats(self) -> LoopStatsResult | None:
         """Control-loop runtime metrics."""
         return _run(self._inner.loop_stats())
+
+    def contact(self) -> ContactReadout | None:
+        """Contact detection readout: thresholds, signals, peaks, stops."""
+        return _run(self._inner.contact())
 
     def shapes(self) -> ShapeWorld | None:
         """The collision world the runtime is enforcing, by layer."""

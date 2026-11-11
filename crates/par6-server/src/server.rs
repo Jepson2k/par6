@@ -358,12 +358,14 @@ struct Core<R: RtCommands> {
     standing_error: Option<WireError>,
     action_state: ActionState,
     estop_latched: bool,
-    /// A teleport was accepted and the RT has not published the snapshot
-    /// yet. Teleporting references the arm, so the homed gate must open
-    /// for the command right behind it — a client sends a teleport and
-    /// its first move in the same breath, and the snapshot is a tick or
-    /// more behind.
-    teleport_homed: bool,
+    /// A teleport was accepted and the RT has not published a snapshot
+    /// from after it yet: the placement count the teleport was sent
+    /// under. A client sends a teleport and its first move in the same
+    /// breath, and the snapshot is a tick or more behind. Teleporting
+    /// references the arm, so the homed gate opens for that move — and
+    /// the move is not planned until the teleport is over, because a
+    /// plan taken before then starts from where the arm no longer is.
+    teleport_pending: Option<u32>,
     active_stream: Option<CmdType>,
     /// Datagrams a preemption drain took off the socket without being
     /// entitled to discard them; dispatched by the run loop, in order.
@@ -479,7 +481,7 @@ impl<R: RtCommands> Core<R> {
             standing_error: None,
             action_state: ActionState::Idle,
             estop_latched: false,
-            teleport_homed: false,
+            teleport_pending: None,
             active_stream: None,
             deferred: VecDeque::new(),
             drainbuf: vec![0u8; 65535],
@@ -1049,7 +1051,7 @@ impl<R: RtCommands> Core<R> {
                     self.runtime
                         .rt
                         .teleport(&p.angles, p.tool_positions.as_deref());
-                    self.teleport_homed = true;
+                    self.teleport_pending = Some(self.snap.placements);
                     self.on_motion_accepted();
                     Ok(())
                 }
@@ -1638,7 +1640,7 @@ impl<R: RtCommands> Core<R> {
             estop_latched: self.estop_latched,
             enabled: self.snap.state == ArmState::Enabled,
             protective: rt_protective_stop(&self.snap),
-            homed: self.snap.homed || self.teleport_homed,
+            homed: self.snap.homed || self.teleport_pending.is_some(),
             simulator: self.simulator,
         };
         check_gate(tag, &ctx)
@@ -1719,8 +1721,10 @@ impl<R: RtCommands> Core<R> {
         // A planned move is planned from the pose the arm is at when it
         // starts, so it waits out a brake: a stop decelerates along the old
         // path and a released jog or stream ramps down, and a plan taken
-        // mid-brake would start from where the arm no longer is.
-        if waits_for_rest(head.cmd.tag()) && self.arm_braking() {
+        // mid-brake would start from where the arm no longer is. A
+        // teleport still on its way to the RT is the same, more so.
+        if waits_for_rest(head.cmd.tag()) && (self.arm_braking() || self.teleport_pending.is_some())
+        {
             return;
         }
         if self.holding_for_blend() {
@@ -2210,8 +2214,11 @@ impl<R: RtCommands> Core<R> {
         if let Some(s) = self.runtime.snapshots.take() {
             self.snap = s;
             self.last_fresh = Some(Instant::now());
-            if self.snap.homed {
-                self.teleport_homed = false;
+            if self
+                .teleport_pending
+                .is_some_and(|sent_under| self.snap.placements != sent_under)
+            {
+                self.teleport_pending = None;
             }
         }
     }

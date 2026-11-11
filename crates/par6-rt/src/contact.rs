@@ -1,13 +1,22 @@
 //! Contact detection: reading something in the arm's way out of the
 //! external-torque estimate.
 //!
-//! The estimate is not judged raw. A joint that is at rest, or about to
-//! be, sits somewhere inside its Coulomb band with its drive still
-//! leaning on it, and that much torque appears and disappears with
-//! nothing touching the arm. So each joint's estimate first loses what
-//! its stiction could account for at its present speed — the whole
-//! Coulomb torque at rest, fading to nothing once the joint slides — and
-//! what is left is the contact signal. Two channels watch it:
+//! The estimate is not judged raw. Two things put torque into it with
+//! nothing touching the arm, and each joint's estimate first loses what
+//! they could account for; what is left is the contact signal.
+//!
+//! - **Stiction.** A joint that is at rest, or about to be, sits
+//!   somewhere inside its Coulomb band with its drive still leaning on
+//!   it: the whole Coulomb torque at rest, fading to nothing once the
+//!   joint slides.
+//! - **The model's own inertial terms.** The model is rigid and the
+//!   drivetrains are not: under a hard change of acceleration a motor
+//!   runs ahead of its link, and for that moment the inertial torque the
+//!   model charged is partly not there. `inertia_slack` of the effort the
+//!   model is charging, held for `inertia_hold_s` while the drivetrain
+//!   rings down, is allowed for.
+//!
+//! Two channels watch the signal:
 //!
 //! - **sustained**: the signal itself beyond `sustained_nm` for
 //!   `sustained_window_s` — something the arm is pressing into.
@@ -101,6 +110,10 @@ impl Default for ContactStatus {
 pub struct ContactDetector {
     coulomb_nm: [f64; MAX_JOINTS],
     stiction_speed_rad_s: f64,
+    inertia_slack: [f64; MAX_JOINTS],
+    /// Per-tick decay of the held inertial effort.
+    effort_decay: f64,
+    effort_held: [f64; MAX_JOINTS],
     sustained_ticks: u32,
     impact_ticks: u32,
     warning_hold_ticks: u32,
@@ -124,6 +137,9 @@ impl ContactDetector {
         Self {
             coulomb_nm: std::array::from_fn(|i| robot.dynamics.friction_coulomb_nm[i]),
             stiction_speed_rad_s: c.stiction_speed_rad_s,
+            inertia_slack: std::array::from_fn(|i| c.inertia_slack[i]),
+            effort_decay: (1.0 - dt / c.inertia_hold_s).max(0.0),
+            effort_held: [0.0; MAX_JOINTS],
             sustained_ticks: robot.ticks(c.sustained_window_s).max(1),
             impact_ticks: robot.ticks(c.impact_window_s).max(1),
             warning_hold_ticks: robot.ticks(c.warning_hold_s).max(1),
@@ -147,6 +163,15 @@ impl ContactDetector {
         &self.status
     }
 
+    /// Start over from the next signal: no average, no windows in
+    /// progress. For when the estimate itself has been started over.
+    pub fn reseed(&mut self) {
+        self.seeded = false;
+        self.over_sustained = [0; MAX_JOINTS];
+        self.over_impact = [0; MAX_JOINTS];
+        self.effort_held = [0.0; MAX_JOINTS];
+    }
+
     /// Forget the peaks: the next run is measured from nothing.
     pub fn reset_peaks(&mut self) {
         self.status.peak_signal = [0.0; MAX_JOINTS];
@@ -167,14 +192,21 @@ impl ContactDetector {
         &mut self,
         tau_ext: &[f64; MAX_JOINTS],
         qd: &[f64; MAX_JOINTS],
+        effort: &[f64; MAX_JOINTS],
         watch: ContactWatch,
     ) -> Option<ContactTrip> {
         let mut trip = None;
         for i in 0..MAX_JOINTS {
-            let hidden =
-                self.coulomb_nm[i] * (1.0 - (qd[i].abs() / self.stiction_speed_rad_s).tanh());
+            self.effort_held[i] = effort[i].max(self.effort_held[i] * self.effort_decay);
+            let hidden = self.coulomb_nm[i]
+                * (1.0 - (qd[i].abs() / self.stiction_speed_rad_s).tanh())
+                + self.inertia_slack[i] * self.effort_held[i];
             let signal = tau_ext[i] - tau_ext[i].clamp(-hidden, hidden);
-            if !self.seeded {
+            // An average that kept its own counsel while nothing was
+            // being read would meet the first armed tick with a level
+            // from another time — an unreferenced arm's, say — and the
+            // difference would read as a bump.
+            if !self.seeded || watch == ContactWatch::Suspended {
                 self.average[i] = signal;
             }
             self.average[i] += self.average_alpha * (signal - self.average[i]);

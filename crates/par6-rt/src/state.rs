@@ -487,6 +487,11 @@ pub struct StreamStatus {
 pub struct StateSnapshot {
     /// Tick this snapshot was produced at.
     pub tick: u64,
+    /// Teleports the simulated arm has been through, landed or refused.
+    /// A snapshot that counts one more than the count a teleport was
+    /// sent under describes the arm after it — which is what anything
+    /// planning from "where the arm is" has to wait for.
+    pub placements: u32,
     /// Operating mode.
     pub mode: Mode,
     /// Enabled/disabled.
@@ -614,6 +619,7 @@ impl Default for StateSnapshot {
     fn default() -> Self {
         Self {
             tick: 0,
+            placements: 0,
             mode: Mode::default(),
             state: ArmState::default(),
             enabled_request_id: 0,
