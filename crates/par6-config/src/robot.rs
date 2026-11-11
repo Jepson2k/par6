@@ -814,6 +814,80 @@ impl Default for DynamicsSection {
     }
 }
 
+/// What the arm does when it reads a contact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContactReaction {
+    /// A moving arm stops, backs off and holds until it is reset; a
+    /// resting one reports.
+    #[default]
+    Stop,
+    /// Report only: nothing stops.
+    Warn,
+    /// Nothing is read into the estimate at all.
+    Off,
+}
+
+/// `[contact]`: reading something in the arm's way out of the
+/// external-torque estimate, and what the arm does about it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ContactSection {
+    /// What a contact does.
+    pub reaction: ContactReaction,
+    /// Per joint: the contact signal held beyond this \[Nm\] for
+    /// `sustained_window_s` is a contact — something being pressed into.
+    /// It has to sit above whatever a load the model does not know, or
+    /// the gravity model's own error, leaves standing on the joint.
+    pub sustained_nm: Vec<f64>,
+    /// How long the signal must stay beyond `sustained_nm` \[s\].
+    pub sustained_window_s: f64,
+    /// Per joint: the contact signal jumping this far \[Nm\] from its own
+    /// slow average for `impact_window_s` is a contact — a bump. A
+    /// standing offset does not count against it.
+    pub impact_nm: Vec<f64>,
+    /// How long the jump must last \[s\].
+    pub impact_window_s: f64,
+    /// Time constant of the slow average the impact channel measures
+    /// against \[s\]: a signal that drifts slower than this is level, not
+    /// impact.
+    pub impact_highpass_s: f64,
+    /// Speed below which a joint's Coulomb friction is taken out of its
+    /// signal \[rad/s\]: a joint that is stopped or about to be shows up
+    /// to that much torque with nothing touching it.
+    pub stiction_speed_rad_s: f64,
+    /// How long a contact warning stands after the signal last crossed a
+    /// threshold \[s\], so one hovering at its threshold does not flicker.
+    pub warning_hold_s: f64,
+    /// How far back along its own track a stopped arm retreats \[s\]: it
+    /// returns to where it measured itself this long before the contact.
+    /// 0 stops it where it is.
+    pub retreat_s: f64,
+    /// The most any joint moves in a retreat \[rad\].
+    pub retreat_max_rad: f64,
+    /// When a retreat that has not come to rest is abandoned for a hold
+    /// where the arm is \[s\].
+    pub retreat_timeout_s: f64,
+}
+
+impl Default for ContactSection {
+    fn default() -> Self {
+        Self {
+            reaction: ContactReaction::Stop,
+            sustained_nm: vec![1.2, 2.0, 1.7, 0.5, 0.5, 0.3],
+            sustained_window_s: 0.08,
+            impact_nm: vec![1.1, 1.0, 0.9, 0.3, 0.3, 0.2],
+            impact_window_s: 0.016,
+            impact_highpass_s: 0.5,
+            stiction_speed_rad_s: 0.05,
+            warning_hold_s: 1.0,
+            retreat_s: 0.15,
+            retreat_max_rad: 0.1,
+            retreat_timeout_s: 1.0,
+        }
+    }
+}
+
 /// `[limits]`: safety-envelope enforcement thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -940,6 +1014,10 @@ pub struct RobotConfig {
     /// reference arm's.
     #[serde(default)]
     pub dynamics: DynamicsSection,
+    /// Contact detection and the stop that follows. Omitted = the
+    /// reference arm's thresholds, stopping.
+    #[serde(default)]
+    pub contact: ContactSection,
     /// This installation's standing collision restrictions — the floor,
     /// cage walls, the table, fixtures. Enforced from boot in the
     /// planner's gate, the streaming gate and the simulator's scene;
@@ -1086,6 +1164,7 @@ impl RobotConfig {
         self.validate_shutdown()?;
         self.validate_sim()?;
         self.validate_dynamics()?;
+        self.validate_contact()?;
         Ok(())
     }
 
@@ -1614,6 +1693,44 @@ impl RobotConfig {
         ] {
             if !is_positive(v) || !v.is_finite() {
                 return Err(invalid(name, "must be > 0 and finite"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_contact(&self) -> Result<(), ConfigError> {
+        let c = &self.contact;
+        for (values, name) in [
+            (&c.sustained_nm, "contact.sustained_nm"),
+            (&c.impact_nm, "contact.impact_nm"),
+        ] {
+            if values.len() != self.joints.len() {
+                return Err(invalid(name, "must carry one entry per joint"));
+            }
+            for (j, v) in values.iter().enumerate() {
+                if !is_positive(*v) || !v.is_finite() {
+                    return Err(invalid(name, format!("entry {j} must be > 0 and finite")));
+                }
+            }
+        }
+        for (v, name) in [
+            (c.sustained_window_s, "contact.sustained_window_s"),
+            (c.impact_window_s, "contact.impact_window_s"),
+            (c.impact_highpass_s, "contact.impact_highpass_s"),
+            (c.stiction_speed_rad_s, "contact.stiction_speed_rad_s"),
+            (c.warning_hold_s, "contact.warning_hold_s"),
+            (c.retreat_timeout_s, "contact.retreat_timeout_s"),
+        ] {
+            if !is_positive(v) || !v.is_finite() {
+                return Err(invalid(name, "must be > 0 and finite"));
+            }
+        }
+        for (v, name) in [
+            (c.retreat_s, "contact.retreat_s"),
+            (c.retreat_max_rad, "contact.retreat_max_rad"),
+        ] {
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(invalid(name, "must be finite and >= 0"));
             }
         }
         Ok(())

@@ -221,6 +221,19 @@ impl ExecPlayback {
         self.policy = policy;
     }
 
+    /// The hold setpoint and nothing else: no sample is consumed, no
+    /// completion advances.
+    pub fn hold(
+        &self,
+        q: &mut [f64; MAX_JOINTS],
+        qd: &mut [f64; MAX_JOINTS],
+        tau_ff: &mut [f64; MAX_JOINTS],
+    ) {
+        *q = self.hold_q;
+        qd.fill(0.0);
+        tau_ff.fill(0.0);
+    }
+
     /// One tick: writes the setpoint into `q`/`qd`/`tau_ff` (gravity is
     /// NOT included — dispatch adds G(q) on top).
     pub fn tick(

@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use par6_proto::command as cmd;
 use par6_proto::{
-    Command, CompletionPolicy, Frame, LoopStatsResult, QueryResult, Shape, Status, ToolStatusWire,
-    WireError, NUM_JOINTS,
+    Command, CompletionPolicy, ContactResult, Frame, LoopStatsResult, QueryResult, Shape, Status,
+    ToolStatusWire, WireError, NUM_JOINTS,
 };
 
 use crate::core::{Ack, Client};
@@ -110,6 +110,13 @@ impl Client {
     /// The standing error, if any.
     pub async fn error(&self) -> Result<Option<WireError>, ClientError> {
         unwrap_query!(self, Command::Error, QueryResult::Error { error } => error)
+    }
+
+    /// The contact detection readout: thresholds, signals, peaks since
+    /// the last reset, stops so far, and the model's gravity torque at
+    /// the pose it was taken in.
+    pub async fn contact(&self) -> Result<ContactResult, ClientError> {
+        unwrap_query!(self, Command::Contact, QueryResult::Contact(c) => c)
     }
 
     /// TCP linear speed \[mm/s\].

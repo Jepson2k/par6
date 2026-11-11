@@ -69,7 +69,7 @@ use tokio::sync::Notify;
 use tokio::time::MissedTickBehavior;
 
 use crate::config::ServerConfig;
-use crate::faults::{gripper_fault_code, rt_standing_error};
+use crate::faults::{gripper_fault_code, rt_protective_stop, rt_standing_error};
 use crate::gating::{check_gate, gate, is_stream, GateContext};
 use crate::link::BroadcastLink;
 use crate::plane::{OwnedPlanContext, OwnedQueued, PlanEvent, PlanRequest, ReplyTag};
@@ -662,6 +662,7 @@ impl<R: RtCommands> Core<R> {
         self.refresh_snapshot();
         self.emit_status_on_tick().await;
         self.stop_invalid_attachments().await;
+        self.end_stream_on_protective_stop();
         self.log_rt_latch_edges();
         self.answer_scans().await;
         self.request_boot_enable();
@@ -670,6 +671,17 @@ impl<R: RtCommands> Core<R> {
         self.settle_bus().await;
         self.expire_chunks().await;
         self.pump().await;
+    }
+
+    /// A protective stop took the arm off whatever was moving it. Queued
+    /// motion ends through the planner, which fails the command that was
+    /// in flight with the stop itself; a stream has no command to fail,
+    /// so its session is ended here. The gate refuses a new one until the
+    /// stop is cleared.
+    fn end_stream_on_protective_stop(&mut self) {
+        if self.snap.protective_active && self.active_stream.take().is_some() {
+            self.runtime.rt.cancel_stream();
+        }
     }
 
     /// The RT's own latch, on its edges: latched (with the catalog's
@@ -1625,6 +1637,7 @@ impl<R: RtCommands> Core<R> {
         let ctx = GateContext {
             estop_latched: self.estop_latched,
             enabled: self.snap.state == ArmState::Enabled,
+            protective: rt_protective_stop(&self.snap),
             homed: self.snap.homed || self.teleport_homed,
             simulator: self.simulator,
         };
@@ -2956,6 +2969,38 @@ impl<R: RtCommands> Core<R> {
                 applied_scale: self.snap.exec.applied_scale,
                 resume_scale: self.snap.exec.resume_scale,
             },
+            C::Contact => {
+                let c = &self.snap.contact;
+                QueryResult::Contact(par6_proto::ContactResult {
+                    reaction: match c.reaction {
+                        par6_config::ContactReaction::Off => par6_proto::ContactReaction::Off,
+                        par6_config::ContactReaction::Warn => par6_proto::ContactReaction::Warn,
+                        par6_config::ContactReaction::Stop => par6_proto::ContactReaction::Stop,
+                    },
+                    sustained_nm: c.sustained_nm,
+                    impact_nm: c.impact_nm,
+                    signal: c.signal,
+                    impact: c.impact,
+                    peak_signal: c.peak_signal,
+                    peak_impact: c.peak_impact,
+                    trips: c.trips,
+                    last_trip: c.last_trip.map(|t| {
+                        (
+                            t.joint,
+                            match t.channel {
+                                par6_rt::ContactChannel::Sustained => {
+                                    par6_proto::ContactChannel::Sustained
+                                }
+                                par6_rt::ContactChannel::Impact => {
+                                    par6_proto::ContactChannel::Impact
+                                }
+                            },
+                        )
+                    }),
+                    angles: self.angles_deg(),
+                    gravity_nm: self.snap.gravity_torque_nm,
+                })
+            }
             C::TcpTransform => QueryResult::TcpTransform {
                 values: tcp_transform_values(self.tcp_offset_mm, self.tcp_rotation_deg),
             },
@@ -3463,6 +3508,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::Pause => "pause",
         T::SetExecutionSpeed => "set_execution_speed",
         T::ExecutionSpeed => "execution_speed",
+        T::Contact => "contact",
         T::Stop => "stop",
         T::WriteIo => "write_io",
         T::Simulator => "simulator",

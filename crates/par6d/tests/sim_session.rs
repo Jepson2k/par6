@@ -280,10 +280,15 @@ fn distance_mm(a: [f64; 3], b: [f64; 3]) -> f64 {
         .sqrt()
 }
 
-/// `tool` is what the runtime runs: STATUS names it, puts the TCP where
-/// its own model does, and implies its gravity — filtered torque minus
-/// external torque is the model's G(q).
-fn assert_fitted(rig: &Rig, bundle: &par6_config::ConfigBundle, tool: &str) -> Status {
+/// `tool` is what the runtime runs: STATUS names it and puts the TCP where
+/// its own model does, and the gravity the runtime's model holds is that
+/// tool's.
+fn assert_fitted(
+    rig: &Rig,
+    c: &mut Client,
+    bundle: &par6_config::ConfigBundle,
+    tool: &str,
+) -> Status {
     rig.drain_status();
     rig.wait_status("the tool reaches STATUS", |s| {
         s.tool_status
@@ -293,15 +298,16 @@ fn assert_fitted(rig: &Rig, bundle: &par6_config::ConfigBundle, tool: &str) -> S
     // The swap lands inside one tick; the frame it lands in can still
     // carry that tick's pre-swap pose.
     let s = frames_later(rig, 2);
-    let (tcp, g) = tool_model(bundle, tool, &s.angles);
+    let (tcp, _) = tool_model(bundle, tool, &s.angles);
     let at = [s.pose[3], s.pose[7], s.pose[11]];
     let off = distance_mm(tcp, at);
     assert!(
         off < 0.05,
         "{tool}: STATUS puts the TCP {off:.3} mm from its model's ({at:?} vs {tcp:?})"
     );
-    for (j, want) in g.iter().enumerate() {
-        let got = s.torques[j] - s.torques_ext[j];
+    let (angles, runs) = c.model_gravity();
+    let (_, g) = tool_model(bundle, tool, &angles);
+    for (j, (got, want)) in runs.iter().zip(g).enumerate() {
         assert!(
             (got - want).abs() < 1e-3,
             "{tool}: J{j} runs gravity {got:.4} Nm, its model says {want:.4}"
@@ -2840,7 +2846,7 @@ fn select_tool_fits_a_different_tool() {
     rig.wait_status("enabled", |s| s.enabled);
 
     // Booted on the key: the prefix rule would have fitted the flange.
-    let s = assert_fitted(&rig, &bundle, KEYED_TOOL);
+    let s = assert_fitted(&rig, &mut c, &bundle, KEYED_TOOL);
     let (keyed_tcp, keyed_g) = tool_model(&bundle, KEYED_TOOL, &s.angles);
     let (flange_tcp, flange_g) = tool_model(&bundle, "Flange", &s.angles);
     assert!(
@@ -2866,7 +2872,7 @@ fn select_tool_fits_a_different_tool() {
         ok,
         "selecting the bare flange must complete, got {detail:?}"
     );
-    assert_fitted(&rig, &bundle, "Flange");
+    assert_fitted(&rig, &mut c, &bundle, "Flange");
     // The jaw's drive came off with it: what it last reported is no
     // reading of anything on the arm now.
     let node = usize::from(bundle.robot.bus.gripper_node);
@@ -2892,7 +2898,7 @@ fn select_tool_fits_a_different_tool() {
         ok,
         "selecting the keyed tool back must complete, got {detail:?}"
     );
-    assert_fitted(&rig, &bundle, KEYED_TOOL);
+    assert_fitted(&rig, &mut c, &bundle, KEYED_TOOL);
     let i = c.ok_index(&tool_action(7005, KEYED_TOOL, "calibrate", &[]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "the driven tool's jaw must work again, got {detail:?}");
@@ -2908,7 +2914,7 @@ fn select_tool_fits_a_different_tool() {
         ok,
         "selecting another driven tool must complete, got {detail:?}"
     );
-    assert_fitted(&rig, &bundle, &other);
+    assert_fitted(&rig, &mut c, &bundle, &other);
     let i = c.ok_index(&tool_action(7007, &other, "calibrate", &[]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "the second driven tool's jaw must work, got {detail:?}");

@@ -602,6 +602,7 @@ impl Preview {
             &GateContext {
                 estop_latched: snap.mode == Mode::SafetyStop,
                 enabled: snap.state == ArmState::Enabled,
+                protective: par6_server::rt_protective_stop(snap),
                 homed: snap.homed,
                 simulator: true,
             },

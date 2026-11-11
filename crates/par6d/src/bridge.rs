@@ -4564,6 +4564,7 @@ mod tests {
                 &par6_server::gating::GateContext {
                     estop_latched: false,
                     enabled: ready.state == ArmState::Enabled,
+                    protective: None,
                     homed: ready.homed,
                     simulator: true,
                 }

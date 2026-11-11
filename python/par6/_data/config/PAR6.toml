@@ -648,6 +648,46 @@ rotor_inertia_kg_m2 = [4.18e-4, 4.08e-3, 1.87e-3, 9.12e-5, 9.12e-5, 1.5e-4]
 # estimate, against how much of the velocity signal's noise does.
 observer_hz = 10.0
 
+[contact]
+# Reading something in the arm's way out of the external-torque estimate.
+# "stop": an arm that is being driven somewhere stops for a contact, backs
+# off the way it came and holds, enabled and referenced, until it is reset;
+# an arm settled on its target only reports. "warn": report, never stop.
+# "off": read nothing.
+#
+# The thresholds are a reference arm's, not this one's: set them from a run
+# of your own programs with nothing in the way (the CONTACT query's peaks,
+# roughly doubled) in the arm's local overlay. None of this is a
+# safety-rated function.
+reaction = "stop"
+# Per joint. Each joint's estimate first loses what its stiction could
+# account for at its speed (all of its Coulomb friction at rest, none once
+# it slides faster than stiction_speed_rad_s); what is left is the signal.
+#
+# sustained: the signal beyond this for the window - pressing into something.
+# Has to sit above what the gravity model's own error, or a load it was not
+# told about, leaves standing on the joint: 0.35/0.65/0.55 Nm on J1-J3 of
+# the reference arm at its ready pose.
+sustained_nm = [1.2, 2.0, 1.7, 0.5, 0.5, 0.3]
+sustained_window_s = 0.08
+# impact: the signal against its own slow average, beyond this for the
+# window - a bump. A standing offset does not count against it. Twice what
+# the simulated arm shows flat out with nothing in the way (0.52 Nm on J1,
+# where the base's soft drivetrain rings as it accelerates).
+impact_nm = [1.1, 1.0, 0.9, 0.3, 0.3, 0.2]
+impact_window_s = 0.016
+impact_highpass_s = 0.5
+stiction_speed_rad_s = 0.05
+# How long a warning stands after the signal last crossed a threshold.
+warning_hold_s = 1.0
+# The retreat: back to where the arm measured itself retreat_s before the
+# contact, no joint further than retreat_max_rad; abandoned for a hold where
+# the arm is if it has not come to rest by retreat_timeout_s. retreat_s = 0
+# stops the arm where it is.
+retreat_s = 0.15
+retreat_max_rad = 0.1
+retreat_timeout_s = 1.0
+
 [stream]
 command_timeout_s = 0.04
 lowpass_cutoff_hz = 0.0

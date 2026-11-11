@@ -86,6 +86,9 @@ impl SimRig {
         rig.until("enable", |s| s.state == ArmState::Enabled);
         rig.core.bus_mut().teleport_joint_rad(&q).expect("teleport");
         rig.core.adopt_landed_pose(&rig.bundle.robot, &q);
+        // The published snapshot still describes the pose the arm booted
+        // in until a tick has run at the landed one.
+        rig.tick();
         rig
     }
 
@@ -120,7 +123,7 @@ impl SimRig {
 
     /// Enter STREAM holding the pose the arm is in.
     pub fn hold(&mut self) -> [f64; MAX_JOINTS] {
-        let at = self.handles.snapshots.latest().q;
+        let at = self.tick().q;
         self.commands
             .send(RtCommand::SetMode(Mode::Stream))
             .unwrap();

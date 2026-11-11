@@ -502,13 +502,6 @@ fn cartesian_surface_over_protocol_v2() {
     rig.shutdown();
 }
 
-/// The runtime model's G(q) for the tick a frame describes: STATUS
-/// carries the measured torque and the external estimate, measured minus
-/// G(q) from the same tick.
-fn model_g(s: &Status) -> [f64; NUM_JOINTS] {
-    std::array::from_fn(|j| s.torques[j] - s.torques_ext[j])
-}
-
 /// The gravity hook is wired, signed right and scaled right, end to end.
 ///
 /// With comp on — the simulator's default, now that the plant has weight
@@ -571,7 +564,7 @@ fn gravity_hook_holds_the_arm() {
     // held pose — the external estimate (measured minus model) is what a
     // mis-signed or mis-scaled hook leaves over.
     let s = wait_still(&rig);
-    let g = model_g(&s);
+    let (_, g) = c.model_gravity();
     assert!(
         g[1].abs() > 1.0,
         "the shoulder carries the arm's weight here, the model says {:.3} Nm",
@@ -699,9 +692,9 @@ fn a_path_past_the_singularity_thresholds_warns_while_it_runs() {
 /// offset centre of mass and an inertia then has to land in the model as
 /// declared, every term of it, and read back as declared.
 ///
-/// STATUS carries the filtered measured torque and `torques_ext` = that
-/// minus G(q) from the same tick, so their difference is the model's own
-/// G(q) whatever the plant is doing.
+/// The contact readout carries the model's own G(q) with the angles it
+/// was evaluated at, from one tick, so the pair is exact whatever the
+/// plant is doing.
 #[test]
 fn gripper_config_mass_changes_published_gravity_torque() {
     let payload = SetPayload {
@@ -718,28 +711,35 @@ fn gripper_config_mass_changes_published_gravity_torque() {
         enable_and_teleport(&rig, &mut c, CART_START_DEG);
         // G(q) is exact on any tick; the heavy tool's wrist cannot hold
         // this posture for long, so it is read on landing.
-        let at = rig.wait_status("at the probe posture", |s| {
+        rig.wait_status("at the probe posture", |s| {
             angles_close(&s.angles, &CART_START_DEG, 0.1)
         });
+        let at = c.model_gravity();
         let loaded = declare.then(|| {
             c.ok(&Command::SetPayload(payload.clone()));
             let readback = match c.query(&Command::Payload) {
                 QueryResult::Payload { mass, com, inertia } => (mass, com, inertia),
                 other => panic!("unexpected {other:?}"),
             };
-            let s = rig.wait_status("the payload reaches the model", |s| {
-                (model_g(s)[1] - model_g(&at)[1]).abs() > 1.0
-            });
-            (config, readback, s)
+            let deadline = Instant::now() + BUDGET;
+            let under_load = loop {
+                let now = c.model_gravity();
+                if (now.1[1] - at.1[1]).abs() > 1.0 {
+                    break now;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the payload never reached the model"
+                );
+            };
+            (config, readback, under_load)
         });
         rig.shutdown();
         (at, loaded)
     };
 
-    let (stock, loaded) = run("grav-stock", 0.37, true);
-    let (heavy, _) = run("grav-heavy", 2.37, false);
-    let (q_stock, g_stock) = (stock.angles, model_g(&stock));
-    let (q_heavy, g_heavy) = (heavy.angles, model_g(&heavy));
+    let ((q_stock, g_stock), loaded) = run("grav-stock", 0.37, true);
+    let ((q_heavy, g_heavy), _) = run("grav-heavy", 2.37, false);
     assert!(
         angles_close(&q_stock, &q_heavy, 0.2),
         "the two runs must be compared at the same posture: {q_stock:?} vs {q_heavy:?}"
@@ -778,7 +778,7 @@ fn gripper_config_mass_changes_published_gravity_torque() {
     );
 
     // The declared payload, every term, is what the runtime's model holds.
-    let (config, readback, s) = loaded.expect("the stock run declared a payload");
+    let (config, readback, (angles, got)) = loaded.expect("the stock run declared a payload");
     assert_eq!(
         readback,
         (
@@ -796,9 +796,8 @@ fn gripper_config_mass_changes_published_gravity_torque() {
     kin.set_tool(payload.mass, payload.com, payload.inertia)
         .expect("payload");
     let mut want = [0.0; NUM_JOINTS];
-    kin.gravity(&s.angles.map(f64::to_radians), &mut want)
+    kin.gravity(&angles.map(f64::to_radians), &mut want)
         .expect("gravity");
-    let got = model_g(&s);
     for j in 0..NUM_JOINTS {
         let want = want[j] * bundle.robot.gravity_scale[j];
         assert!(

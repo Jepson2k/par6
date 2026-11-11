@@ -11,7 +11,7 @@
 //! `req_id` is the client-generated u32 echoed verbatim; pushes use 0.
 
 use crate::command::r_len;
-use crate::enums::{ActionState, MsgType, QueryType, ToolState};
+use crate::enums::{ActionState, ContactChannel, ContactReaction, MsgType, QueryType, ToolState};
 use crate::error::WireError;
 use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
 use crate::{DecodeError, EN_SLOTS, MAX_IO_SLOTS, NUM_JOINTS, POSE_ELEMS};
@@ -99,6 +99,36 @@ impl ToolStatusWire {
             variant_key: r.str()?.to_owned(),
         })
     }
+}
+
+/// Contact detection readout (CONTACT query result fields).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ContactResult {
+    /// What the arm does about a contact.
+    pub reaction: ContactReaction,
+    /// Sustained thresholds in force, per joint \[Nm\].
+    pub sustained_nm: [f64; NUM_JOINTS],
+    /// Impact thresholds in force, per joint \[Nm\].
+    pub impact_nm: [f64; NUM_JOINTS],
+    /// The contact signal now \[Nm\]: the external-torque estimate less
+    /// what each joint's stiction accounts for.
+    pub signal: [f64; NUM_JOINTS],
+    /// The signal against its own slow average now \[Nm\].
+    pub impact: [f64; NUM_JOINTS],
+    /// Largest `|signal|` while the arm was being moved, since the last
+    /// reset \[Nm\].
+    pub peak_signal: [f64; NUM_JOINTS],
+    /// Largest `|impact|` likewise \[Nm\].
+    pub peak_impact: [f64; NUM_JOINTS],
+    /// Contacts the arm has stopped for since boot.
+    pub trips: u32,
+    /// The most recent of them: the joint that read it, and the channel.
+    pub last_trip: Option<(u8, ContactChannel)>,
+    /// The joint angles the readout was taken at \[deg\].
+    pub angles: [f64; NUM_JOINTS],
+    /// The gravity torque the runtime's model holds at those angles
+    /// \[Nm\].
+    pub gravity_nm: [f64; NUM_JOINTS],
 }
 
 /// Control-loop timing statistics (LOOP_STATS query result fields).
@@ -300,6 +330,8 @@ pub enum QueryResult {
         /// Settle verdict on a successful tool move, as on COMPLETE.
         verdict: Option<u8>,
     },
+    /// CONTACT result.
+    Contact(ContactResult),
     /// Fresh queued-execution timing from the real-time loop.
     ExecutionSpeed {
         /// Zero when pause is requested; otherwise the selected speed.
@@ -419,6 +451,7 @@ impl QueryResult {
             Q::TcpTransform { .. } => QueryType::TcpTransform,
             Q::CommandCompletion { .. } => QueryType::CommandCompletion,
             Q::ExecutionSpeed { .. } => QueryType::ExecutionSpeed,
+            Q::Contact(_) => QueryType::Contact,
             Q::ToolStatus { .. } => QueryType::ToolStatus,
             Q::IsSimulator { .. } => QueryType::IsSimulator,
             Q::ConfigInfo { .. } => QueryType::ConfigInfo,
@@ -647,6 +680,27 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_f64(buf, *target_scale);
             w_f64(buf, *applied_scale);
             w_f64(buf, *resume_scale);
+        }
+        Q::Contact(c) => {
+            w_array(buf, 13);
+            w_uint(buf, u64::from(tag));
+            w_uint(buf, u64::from(c.reaction as u8));
+            w_f64s(buf, &c.sustained_nm);
+            w_f64s(buf, &c.impact_nm);
+            w_f64s(buf, &c.signal);
+            w_f64s(buf, &c.impact);
+            w_f64s(buf, &c.peak_signal);
+            w_f64s(buf, &c.peak_impact);
+            w_uint(buf, u64::from(c.trips));
+            // No trip yet: joint -1, channel 0.
+            w_int(buf, c.last_trip.map_or(-1, |(joint, _)| i64::from(joint)));
+            w_uint(
+                buf,
+                c.last_trip
+                    .map_or(0, |(_, channel)| u64::from(channel as u8)),
+            );
+            w_f64s(buf, &c.angles);
+            w_f64s(buf, &c.gravity_nm);
         }
         Q::TcpTransform { values } => {
             w_array(buf, 7);
@@ -1187,6 +1241,79 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
                 }
             }
             QueryResult::TcpTransform { values }
+        }
+        T::Contact => {
+            expect_arity("contact result", n, 13)?;
+            let raw = r.uint()?;
+            let reaction =
+                ContactReaction::from_wire(raw as i64).ok_or(DecodeError::InvalidEnum {
+                    what: "contact reaction",
+                    value: raw as i64,
+                })?;
+            let sustained_nm: [f64; NUM_JOINTS] = r_f64_fixed(r, "contact sustained_nm")?;
+            let impact_nm: [f64; NUM_JOINTS] = r_f64_fixed(r, "contact impact_nm")?;
+            let signal: [f64; NUM_JOINTS] = r_f64_fixed(r, "contact signal")?;
+            let impact: [f64; NUM_JOINTS] = r_f64_fixed(r, "contact impact")?;
+            let peak_signal: [f64; NUM_JOINTS] = r_f64_fixed(r, "contact peak_signal")?;
+            let peak_impact: [f64; NUM_JOINTS] = r_f64_fixed(r, "contact peak_impact")?;
+            let trips = r.uint()?;
+            let last_joint = r.int()?;
+            let last_channel = r.uint()?;
+            let angles: [f64; NUM_JOINTS] = r_f64_fixed(r, "contact angles")?;
+            let gravity_nm: [f64; NUM_JOINTS] = r_f64_fixed(r, "contact gravity_nm")?;
+            let refuse = |why: &str| DecodeError::Validation {
+                what: "contact result",
+                why: why.to_owned(),
+            };
+            let thresholds = sustained_nm.iter().chain(&impact_nm);
+            if !thresholds.clone().all(|v| v.is_finite() && *v > 0.0) {
+                return Err(refuse("thresholds must be finite and > 0"));
+            }
+            let peaks = peak_signal.iter().chain(&peak_impact);
+            if !peaks.clone().all(|v| v.is_finite() && *v >= 0.0) {
+                return Err(refuse("peaks must be finite and >= 0"));
+            }
+            let readings = signal
+                .iter()
+                .chain(&impact)
+                .chain(&angles)
+                .chain(&gravity_nm);
+            if !readings.clone().all(|v| v.is_finite()) {
+                return Err(refuse("readings must be finite"));
+            }
+            let trips = u32::try_from(trips).map_err(|_| refuse("trip count out of range"))?;
+            let last_trip = match (last_joint, last_channel) {
+                (-1, 0) => None,
+                (joint, channel) => {
+                    let joint = u8::try_from(joint)
+                        .ok()
+                        .filter(|j| usize::from(*j) < NUM_JOINTS)
+                        .ok_or_else(|| refuse("last trip names no joint of this arm"))?;
+                    let channel = ContactChannel::from_wire(channel as i64).ok_or(
+                        DecodeError::InvalidEnum {
+                            what: "contact channel",
+                            value: channel as i64,
+                        },
+                    )?;
+                    Some((joint, channel))
+                }
+            };
+            if (trips == 0) != last_trip.is_none() {
+                return Err(refuse("trip count and last trip disagree"));
+            }
+            QueryResult::Contact(ContactResult {
+                reaction,
+                sustained_nm,
+                impact_nm,
+                signal,
+                impact,
+                peak_signal,
+                peak_impact,
+                trips,
+                last_trip,
+                angles,
+                gravity_nm,
+            })
         }
         T::CommandCompletion => {
             expect_arity("command_completion result", n, 6)?;

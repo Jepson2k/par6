@@ -691,6 +691,7 @@ impl Preview {
             &GateContext {
                 estop_latched: self.latches.estop_latched,
                 enabled: !self.flashing,
+                protective: None,
                 homed: self.snap.homed,
                 simulator: self.simulator,
             },

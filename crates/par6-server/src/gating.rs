@@ -18,7 +18,8 @@ use par6_proto::{
 /// Requirements a command must meet to be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Gate {
-    /// Controller must be ENABLED (and the e-stop latch clear).
+    /// Controller must be ENABLED, with the e-stop latch clear and no
+    /// protective stop standing.
     pub needs_enabled: bool,
     /// Robot must be homed. Set for commands that target absolute
     /// coordinates — planned moves and streamed setpoints — mirroring the
@@ -103,6 +104,25 @@ pub fn is_stream(cmd: CmdType) -> bool {
     )
 }
 
+/// A protective stop the RT has latched: the arm stopped for something,
+/// is still enabled and referenced, and moves again only after `reset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectiveStop {
+    /// The code it stands under.
+    pub code: ErrorCode,
+    /// The joint that read it, for the codes that name one.
+    pub joint: Option<u8>,
+}
+
+impl ProtectiveStop {
+    /// The wire error it stands as — in STATUS, and as the answer to a
+    /// motion command refused while it stands.
+    pub fn error(&self) -> WireError {
+        let joint = self.joint.map(|j| j.to_string()).unwrap_or_default();
+        make_error(self.code, UNATTRIBUTED, &[("joint", &joint)])
+    }
+}
+
 /// What the gate is evaluated against: the server's view of the arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GateContext {
@@ -110,6 +130,8 @@ pub struct GateContext {
     pub estop_latched: bool,
     /// The RT core reports ENABLED.
     pub enabled: bool,
+    /// The RT core holds a protective stop (cleared by `reset`).
+    pub protective: Option<ProtectiveStop>,
     /// The arm holds its home references.
     pub homed: bool,
     /// The runtime drives the simulator, not hardware.
@@ -131,6 +153,9 @@ pub fn check_gate(tag: CmdType, ctx: &GateContext) -> Option<WireError> {
                 UNATTRIBUTED,
                 &[("detail", "The RT core reports DISABLED.")],
             ));
+        }
+        if let Some(stop) = &ctx.protective {
+            return Some(stop.error());
         }
     }
     if g.needs_homed && !ctx.homed {

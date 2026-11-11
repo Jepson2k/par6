@@ -42,6 +42,7 @@
 //!   latch list, homing/exec/jog/stream status, loop stats).
 
 pub mod adapters;
+pub mod contact;
 pub mod core;
 pub mod dispatch;
 pub mod errors;
@@ -59,6 +60,7 @@ pub mod snapshot;
 pub mod state;
 pub mod timing;
 
+pub use crate::contact::{ContactChannel, ContactStatus, ContactTrip};
 pub use crate::core::{
     CoreError, ExecHeartbeat, GateRefusal, RtCore, RtHandles, RtHooks, StreamInput, StreamSetpoint,
     EXEC_HEARTBEAT_TIMEOUT_S,

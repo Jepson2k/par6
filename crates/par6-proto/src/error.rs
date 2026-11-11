@@ -95,6 +95,12 @@ wire_enum! {
         /// sustained interval (hard latch — the stream was silently
         /// holding, not tracking).
         SysStreamFault = 64,
+        /// A joint read a contact. As the standing error it is a
+        /// protective stop: a moving arm stopped for it, backed off and
+        /// holds, enabled and referenced, refusing motion until `Reset`.
+        /// As a warning it is a contact the arm does not stop for — one
+        /// at rest, or one configured to report.
+        SysContact = 65,
     }
 }
 
@@ -367,6 +373,13 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
             cause: "Joint {joint}'s external torque stayed beyond the configured margin.",
             effect: "Controller DISABLED; error latched.",
             remedy: "Remove the obstruction or update the payload model, then send reset.",
+        },
+        E::SysContact => ErrorTemplate {
+            title: "Contact detected",
+            cause: "Joint {joint}'s external torque went beyond its contact threshold.",
+            effect: "Standing: motion stopped, backed off and refused; controller stays \
+                     ENABLED. Warning: reported only.",
+            remedy: "Clear what the arm touched, then send reset.",
         },
         E::MotnHomingFailed => ErrorTemplate {
             title: "Homing failed",

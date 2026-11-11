@@ -29,6 +29,8 @@ mod braking_tests;
 mod bridge;
 pub mod calibrate;
 pub mod collision_world;
+#[cfg(test)]
+mod contact_tests;
 pub mod daemon;
 mod execution_path;
 mod grant;

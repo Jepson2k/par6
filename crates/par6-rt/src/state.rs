@@ -5,6 +5,7 @@
 use par6_bus::{Freshness, GripperState, LinkHealth, NodeState};
 use par6_config::MAX_IO_LINES;
 
+use crate::contact::ContactStatus;
 use crate::gripper_settle::ToolStatus;
 use crate::{MAX_JOINTS, NUM_NODES};
 
@@ -106,6 +107,12 @@ pub enum ErrorCode {
     /// Per-joint: external-torque estimate beyond the configured
     /// envelope margin for the configured window (hard latch).
     TorqueEnvelope,
+    /// Per-joint: a moving arm read a contact and stopped for it
+    /// (protective latch — the arm stays enabled and referenced).
+    Contact,
+    /// Per-joint: a contact read on an arm that does not stop for it —
+    /// one at rest, or one configured to report (warning, self-clears).
+    ContactWarning,
 }
 
 impl ErrorCode {
@@ -119,7 +126,21 @@ impl ErrorCode {
                 | ErrorCode::NotHomed
                 | ErrorCode::LoopDegraded
                 | ErrorCode::LinkErrorPassive
+                | ErrorCode::ContactWarning
         )
+    }
+
+    /// Protective stops latch like a hard error and refuse motion until
+    /// the user clears them, but they are the arm working as intended,
+    /// not a fault: it stays enabled and referenced, and nothing on the
+    /// drives needs clearing.
+    pub fn is_protective(self) -> bool {
+        matches!(self, ErrorCode::Contact)
+    }
+
+    /// Hard errors disable the arm and set `error_active`.
+    pub fn is_hard(self) -> bool {
+        !self.is_warning() && !self.is_protective()
     }
 }
 
@@ -187,10 +208,28 @@ impl ErrorList {
         self.as_slice().contains(&entry)
     }
 
-    /// Whether any NON-warning (latching) entry is present — drives
-    /// `error_active` / the DISABLED reaction.
+    /// Whether any hard entry is present — drives `error_active` / the
+    /// DISABLED reaction.
     pub fn any_hard(&self) -> bool {
-        self.as_slice().iter().any(|e| !e.code.is_warning())
+        self.as_slice().iter().any(|e| e.code.is_hard())
+    }
+
+    /// Whether a protective stop is latched — motion is refused, the arm
+    /// is not disabled.
+    pub fn any_protective(&self) -> bool {
+        self.as_slice().iter().any(|e| e.code.is_protective())
+    }
+
+    /// Remove every protective entry, leaving the rest.
+    pub fn clear_protective(&mut self) {
+        let mut kept = 0;
+        for i in 0..usize::from(self.len) {
+            if !self.entries[i].code.is_protective() {
+                self.entries[kept] = self.entries[i];
+                kept += 1;
+            }
+        }
+        self.len = kept as u8;
     }
 
     /// Remove every entry (user clear path; real faults re-latch on the
@@ -516,6 +555,11 @@ pub struct StateSnapshot {
     pub errors: ErrorList,
     /// Whether any hard (latching) error is active.
     pub error_active: bool,
+    /// Whether a protective stop is latched: the arm stopped for
+    /// something, stays enabled, and refuses motion until it is cleared.
+    pub protective_active: bool,
+    /// Contact detection readout.
+    pub contact: ContactStatus,
     /// Loop timing statistics.
     pub loop_stats: LoopStats,
     /// Motor-bus link health as the backend reports it (kernel link
@@ -599,6 +643,8 @@ impl Default for StateSnapshot {
             homing: HomingStatus::default(),
             errors: ErrorList::new(),
             error_active: false,
+            protective_active: false,
+            contact: ContactStatus::default(),
             loop_stats: LoopStats::default(),
             link: LinkHealth::default(),
             exec: ExecStatus::default(),

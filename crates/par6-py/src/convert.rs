@@ -339,6 +339,33 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("applied_scale", *applied_scale)?;
             d.set_item("resume_scale", *resume_scale)?;
         }
+        QueryResult::Contact(c) => {
+            d.set_item(
+                "reaction",
+                match c.reaction {
+                    par6_proto::ContactReaction::Off => "off",
+                    par6_proto::ContactReaction::Warn => "warn",
+                    par6_proto::ContactReaction::Stop => "stop",
+                },
+            )?;
+            d.set_item("sustained_nm", c.sustained_nm.to_vec())?;
+            d.set_item("impact_nm", c.impact_nm.to_vec())?;
+            d.set_item("signal", c.signal.to_vec())?;
+            d.set_item("impact", c.impact.to_vec())?;
+            d.set_item("peak_signal", c.peak_signal.to_vec())?;
+            d.set_item("peak_impact", c.peak_impact.to_vec())?;
+            d.set_item("trips", c.trips)?;
+            d.set_item("last_trip_joint", c.last_trip.map(|(joint, _)| joint))?;
+            d.set_item(
+                "last_trip_channel",
+                c.last_trip.map(|(_, channel)| match channel {
+                    par6_proto::ContactChannel::Sustained => "sustained",
+                    par6_proto::ContactChannel::Impact => "impact",
+                }),
+            )?;
+            d.set_item("angles", c.angles.to_vec())?;
+            d.set_item("gravity_nm", c.gravity_nm.to_vec())?;
+        }
         QueryResult::Payload { mass, com, inertia } => {
             fill_payload(&d, *mass, *com, *inertia)?;
         }

@@ -859,6 +859,8 @@ pub enum Command {
     TcpTransform,
     /// Read controller-owned execution timing.
     ExecutionSpeed,
+    /// Read the contact detection readout.
+    Contact,
     /// How queued command `index` finished — what its COMPLETE push
     /// carried, for a client whose push never arrived.
     CommandCompletion {
@@ -941,6 +943,7 @@ impl Command {
             C::TcpTransform => CmdType::TcpTransform,
             C::CommandCompletion { .. } => CmdType::CommandCompletion,
             C::ExecutionSpeed => CmdType::ExecutionSpeed,
+            C::Contact => CmdType::Contact,
             C::ToolStatus => CmdType::ToolStatus,
             C::IsSimulator => CmdType::IsSimulator,
             C::Shapes => CmdType::Shapes,
@@ -1021,6 +1024,7 @@ impl Command {
             | C::TcpSpeed
             | C::TcpOffset
             | C::ExecutionSpeed
+            | C::Contact
             | C::TcpTransform
             | C::CommandCompletion { .. }
             | C::ToolStatus
@@ -1401,6 +1405,7 @@ fn arity(tag: CmdType) -> usize {
         | T::TcpSpeed
         | T::TcpOffset
         | T::ExecutionSpeed
+        | T::Contact
         | T::TcpTransform
         | T::ToolStatus
         | T::IsSimulator
@@ -1522,6 +1527,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         | C::TcpSpeed
         | C::TcpOffset
         | C::ExecutionSpeed
+        | C::Contact
         | C::TcpTransform
         | C::ToolStatus
         | C::IsSimulator
@@ -2085,6 +2091,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         T::TcpTransform => Command::TcpTransform,
         T::CommandCompletion => Command::CommandCompletion { index: r.uint()? },
         T::ExecutionSpeed => Command::ExecutionSpeed,
+        T::Contact => Command::Contact,
         T::ToolStatus => Command::ToolStatus,
         T::IsSimulator => Command::IsSimulator,
         T::Shapes => Command::Shapes,

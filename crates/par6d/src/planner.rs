@@ -1988,7 +1988,9 @@ impl Par6Planner {
         fl: &mut InFlight,
         snap: &StateSnapshot,
     ) -> Option<Result<Option<u8>, WireError>> {
-        if snap.error_active {
+        // A protective stop ends the command it stopped the same way a
+        // fault does: the RT has already taken the arm off its path.
+        if snap.error_active || snap.protective_active {
             return Some(Err(rt_error(snap)));
         }
         match &mut fl.kind {

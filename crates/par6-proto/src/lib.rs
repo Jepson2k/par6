@@ -46,13 +46,14 @@ pub use command::{
     ToolParam,
 };
 pub use enums::{
-    command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode,
-    FlashingAssertion, Frame, HomingJointState, HomingPhase, LinkState, MsgType, QueryType,
-    ToolState,
+    command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ContactChannel,
+    ContactReaction, ControllerMode, FlashingAssertion, Frame, HomingJointState, HomingPhase,
+    LinkState, MsgType, QueryType, ToolState,
 };
 pub use error::{make_error, template, ErrorCode, ErrorTemplate, WireError, UNATTRIBUTED};
 pub use reply::{
-    decode_reply, encode_reply, BusNode, LoopStatsResult, QueryResult, Reply, ToolStatusWire,
+    decode_reply, encode_reply, BusNode, ContactResult, LoopStatsResult, QueryResult, Reply,
+    ToolStatusWire,
 };
 pub use status::{
     decode_status, encode_status_into, peek_status_proto_version, DriveHealthWire, HomingWire,
@@ -60,7 +61,7 @@ pub use status::{
 };
 
 /// Protocol version carried in the STATUS header.
-pub const PROTO_VERSION: u8 = 7;
+pub const PROTO_VERSION: u8 = 8;
 /// Number of arm joints.
 pub const NUM_JOINTS: usize = 6;
 /// Elements in a flattened 4×4 row-major pose.

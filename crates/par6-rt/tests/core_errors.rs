@@ -663,7 +663,10 @@ fn torque_envelope_latches_only_when_configured_and_sustained() {
 
     // Held on its drives, the arm is.
     rig.cmd(RtCommand::SetGravityComp(false));
-    assert!(!rig.snap().gravity_comp, "the arm holds instead of floating");
+    assert!(
+        !rig.snap().gravity_comp,
+        "the arm holds instead of floating"
+    );
 
     // A transient shorter than the window stays green: the counter never
     // reaches the window before the load disappears and resets it.

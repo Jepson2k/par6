@@ -719,6 +719,10 @@ impl CoreClient {
         query_future(py, self.rt(), Command::ExecutionSpeed)
     }
 
+    fn contact<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        query_future(py, self.rt(), Command::Contact)
+    }
+
     fn set_execution_speed<'py>(&self, py: Python<'py>, scale: f64) -> PyResult<Bound<'py, PyAny>> {
         sys_future(
             py,

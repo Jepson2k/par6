@@ -610,6 +610,17 @@ impl Client {
         }
     }
 
+    /// The gravity torque the runtime's own model holds \[Nm\], and the
+    /// joint angles \[deg\] it was evaluated at: the contact readout
+    /// carries both from one tick, so the pair is exact whatever the arm
+    /// is doing.
+    pub fn model_gravity(&mut self) -> ([f64; NUM_JOINTS], [f64; NUM_JOINTS]) {
+        match self.query(&Command::Contact) {
+            QueryResult::Contact(c) => (c.angles, c.gravity_nm),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
     /// Expect a plain OK — no queue index. A command that allocates one is
     /// a different class, so accepting either here would hide a
     /// misclassified tag.
