@@ -96,6 +96,7 @@ class ErrorCode(IntEnum):
     SYS_TORQUE_ENVELOPE = 63
     SYS_STREAM_FAULT = 64
     SYS_CONTACT = 65
+    SYS_FREEDRIVE_CATCH = 66
 
 class Frame(IntEnum):
     """Reference frame a Cartesian target is expressed in."""

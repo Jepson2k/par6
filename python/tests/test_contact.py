@@ -86,3 +86,48 @@ async def test_a_move_into_an_undeclared_obstacle_stops_and_reset_rearms(tmp_pat
             )
     finally:
         live.stop()
+
+
+@pytest.mark.timeout(120)
+async def test_a_floating_arm_that_runs_away_is_caught_and_refuses_to_float_until_reset(
+    daemon: LiveDaemon,
+):
+    """Freedrive with a payload declared that the arm is not carrying: the
+    drives push up against two kilos that are not there, the arm takes off
+    faster than a hand moves it, and the catch stops it and holds."""
+    async with daemon.client() as client:
+        assert await client.wait_ready(timeout=STEP_BUDGET_S)
+        await settle_at(client, REACH_DEG)
+        assert await client.freedrive(True) == 1
+        assert await client.wait_status(lambda s: s.freedrive, timeout=STEP_BUDGET_S)
+
+        assert await client.set_payload(2.0, com=(0.0, 0.0, 0.05)) == 1
+        assert await client.wait_status(
+            lambda s: s.protective_stop, timeout=STEP_BUDGET_S
+        ), "the arm was never caught"
+        standing = await client.error()
+        assert standing is not None and standing.code == ErrorCode.SYS_FREEDRIVE_CATCH
+        assert await client.wait_status(
+            lambda s: (
+                s.enabled
+                and s.homed
+                and not s.freedrive
+                and all(abs(v) < 3.0 for v in s.speeds)
+            ),
+            timeout=STEP_BUDGET_S,
+        ), "a caught arm is held: enabled, referenced, at rest and not floating"
+
+        with pytest.raises(RobotError) as refused:
+            await client.freedrive(True)
+        assert refused.value.code == ErrorCode.SYS_FREEDRIVE_CATCH
+
+        assert await client.set_payload(0.0) == 1
+        assert await client.reset() == 1
+        assert await client.wait_status(
+            lambda s: not s.protective_stop and s.error is None, timeout=STEP_BUDGET_S
+        )
+        assert await client.freedrive(True) == 1
+        assert await client.wait_status(lambda s: s.freedrive, timeout=STEP_BUDGET_S)
+        assert not await client.wait_status(lambda s: s.protective_stop, timeout=1.0), (
+            "with the payload cleared the arm floats where it is"
+        )

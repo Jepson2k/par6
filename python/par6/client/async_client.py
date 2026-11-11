@@ -1349,9 +1349,16 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         """Enter or leave freedrive (hand-guiding).
 
         par6 has no separate freedrive mode and does not need one: with the
-        gravity feedforward applied, IDLE emits a torque-only G(q) hold with
-        no position term, so a homed and enabled arm floats and can be
-        pushed by hand. Freedrive here is therefore exactly that switch.
+        gravity feedforward applied, IDLE carries the arm's weight with no
+        position term, so a homed and enabled arm floats and can be pushed
+        by hand. Freedrive here is therefore exactly that switch.
+
+        While it floats the runtime adds to the hand's push
+        (``[freedrive] push_assist``), holds a joint that reaches a soft
+        limit until it is pushed back in, and catches an arm that moves
+        faster than a hand moves it: that stops it where it is under
+        ``SYS_FREEDRIVE_CATCH``, a protective stop.  Any protective stop
+        refuses this call until ``reset()``.
 
         Category: Control
 

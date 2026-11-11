@@ -116,6 +116,12 @@ class StatusBuffer:
     mode: ControllerMode = ControllerMode.BOOTING
     enabled: bool = False
     gravity_comp: bool = False
+    protective_stop: bool = False
+    """The arm stopped itself — a contact, a freedrive catch — and holds
+    under power, still ``enabled`` and ``homed``, refusing motion until
+    ``reset()``.  ``error`` says what for.  A failed command's error also
+    stands on an enabled controller and needs no reset; this is what tells
+    the two apart."""
     warnings: list[tuple] = field(default_factory=list)
     """Warning-class latch entries (wire 6-tuples): self-clearing
     conditions — stale CAN data, degraded loop, failed homing. The
@@ -143,8 +149,8 @@ class StatusBuffer:
     torques_ext: np.ndarray = field(
         default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64)
     )
-    """External joint torque estimate [Nm]: filtered measured torque
-    minus the model's gravity torque."""
+    """External joint torque estimate [Nm]: measured torque minus what the
+    arm's modelled dynamics (gravity, inertia, friction) account for."""
     drive_health: dict = field(default_factory=dict)
     """Per-drive readings and faults: ``temperatures_c`` and ``currents_ma``
     (per node, arm joints first, ``NaN`` where a node has not answered
@@ -237,6 +243,7 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
     buf.mode = _enum(buf.mode, ControllerMode, d["mode"])
     buf.enabled = d["enabled"]
     buf.gravity_comp = d["gravity_comp"]
+    buf.protective_stop = d["protective_stop"]
     buf.warnings[:] = map(tuple, d["warnings"])
     link = buf.link_health
     for key, value in d["link_health"].items():

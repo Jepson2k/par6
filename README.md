@@ -645,6 +645,10 @@ completes with `SysContact`, everything queued behind it is discarded, and every
 motion command is refused with the same error until `reset()` — which clears it on the
 next tick, because nothing on the drives needs clearing. Nothing resumes by itself.
 
+A failed move's error also stands in STATUS on an enabled controller, and needs no
+reset. What tells a client the two apart is the code: the clients answer it as
+`protective_stop` (`par6_client::protective_stop`, `StatusBuffer.protective_stop`).
+
 Detection is armed only while the arm is homed, enabled, modelled with inertia and
 being driven (EXEC, JOG or STREAM with a commanded velocity, or still short of its
 target). It stands down while the arm floats in freedrive, while homing, during the
