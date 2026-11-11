@@ -986,7 +986,7 @@ impl StreamGate {
     /// [`Self::jog_lookahead`]).
     ///
     /// From inside a keep-out the verdict is on the ground the jog asks
-    /// for, held at its own speed, instead. Inside, a move has to earn
+    /// for, held at the full jog rate in its direction, instead. Inside, a move has to earn
     /// measurable distance (see [`Self::blocked`]), and an arm at rest
     /// stops a few milliradians on: every direction, the way out
     /// included, reads as no farther, and the refusal's placement takes
@@ -1004,7 +1004,19 @@ impl StreamGate {
         if pairs.is_none() || !self.inside_world(q)? {
             return Ok((la, pairs));
         }
-        let held = self.held_jog_lookahead(q, speeds, accel);
+        // Which way the jog is asking to go, not how fast. Inside, a move
+        // is admitted for the distance it gains, and a slow jog gains
+        // almost none in the reach it projects: read at its own speed the
+        // way out is refused with every other direction, and the arm is
+        // trapped by having been jogged gently — which is how every jog
+        // arrives once the tool-speed ceiling has slowed it.
+        let largest = speeds.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+        let direction = if largest > 0.0 {
+            speeds.map(|v| v / largest)
+        } else {
+            *speeds
+        };
+        let held = self.held_jog_lookahead(q, &direction, accel);
         let pairs = self.blocked(q, &held)?;
         Ok((held, pairs))
     }

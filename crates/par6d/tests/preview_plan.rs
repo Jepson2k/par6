@@ -303,10 +303,11 @@ fn a_jog_streams_rows_and_owns_its_ramp_down() {
 
 /// A joint move is timed against joint limits, and out at reach that
 /// carries the tool several times faster than any cartesian move may. The
-/// plan is the same path slowed until the tool stays under `[limits]
-/// tcp_speed_max_m_s`, a run of it follows that plan without tripping the
-/// ceiling it was planned to, and with the ceiling off the same move is
-/// the fast one it was.
+/// plan is the same path, slowed where the tool would be over `[limits]
+/// tcp_speed_max_m_s` so that it cruises at the ceiling instead; a run of
+/// it follows that plan without tripping the ceiling it was planned to;
+/// asking for more speed never yields a slower move; and with the ceiling
+/// off the same move is the fast one it was.
 #[test]
 fn a_fast_joint_move_is_slowed_until_its_tool_is_under_the_speed_ceiling() {
     let reach = [0.0_f64, -60.0, 220.0, 0.0, 30.0, 180.0];
@@ -321,8 +322,8 @@ fn a_fast_joint_move_is_slowed_until_its_tool_is_under_the_speed_ceiling() {
             })
             .fold(0.0, f64::max)
     };
-    let planned = |ceiling: f64| {
-        let config = common::retimed_config(&format!("tool-speed-{ceiling}"), 0.02);
+    let planned = |ceiling: f64, speed: f64| {
+        let config = common::retimed_config(&format!("tool-speed-{ceiling}-{speed}"), 0.02);
         let text = std::fs::read_to_string(&config).expect("read config");
         let patched = text.replace(
             "tcp_speed_max_m_s = 0.25",
@@ -341,7 +342,7 @@ fn a_fast_joint_move_is_slowed_until_its_tool_is_under_the_speed_ceiling() {
             key: 1,
             angles: swung,
             duration: None,
-            speed: Some(1.0),
+            speed: Some(speed),
             accel: None,
             blend_radius: None,
             rel: false,
@@ -356,8 +357,8 @@ fn a_fast_joint_move_is_slowed_until_its_tool_is_under_the_speed_ceiling() {
         (plan, run)
     };
 
-    let (free, _) = planned(0.0);
-    let (held, run) = planned(0.25);
+    let (free, _) = planned(0.0, 1.0);
+    let (held, run) = planned(0.25, 1.0);
     let (free_peak, held_peak) = (fastest(&free), fastest(&held));
     assert!(
         free_peak > 0.5,
@@ -367,18 +368,47 @@ fn a_fast_joint_move_is_slowed_until_its_tool_is_under_the_speed_ceiling() {
         held_peak <= 0.25 * 1.02 && held_peak > 0.25 * 0.9,
         "the plan must be slowed to its ceiling, no further: {held_peak:.3} m/s"
     );
-    let stretch = held.rows as f64 / free.rows as f64;
     assert!(
-        (stretch - free_peak / 0.25).abs() < 0.15 * stretch,
-        "the whole plan is slowed by the one factor its fastest instant needs: \
-         {} rows became {}, for {free_peak:.3} m/s over a 0.25 m/s ceiling",
-        free.rows,
-        held.rows
+        held.rows > free.rows,
+        "a slowed plan takes longer: {} rows against {}",
+        held.rows,
+        free.rows
     );
     assert_eq!(
         last_row(&held, 0),
         last_row(&free, 0),
         "slower, and to the same place"
+    );
+    // Most of the swing is spent at the ceiling: the plan takes little
+    // longer than the tool's path at that speed.
+    let path_m: f64 = (1..held.rows)
+        .map(|r| {
+            let (a, b) = (&held.tcp[(r - 1) * 6..], &held.tcp[r * 6..]);
+            (0..3)
+                .map(|k| f64::from(b[k] - a[k]).powi(2))
+                .sum::<f64>()
+                .sqrt()
+        })
+        .sum();
+    let at_ceiling_s = path_m / 0.25;
+    let took_s = held.rows as f64 * held.row_dt_s;
+    assert!(
+        took_s < 1.3 * at_ceiling_s + 1.0,
+        "the plan was slowed where it had no need to be: {took_s:.2} s for a path that \
+         takes {at_ceiling_s:.2} s at the ceiling"
+    );
+
+    // Flat out and at a quarter speed both spend this swing at the
+    // ceiling, so they take the same time to within the rounding of where
+    // each meets it. Slowing the whole plan by its peak instead put the
+    // flat-out move more than a second behind.
+    let (gentle, _) = planned(0.25, 0.25);
+    let behind_s = (held.rows as f64 - gentle.rows as f64) * held.row_dt_s;
+    assert!(
+        behind_s < 0.15,
+        "asking for more speed gave a slower move: {} rows flat out, {} at a quarter",
+        held.rows,
+        gentle.rows
     );
 
     assert!(

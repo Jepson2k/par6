@@ -954,7 +954,7 @@ pub struct LimitsSection {
     /// latches \[s\] — rides out measurement transients and filter lag.
     pub tau_ext_window_s: f64,
     /// Ceiling on the tool's linear speed \[m/s\], whatever is driving the
-    /// arm. Planned moves are stretched in time to stay under it, jogs and
+    /// arm. Planned moves are slowed wherever the tool would be over it, jogs and
     /// streamed joint targets are slowed to it, and an arm measured more
     /// than a fifth over it for `tcp_speed_window_s` stops itself. 0
     /// disables it. It does not apply to a floating arm, which a hand is

@@ -981,11 +981,10 @@ impl Par6Planner {
                 }
             }
         }
-        let peak = crate::tool_speed::peak_speed(&points, self.dt);
-        if peak <= ceiling {
+        if crate::tool_speed::peak_speed(&points, self.dt) <= ceiling {
             return samples;
         }
-        crate::tool_speed::stretched(start_q, &samples, peak / ceiling, self.dt)
+        crate::tool_speed::held_under(start_q, &samples, &points, ceiling, self.dt)
     }
 
     /// Plan a joint-space move from the measured pose in `snap` to

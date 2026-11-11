@@ -741,7 +741,7 @@ speed, whatever is driving the arm:
 
 | What moves the arm | How it is held to the ceiling |
 |---|---|
-| Planned moves (`move_j`, `move_l`, …, blends) | The plan is the same path played back slower: the whole of it by the one factor that brings its fastest instant down to the ceiling. A joint move at reach is where this bites — joint limits alone let the base swing the tool at several times any cartesian speed. The preview plans with the same planner, so it reports the same duration. |
+| Planned moves (`move_j`, `move_l`, …, blends) | The plan is the same path, played back slower wherever the tool would otherwise be over the ceiling and at its own pace everywhere else. A joint move at reach is where this bites — joint limits alone let the base swing the tool at several times any cartesian speed. The preview plans with the same planner, so it reports the same duration. |
 | `jog_j` | The requested speeds are scaled, at the pose the arm is in, until the tool is at the ceiling. |
 | `servo_j`, `servo_j_pose` | The stream's speed fraction is scaled the same way, taking every joint with somewhere to go at its stream limit. |
 | `jog_l`, `servo_l` | Already limited in cartesian space by `[motion] jog_l_linear_max_m_s`, which the config refuses to load above the ceiling. |

@@ -944,7 +944,7 @@ fn a_jog_re_pressed_during_its_ramp_down_never_comes_to_rest() {
 /// it — measured on the same executor and clamp the RT core ticks.
 #[test]
 fn the_servo_preview_runs_the_limiter_from_the_virtual_pose() {
-    let config = test_config();
+    let config = common::uncapped_config("preview-servo", 0.02);
     let robot = par6_config::RobotConfig::load(&config).expect("config");
     let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview");
     let lim = &robot.joints[0].limits;
