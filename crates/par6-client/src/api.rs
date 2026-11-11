@@ -806,3 +806,15 @@ pub struct MotionWait {
 pub fn freedrive(s: &Status) -> bool {
     s.mode == par6_proto::ControllerMode::Idle && s.homed && s.enabled && s.gravity_comp
 }
+
+/// Whether the arm has stopped itself and holds, still enabled, refusing
+/// motion until `reset` — read off a STATUS frame. A failed command's
+/// error also stands on an enabled controller, and needs no reset; the
+/// standing code is what tells the two apart.
+pub fn protective_stop(s: &Status) -> bool {
+    s.enabled
+        && s.error.as_ref().is_some_and(|e| {
+            par6_proto::ErrorCode::from_wire(i64::from(e.code))
+                .is_some_and(par6_proto::ErrorCode::is_protective)
+        })
+}

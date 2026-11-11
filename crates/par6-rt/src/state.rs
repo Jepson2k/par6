@@ -113,6 +113,9 @@ pub enum ErrorCode {
     /// Per-joint: a contact read on an arm that does not stop for it —
     /// one at rest, or one configured to report (warning, self-clears).
     ContactWarning,
+    /// Per-joint: a floating arm moved faster than a hand moves it and
+    /// was stopped and held (protective latch).
+    FreedriveCatch,
 }
 
 impl ErrorCode {
@@ -135,7 +138,7 @@ impl ErrorCode {
     /// not a fault: it stays enabled and referenced, and nothing on the
     /// drives needs clearing.
     pub fn is_protective(self) -> bool {
-        matches!(self, ErrorCode::Contact)
+        matches!(self, ErrorCode::Contact | ErrorCode::FreedriveCatch)
     }
 
     /// Hard errors disable the arm and set `error_active`.

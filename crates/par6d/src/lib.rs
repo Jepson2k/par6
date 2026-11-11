@@ -33,6 +33,8 @@ pub mod collision_world;
 mod contact_tests;
 pub mod daemon;
 mod execution_path;
+#[cfg(test)]
+mod freedrive_tests;
 mod grant;
 pub mod kin;
 pub mod logging;

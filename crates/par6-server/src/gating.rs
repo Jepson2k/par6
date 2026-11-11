@@ -30,6 +30,10 @@ pub struct Gate {
     pub needs_homed: bool,
     /// Simulator backend must be active.
     pub needs_simulator: bool,
+    /// The command takes the arm off its position hold and into IDLE,
+    /// where it floats. Refused while a protective stop stands: an arm
+    /// that stopped itself stays where it stopped until it is reset.
+    pub releases_hold: bool,
 }
 
 /// The gating table entry for `cmd`.
@@ -87,6 +91,11 @@ pub fn gate(cmd: CmdType) -> Gate {
         // arm must work, exactly as it did when the command was immediate.
         C::SetTcpOffset | C::SetTcpTransform => g.needs_enabled = false,
         C::ResetLoopStats => g.needs_enabled = false,
+        // Freedrive is IDLE with gravity compensation on, and the
+        // maintenance commands idle the arm to do their work.
+        C::SetGravityComp | C::EnterFlashing | C::SetCanId | C::SaveConfig | C::SetToolId => {
+            g.releases_hold = true;
+        }
         _ => {}
     }
     g
@@ -154,6 +163,11 @@ pub fn check_gate(tag: CmdType, ctx: &GateContext) -> Option<WireError> {
                 &[("detail", "The RT core reports DISABLED.")],
             ));
         }
+        if let Some(stop) = &ctx.protective {
+            return Some(stop.error());
+        }
+    }
+    if g.releases_hold {
         if let Some(stop) = &ctx.protective {
             return Some(stop.error());
         }

@@ -95,9 +95,15 @@ fn a_moving_arm_stops_for_what_it_runs_into_backs_off_and_holds() {
                 "dt {dt}: and holds there: it moved {drift:.5} rad in the next 0.3 s"
             );
 
-            // Latched: no motion until the operator has dealt with it.
+            // Latched: neither moved nor let go until the operator has
+            // dealt with it. IDLE is where the arm would float.
             rig.commands.send(RtCommand::SetMode(Mode::Idle)).unwrap();
-            rig.tick();
+            let kept = rig.tick();
+            assert_eq!(
+                kept.mode,
+                Mode::Exec,
+                "dt {dt}: a latched contact keeps its hold"
+            );
             rig.commands.send(RtCommand::SetMode(Mode::Stream)).unwrap();
             let refused = rig.stream(target);
             assert_ne!(
@@ -115,6 +121,7 @@ fn a_moving_arm_stops_for_what_it_runs_into_backs_off_and_holds() {
                 "dt {dt}: a contact clears at once: {:?}",
                 cleared.errors.as_slice()
             );
+            rig.commands.send(RtCommand::SetMode(Mode::Idle)).unwrap();
             let at = rig.hold();
             let mut away = at;
             away[0] -= direction * 0.3;

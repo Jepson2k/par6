@@ -47,6 +47,7 @@ pub mod core;
 pub mod dispatch;
 pub mod errors;
 pub mod exec;
+pub mod freedrive;
 pub mod gpio;
 pub mod gravity;
 mod gripper_gate;

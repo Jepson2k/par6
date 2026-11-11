@@ -900,6 +900,44 @@ impl Default for ContactSection {
     }
 }
 
+/// `[freedrive]`: the floating arm — IDLE with gravity compensation on,
+/// where the drives carry the arm's weight and a hand moves it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FreedriveSection {
+    /// How much of the hand's push the drives add to it: the torque the
+    /// external-torque estimate reads on a floating joint, beyond its
+    /// stiction, is applied again times this. 0 is a plain gravity float;
+    /// 1 halves what the hand has to supply. It amplifies whatever the
+    /// estimate reads, a gravity error included, so it stays modest.
+    pub push_assist: f64,
+    /// Corner of the low-pass the assist follows the push through \[Hz\].
+    /// Below the arm's drivetrain resonances, which the estimate does not
+    /// model and the assist must not chase.
+    pub push_assist_hz: f64,
+    /// Per joint: a joint held at a soft limit is let go when the contact
+    /// signal shows this much torque pushing it back in \[Nm\].
+    pub limit_release_nm: Vec<f64>,
+    /// Per joint: a joint faster than this for `catch_window_s` is falling
+    /// or was thrown, not guided \[rad/s\]. The arm stops where it is and
+    /// holds until it is reset.
+    pub catch_speed_rad_s: Vec<f64>,
+    /// How long a joint must stay above `catch_speed_rad_s` \[s\].
+    pub catch_window_s: f64,
+}
+
+impl Default for FreedriveSection {
+    fn default() -> Self {
+        Self {
+            push_assist: 0.6,
+            push_assist_hz: 2.0,
+            limit_release_nm: vec![0.6, 1.0, 0.85, 0.25, 0.25, 0.15],
+            catch_speed_rad_s: vec![1.6, 1.6, 1.6, 3.0, 3.0, 3.0],
+            catch_window_s: 0.05,
+        }
+    }
+}
+
 /// `[limits]`: safety-envelope enforcement thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -1030,6 +1068,9 @@ pub struct RobotConfig {
     /// reference arm's thresholds, stopping.
     #[serde(default)]
     pub contact: ContactSection,
+    /// The floating arm's law. Omitted = the reference arm's.
+    #[serde(default)]
+    pub freedrive: FreedriveSection,
     /// This installation's standing collision restrictions — the floor,
     /// cage walls, the table, fixtures. Enforced from boot in the
     /// planner's gate, the streaming gate and the simulator's scene;
@@ -1177,6 +1218,7 @@ impl RobotConfig {
         self.validate_sim()?;
         self.validate_dynamics()?;
         self.validate_contact()?;
+        self.validate_freedrive()?;
         Ok(())
     }
 
@@ -1755,6 +1797,39 @@ impl RobotConfig {
             if !(v.is_finite() && v >= 0.0) {
                 return Err(invalid(name, "must be finite and >= 0"));
             }
+        }
+        Ok(())
+    }
+
+    fn validate_freedrive(&self) -> Result<(), ConfigError> {
+        let f = &self.freedrive;
+        if !(f.push_assist.is_finite() && (0.0..=2.0).contains(&f.push_assist)) {
+            return Err(invalid("freedrive.push_assist", "must be in [0, 2]"));
+        }
+        if !is_positive(f.push_assist_hz) || !f.push_assist_hz.is_finite() {
+            return Err(invalid(
+                "freedrive.push_assist_hz",
+                "must be > 0 and finite",
+            ));
+        }
+        for (values, name) in [
+            (&f.limit_release_nm, "freedrive.limit_release_nm"),
+            (&f.catch_speed_rad_s, "freedrive.catch_speed_rad_s"),
+        ] {
+            if values.len() != self.joints.len() {
+                return Err(invalid(name, "must carry one entry per joint"));
+            }
+            for (j, v) in values.iter().enumerate() {
+                if !is_positive(*v) || !v.is_finite() {
+                    return Err(invalid(name, format!("entry {j} must be > 0 and finite")));
+                }
+            }
+        }
+        if !is_positive(f.catch_window_s) || !f.catch_window_s.is_finite() {
+            return Err(invalid(
+                "freedrive.catch_window_s",
+                "must be > 0 and finite",
+            ));
         }
         Ok(())
     }

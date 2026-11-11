@@ -120,14 +120,16 @@ pub fn rt_protective_stop(snap: &StateSnapshot) -> Option<ProtectiveStop> {
     if !snap.protective_active {
         return None;
     }
-    let contact = snap
-        .errors
-        .as_slice()
-        .iter()
-        .find(|e| e.code == RtCode::Contact)?;
-    Some(ProtectiveStop {
-        code: ErrorCode::SysContact,
-        joint: contact.joint,
+    snap.errors.as_slice().iter().find_map(|e| {
+        let code = match e.code {
+            RtCode::Contact => ErrorCode::SysContact,
+            RtCode::FreedriveCatch => ErrorCode::SysFreedriveCatch,
+            _ => return None,
+        };
+        Some(ProtectiveStop {
+            code,
+            joint: e.joint,
+        })
     })
 }
 

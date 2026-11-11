@@ -44,11 +44,11 @@ pub use overlay::{
     local_overlay, LOCAL_CONFIG_ENV, LOCAL_CONFIG_NAME,
 };
 pub use robot::{
-    BusConfig, ContactReaction, ContactSection, ControlMode, DriverType, DynamicsSection, Gains,
-    JogDefaults, JogProfile, JointConfig, JointLimits, KtFetchConfig, KtSource, LimitMode,
-    LimitsSection, ModeLimits, MotionConfig, ProtocolConfig, ResolvedLimits, RippleHarmonic,
-    RobotConfig, RobotSection, ScanConfig, SimConfig, StreamDefaults, TimingConfig, WatchdogAction,
-    MAX_OPEN_RETRY_S, MAX_RIPPLE_HARMONICS,
+    BusConfig, ContactReaction, ContactSection, ControlMode, DriverType, DynamicsSection,
+    FreedriveSection, Gains, JogDefaults, JogProfile, JointConfig, JointLimits, KtFetchConfig,
+    KtSource, LimitMode, LimitsSection, ModeLimits, MotionConfig, ProtocolConfig, ResolvedLimits,
+    RippleHarmonic, RobotConfig, RobotSection, ScanConfig, SimConfig, StreamDefaults, TimingConfig,
+    WatchdogAction, MAX_OPEN_RETRY_S, MAX_RIPPLE_HARMONICS,
 };
 
 use std::path::Path;

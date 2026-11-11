@@ -41,6 +41,7 @@ use crate::contact::{ContactDetector, ContactWatch};
 use crate::dispatch::{self, CommandMirror, JointSetpoint};
 use crate::errors::ErrorManager;
 use crate::exec::{ExecPlayback, ExecTick};
+use crate::freedrive::Freedrive;
 use crate::gpio::{Debouncer, DigitalIo, EstopGpio, EstopMonitor};
 use crate::gravity::GravityModel;
 use crate::gripper_gate::GripperGate;
@@ -304,8 +305,8 @@ pub enum GateRefusal {
     /// The mode's output law is not implemented yet (HAND_GUIDING,
     /// IMPEDANCE) — explicit refusal, never a silent no-op mode.
     NotImplemented,
-    /// Target is a motion mode and a protective stop is latched: the arm
-    /// stopped for something and stays put until that is cleared.
+    /// A protective stop is latched: the arm stopped itself and stays
+    /// put, neither moved nor let go, until that is cleared.
     ProtectiveStop,
 }
 
@@ -638,6 +639,7 @@ pub struct RtCore<B: DriverBus> {
     /// Per-joint consecutive over-margin tick counters.
     tau_env_over: [u32; MAX_JOINTS],
     contact: ContactDetector,
+    freedrive: Freedrive,
     /// The measured poses of the last `[contact] retreat_s`, oldest
     /// overwritten: where a stopped arm retreats to is somewhere it has
     /// just been. Empty when the config asks for no retreat.
@@ -916,6 +918,7 @@ impl<B: DriverBus> RtCore<B> {
             tau_env_window_ticks: robot.ticks(robot.limits.tau_ext_window_s).max(1),
             tau_env_over: [0; MAX_JOINTS],
             contact: ContactDetector::new(robot),
+            freedrive: Freedrive::new(robot),
             trail: vec![[0.0; MAX_JOINTS]; robot.ticks(robot.contact.retreat_s) as usize],
             trail_next: 0,
             trail_len: 0,
@@ -2061,8 +2064,9 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     /// Mode transition request with the gates applied in order:
-    /// maintenance park assertion, SAFETY_STOP/IDLE unconditional
-    /// reachability, then enabled ∧ no-errors ∧ homed-if-motion.
+    /// maintenance park assertion, SAFETY_STOP's unconditional
+    /// reachability, IDLE unless a protective stop stands, then
+    /// enabled ∧ no-errors ∧ homed-if-motion.
     fn request_mode(&mut self, target: Mode) -> Result<(), GateRefusal> {
         if target == self.mode {
             // A STREAM request while STREAM is braking to rest resumes
@@ -2100,8 +2104,16 @@ impl<B: DriverBus> RtCore<B> {
             return Err(GateRefusal::InvalidTransition);
         }
         match target {
-            // →IDLE always allowed; SAFETY_STOP always reachable, no checks.
-            Mode::Idle | Mode::SafetyStop => {}
+            // SAFETY_STOP is always reachable, no checks.
+            Mode::SafetyStop => {}
+            // IDLE is where an arm floats, and one that stopped itself
+            // holds where it stopped until it is reset — whatever asks
+            // for IDLE in the meantime.
+            Mode::Idle => {
+                if self.errors.any_protective() {
+                    return Err(GateRefusal::ProtectiveStop);
+                }
+            }
             // Maintenance exemption: FLASHING skips enabled/errors/homed,
             // gated ONLY on the human park assertion.
             Mode::Flashing => {
@@ -2565,6 +2577,18 @@ impl<B: DriverBus> RtCore<B> {
             }
         }
 
+        // A floating arm goes where a hand takes it, at a hand's speed.
+        // Faster than that it is falling or was thrown: stop it where it
+        // is and hold, as for a contact but with nowhere to back off to.
+        if self.mode == Mode::Idle && self.gravity_applied() {
+            if let Some(joint) = self.freedrive.overspeed(&self.qd) {
+                self.errors.latch(ErrorCode::FreedriveCatch, Some(joint));
+                self.begin_reflex(false);
+            }
+        } else {
+            self.freedrive.reset();
+        }
+
         // Contact: a moving arm that reads one stops for it in this
         // tick and latches until the operator has dealt with it; a
         // resting one reports.
@@ -2924,7 +2948,20 @@ impl<B: DriverBus> RtCore<B> {
 
         match self.mode {
             Mode::Booting => dispatch::law_booting(&mut self.setpoints),
-            Mode::Idle => dispatch::law_idle(self.gravity_applied(), &self.g, &mut self.setpoints),
+            Mode::Idle if self.gravity_applied() => {
+                // The floating law reads the hand out of the estimate, and
+                // without the arm's inertia in the model the estimate is
+                // every acceleration the arm makes: nothing to read.
+                const NOTHING: [f64; MAX_JOINTS] = [0.0; MAX_JOINTS];
+                let signal = if self.observer.inertial() {
+                    &self.contact.status().signal
+                } else {
+                    &NOTHING
+                };
+                self.freedrive
+                    .law(&self.q, &self.qd, &self.g, signal, &mut self.setpoints);
+            }
+            Mode::Idle => dispatch::law_idle(&mut self.setpoints),
             Mode::ActiveError => dispatch::law_active_error(&mut self.setpoints),
             Mode::SafetyStop => dispatch::law_safety_stop(&mut self.setpoints),
             Mode::Jog => {

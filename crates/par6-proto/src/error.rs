@@ -101,6 +101,22 @@ wire_enum! {
         /// As a warning it is a contact the arm does not stop for — one
         /// at rest, or one configured to report.
         SysContact = 65,
+        /// A floating (freedrive) joint moved faster than a hand moves it
+        /// — the arm was falling or thrown. Protective stop: the arm was
+        /// stopped where it was and holds, enabled and referenced,
+        /// refusing motion until `Reset`.
+        SysFreedriveCatch = 66,
+    }
+}
+
+impl ErrorCode {
+    /// Whether this code, standing in STATUS, is a protective stop: the
+    /// arm stopped itself and holds under power, still ENABLED and
+    /// referenced, and refuses motion until `Reset`. A client tells that
+    /// apart from a failed command's error — which also stands on an
+    /// enabled controller, and needs no reset — by this.
+    pub const fn is_protective(self) -> bool {
+        matches!(self, ErrorCode::SysContact | ErrorCode::SysFreedriveCatch)
     }
 }
 
@@ -380,6 +396,14 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
             effect: "Standing: motion stopped, backed off and refused; controller stays \
                      ENABLED. Warning: reported only.",
             remedy: "Clear what the arm touched, then send reset.",
+        },
+        E::SysFreedriveCatch => ErrorTemplate {
+            title: "Freedrive catch",
+            cause: "Joint {joint} moved faster than its freedrive catch speed while floating.",
+            effect: "The arm was stopped where it was and holds; motion and freedrive are \
+                     refused; controller stays ENABLED.",
+            remedy: "Check the declared payload and tool, then send reset and ask for \
+                     freedrive again.",
         },
         E::MotnHomingFailed => ErrorTemplate {
             title: "Homing failed",

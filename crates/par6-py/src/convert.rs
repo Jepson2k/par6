@@ -171,6 +171,7 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     d.set_item("mode", s.mode as u8)?;
     d.set_item("enabled", s.enabled)?;
     d.set_item("gravity_comp", s.gravity_comp)?;
+    d.set_item("protective_stop", par6_client::protective_stop(s))?;
     let warnings = PyList::empty(py);
     for w in &s.warnings {
         warnings.append(wire_error_tuple(py, w))?;

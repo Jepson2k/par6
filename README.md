@@ -342,7 +342,7 @@ One tick, in order:
    [Collaborative behaviour](#collaborative-behaviour)).
 4. **Mode dispatch** — one of IDLE / HOMING / JOG / STREAM / EXEC / SAFETY_STOP /
    FLASHING produces this tick's setpoints. IDLE on a homed, enabled arm with
-   gravity comp on is freedrive: torque-only `G(q)`, no position hold.
+   gravity comp on is [freedrive](#freedrive): `G(q)` and no position hold.
 5. **CAN TX** — one motion pack per joint, plus any queued control frame.
 6. **Snapshot** — publish state to the command plane's reader slot.
 
@@ -681,6 +681,43 @@ pose = [0.3204, 0.185, 0.2, 0.0, 0.0, 0.0]
 TOML
 pixi run cargo run -p par6d -- --sim --sim-scenario post.toml
 ```
+
+### Freedrive
+
+`freedrive(True)` floats the arm: IDLE with gravity compensation on, where the drives
+carry the arm's weight, nothing holds its position, and a hand moves it. `[freedrive]`
+is what else the drives do while it floats, per joint:
+
+- **Push assist.** The torque a hand puts on a joint is what the
+  [external-torque estimate](#external-torque-estimate) reads on a floating arm. The
+  drive applies it again, times `push_assist`, through a `push_assist_hz` low-pass:
+  the hand feels a lighter arm, and with nothing pushing there is nothing to add to,
+  so the joint stops as it always did. It does nothing for a joint at rest — breaking
+  it loose still takes its full stiction, because a push that small never reaches the
+  motor current — and it amplifies whatever the estimate reads, a gravity error
+  included, so it ships modest.
+- **Soft limits.** A joint that reaches a soft limit moving outward is held there by
+  its drive — that joint alone, the rest of the arm goes on floating — until the
+  contact signal shows `limit_release_nm` pushing it back in.
+- **The catch.** A joint faster than `catch_speed_rad_s` for `catch_window_s` is not
+  being guided: it is falling under a payload the model was not told about, or it was
+  thrown. The arm stops where it is and holds, and `SysFreedriveCatch` stands as a
+  protective stop: `reset()`, then ask for freedrive again.
+
+Both stops are the drive's own position loop, and nothing in the floating law feeds a
+joint's velocity back to it — no speed ceiling short of the catch, no damping toward
+a limit, no paying a joint's friction for it. A torque computed from velocity on the
+runtime's side of the bus is a loop closed at the tick rate around a rotor that
+weighs almost nothing, and at any gain worth having it shakes the drivetrain.
+
+Contact detection is not armed while the arm floats — contact is the point — and a
+protective stop of either kind refuses `freedrive(True)` until it is reset: an arm
+that stopped itself stays where it stopped.
+
+The gravity model is all that holds a floating arm up. A wrong payload or tool mass
+makes it drift, toward the floor or the ceiling; the limits and the catch bound how
+far and how fast, and neither is a reason to float an arm over something it must not
+land on.
 
 ## The Pinocchio shim
 
