@@ -25,6 +25,7 @@ below works on a laptop and in CI.
 - [Collision world](#collision-world)
 - [Kinematics and tools](#kinematics-and-tools)
 - [Payload and gravity](#payload-and-gravity)
+- [Collaborative behaviour](#collaborative-behaviour)
 - [The Pinocchio shim](#the-pinocchio-shim)
 - [Ports and environment variables](#ports-and-environment-variables)
 - [Development setup](#development-setup)
@@ -337,7 +338,8 @@ One tick, in order:
 2. **State** — update positions, velocities, currents, temperatures, error latches.
 3. **Gravity compensation** — `G(q)` from Pinocchio on the arm-only chain, with the
    active tool's inertials attached from its gripper config so tool mass has exactly
-   one source.
+   one source. The same model then feeds the external-torque observer (see
+   [Collaborative behaviour](#collaborative-behaviour)).
 4. **Mode dispatch** — one of IDLE / HOMING / JOG / STREAM / EXEC / SAFETY_STOP /
    FLASHING produces this tick's setpoints. IDLE on a homed, enabled arm with
    gravity comp on is freedrive: torque-only `G(q)`, no position hold.
@@ -563,6 +565,44 @@ good residual. Anything that physically changes a link needs new nominal data,
 not a measurement.
 
 Worked example: [`examples/payload_estimate.py`](examples/payload_estimate.py).
+
+## Collaborative behaviour
+
+par6 reads what the arm touches from the motor currents its drives already report.
+**None of this is a safety-rated function.** The arm has no brakes, the sensing is
+single-channel and the controller is a general-purpose computer: it makes working
+beside the arm pleasant, and it is not what makes that safe.
+
+### External-torque estimate
+
+Every tick the runtime estimates, per joint, the motor torque its own model does
+not account for:
+
+```
+measured − ( G(q) + C(q,q̇)·q̇ + (M(q) + B)·q̈ + friction )
+```
+
+`G`, `C` and `M` come from the Pinocchio model gravity compensation already runs,
+declared payload included. `B` — rotor inertia reflected through the gearbox — and
+the Coulomb and viscous friction come from `[dynamics]`. Acceleration is the
+tick-to-tick change of the velocity the drives report, and the result is low-passed
+at `observer_hz`: the generalized-momentum observer in its discrete form. Nothing in
+it depends on what was commanded, so the estimate means the same thing in a planned
+move, a jog, a hold and a floating arm.
+
+It is published as STATUS `torques_ext`, signed measured-minus-model: a joint that
+has to push harder than its dynamics call for reads positive in its direction of
+effort, so a hand pressing a held joint one way reads the other.
+
+Two things bound what it can see. A joint at rest sits anywhere inside its stiction
+band, so a push smaller than its Coulomb friction is carried by the gearbox and never
+reaches the motor current. And the estimate is exactly as good as the model:
+`[dynamics]` ships the reference arm's friction, and an arm calibrated on its own
+gearboxes puts its own figures in its [local overlay](#local-overlay).
+
+A gravity model without inertia (a test stand-in) still produces the estimate, with
+every acceleration of the arm in it; anything that would read a contact from the
+estimate stands down in that case.
 
 ## The Pinocchio shim
 

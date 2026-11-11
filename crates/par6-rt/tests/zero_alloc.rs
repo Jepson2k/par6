@@ -9,12 +9,38 @@ use std::sync::mpsc;
 
 use par6_bus::sim::scene::{Scene, Tool};
 use par6_bus::sim::SimBus;
+use par6_kin::{GripperVariant, Kin};
 use par6_rt::adapters::{MotionJog, MotionStream};
 use par6_rt::hooks::ClampStream;
 use par6_rt::{
-    sample_ring, CompletionPolicy, Mode, NoFk, RtCommand, RtCore, RtHooks, Sample, SampleMeta,
-    SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity, MAX_JOINTS,
+    sample_ring, CompletionPolicy, GravityModel, Mode, NoFk, RtCommand, RtCore, RtHooks, Sample,
+    SampleMeta, SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle, MAX_JOINTS,
 };
+
+/// The arm's own model behind the gravity seam, as par6d wires it: the
+/// tick is measured with the external-torque observer running the
+/// inverse dynamics, not standing down for want of a model.
+struct ArmModel(Kin);
+
+impl GravityModel for ArmModel {
+    fn gravity(&mut self, q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
+        self.0.gravity(q, out).expect("gravity");
+    }
+
+    /// Nothing in this test declares a payload.
+    fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
+
+    fn dynamics(
+        &mut self,
+        q: &[f64; MAX_JOINTS],
+        v: &[f64; MAX_JOINTS],
+        a: &[f64; MAX_JOINTS],
+        out: &mut [f64; MAX_JOINTS],
+    ) -> bool {
+        self.0.dyn_feedforward(q, v, a, out).expect("dynamics");
+        true
+    }
+}
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
 
@@ -77,8 +103,12 @@ fn steady_state_ticks_allocate_nothing() {
     let (marker, _flash) = SharedFlashMarker::new();
     let (io, _io_lines) = SharedDigitalIo::new(robot.io.inputs.len(), robot.io.outputs.len());
     let (mut producer, consumer) = sample_ring(4096);
+    let assets =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/par6_description");
     let hooks = RtHooks {
-        gravity: Box::new(ZeroGravity),
+        gravity: Box::new(ArmModel(
+            Kin::load(&assets, GripperVariant::Flange).expect("arm model"),
+        )),
         jog: Box::new(MotionJog::from_config(robot).expect("jog engine")),
         stream: Box::new(MotionStream::from_config(robot).expect("stream limiter")),
         stream_shaped: Box::new(ClampStream::new(robot)),
@@ -94,8 +124,7 @@ fn steady_state_ticks_allocate_nothing() {
     // and the plant is part of what must not.
     let scene = Scene {
         tool: Tool::Flange,
-        assets: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../assets/par6_description"),
+        assets,
     };
     let (mut core, mut handles) = RtCore::new(&bundle, SimBus::new(scene), hooks).expect("core");
 

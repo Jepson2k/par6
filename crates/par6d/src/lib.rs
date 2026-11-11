@@ -34,9 +34,13 @@ mod execution_path;
 mod grant;
 pub mod kin;
 pub mod logging;
+#[cfg(test)]
+mod observer_tests;
 pub mod options;
 mod planner;
 pub mod preview;
+#[cfg(test)]
+mod sim_rig;
 pub mod vitals;
 
 pub use bridge::{held_jog_travel, stream_stopping_travel};

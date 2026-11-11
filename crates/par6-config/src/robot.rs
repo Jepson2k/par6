@@ -774,6 +774,46 @@ impl Default for MotionConfig {
     }
 }
 
+/// `[dynamics]`: what the controller knows about the arm beyond its
+/// rigid-body model — the terms the external-torque observer subtracts
+/// so that the arm's own motion does not read as something pushing on it.
+///
+/// These describe the arm the runtime is driving, where `[sim]` describes
+/// the plant the simulator stands in for it with; the shipped values are
+/// the same reference arm, and a per-arm calibration belongs here.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct DynamicsSection {
+    /// Coulomb friction per joint \[Nm, joint side\].
+    pub friction_coulomb_nm: Vec<f64>,
+    /// Viscous friction per joint \[Nm·s/rad, joint side\].
+    pub friction_viscous_nm_s: Vec<f64>,
+    /// Speed below which a joint's direction of sliding is not trusted
+    /// \[rad/s\]: the Coulomb term fades in across it rather than
+    /// flipping sign on encoder noise around rest.
+    pub friction_stick_rad_s: f64,
+    /// Rotor inertia per joint, reflected through the gearbox
+    /// \[kg·m², joint side\] — `G²·Jm`. The rigid-body model carries the
+    /// links only.
+    pub rotor_inertia_kg_m2: Vec<f64>,
+    /// Bandwidth of the external-torque observer \[Hz\]: how fast a
+    /// contact shows in the estimate, against how much of the velocity
+    /// signal's noise does.
+    pub observer_hz: f64,
+}
+
+impl Default for DynamicsSection {
+    fn default() -> Self {
+        Self {
+            friction_coulomb_nm: vec![0.29, 0.95, 0.64, 0.066, 0.045, 0.079],
+            friction_viscous_nm_s: vec![0.29, 1.0, 0.34, 0.047, 0.023, 0.022],
+            friction_stick_rad_s: 0.02,
+            rotor_inertia_kg_m2: vec![4.18e-4, 4.08e-3, 1.87e-3, 9.12e-5, 9.12e-5, 1.5e-4],
+            observer_hz: 10.0,
+        }
+    }
+}
+
 /// `[limits]`: safety-envelope enforcement thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -895,6 +935,10 @@ pub struct RobotConfig {
     /// Torque-level sim plant parameters. Omitted = the vendor table.
     #[serde(default)]
     pub sim: SimConfig,
+    /// The controller's friction and rotor model. Omitted = the
+    /// reference arm's.
+    #[serde(default)]
+    pub dynamics: DynamicsSection,
     /// This installation's standing collision restrictions — the floor,
     /// cage walls, the table, fixtures. Enforced from boot in the
     /// planner's gate, the streaming gate and the simulator's scene;
@@ -1040,6 +1084,7 @@ impl RobotConfig {
         self.validate_motion()?;
         self.validate_shutdown()?;
         self.validate_sim()?;
+        self.validate_dynamics()?;
         Ok(())
     }
 
@@ -1538,6 +1583,33 @@ impl RobotConfig {
             ),
             (m.singularity_cond_max, "motion.singularity_cond_max"),
             (m.singularity_sigma_min, "motion.singularity_sigma_min"),
+        ] {
+            if !is_positive(v) || !v.is_finite() {
+                return Err(invalid(name, "must be > 0 and finite"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_dynamics(&self) -> Result<(), ConfigError> {
+        let d = &self.dynamics;
+        for (values, name) in [
+            (&d.friction_coulomb_nm, "dynamics.friction_coulomb_nm"),
+            (&d.friction_viscous_nm_s, "dynamics.friction_viscous_nm_s"),
+            (&d.rotor_inertia_kg_m2, "dynamics.rotor_inertia_kg_m2"),
+        ] {
+            if values.len() != self.joints.len() {
+                return Err(invalid(name, "must carry one entry per joint"));
+            }
+            for (j, v) in values.iter().enumerate() {
+                if !(v.is_finite() && *v >= 0.0) {
+                    return Err(invalid(name, format!("entry {j} must be finite and >= 0")));
+                }
+            }
+        }
+        for (v, name) in [
+            (d.friction_stick_rad_s, "dynamics.friction_stick_rad_s"),
+            (d.observer_hz, "dynamics.observer_hz"),
         ] {
             if !is_positive(v) || !v.is_finite() {
                 return Err(invalid(name, "must be > 0 and finite"));

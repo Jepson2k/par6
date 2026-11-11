@@ -335,6 +335,7 @@ pub(crate) struct KinGravity {
     kin: Kin,
     scratch: [f64; MAX_JOINTS],
     last_good: [f64; MAX_JOINTS],
+    last_good_dynamics: [f64; MAX_JOINTS],
 }
 
 impl KinGravity {
@@ -343,6 +344,7 @@ impl KinGravity {
             kin,
             scratch: [0.0; MAX_JOINTS],
             last_good: [0.0; MAX_JOINTS],
+            last_good_dynamics: [0.0; MAX_JOINTS],
         }
     }
 }
@@ -361,6 +363,20 @@ impl GravityModel for KinGravity {
         if let Err(e) = self.kin.set_tool(mass, com, inertia) {
             log::error!("gravity payload update refused: {e}");
         }
+    }
+
+    fn dynamics(
+        &mut self,
+        q: &[f64; MAX_JOINTS],
+        v: &[f64; MAX_JOINTS],
+        a: &[f64; MAX_JOINTS],
+        out: &mut [f64; MAX_JOINTS],
+    ) -> bool {
+        if self.kin.dyn_feedforward(q, v, a, &mut self.scratch).is_ok() {
+            self.last_good_dynamics = self.scratch;
+        }
+        *out = self.last_good_dynamics;
+        true
     }
 }
 

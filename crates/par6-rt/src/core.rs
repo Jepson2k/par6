@@ -48,6 +48,7 @@ use crate::homing::{HomingSystem, SeqStatus};
 use crate::hooks::{
     CommandSource, FlashMarker, ForwardKin, JogEngine, RtCommand, SettlePolicy, StreamTracker,
 };
+use crate::observer::TorqueObserver;
 use crate::ring::SampleConsumer;
 use crate::snapshot::{snapshot_channel, SnapshotReader, SnapshotWriter};
 use crate::state::{
@@ -619,10 +620,11 @@ pub struct RtCore<B: DriverBus> {
     q_filt: [f64; MAX_JOINTS],
     qd_filt: [f64; MAX_JOINTS],
     tau_filt: [f64; MAX_JOINTS],
-    /// External torque estimate \[Nm\]: filtered measured torque minus
-    /// the model's gravity torque. What a hand pushing the arm looks
-    /// like in the torque domain.
+    /// External torque estimate \[Nm\], measured minus model: the
+    /// observer's output. What a hand pushing the arm looks like in the
+    /// torque domain.
     tau_ext: [f64; MAX_JOINTS],
+    observer: TorqueObserver,
     filters_seeded: bool,
     /// `[limits] tau_ext_margin_nm`; 0 disables the envelope.
     tau_env_margin_nm: f64,
@@ -884,6 +886,7 @@ impl<B: DriverBus> RtCore<B> {
             qd_filt: [0.0; MAX_JOINTS],
             tau_filt: [0.0; MAX_JOINTS],
             tau_ext: [0.0; MAX_JOINTS],
+            observer: TorqueObserver::new(robot),
             filters_seeded: false,
             tau_env_margin_nm: robot.limits.tau_ext_margin_nm,
             tau_env_window_ticks: robot.ticks(robot.limits.tau_ext_window_s).max(1),
@@ -1433,11 +1436,15 @@ impl<B: DriverBus> RtCore<B> {
         // Gravity: computed every tick, published always.
         self.refresh_gravity();
 
-        // External torque: what the measured (filtered) torque carries
-        // beyond the model's gravity — a contact, a payload the model
-        // does not know, a hand on the arm.
-        for i in 0..MAX_JOINTS {
-            self.tau_ext[i] = self.tau_filt[i] - self.g[i];
+        // External torque: what the measured torque carries beyond the
+        // arm's own dynamics — a contact, a payload the model does not
+        // know, a hand on the arm. Fed the raw measurement: the observer
+        // is its own filter, and a second one in front would only add
+        // lag to the acceleration it differences.
+        if self.filters_seeded {
+            self.observer
+                .update(self.gravity.as_mut(), &self.q, &self.qd, &self.tau, &self.g);
+            self.tau_ext = *self.observer.estimate();
         }
         lap(&mut mark, &mut laps, 5);
 
@@ -2398,26 +2405,22 @@ impl<B: DriverBus> RtCore<B> {
         // where the estimate is meaningful: homed (the gravity model
         // needs referenced angles), enabled, and in a mode whose drives
         // actively bear the load — a limp or protective-hold arm reads
-        // `-g(q)` as "external" torque and would re-latch forever. The
-        // EXEC feed-forward is subtracted so planned acceleration does
-        // not count against the margin (one tick stale, matching the
-        // measurement's own lag). Only IDLE and the working modes are
-        // policed: the protective laws, BOOTING and FLASHING command no
-        // torque of their own, so there is nothing to compare against.
+        // `-g(q)` as "external" torque and would re-latch forever. Only
+        // IDLE and the working modes are policed: the protective laws,
+        // BOOTING and FLASHING command no torque of their own, so there
+        // is nothing to compare against. A floating arm is not policed
+        // either: there the estimate is the hand that is guiding it.
         if self.tau_env_margin_nm > 0.0 {
+            let floating = self.mode == Mode::Idle && self.gravity_applied();
             let enforce = self.homed
                 && self.state == ArmState::Enabled
+                && !floating
                 && matches!(
                     self.mode,
                     Mode::Idle | Mode::Jog | Mode::Stream | Mode::Exec
                 );
             for i in 0..MAX_JOINTS {
-                let ff = if self.mode == Mode::Exec {
-                    self.scratch_tau[i]
-                } else {
-                    0.0
-                };
-                if enforce && (self.tau_ext[i] - ff).abs() > self.tau_env_margin_nm {
+                if enforce && self.tau_ext[i].abs() > self.tau_env_margin_nm {
                     self.tau_env_over[i] = self.tau_env_over[i].saturating_add(1);
                     if self.tau_env_over[i] >= self.tau_env_window_ticks {
                         self.errors.latch(ErrorCode::TorqueEnvelope, Some(i as u8));
@@ -2660,8 +2663,11 @@ impl<B: DriverBus> RtCore<B> {
             let _ = self.bus.poll_step();
             match status {
                 SeqStatus::Checking => {
-                    for (sum, ext) in self.ref_check_sum.iter_mut().zip(self.tau_ext) {
-                        *sum += ext;
+                    // The holding residual against gravity alone: the
+                    // arm is at rest on its drives' loops, and the
+                    // check's bounds were set against this quantity.
+                    for i in 0..MAX_JOINTS {
+                        self.ref_check_sum[i] += self.tau_filt[i] - self.g[i];
                     }
                     self.ref_check_n += 1;
                 }

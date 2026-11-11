@@ -494,8 +494,9 @@ pub struct StateSnapshot {
     /// Gravity torque G(q) \[Nm\] — computed and published every tick,
     /// applied only when the mode allows.
     pub gravity_torque_nm: [f64; MAX_JOINTS],
-    /// External torque estimate \[Nm\]: filtered measured torque minus
-    /// the model's gravity torque.
+    /// External torque estimate \[Nm\], measured minus model: the motor
+    /// torque that gravity, friction and the arm's own acceleration do
+    /// not account for.
     pub tau_ext: [f64; MAX_JOINTS],
     /// Per-node motor telemetry: arm joints 0..MAX_JOINTS, gripper last.
     pub nodes: [NodeState; NUM_NODES],
