@@ -118,6 +118,16 @@ pub enum RtCommand {
     /// Enable/disable the gravity-compensation feedforward (G(q) is still
     /// computed and published every tick regardless).
     SetGravityComp(bool),
+    /// Replace what the arm does on contact and the per-joint thresholds
+    /// it reads one at \[Nm\], from the next tick. Validated upstream.
+    SetContactLimits {
+        /// What a contact does from now on.
+        reaction: par6_config::ContactReaction,
+        /// Sustained-channel thresholds.
+        sustained_nm: [f64; MAX_JOINTS],
+        /// Impact-channel thresholds.
+        impact_nm: [f64; MAX_JOINTS],
+    },
     /// Replace the runtime payload in the gravity model (mass \[kg\],
     /// COM \[m\] ee-frame, inertia about the COM or `None` for a point
     /// mass). Plain data into the tick loop — the model updates between

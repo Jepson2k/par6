@@ -676,6 +676,15 @@ read the peaks, and set each threshold at roughly twice its peak in the arm's
 [local overlay](#local-overlay) — with `reaction = "warn"` first if you would rather
 watch before it stops anything.
 
+`set_contact_limits(reaction=…, sustained_nm=…, impact_nm=…)` applies a reaction and
+thresholds to the running arm, so the loop does not need a restart per try; what it
+sets lives until the runtime restarts, and the overlay is where the values are kept.
+In Waldo Commander the **Contact** tab (`par6.gui.contact`, a `waldoctl.panels`
+plugin beside Drives) is that loop with the numbers in front of you: each joint's
+signal and peak against its limit on both channels, the limits editable in place,
+"Set from peaks", and the `[contact]` table for the overlay ready to copy. A simulated
+run of a program honours the limits the program set.
+
 To try it without an arm, give the simulator something the runtime does not know
 about (see [`docs/simulation-scenarios.md`](docs/simulation-scenarios.md)):
 

@@ -7,7 +7,7 @@ Composite results cross as plain dicts (see the crate's `convert.rs`
 for the exact keys).
 """
 
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Sequence
 from enum import IntEnum
 from typing import Any
 
@@ -97,6 +97,7 @@ class ErrorCode(IntEnum):
     SYS_STREAM_FAULT = 64
     SYS_CONTACT = 65
     SYS_FREEDRIVE_CATCH = 66
+    SYS_SPEED_LIMIT = 67
 
 class Frame(IntEnum):
     """Reference frame a Cartesian target is expressed in."""
@@ -290,6 +291,9 @@ class CoreClient:
     def reset(self) -> Awaitable[int]: ...
     def estop(self) -> Awaitable[int]: ...
     def set_gravity_comp(self, on: bool) -> Awaitable[int]: ...
+    def set_contact_limits(
+        self, reaction: str, sustained_nm: Sequence[float], impact_nm: Sequence[float]
+    ) -> Awaitable[int]: ...
     def pause(self, on: bool) -> Awaitable[int]: ...
     def set_execution_speed(self, scale: float) -> Awaitable[int]: ...
     def stop(self, clear_queue: bool) -> Awaitable[int]: ...

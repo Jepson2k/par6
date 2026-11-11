@@ -226,6 +226,8 @@ pub struct Preview {
     tcp_rotation_deg: [f64; 3],
     policy: CompletionPolicy,
     payload: PayloadSpec,
+    /// Contact limits the program set, which a run of it boots with.
+    contact_limits: Option<par6_proto::command::SetContactLimits>,
     io_levels: Vec<u8>,
     io_inputs: usize,
     /// Commanded jaw position 0 = open … 1 = closed.
@@ -383,6 +385,7 @@ impl Preview {
             tcp_rotation_deg: [0.0; 3],
             policy: CompletionPolicy::Settled,
             payload: PayloadSpec::default(),
+            contact_limits: None,
             io_levels: vec![0; cfg.digital_outputs.len()],
             io_inputs: robot.io.inputs.len(),
             tool_position: 0.0,
@@ -1205,6 +1208,7 @@ impl Preview {
                 };
                 self.sync_planner();
             }
+            Command::SetContactLimits(p) => self.contact_limits = Some(p),
             Command::SetShapes(p) => {
                 if let Err(e) = self.set_shapes(ShapeLayer::Program, &p.shapes) {
                     return self.refuse(e);

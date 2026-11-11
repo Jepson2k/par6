@@ -1988,6 +1988,11 @@ impl<B: DriverBus> RtCore<B> {
                     }
                 }
             }
+            RtCommand::SetContactLimits {
+                reaction,
+                sustained_nm,
+                impact_nm,
+            } => self.contact.set_limits(reaction, sustained_nm, impact_nm),
             RtCommand::SetPayload { mass, com, inertia } => {
                 self.payload = (mass, com, inertia);
                 self.gravity.set_payload(mass, com, inertia);

@@ -168,6 +168,23 @@ impl ContactDetector {
         &self.status
     }
 
+    /// Replace the reaction and the thresholds, keeping the peaks and the
+    /// trip count: they are what the new values are being judged against.
+    /// Windows in progress start over, since what they were counting
+    /// toward has moved.
+    pub fn set_limits(
+        &mut self,
+        reaction: ContactReaction,
+        sustained_nm: [f64; MAX_JOINTS],
+        impact_nm: [f64; MAX_JOINTS],
+    ) {
+        self.status.reaction = reaction;
+        self.status.sustained_nm = sustained_nm;
+        self.status.impact_nm = impact_nm;
+        self.over_sustained = [0; MAX_JOINTS];
+        self.over_impact = [0; MAX_JOINTS];
+    }
+
     /// Start over from the next signal: no average, no windows in
     /// progress. For when the estimate itself has been started over.
     pub fn reseed(&mut self) {

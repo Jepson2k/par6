@@ -22,7 +22,7 @@ import logging
 import math
 import time
 import weakref
-from collections.abc import AsyncGenerator, Callable, Iterable
+from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -2030,6 +2030,43 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         if result is None:
             return None
         return ContactReadout(**result)
+
+    async def set_contact_limits(
+        self,
+        *,
+        reaction: str,
+        sustained_nm: Sequence[float],
+        impact_nm: Sequence[float],
+    ) -> int:
+        """Replace what the arm does on contact and the thresholds it reads
+        one at, live.
+
+        *reaction* is ``"stop"`` (a driven arm stops, backs off and holds
+        until ``reset()``), ``"warn"`` (report only) or ``"off"``.  The
+        thresholds are Nm per joint, each above zero: *sustained_nm* on the
+        contact signal itself, *impact_nm* on the signal against its own
+        slow average.  All three are required — the frame replaces the
+        whole set, and :meth:`contact` answers what is in force now.
+
+        What is set lives until the runtime restarts.  The arm's
+        ``local.toml`` ``[contact]`` table is where the values are kept.
+
+        Category: Configuration
+
+        Example:
+            now = rbt.contact()
+            rbt.set_contact_limits(reaction="warn",
+                                   sustained_nm=now.sustained_nm,
+                                   impact_nm=now.impact_nm)
+        """
+        core = await self._ensure_core()
+        return await self._call(
+            core.set_contact_limits(
+                str(reaction),
+                [float(v) for v in sustained_nm],
+                [float(v) for v in impact_nm],
+            )
+        )
 
     async def shapes(self) -> ShapeWorld | None:
         """The collision world the runtime is currently enforcing, by layer.

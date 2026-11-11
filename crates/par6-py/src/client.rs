@@ -723,6 +723,34 @@ impl CoreClient {
         query_future(py, self.rt(), Command::Contact)
     }
 
+    fn set_contact_limits<'py>(
+        &self,
+        py: Python<'py>,
+        reaction: &str,
+        sustained_nm: [f64; par6_proto::NUM_JOINTS],
+        impact_nm: [f64; par6_proto::NUM_JOINTS],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let reaction = match reaction {
+            "off" => par6_proto::ContactReaction::Off,
+            "warn" => par6_proto::ContactReaction::Warn,
+            "stop" => par6_proto::ContactReaction::Stop,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "contact reaction must be \"stop\", \"warn\" or \"off\", got {other:?}"
+                )))
+            }
+        };
+        sys_future(
+            py,
+            self.rt(),
+            Command::SetContactLimits(cmd::SetContactLimits {
+                reaction,
+                sustained_nm,
+                impact_nm,
+            }),
+        )
+    }
+
     fn set_execution_speed<'py>(&self, py: Python<'py>, scale: f64) -> PyResult<Bound<'py, PyAny>> {
         sys_future(
             py,

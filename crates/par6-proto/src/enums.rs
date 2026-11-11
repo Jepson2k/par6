@@ -143,6 +143,11 @@ wire_enum! {
         /// and `force` rule as SET_CAN_ID. The drive reports the id in its
         /// device info from then on, and the runtime fits that tool at boot.
         SetToolId = 33,
+        /// Replace what the arm does on contact and the per-joint
+        /// thresholds it reads one at, live — for tuning against the
+        /// arm's own programs. Lives until the runtime restarts; the
+        /// config is where the values are kept.
+        SetContactLimits = 34,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -498,6 +503,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SetCanId
         | C::SaveConfig
         | C::SetToolId
+        | C::SetContactLimits
         | C::SetExecutionSpeed
         | C::SetStatusRate
         | C::Teleport => CommandClass::System,

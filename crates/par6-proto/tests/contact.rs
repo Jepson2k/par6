@@ -112,3 +112,75 @@ fn a_contact_readout_that_cannot_be_true_is_refused() {
         assert!(decode_reply(&bytes).is_err(), "{what} decoded");
     }
 }
+
+/// The limits a client sets cross the wire whole, and nothing that could
+/// not be a threshold — a negative one, a zero, a NaN, a reaction no arm
+/// has, a truncated frame — decodes into a command.
+#[test]
+fn contact_limits_survive_the_wire_and_hostile_ones_are_refused() {
+    use par6_proto::command::SetContactLimits;
+    let limits = |reaction| SetContactLimits {
+        reaction,
+        sustained_nm: [1.2, 2.0, 1.7, 0.5, 0.5, 0.3],
+        impact_nm: [1.1, 1.0, 0.9, 0.3, 0.3, 0.2],
+    };
+    let mut bytes = Vec::new();
+    for reaction in [
+        ContactReaction::Stop,
+        ContactReaction::Warn,
+        ContactReaction::Off,
+    ] {
+        let command = Command::SetContactLimits(limits(reaction));
+        encode_command(&command, 41, &mut bytes).unwrap();
+        assert_eq!(decode_command(&bytes).unwrap(), (41, command));
+        for end in 0..bytes.len() {
+            assert!(
+                decode_command(&bytes[..end]).is_err(),
+                "a frame cut at {end} of {} decoded",
+                bytes.len()
+            );
+        }
+    }
+
+    for bad in [0.0, -0.5, f64::NAN, f64::INFINITY] {
+        for channel in 0..2 {
+            let mut hostile = limits(ContactReaction::Stop);
+            let thresholds = if channel == 0 {
+                &mut hostile.sustained_nm
+            } else {
+                &mut hostile.impact_nm
+            };
+            thresholds[3] = bad;
+            assert!(
+                encode_command(&Command::SetContactLimits(hostile), 1, &mut bytes).is_err(),
+                "a threshold of {bad} on channel {channel} was encoded"
+            );
+        }
+    }
+
+    // The same refusals on the way in: a frame built by hand, so the
+    // decoder is what says no.
+    encode_command(
+        &Command::SetContactLimits(limits(ContactReaction::Stop)),
+        1,
+        &mut bytes,
+    )
+    .unwrap();
+    let reaction_at = 3;
+    assert_eq!(bytes[reaction_at], ContactReaction::Stop as u8);
+    let mut unknown = bytes.clone();
+    unknown[reaction_at] = 9;
+    assert!(decode_command(&unknown).is_err(), "reaction 9 decoded");
+    // The first sustained threshold: an f64 marker and eight bytes, after
+    // the reaction and the array header.
+    let first = reaction_at + 2;
+    assert_eq!(bytes[first], 0xcb, "a float64 where the first threshold is");
+    for bad in [-1.0_f64, 0.0, f64::NAN] {
+        let mut hostile = bytes.clone();
+        hostile[first + 1..first + 9].copy_from_slice(&bad.to_be_bytes());
+        assert!(
+            decode_command(&hostile).is_err(),
+            "a decoded threshold of {bad} was accepted"
+        );
+    }
+}

@@ -1934,6 +1934,21 @@ impl RtBridge {
     }
 }
 
+/// `SET_CONTACT_LIMITS` as the RT takes it.
+pub(crate) fn contact_limits_command(limits: &par6_proto::command::SetContactLimits) -> RtCommand {
+    use par6_config::ContactReaction as Configured;
+    use par6_proto::ContactReaction as Wire;
+    RtCommand::SetContactLimits {
+        reaction: match limits.reaction {
+            Wire::Off => Configured::Off,
+            Wire::Warn => Configured::Warn,
+            Wire::Stop => Configured::Stop,
+        },
+        sustained_nm: limits.sustained_nm,
+        impact_nm: limits.impact_nm,
+    }
+}
+
 /// The RT half of a teleport: re-seed the simulated plant at `q` and have
 /// the core adopt the landed pose.
 fn place(
@@ -2837,6 +2852,10 @@ impl RtCommands for RtBridge {
 
     fn set_tool_id(&mut self, node: u8, tool_id: u8) {
         self.link.send(RtCommand::SetToolId { node, tool_id });
+    }
+
+    fn set_contact_limits(&mut self, limits: &par6_proto::command::SetContactLimits) {
+        self.link.send(contact_limits_command(limits));
     }
 
     fn rescan_bus(&mut self) {

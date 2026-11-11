@@ -401,6 +401,15 @@ impl Client {
         self.system(Command::SetPidGains(gains)).await
     }
 
+    /// Replace what the arm does on contact and the thresholds it reads
+    /// one at, until the runtime restarts.
+    pub async fn set_contact_limits(
+        &self,
+        limits: cmd::SetContactLimits,
+    ) -> Result<Ack, ClientError> {
+        self.system(Command::SetContactLimits(limits)).await
+    }
+
     /// Commissioning: rename drive `node` to `new_id` (`SET_CAN_ID`).
     /// Refused unless the arm is idle or latched with nothing in flight;
     /// `force` allows an id the config does not list.

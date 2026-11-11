@@ -13,7 +13,7 @@ import atexit
 import contextlib
 import threading
 import weakref
-from collections.abc import Callable, Coroutine, Iterable
+from collections.abc import Callable, Coroutine, Iterable, Sequence
 from typing import TYPE_CHECKING, Any, TypeVar
 
 from waldoctl.execution import ExecutionSpeed
@@ -726,6 +726,21 @@ class RobotClient:
     def contact(self) -> ContactReadout | None:
         """Contact detection readout: thresholds, signals, peaks, stops."""
         return _run(self._inner.contact())
+
+    def set_contact_limits(
+        self,
+        *,
+        reaction: str,
+        sustained_nm: Sequence[float],
+        impact_nm: Sequence[float],
+    ) -> int:
+        """Replace the contact reaction and per-joint thresholds, live
+        (all three required — the frame replaces the whole set)."""
+        return _run(
+            self._inner.set_contact_limits(
+                reaction=reaction, sustained_nm=sustained_nm, impact_nm=impact_nm
+            )
+        )
 
     def shapes(self) -> ShapeWorld | None:
         """The collision world the runtime is enforcing, by layer."""

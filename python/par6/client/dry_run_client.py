@@ -23,7 +23,7 @@ import copy
 import hashlib
 import logging
 import math
-from collections.abc import Callable, Coroutine, Iterator
+from collections.abc import Callable, Coroutine, Iterator, Sequence
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -1097,6 +1097,25 @@ class DryRunRobotClient(RobotOwner):
     def contact(self) -> None:
         """None: a preview measures no motor torque to read a contact from."""
         return None
+
+    def set_contact_limits(
+        self,
+        *,
+        reaction: str,
+        sustained_nm: Sequence[float],
+        impact_nm: Sequence[float],
+    ) -> int:
+        """Planned as the runtime takes it; a simulated run of the program
+        reads contacts with these limits from here on."""
+        return self._system(
+            {
+                "type": "set_contact_limits",
+                "reaction": str(reaction),
+                "sustained_nm": [float(v) for v in sustained_nm],
+                "impact_nm": [float(v) for v in impact_nm],
+            },
+            "set_contact_limits",
+        )
 
     def reset_loop_stats(self, **kwargs: Any) -> int:
         """A preview runs no control loop."""

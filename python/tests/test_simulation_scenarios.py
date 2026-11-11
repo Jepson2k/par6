@@ -49,3 +49,30 @@ def test_a_push_in_the_scenario_ends_the_replayed_move_as_a_contact():
     error = pushed.blocks[-1].error
     assert isinstance(error, RobotError) and error.code == ErrorCode.SYS_CONTACT
     assert np.degrees(pushed.joints_rad[-1, 0]) < target[0] - 5.0
+
+
+def test_a_replay_reads_contacts_with_the_limits_the_program_set():
+    """A program that raises its thresholds before a move it expects to be
+    nudged in is replayed with them in force: the same nudge that ends the
+    move as a contact under the shipped limits is ridden through."""
+    nudge = {"joint_push": {"at_s": 0.4, "duration_s": 0.3, "node": 0, "nm": -2.0}}
+
+    def swing(client: DryRunRobotClient) -> list[float]:
+        target = client.angles()
+        target[0] += 60.0
+        client.move_j(target, speed=0.5)
+        return target
+
+    shipped = DryRunRobotClient()
+    swing(shipped)
+    error = shipped.simulate(10, scenario=nudge).blocks[-1].error
+    assert isinstance(error, RobotError) and error.code == ErrorCode.SYS_CONTACT
+
+    raised = DryRunRobotClient()
+    raised.set_contact_limits(
+        reaction="stop", sustained_nm=[6.0] * 6, impact_nm=[6.0] * 6
+    )
+    target = swing(raised)
+    ran = raised.simulate(10, scenario=nudge)
+    assert ran.stop == "completed" and ran.blocks[-1].error is None
+    assert np.degrees(ran.joints_rad[-1, 0]) == pytest.approx(target[0], abs=1.0)

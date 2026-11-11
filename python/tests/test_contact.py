@@ -131,3 +131,80 @@ async def test_a_floating_arm_that_runs_away_is_caught_and_refuses_to_float_unti
         assert not await client.wait_status(lambda s: s.protective_stop, timeout=1.0), (
             "with the payload cleared the arm floats where it is"
         )
+
+
+@pytest.mark.timeout(120)
+async def test_the_reaction_set_live_decides_whether_the_arm_stops(tmp_path):
+    """The tuning loop's write, against the post: told to report, the arm
+    says it has met something and goes on pushing; told to stop, the same
+    move ends as a contact.  What was set is what the readout answers, at
+    once, and thresholds that could not be thresholds are refused."""
+    live = LiveDaemon.start(tmp_path, scenario=POST)
+    try:
+        async with live.client() as client:
+            assert await client.wait_ready(timeout=STEP_BUDGET_S)
+            await settle_at(client, REACH_DEG)
+            shipped = await client.contact()
+            assert shipped is not None and shipped.reaction == "stop"
+            through = list(REACH_DEG)
+            through[0] = 60.0
+
+            raised = [limit + 0.25 for limit in shipped.impact_nm]
+            assert (
+                await client.set_contact_limits(
+                    reaction="warn",
+                    sustained_nm=shipped.sustained_nm,
+                    impact_nm=raised,
+                )
+                == 1
+            )
+            reporting = await client.contact()
+            assert reporting is not None and reporting.reaction == "warn"
+            assert reporting.impact_nm == pytest.approx(raised)
+            assert reporting.sustained_nm == pytest.approx(shipped.sustained_nm)
+
+            pressing = await client.move_j(through, speed=0.5)
+            assert await client.wait_status(
+                lambda s: any(w[1] == ErrorCode.SYS_CONTACT for w in s.warnings),
+                timeout=STEP_BUDGET_S,
+            ), "an arm that reports must say it has met the post"
+            assert await client.wait_status(
+                lambda s: not s.protective_stop and s.error is None, timeout=1.0
+            ), "reporting is not stopping"
+            assert await client.stop() == 1
+            with pytest.raises(RobotError) as cancelled:
+                await client.wait_command(pressing, timeout=STEP_BUDGET_S)
+            assert cancelled.value.cancelled
+            unstopped = await client.contact()
+            assert unstopped is not None and unstopped.trips == 0
+
+            await client.move_j(REACH_DEG, speed=0.5, wait=True, timeout=STEP_BUDGET_S)
+            assert (
+                await client.set_contact_limits(
+                    reaction="stop",
+                    sustained_nm=shipped.sustained_nm,
+                    impact_nm=shipped.impact_nm,
+                )
+                == 1
+            )
+            with pytest.raises(RobotError) as stopped:
+                await client.move_j(
+                    through, speed=0.5, wait=True, timeout=STEP_BUDGET_S
+                )
+            assert stopped.value.code == ErrorCode.SYS_CONTACT
+
+            for hostile in (-1.0, 0.0, math.nan):
+                with pytest.raises((RobotError, ValueError)):
+                    await client.set_contact_limits(
+                        reaction="stop",
+                        sustained_nm=[hostile] * len(raised),
+                        impact_nm=shipped.impact_nm,
+                    )
+            with pytest.raises(ValueError):
+                await client.set_contact_limits(
+                    reaction="sometimes",
+                    sustained_nm=shipped.sustained_nm,
+                    impact_nm=shipped.impact_nm,
+                )
+    finally:
+        live.stop()

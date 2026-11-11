@@ -41,8 +41,8 @@ dev = ["ruff==0.15.8", "ty", "pre-commit", "pytest", "pytest-asyncio", "pytest-t
 # OLED frames, gpiozero owns the buttons and LEDs, the Adafruit driver talks
 # to the SSD1306 over I2C, pyserial to the mainboard PCB.
 panel = ["pillow", "gpiozero", "adafruit-circuitpython-ssd1306", "pyserial"]
-# The Drives tab par6 contributes to a waldoctl frontend. Only the host
-# process needs NiceGUI; the runtime and the CLI never import it.
+# The Drives and Contact tabs par6 contributes to a waldoctl frontend. Only
+# the host process needs NiceGUI; the runtime and the CLI never import it.
 gui = ["nicegui"]
 # Firmware flashing talks SocketCAN directly, so it is only installable —
 # and only useful — on the machine holding the CAN interface.
@@ -53,6 +53,7 @@ par6 = "par6.robot:Robot"
 
 [project.entry-points."waldoctl.panels"]
 par6-drives = "par6.gui.drives:DrivesPanel"
+par6-contact = "par6.gui.contact:ContactPanel"
 
 [tool.maturin]
 # The extension crate (the engine binding); the pure-Python shim package

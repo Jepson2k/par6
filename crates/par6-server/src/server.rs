@@ -392,6 +392,11 @@ struct Core<R: RtCommands> {
     tcp_rotation_deg: [f64; 3],
     /// The commanded runtime payload — served back by the PAYLOAD query.
     payload: PayloadSpec,
+    /// The contact limits last set over the wire, if any. The RT takes
+    /// them a tick or two after the ack, and a client that reads back what
+    /// it has just written must see it: until the snapshot carries them,
+    /// and from then on identically, this is what the readout answers.
+    contact_limits: Option<par6_proto::command::SetContactLimits>,
     shapes: Vec<par6_proto::Shape>,
     attachment_epoch: u64,
     attachment_stop_pending: bool,
@@ -494,6 +499,7 @@ impl<R: RtCommands> Core<R> {
             tcp_offset_mm: [0.0; 3],
             tcp_rotation_deg: [0.0; 3],
             payload: PayloadSpec::default(),
+            contact_limits: None,
             shapes: Vec::new(),
             attachment_epoch: RandomState::new()
                 .hash_one((std::process::id(), std::time::SystemTime::now()))
@@ -1105,6 +1111,11 @@ impl<R: RtCommands> Core<R> {
             C::SaveConfig(p) => self
                 .commissioning_gate(p.node, p.force, "save_config")
                 .map(|()| self.runtime.rt.save_config(p.node)),
+            C::SetContactLimits(p) => {
+                self.runtime.rt.set_contact_limits(p);
+                self.contact_limits = Some(p.clone());
+                Ok(())
+            }
             C::SetToolId(p) => self
                 .commissioning_gate(p.node, p.force, "set_tool_id")
                 .and_then(|()| {
@@ -2978,14 +2989,22 @@ impl<R: RtCommands> Core<R> {
             },
             C::Contact => {
                 let c = &self.snap.contact;
+                let (reaction, sustained_nm, impact_nm) = match &self.contact_limits {
+                    Some(set) => (set.reaction, set.sustained_nm, set.impact_nm),
+                    None => (
+                        match c.reaction {
+                            par6_config::ContactReaction::Off => par6_proto::ContactReaction::Off,
+                            par6_config::ContactReaction::Warn => par6_proto::ContactReaction::Warn,
+                            par6_config::ContactReaction::Stop => par6_proto::ContactReaction::Stop,
+                        },
+                        c.sustained_nm,
+                        c.impact_nm,
+                    ),
+                };
                 QueryResult::Contact(par6_proto::ContactResult {
-                    reaction: match c.reaction {
-                        par6_config::ContactReaction::Off => par6_proto::ContactReaction::Off,
-                        par6_config::ContactReaction::Warn => par6_proto::ContactReaction::Warn,
-                        par6_config::ContactReaction::Stop => par6_proto::ContactReaction::Stop,
-                    },
-                    sustained_nm: c.sustained_nm,
-                    impact_nm: c.impact_nm,
+                    reaction,
+                    sustained_nm,
+                    impact_nm,
                     signal: c.signal,
                     impact: c.impact,
                     peak_signal: c.peak_signal,
@@ -3533,6 +3552,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::SetCanId => "set_can_id",
         T::SaveConfig => "save_config",
         T::SetToolId => "set_tool_id",
+        T::SetContactLimits => "set_contact_limits",
         T::SetStatusRate => "set_status_rate",
         T::StatusRate => "status_rate",
         T::BusScan => "bus_scan",

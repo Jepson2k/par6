@@ -79,6 +79,7 @@ pub(super) struct RunStart {
     tcp_rotation_deg: [f64; 3],
     policy: par6_proto::CompletionPolicy,
     payload: par6_server::PayloadSpec,
+    contact_limits: Option<par6_proto::command::SetContactLimits>,
     shapes: Vec<par6_proto::Shape>,
     resume_scale: f64,
     attachment_epoch: u64,
@@ -97,6 +98,7 @@ impl RunStart {
             tcp_rotation_deg: preview.tcp_rotation_deg,
             policy: preview.policy,
             payload: preview.payload,
+            contact_limits: preview.contact_limits.clone(),
             shapes: preview.shapes.clone(),
             resume_scale: preview.snap.exec.resume_scale,
             attachment_epoch: preview.attachment_epoch,
@@ -243,6 +245,10 @@ impl Preview {
             inertia: context.payload.inertia,
         });
         driver.tick();
+        if let Some(limits) = &context.contact_limits {
+            driver.send(crate::bridge::contact_limits_command(limits));
+            driver.tick();
+        }
         // The engine boots unpaused whatever the session's pause: the
         // program's own pause commands are what a run replays.
         driver.send(RtCommand::ExecSetSpeedScale(context.resume_scale));
@@ -411,6 +417,11 @@ impl Preview {
                             com: p.com,
                             inertia: p.inertia,
                         });
+                        true
+                    }
+                    Command::SetContactLimits(p) => {
+                        context.contact_limits = Some(p.clone());
+                        driver.send(crate::bridge::contact_limits_command(p));
                         true
                     }
                     Command::SetCompletionPolicy(p) => {
@@ -620,6 +631,7 @@ impl Preview {
                     | Command::Pause(_)
                     | Command::SelectProfile(_)
                     | Command::SetPayload(_)
+                    | Command::SetContactLimits(_)
                     | Command::SetCompletionPolicy(_)
                     | Command::WriteIo(_)
                     | Command::Stop(_)
