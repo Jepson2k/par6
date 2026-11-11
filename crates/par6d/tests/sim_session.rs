@@ -496,6 +496,56 @@ fn full_sim_session_over_protocol_v3() {
     rig.shutdown();
 }
 
+/// A stop that arrives as a move is accepted cancels it before it has been
+/// planned. The move is reported cancelled, and it must stay cancelled:
+/// its plan must not reach the arm then, nor wait in the ring to be played
+/// ahead of whatever is sent next.
+#[test]
+fn a_move_stopped_as_it_is_accepted_never_runs() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    rig.wait_status("enabled", |s| s.enabled);
+    let park = park_deg();
+    common::teleport_home(&rig, &mut c, park);
+
+    let far = with_j0(park, 40.0);
+    let cancelled = c.ok_index(&move_j(5001, far, 3.0));
+    c.ok(&Command::Stop(Stop { clear_queue: true }));
+    let (ok, detail) = c.wait_complete(cancelled);
+    assert!(
+        !ok && detail.is_some_and(|e| e.code == ErrorCode::MotnCancelled as u16),
+        "the stopped move reports its cancellation"
+    );
+    let after_stop = rig.collect_status(Duration::from_millis(1500));
+    let strayed = after_stop
+        .iter()
+        .map(|s| (s.angles[0] - park[0]).abs())
+        .fold(0.0, f64::max);
+    assert!(
+        strayed < 1.0,
+        "a cancelled move ran: the base went {strayed:.2} deg toward its target after the stop"
+    );
+
+    // The next move starts from where the arm is and goes one way.
+    let near = with_j0(park, -10.0);
+    let next = c.ok_index(&move_j(5002, near, 1.0));
+    let run = rig.collect_through(next, BUDGET);
+    let (ok, detail) = c.wait_complete(next);
+    assert!(ok, "the move after the stop must run: {detail:?}");
+    let furthest_wrong_way = run
+        .iter()
+        .map(|s| s.angles[0] - park[0])
+        .fold(0.0, f64::max);
+    assert!(
+        furthest_wrong_way < 1.0,
+        "the next move played the cancelled one first: the base went \
+         {furthest_wrong_way:.2} deg the other way"
+    );
+    rig.shutdown();
+}
+
 /// The real binary: `--sim --port 0` boots on an ephemeral port,
 /// announces it in the machine-readable ready line, answers PING there,
 /// and exits cleanly (code 0, no abort) on SIGTERM — the exact flow the

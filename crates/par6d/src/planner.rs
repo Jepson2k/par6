@@ -2636,11 +2636,11 @@ impl Planner for Par6Planner {
     }
 
     fn cancel(&mut self, halt_tool: bool) {
-        // Only this planner's own state — and the jaws. The RT half of a
-        // cancelled motion — braking the program and flushing the ring —
-        // is the server's `RtCommands::discard_exec`, because it has to be
-        // ordered against the stream that may be replacing this motion,
-        // and an answer arriving from another thread cannot be.
+        // This planner's own state, the jaws, and its own fill of the
+        // ring. Braking the program is the server's
+        // `RtCommands::discard_exec`, because it has to be ordered against
+        // the stream that may be replacing this motion, and an answer
+        // arriving from another thread cannot be.
         let inflight = self.inflight.take();
         if halt_tool
             && matches!(
@@ -2654,6 +2654,24 @@ impl Planner for Par6Planner {
             // Halt in place rather than release: a cancellation must never
             // drop whatever the jaws are holding.
             self.link.send(RtCommand::GripperStop);
+        }
+        if matches!(
+            inflight,
+            Some(InFlight {
+                kind: InFlightKind::Exec { .. },
+                ..
+            })
+        ) {
+            // The server's flush is marked when the stop arrives, and this
+            // thread may only have got round to planning the move after
+            // that: its samples then went into the ring under a newer
+            // generation than the mark, where no flush reaches them, and
+            // the cancelled move would run in full the next time EXEC
+            // played. Only the producer knows what it pushed, so it marks
+            // its own fill. A second stop behind the server's is harmless:
+            // it brakes a clock already at rest and flushes.
+            self.producer.flush_marker().mark();
+            self.link.send(RtCommand::ExecStop);
         }
         self.near_singularity = None;
     }
