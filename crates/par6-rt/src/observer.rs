@@ -14,7 +14,8 @@
 //! momentum balance instead of differentiating velocity is what the
 //! continuous observer is known for; at a fixed tick the two are the same
 //! recursion, with `q̈` the tick-to-tick change of the drives' reported
-//! velocity and the filter absorbing that difference's noise:
+//! velocity (and the torque and velocity it is balanced against that
+//! tick's means) and the filter absorbing that difference's noise:
 //!
 //! ```text
 //! r[k] = (r[k−1] + K·dt·e[k]) / (1 + K·dt)
@@ -73,6 +74,8 @@ pub struct TorqueObserver {
     friction: Friction,
     rotor_kg_m2: [f64; MAX_JOINTS],
     qd_prev: [f64; MAX_JOINTS],
+    tau_prev: [f64; MAX_JOINTS],
+    qd_mid: [f64; MAX_JOINTS],
     qdd: [f64; MAX_JOINTS],
     dynamic: [f64; MAX_JOINTS],
     estimate: [f64; MAX_JOINTS],
@@ -92,6 +95,8 @@ impl TorqueObserver {
             friction: Friction::from_config(robot),
             rotor_kg_m2: std::array::from_fn(|i| d.rotor_inertia_kg_m2[i]),
             qd_prev: [0.0; MAX_JOINTS],
+            tau_prev: [0.0; MAX_JOINTS],
+            qd_mid: [0.0; MAX_JOINTS],
             qdd: [0.0; MAX_JOINTS],
             dynamic: [0.0; MAX_JOINTS],
             estimate: [0.0; MAX_JOINTS],
@@ -116,20 +121,31 @@ impl TorqueObserver {
     ) {
         if !self.seeded {
             self.qd_prev = *qd;
+            self.tau_prev = *tau;
             self.seeded = true;
             return;
         }
-        for (qdd, (now, before)) in self.qdd.iter_mut().zip(qd.iter().zip(&self.qd_prev)) {
-            *qdd = (now - before) / self.dt;
+        // The balance is struck over the tick that just ended: the
+        // acceleration is that tick's mean, so the velocity and the motor
+        // torque it is set against are the tick's means too, not its last
+        // sample. At a coarse tick the difference is most of what a hard
+        // start would otherwise leave unexplained.
+        for (i, (now, before)) in qd.iter().zip(&self.qd_prev).enumerate() {
+            self.qdd[i] = (now - before) / self.dt;
+            self.qd_mid[i] = 0.5 * (now + before);
         }
-        self.qd_prev = *qd;
-        self.inertial = model.dynamics(q, qd, &self.qdd, &mut self.dynamic);
+        self.inertial = model.dynamics(q, &self.qd_mid, &self.qdd, &mut self.dynamic);
         for i in 0..MAX_JOINTS {
             let inertial = self.dynamic[i] + self.rotor_kg_m2[i] * self.qdd[i];
-            let unexplained = tau[i] - self.friction.torque(i, qd[i]) - g[i] - inertial;
+            let unexplained = 0.5 * (tau[i] + self.tau_prev[i])
+                - self.friction.torque(i, self.qd_mid[i])
+                - g[i]
+                - inertial;
             self.estimate[i] = (self.estimate[i] + self.gain * unexplained) / (1.0 + self.gain);
             self.effort[i] = (self.effort[i] + self.gain * inertial.abs()) / (1.0 + self.gain);
         }
+        self.qd_prev = *qd;
+        self.tau_prev = *tau;
     }
 
     /// Start over: the next update only takes its velocity reference.

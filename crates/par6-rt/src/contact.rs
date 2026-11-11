@@ -122,11 +122,16 @@ pub struct ContactDetector {
     average_alpha: f64,
     average: [f64; MAX_JOINTS],
     seeded: bool,
-    over_sustained: [u32; MAX_JOINTS],
-    over_impact: [u32; MAX_JOINTS],
+    over_sustained: [i32; MAX_JOINTS],
+    over_impact: [i32; MAX_JOINTS],
     warning_left: [u32; MAX_JOINTS],
     status: ContactStatus,
 }
+
+/// Fewest consecutive ticks a crossing has to last, whatever the tick
+/// rate makes of the configured windows. One sample cannot say that
+/// something is pushing, as against something having rung once.
+const MIN_WINDOW_TICKS: u32 = 2;
 
 impl ContactDetector {
     /// From `[contact]` and the friction `[dynamics]` declares, at the
@@ -140,8 +145,8 @@ impl ContactDetector {
             inertia_slack: std::array::from_fn(|i| c.inertia_slack[i]),
             effort_decay: (1.0 - dt / c.inertia_hold_s).max(0.0),
             effort_held: [0.0; MAX_JOINTS],
-            sustained_ticks: robot.ticks(c.sustained_window_s).max(1),
-            impact_ticks: robot.ticks(c.impact_window_s).max(1),
+            sustained_ticks: robot.ticks(c.sustained_window_s).max(MIN_WINDOW_TICKS),
+            impact_ticks: robot.ticks(c.impact_window_s).max(MIN_WINDOW_TICKS),
             warning_hold_ticks: robot.ticks(c.warning_hold_s).max(1),
             average_alpha: dt / (c.impact_highpass_s + dt),
             average: [0.0; MAX_JOINTS],
@@ -226,12 +231,14 @@ impl ContactDetector {
             }
             let sustained = step(
                 &mut self.over_sustained[i],
-                signal.abs() > self.status.sustained_nm[i],
+                signal,
+                self.status.sustained_nm[i],
                 self.sustained_ticks,
             );
             let bumped = step(
                 &mut self.over_impact[i],
-                impact.abs() > self.status.impact_nm[i],
+                impact,
+                self.status.impact_nm[i],
                 self.impact_ticks,
             );
             let channel = if sustained {
@@ -262,12 +269,22 @@ impl ContactDetector {
 }
 
 /// Advance one over-threshold counter; `true` while it has filled its
-/// window.
-fn step(count: &mut u32, over: bool, window: u32) -> bool {
-    if over {
-        *count = count.saturating_add(1);
+/// window. The count is signed with the side the value is over on, and a
+/// change of side starts it again: a contact pushes one way, and a
+/// drivetrain ringing after a hard start crosses both thresholds in
+/// turn without anything being there.
+fn step(count: &mut i32, value: f64, threshold: f64, window: u32) -> bool {
+    let side = if value > threshold {
+        1
+    } else if value < -threshold {
+        -1
     } else {
-        *count = 0;
-    }
-    *count >= window
+        0
+    };
+    *count = if side != 0 && count.signum() == side {
+        count.saturating_add(side)
+    } else {
+        side
+    };
+    count.unsigned_abs() >= window
 }
