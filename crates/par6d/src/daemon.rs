@@ -32,9 +32,9 @@ use par6_bus::{RuntimeBus, SocketCanBus};
 use par6_config::{ConfigBundle, ConfigError, LimitMode, TimingConfig};
 use par6_motion::{JogEngine, MotionError, MotionLimits, StreamingExecutor};
 use par6_rt::{
-    sample_ring, snapshot_channel, CompletionPolicy, DigitalIo, EstopGpio, FlashMarker, ForwardKin,
-    GravityModel, RtCore, RtHooks, RunOptions, SharedDigitalIo, SharedLineGpio, SnapshotReader,
-    SnapshotWriter, SpecSettle, StateSnapshot,
+    sample_ring, snapshot_channel, ArmHolder, CompletionPolicy, DigitalIo, EstopGpio, FlashMarker,
+    ForwardKin, GravityModel, RtCore, RtHooks, RunOptions, SharedDigitalIo, SharedLineGpio,
+    SnapshotReader, SnapshotWriter, SpecSettle, StateSnapshot,
 };
 use par6_server::{ConfigInfoData, ServerConfig, ServerHandle};
 
@@ -100,6 +100,8 @@ pub struct Daemon {
     shutdown: Arc<AtomicBool>,
     rt_break: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    /// Stopped last: it holds the arm until the RT thread has taken it back.
+    holder: Option<(Arc<ArmHolder<RuntimeBus>>, JoinHandle<()>)>,
     vitals: Arc<Mutex<crate::vitals::Vitals>>,
 }
 
@@ -367,8 +369,10 @@ impl Daemon {
             position_loop_gains(robot),
             robot.robot.tick_dt_s,
         )));
+        let holder = Arc::new(ArmHolder::<RuntimeBus>::default());
         let bridge = RtBridge::new(
             link.clone(),
+            holder.clone(),
             stream_input.clone(),
             shared.clone(),
             flush_marker,
@@ -444,12 +448,19 @@ impl Daemon {
                 tick_profile: opts.tick_profile,
             }
         };
+        let holder_thread = {
+            let (holder, dt) = (holder.clone(), robot.robot.tick_dt_s);
+            std::thread::Builder::new()
+                .name("par6d-holder".into())
+                .spawn(move || holder.run(dt, &run_opts))?
+        };
         {
             let (rt_break, shutdown) = (rt_break.clone(), shutdown.clone());
+            let holder = holder.clone();
             threads.push(
                 std::thread::Builder::new()
                     .name("par6d-rt".into())
-                    .spawn(move || rt_loop(core, ops_rx, rt_break, shutdown, run_opts))?,
+                    .spawn(move || rt_loop(core, ops_rx, rt_break, shutdown, run_opts, holder))?,
             );
         }
         {
@@ -521,6 +532,7 @@ impl Daemon {
             shutdown,
             rt_break,
             threads,
+            holder: Some((holder, holder_thread)),
             vitals,
         })
     }
@@ -556,12 +568,16 @@ impl Daemon {
         }
         self.shutdown.store(true, Ordering::SeqCst);
         self.rt_break.store(true, Ordering::SeqCst);
-        let panicked = self
+        let mut panicked = self
             .threads
             .drain(..)
             .map(JoinHandle::join)
             .filter(Result::is_err)
             .count();
+        if let Some((holder, thread)) = self.holder.take() {
+            holder.shut_down();
+            panicked += usize::from(thread.join().is_err());
+        }
         if let Some(rt) = self.runtime.take() {
             rt.shutdown_timeout(Duration::from_secs(1));
         }
@@ -588,6 +604,7 @@ fn rt_loop(
     rt_break: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
     run_opts: RunOptions,
+    holder: Arc<ArmHolder<RuntimeBus>>,
 ) {
     core.set_tick_profile(run_opts.tick_profile);
     loop {
@@ -605,6 +622,9 @@ fn rt_loop(
         }
         core.run(&run_opts, &rt_break);
     }
+    // The exit is the arm's, not that of a simulator standing in for it;
+    // the simulator is freed once the arm has been put down.
+    let _stood_in = holder.release().map(|arm| core.resume(arm));
     // Deliberate exit: stop the arm and idle the drives with a terminal
     // limp frame, instead of leaving them to act on the last motion frame
     // until the CAN watchdog expires.

@@ -102,6 +102,12 @@ const STREAM_REST_RAD_S: f64 = 1e-9;
 /// the same displacement plateau the homing detector reads a stall
 /// from.
 const RELEASE_REST_BAND_RAD: f64 = 0.05;
+
+/// How far a joint may stand from the target it was held on and still be
+/// taken back onto it \[rad\]: the offset a loaded position loop settles
+/// at. A joint further off was let go of meanwhile, and commanding it back
+/// to the target would be a lunge.
+const HELD_TARGET_BAND_RAD: f64 = 0.01;
 const RELEASE_REST_WINDOW_S: f64 = 0.2;
 
 /// Wait from a bus coming up to its selfcheck scan \[s\].
@@ -376,6 +382,107 @@ pub enum CoreError {
     /// Bus boot configuration failed.
     #[error("bus boot configuration failed: {0}")]
     Bus(#[from] BusError),
+    /// A simulator cannot stand in while the bus is silent for a flash.
+    #[error("the bus is silent for flashing")]
+    Flashing,
+}
+
+/// The arm a simulator is standing in for: its bus, the frames that hold
+/// it where it stands, and what the core knew of it.
+///
+/// A drive stops its motor once nothing has commanded it for
+/// `watchdog_timeout_ms`, and an arm let go of falls. So the owner calls
+/// [`Self::keep`] once per tick period for as long as the simulator runs,
+/// from a thread the simulator cannot stall, and hands the arm back with
+/// [`RtCore::resume`].
+pub struct HeldArm<B> {
+    bus: B,
+    tick: u64,
+    state: BusState,
+    hold: [JointCommand; MAX_JOINTS],
+    gripper: GripperCommand,
+    /// Where each joint is held \[rad\]; NaN for one held by speed alone.
+    target: [f64; MAX_JOINTS],
+    /// Limp by a protective stop, and left limp.
+    limp: bool,
+    conv: [JointConversion; MAX_JOINTS],
+    sector_done: [bool; MAX_JOINTS],
+    ranges: DriveRanges,
+    ranges_due: Option<u64>,
+    homed: bool,
+    arm_state: ArmState,
+    gripper_gate: GripperGate,
+    bus_booted_at: u64,
+    config_repush_armed_at: u64,
+    node_of: [NodeId; MAX_JOINTS],
+    bus_faults: FaultLog,
+    /// A drive of the held arm reported a fault, said once.
+    drive_fault_logged: bool,
+    /// What took the arm's reference while it was held, for the core to
+    /// latch when it takes the arm back.
+    lost: Option<(u8, ErrorCode)>,
+}
+
+impl<B: DriverBus> HeldArm<B> {
+    /// One tick period's hold: the same frames, the drives' replies read,
+    /// the telemetry poll. Nothing else reaches the arm — no
+    /// configuration, no clear, no range. Allocates nothing.
+    pub fn keep(&mut self) {
+        self.tick += 1;
+        self.bus.begin_tick(self.tick);
+        let rx = self.bus.drain_rx(&mut self.state).map(drop);
+        let joints = self.bus.send_joint_commands(&self.hold);
+        let gripper = self.bus.send_gripper(&self.gripper);
+        let poll = self.bus.poll_step();
+        match rx.and(joints).and(gripper).and(poll) {
+            Ok(()) => self.bus_faults.healthy(),
+            Err(e) => {
+                if let Some(n) = self.bus_faults.admit(self.tick) {
+                    log::warn!("the held arm's bus failed: {e} (+{n} suppressed)");
+                }
+            }
+        }
+        // A drive that restarted counts from another zero, and one gone
+        // quiet may come back so: the position its frame holds is then no
+        // longer where the joint stands. The reference goes, as it does
+        // when the core drives the arm, and every joint is held by speed.
+        let restarted = self
+            .ranges
+            .watch(&self.state.nodes)
+            .map(|j| (j, ErrorCode::RangeLost));
+        let quiet = self
+            .node_of
+            .iter()
+            .position(|node| self.bus.freshness(*node) == Freshness::Lost)
+            .map(|j| (j, ErrorCode::CanLost));
+        if let (true, Some((j, code))) = (self.homed, restarted.or(quiet)) {
+            self.homed = false;
+            self.lost = Some((j as u8, code));
+            self.target = [f64::NAN; MAX_JOINTS];
+            for frame in self.hold.iter_mut().filter(|f| f.vel.is_some()) {
+                *frame = JointCommand::velocity(0, 0);
+            }
+            log::warn!(
+                "J{}: its drive restarted or went quiet while the simulator stood in: homing \
+                 invalidated",
+                j + 1
+            );
+        }
+        if !self.drive_fault_logged {
+            let faulted = self
+                .node_of
+                .iter()
+                .position(|node| self.state.nodes[usize::from(*node)].live_error_bit);
+            if let Some(j) = faulted {
+                self.drive_fault_logged = true;
+                log::warn!(
+                    "J{}: its drive reports a fault while the simulator stands in; the joint \
+                     may no longer be held",
+                    j + 1
+                );
+            }
+        }
+    }
 }
 
 /// The pluggable seams [`RtCore`] runs on. `par6d` wires the real
@@ -1143,12 +1250,182 @@ impl<B: DriverBus> RtCore<B> {
     /// cannot be `boot_configure`d is refused here with the OLD bus
     /// still installed and still driving the arm.
     pub fn replace_bus(&mut self, mut bus: B) -> Result<(), CoreError> {
+        bus.start_at(self.tick);
         bus.boot_configure(
             &self.boot.robot,
             self.boot.tool.as_ref(),
             self.boot.config_repeats,
         )?;
         self.bus = bus;
+        self.boot_on_new_bus();
+        Ok(())
+    }
+
+    /// Put the simulator `sim` in front of the arm without letting go of
+    /// the arm.
+    ///
+    /// The core comes out as it does from [`Self::replace_bus`], reading
+    /// and commanding `sim` alone. The arm's bus is not closed: it goes to
+    /// `hand_off` with the frames that hold the arm where it stands — a
+    /// joint resting on a position target keeps that frame, a moving one
+    /// is stopped the way an e-stop stops it — for the caller to
+    /// [`keep`](HeldArm::keep), and [`Self::resume`] takes it back.
+    ///
+    /// The arm is handed off before `sim` is brought up: it gets no frames
+    /// until someone keeps it, and a simulator builds its plant in
+    /// `boot_configure`. So an `Err` leaves the arm with the caller and a
+    /// simulator that never came up installed; the caller resumes.
+    pub fn stand_in(&mut self, sim: B, hand_off: impl FnOnce(HeldArm<B>)) -> Result<(), CoreError> {
+        if self.mode == Mode::Flashing {
+            return Err(CoreError::Flashing);
+        }
+        if self.mode == Mode::Homing {
+            // The seek's reduced current limits come off the drives
+            // before nothing is left to restore them.
+            self.leave_mode(Mode::Idle);
+        }
+        let (hold, target) = self.hold_frames();
+        let held = HeldArm {
+            bus: std::mem::replace(&mut self.bus, sim),
+            tick: self.tick,
+            state: std::mem::replace(&mut self.bus_state, BusState::new()),
+            hold,
+            // The empty poll feeds the jaw drive's watchdog and leaves
+            // the grip it holds alone.
+            gripper: if self.has_can_gripper {
+                GripperCommand::FirmwarePoll
+            } else {
+                GripperCommand::NoGripper
+            },
+            target,
+            limp: self.mode == Mode::SafetyStop,
+            conv: self.conv,
+            sector_done: self.sector_done,
+            ranges: self.ranges,
+            ranges_due: self.ranges_due.take(),
+            homed: self.homed,
+            arm_state: self.state,
+            gripper_gate: self.gripper_gate,
+            bus_booted_at: self.bus_booted_at,
+            config_repush_armed_at: self.config_repush_armed_at,
+            node_of: self.node_of,
+            bus_faults: FaultLog::new(self.bus_faults.rx.period_ticks),
+            drive_fault_logged: false,
+            lost: None,
+        };
+        hand_off(held);
+        self.bus.start_at(self.tick);
+        let configured = self.bus.boot_configure(
+            &self.boot.robot,
+            self.boot.tool.as_ref(),
+            self.boot.config_repeats,
+        );
+        self.boot_on_new_bus();
+        Ok(configured?)
+    }
+
+    /// Take the arm back from the simulator standing in for it, as it
+    /// was left: its bus never closed, so its drives kept their counts
+    /// and its references stand, and it rests where it was held. An arm
+    /// that lost a drive meanwhile comes back unreferenced, with the
+    /// error that says why.
+    ///
+    /// Returns the simulator, for the caller to drop once the arm is
+    /// getting frames again: freeing a plant is not quick.
+    pub fn resume(&mut self, held: HeldArm<B>) -> B {
+        // Whatever the simulator was doing ends on the simulator.
+        self.leave_mode(Mode::Idle);
+        let stood_in = std::mem::replace(&mut self.bus, held.bus);
+        self.bus.start_at(self.tick);
+        self.bus_state = held.state;
+        self.bus_off_events_seen = self.bus.link_health().bus_off_events;
+        self.conv = held.conv;
+        self.sector_done = held.sector_done;
+        self.ranges = held.ranges;
+        self.ranges_due = held.ranges_due;
+        self.homed = held.homed;
+        self.not_homed_refused = false;
+        if let Some((joint, code)) = held.lost {
+            self.errors.latch(code, Some(joint));
+        }
+        self.gripper_gate = held.gripper_gate;
+        self.gripper_settle.disarm();
+        // Nothing owed to the simulator's drives reaches the arm's.
+        self.bus_booted_at = held.bus_booted_at;
+        self.config_repush_armed_at = held.config_repush_armed_at;
+        self.config_resend_pending = 0;
+        self.drive_clear_at = None;
+        self.drive_faults_from = self.tick;
+        self.tool_hold = false;
+        self.rescan_at = None;
+        self.filters_seeded = false;
+        let mut at = held.target;
+        for (i, at) in at.iter_mut().enumerate() {
+            let node = &self.bus_state.nodes[usize::from(self.node_of[i])];
+            if let Some(pos) = node.position_ticks {
+                self.q[i] = self.conv[i].joint_rad(pos);
+            }
+            if at.is_nan() || (*at - self.q[i]).abs() > HELD_TARGET_BAND_RAD {
+                *at = self.q[i];
+            }
+        }
+        self.reseed_motion_targets();
+        self.refresh_gravity();
+        let applied = if self.gravity_applied() && !held.limp {
+            self.g
+        } else {
+            [0.0; MAX_JOINTS]
+        };
+        self.torque_slew.seed(&applied);
+        self.state = held.arm_state;
+        if held.limp {
+            self.mode = Mode::SafetyStop;
+        } else {
+            self.mode = Mode::Idle;
+            self.rest_into_hold(at);
+        }
+        stood_in
+    }
+
+    /// The frames that keep the arm where it stands with nothing computing
+    /// for it, and the pose they hold it at. A joint resting on a position
+    /// target keeps its frame, so its drive sees no change at all; a limp
+    /// arm stays limp; any other joint gets the e-stop's zero-velocity
+    /// hold, since a frozen gravity torque alone follows nothing.
+    fn hold_frames(&self) -> ([JointCommand; MAX_JOINTS], [f64; MAX_JOINTS]) {
+        let mut target = [f64::NAN; MAX_JOINTS];
+        if self.mode == Mode::SafetyStop {
+            return (self.cmds, target);
+        }
+        let mut setpoints = self.setpoints;
+        dispatch::law_active_error(self.gravity_applied(), &self.g, &mut setpoints);
+        let mut hold = self.cmds;
+        let mut slew = self.torque_slew;
+        dispatch::commit(
+            &setpoints,
+            &self.conv,
+            &self.torque_ma_factor,
+            &mut slew,
+            false,
+            &mut hold,
+            &mut CommandMirror::default(),
+        );
+        // HOMING sends its own frames: `cmds` is from before the seek.
+        if self.mode != Mode::Homing {
+            for i in 0..MAX_JOINTS {
+                let sent = self.cmds[i];
+                if sent.pos.is_some() && sent.vel == Some(0) {
+                    hold[i] = sent;
+                    target[i] = self.mirror.q[i];
+                }
+            }
+        }
+        (hold, target)
+    }
+
+    /// The bring-up every newly installed bus gets: nothing learned from
+    /// the last one is carried over, and the boot one-shots run again.
+    fn boot_on_new_bus(&mut self) {
         self.bus_state = BusState::new();
         // Bus-off events counted on the old bus are no fault of the new one.
         self.bus_off_events_seen = self.bus.link_health().bus_off_events;
@@ -1165,7 +1442,6 @@ impl<B: DriverBus> RtCore<B> {
         self.not_homed_refused = false;
         self.mode = Mode::Booting;
         self.state = ArmState::Disabled;
-        Ok(())
     }
 
     /// Simulator/teleport path: declare the home references valid (or

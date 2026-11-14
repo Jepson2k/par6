@@ -62,8 +62,8 @@ pub mod state;
 pub mod timing;
 
 pub use crate::core::{
-    CoreError, ExecHeartbeat, GateRefusal, RtCore, RtHandles, RtHooks, StreamInput, StreamSetpoint,
-    EXEC_HEARTBEAT_TIMEOUT_S,
+    CoreError, ExecHeartbeat, GateRefusal, HeldArm, RtCore, RtHandles, RtHooks, StreamInput,
+    StreamSetpoint, EXEC_HEARTBEAT_TIMEOUT_S,
 };
 pub use gpio::{
     Debouncer, DigitalIo, EstopGpio, EstopMonitor, NoDigitalIo, SharedDigitalIo, SharedIoLines,
@@ -78,7 +78,7 @@ pub use par6_bus::{Freshness, LinkHealth, LinkState, NodeState};
 pub use ring::{
     sample_ring, FlushMarker, Sample, SampleConsumer, SampleMeta, SampleProducer, SampleStart,
 };
-pub use rt::RunOptions;
+pub use rt::{ArmHolder, RunOptions};
 pub use snapshot::{snapshot_channel, SnapshotReader, SnapshotWriter};
 pub use state::{
     ArmState, ErrorCode, ErrorEntry, ErrorList, ExecStatus, HomingJointStatus, HomingPhase,

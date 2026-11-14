@@ -46,6 +46,13 @@ use crate::types::{
 /// reaction. A `Result` here reports transport failure — protocol-level
 /// faults arrive through [`BusState`] instead.
 pub trait DriverBus {
+    /// Start the time base at `tick`, without the ticks before it having
+    /// happened: a bus installed under a loop that is already running
+    /// counts from the loop's tick. Called before
+    /// [`boot_configure`](Self::boot_configure), or when a bus comes back
+    /// to a loop it was kept apart from.
+    fn start_at(&mut self, tick: u64);
+
     /// Advance the bus time base to `tick`. Called exactly once per RT
     /// tick, before any other per-tick method; `tick` is monotonically
     /// non-decreasing. Freshness classification (stale/lost transitions,

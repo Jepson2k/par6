@@ -1134,7 +1134,9 @@ impl Preview {
             // `cancel_all_motion`), the held blend chain included — and
             // decides the references: the simulator is born referenced
             // (`swap_to_sim` sets homed), while real hardware knows
-            // nothing until it seeks (`swap_to_hardware` un-homes).
+            // nothing until it seeks (`swap_to_hardware` un-homes). An arm
+            // the simulator stood in for keeps its own, which a preview
+            // cannot know, so it plans for the arm that has none.
             Command::Simulator(p) => {
                 self.invalidate_attachments();
                 self.held.clear();

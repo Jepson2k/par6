@@ -128,6 +128,10 @@ impl FailingBus {
 }
 
 impl DriverBus for FailingBus {
+    fn start_at(&mut self, tick: u64) {
+        self.inner.start_at(tick);
+    }
+
     fn begin_tick(&mut self, tick: u64) {
         self.inner.begin_tick(tick);
     }

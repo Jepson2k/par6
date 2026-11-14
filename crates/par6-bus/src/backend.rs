@@ -64,6 +64,10 @@ macro_rules! dispatch {
 }
 
 impl DriverBus for RuntimeBus {
+    fn start_at(&mut self, tick: u64) {
+        dispatch!(self, start_at(tick))
+    }
+
     fn begin_tick(&mut self, tick: u64) {
         dispatch!(self, begin_tick(tick))
     }

@@ -9,10 +9,11 @@
 //! this loop.
 
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Condvar, Mutex};
 
 use par6_bus::DriverBus;
 
-use crate::core::RtCore;
+use crate::core::{HeldArm, RtCore};
 
 /// Scheduling setup for [`RtCore::run`]. Defaults are the vendor values
 /// (SCHED_FIFO priority 99, pinned to core 3); `None` skips that step.
@@ -191,6 +192,102 @@ fn setup_realtime(opts: &RunOptions) -> (bool, bool) {
     (fifo, pinned)
 }
 
+/// Keeps the arm a simulator stands in for held, on a thread of its own.
+///
+/// While a simulator stands in, the control loop runs the simulator, and
+/// that is unbounded work: a plant refit, a re-seed or a contact-heavy
+/// step can outlast the 100 ms a drive waits before it stops its motor.
+/// The hold's deadline is that watchdog, so it does not share the loop's
+/// thread, or its CPU.
+pub struct ArmHolder<B> {
+    arm: Mutex<Option<HeldArm<B>>>,
+    wake: Condvar,
+    stop: AtomicBool,
+}
+
+impl<B> Default for ArmHolder<B> {
+    fn default() -> Self {
+        Self {
+            arm: Mutex::new(None),
+            wake: Condvar::new(),
+            stop: AtomicBool::new(false),
+        }
+    }
+}
+
+impl<B: DriverBus> ArmHolder<B> {
+    /// Start holding `arm`: its first frames go out within a tick period.
+    pub fn hold(&self, arm: HeldArm<B>) {
+        *self.arm.lock().unwrap() = Some(arm);
+        self.wake.notify_one();
+    }
+
+    /// Stop holding and hand the arm back, if one is held. The caller
+    /// owes it frames from here on.
+    pub fn release(&self) -> Option<HeldArm<B>> {
+        self.arm.lock().unwrap().take()
+    }
+
+    /// End [`Self::run`]. An arm still held is let go of with it.
+    pub fn shut_down(&self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.wake.notify_one();
+    }
+
+    /// The holder thread's body: asleep while nothing is held, one
+    /// [`HeldArm::keep`] per `dt_s` while an arm is. `rt` is the control
+    /// loop's scheduling, whose priority this thread takes and whose CPU
+    /// it stays off.
+    pub fn run(&self, dt_s: f64, rt: &RunOptions) {
+        if let Some(asked) = rt.fifo_priority {
+            let prio = permitted_priority(asked, rtprio_ceiling());
+            if prio > 0 {
+                match set_fifo_priority(prio) {
+                    Ok(()) => log::info!("holder thread: SCHED_FIFO priority {prio}"),
+                    Err(e) => log::error!(
+                        "holder thread DEGRADED: SCHED_FIFO {prio} refused ({e}); a held arm \
+                         is kept at ordinary priority"
+                    ),
+                }
+            }
+        }
+        if let Some(cpu) = rt.cpu {
+            if let Err(e) = keep_off_cpu(cpu) {
+                log::warn!("holder thread DEGRADED: it may share CPU {cpu} ({e}); continuing");
+            }
+        }
+        let dt_ns = (dt_s * 1e9).round() as u64;
+        let mut deadline = 0u64;
+        let mut holding = false;
+        loop {
+            {
+                let mut arm = self.arm.lock().unwrap();
+                while arm.is_none() && !self.stop.load(Ordering::SeqCst) {
+                    holding = false;
+                    arm = self.wake.wait(arm).unwrap();
+                }
+                if self.stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Some(arm) = arm.as_mut() {
+                    arm.keep();
+                }
+            }
+            let now = monotonic_ns();
+            if !holding {
+                holding = true;
+                deadline = now;
+            }
+            deadline += dt_ns;
+            if now >= deadline {
+                deadline = now;
+            } else {
+                sleep_until(deadline);
+            }
+        }
+    }
+}
+
 /// The SCHED_FIFO priority to actually ask for, given what the config
 /// named and what this process is allowed (`None` = unknown, so the
 /// config's number stands). 0 means "do not ask": the box permits no
@@ -314,6 +411,35 @@ pub fn pin_to_cpu(cpu: usize) -> Result<(), String> {
 #[cfg(not(target_os = "linux"))]
 pub fn pin_to_cpu(_cpu: usize) -> Result<(), String> {
     Err("CPU pinning is linux-only".into())
+}
+
+/// Take `cpu` out of the calling thread's affinity, when that leaves it
+/// somewhere to run.
+#[cfg(target_os = "linux")]
+pub fn keep_off_cpu(cpu: usize) -> Result<(), String> {
+    // SAFETY: CPU_* macros operate on a locally owned, zeroed cpu_set_t;
+    // sched_{get,set}affinity(0, …) target the calling thread only.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        let size = std::mem::size_of::<libc::cpu_set_t>();
+        if libc::sched_getaffinity(0, size, &mut set) != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        libc::CPU_CLR(cpu, &mut set);
+        if libc::CPU_COUNT(&set) == 0 {
+            return Err("it is the only CPU this thread may use".into());
+        }
+        if libc::sched_setaffinity(0, size, &set) == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error().to_string())
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn keep_off_cpu(_cpu: usize) -> Result<(), String> {
+    Err("CPU affinity is linux-only".into())
 }
 
 #[cfg(target_os = "linux")]

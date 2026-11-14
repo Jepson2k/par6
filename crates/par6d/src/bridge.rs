@@ -33,8 +33,8 @@ use par6_motion::{CartLimits, CartesianStreamingExecutor, MotionLimits};
 use par6_proto::command::MAX_JOG_DURATION_S;
 use par6_proto::{make_error, Command, ErrorCode, WireError, NUM_JOINTS, UNATTRIBUTED};
 use par6_rt::{
-    ArmState, FlushMarker, Mode, RtCommand, RtCore, SnapshotReader, StateSnapshot, StreamInput,
-    StreamSetpoint, MAX_JOINTS,
+    ArmHolder, ArmState, FlushMarker, Mode, RtCommand, RtCore, SnapshotReader, StateSnapshot,
+    StreamInput, StreamSetpoint, MAX_JOINTS,
 };
 use par6_server::RtCommands;
 use par6_server::{CollisionState, ShapeLayer};
@@ -1671,6 +1671,9 @@ pub(crate) struct SharedState {
     /// waiting to be collected by the server: the install runs on the RT
     /// thread, and the reply waits for it.
     bus_outcome: Option<Result<(), WireError>>,
+    /// A simulator the RT stopped running, left for the server to free:
+    /// the RT owes the arm it took back its frames first.
+    retired_sim: Option<RuntimeBus>,
 }
 
 /// The bridge's kinematics kit (feature `ffi`): its own model instance,
@@ -1687,6 +1690,8 @@ pub(crate) struct CartStream {
 /// The `RtCommands` implementation `par6d` hands to the server.
 pub(crate) struct RtBridge {
     link: CoreLink,
+    /// Where the arm goes while a simulator stands in for it.
+    holder: Arc<ArmHolder<RuntimeBus>>,
     stream_input: Arc<Mutex<StreamInput>>,
     shared: Arc<Mutex<SharedState>>,
     /// Bound for the EXEC flushes `halt` queues (see [`RtBridge::halt`]).
@@ -1703,6 +1708,9 @@ pub(crate) struct RtBridge {
     /// Where the running simulator takes world layers from; `None` on
     /// hardware.
     sim_world: Option<WorldMailbox>,
+    /// The simulator stands in for the arm on `hardware_interface`, which
+    /// the holder thread keeps.
+    arm_held: bool,
     /// A swap handed to the RT and not yet answered. What it would make
     /// true is applied only once the RT reports it installed, so a swap
     /// the RT refuses leaves this side describing the bus that still runs.
@@ -1721,6 +1729,7 @@ impl RtBridge {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         link: CoreLink,
+        holder: Arc<ArmHolder<RuntimeBus>>,
         stream_input: Arc<Mutex<StreamInput>>,
         shared: Arc<Mutex<SharedState>>,
         flush: FlushMarker,
@@ -1737,6 +1746,7 @@ impl RtBridge {
             collision_latch,
             tools,
             link,
+            holder,
             stream_input,
             shared,
             flush,
@@ -1745,6 +1755,7 @@ impl RtBridge {
             hardware_interface,
             scene,
             sim_world,
+            arm_held: false,
             pending_swap: None,
             world_layers: [Vec::new(), Vec::new()],
             cart,
@@ -2796,10 +2807,15 @@ impl RtCommands for RtBridge {
     }
 
     fn take_bus_outcome(&mut self) -> Option<Result<(), WireError>> {
-        let outcome = self.shared.lock().unwrap().bus_outcome.take()?;
+        let (outcome, retired_sim) = {
+            let mut shared = self.shared.lock().unwrap();
+            (shared.bus_outcome.take()?, shared.retired_sim.take())
+        };
+        drop(retired_sim);
         if let (Some(swap), Ok(())) = (self.pending_swap.take(), &outcome) {
             self.sim = swap.sim;
             self.sim_world = swap.world;
+            self.arm_held = swap.arm_held;
             if let Some(interface) = swap.interface {
                 self.hardware_interface = interface;
             }
@@ -2885,10 +2901,9 @@ impl RtBridge {
     /// the sim now holds — which is the one direction where keeping it
     /// is true.
     ///
-    /// What this does NOT do is park the physical arm. The drivers keep
-    /// whatever they were last commanded until their own watchdogs trip
-    /// (`watchdog_timeout_ms`) and brake, so on hardware this is a way to
-    /// stop LOOKING at the arm, not a way to park it.
+    /// The physical arm is neither parked nor let go of: any motion is
+    /// stopped and the holder thread keeps it where it stands for as long
+    /// as the simulator runs, and `simulator(false)` takes it back.
     fn swap_to_sim(&mut self) -> Result<(), WireError> {
         self.end_stream_for_swap();
         let sim = SimBus::new(self.scene.clone());
@@ -2904,34 +2919,38 @@ impl RtBridge {
             sim: true,
             world: Some(world),
             interface: None,
+            arm_held: true,
         });
         let bundle = self.bundle.clone();
         let shared = self.shared.clone();
+        let holder = self.holder.clone();
         shared.lock().unwrap().bus_outcome = None;
         self.link.op(Box::new(move |core| {
             let q = core.measured_q();
-            if let Err(e) = core.replace_bus(RuntimeBus::from(sim)) {
-                swap_failed(&shared, format!("simulator swap refused: {e}"));
-                return;
-            }
+            let refused = core
+                .stand_in(RuntimeBus::from(sim), |arm| holder.hold(arm))
+                .err()
+                .map(|e| format!("simulator swap refused: {e}"));
             let robot = &bundle.robot;
             let n = robot.joints.len();
-            let Some(bus) = core.bus_mut().sim_mut() else {
-                swap_failed(
-                    &shared,
-                    "the simulator swap did not install a simulator".to_owned(),
-                );
-                return;
+            let seeded = match (refused, core.bus_mut().sim_mut()) {
+                (Some(detail), _) => Err(detail),
+                (None, Some(bus)) => bus
+                    .teleport_joint_rad(&q[..n])
+                    .map_err(|e| format!("simulator swap: plant re-seed failed: {e}")),
+                (None, None) => Err("the simulator swap did not install a simulator".to_owned()),
             };
-            if let Err(e) = bus.teleport_joint_rad(&q[..n]) {
-                swap_failed(
-                    &shared,
-                    format!("simulator swap: plant re-seed failed: {e}"),
-                );
+            if let Err(detail) = seeded {
+                // The refused swap leaves the arm's bus running, as the
+                // reply says.
+                if let Some(arm) = holder.release() {
+                    shared.lock().unwrap().retired_sim = Some(core.resume(arm));
+                }
+                swap_failed(&shared, detail);
                 return;
             }
             core.adopt_landed_pose(robot, &q);
-            log::info!("bus backend: simulator, seeded at {q:?} rad");
+            log::info!("bus backend: simulator, seeded at {q:?} rad; the arm is held");
             shared.lock().unwrap().bus_outcome = Some(Ok(()));
         }));
         Ok(())
@@ -2949,7 +2968,52 @@ impl RtBridge {
     /// a pose the physical arm was never in. The core drops it, so the
     /// first motion command afterwards is refused as un-homed rather
     /// than run against a fiction.
+    ///
+    /// The arm a simulator stands in for is the exception. Its bus never
+    /// closed, so there is nothing to open and its own references stand:
+    /// the RT takes it back as it was held.
     fn swap_to_hardware(&mut self, interface: &str) -> Result<(), WireError> {
+        if self.arm_held && interface == self.hardware_interface {
+            self.end_stream_for_swap();
+            self.pending_swap = Some(PendingSwap {
+                sim: false,
+                world: None,
+                interface: None,
+                arm_held: false,
+            });
+            let name = interface.to_owned();
+            let shared = self.shared.clone();
+            let holder = self.holder.clone();
+            shared.lock().unwrap().bus_outcome = None;
+            self.link.op(Box::new(move |core| {
+                let Some(arm) = holder.release() else {
+                    swap_failed(&shared, format!("no arm is held on '{name}'"));
+                    return;
+                };
+                let stood_in = core.resume(arm);
+                log::info!("bus backend: SocketCAN on '{name}', the arm as it was held");
+                let mut shared = shared.lock().unwrap();
+                shared.retired_sim = Some(stood_in);
+                shared.bus_outcome = Some(Ok(()));
+            }));
+            return Ok(());
+        }
+        if self.arm_held {
+            // Opening another arm would leave this one held with nothing
+            // to take it back.
+            return Err(make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    &format!(
+                        "the arm on '{}' is held behind the simulator; switch back to it \
+                         before connecting another",
+                        self.hardware_interface
+                    ),
+                )],
+            ));
+        }
         let mut cfg = self.bundle.robot.bus.clone();
         interface.clone_into(&mut cfg.interface);
         // The same opener as boot: a driver power-cycle leaves the
@@ -2972,6 +3036,7 @@ impl RtBridge {
             sim: false,
             world: None,
             interface: Some(cfg.interface.clone()),
+            arm_held: false,
         });
         let name = cfg.interface.clone();
         let shared = self.shared.clone();
@@ -3041,6 +3106,8 @@ struct PendingSwap {
     world: Option<WorldMailbox>,
     /// The interface a hardware swap opened.
     interface: Option<String>,
+    /// Whether the arm is left held behind a simulator.
+    arm_held: bool,
 }
 
 impl RtBridge {

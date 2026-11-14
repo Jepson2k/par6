@@ -243,7 +243,7 @@ daemon runs, so a preview cannot disagree with the runtime — it *is* the runti
 
 ### One plane per deadline
 
-`par6d` is one process with four planes, one per distinct deadline. Work is assigned to
+`par6d` is one process with five planes, one per distinct deadline. Work is assigned to
 a plane by its **timing class**, never by feature:
 
 | Class | What it means | A miss costs |
@@ -266,11 +266,12 @@ Two corollaries do most of the work:
    naming its deadline and what a miss costs. If the sentence cannot be written, the
    plane is wrong.
 
-The four sentences:
+The five sentences:
 
 | Thread | Class | Deadline | A miss costs |
 |---|---|---|---|
 | `par6d-rt` | hard | every tick | `LOOP_CRITICAL`; the arm stops |
+| `par6d-holder` | hard | the drives' watchdog, 100 ms | the arm a simulator stands in for trips its drives' watchdogs: held by the drives alone for the fallback time, then let go of |
 | `par6d-housekeeping` | soft | one tick | a cart-jog ramp or an enable retry lands a tick late |
 | command plane (tokio) | soft | the status period | a datagram is acked late; a STATUS frame is skipped |
 | `par6d-planner` | none | — | a queued move starts later |
@@ -1221,6 +1222,13 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
   and a moving joint whose estimate leaves where it stood still by more than its
   `collision_nm` latches. The shipped mode is `warn`, which only reports contact and
   collisions, until the thresholds are measured on the arm.
+- **Switching to the simulator holds the arm where it is**: `simulator(true)` stops any
+  motion and `par6d-holder` goes on commanding that hold to the arm's drives for as long
+  as the simulator runs. The RT thread runs the simulator meanwhile, which is unbounded
+  work — a plant refit or a re-seed can outlast the watchdog — so the hold has a thread
+  and a CPU of its own. `simulator(false)` takes the arm back as it was left, home
+  reference included unless a drive restarted or went quiet meanwhile, and a shutdown
+  takes it back first.
 - **A client that crashes or loses its link stops its own motion**: one that sends
   heartbeats and then falls silent for `[protocol] client_timeout_s` while motion it sent
   is still running gets that motion stopped and the queue cleared. A client that closes on

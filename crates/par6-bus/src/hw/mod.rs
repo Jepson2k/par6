@@ -621,6 +621,10 @@ impl DriverBus for SocketCanBus {
         }
     }
 
+    fn start_at(&mut self, tick: u64) {
+        self.tick = tick;
+    }
+
     fn begin_tick(&mut self, tick: u64) {
         debug_assert!(tick >= self.tick, "tick must be non-decreasing");
         self.tick = tick;
