@@ -3323,6 +3323,7 @@ pub(crate) fn housekeeping_loop(
                             && matches!(phase, Standoff::Placing { .. } | Standoff::Settling { .. })
                             && !gate.lock().unwrap().inside_world(&snap.q).unwrap_or(true)
                         {
+                            log::debug!("placing: let go of outside the clearance; parking");
                             let rest = full_rate_rest(&snap, &stream_limits);
                             a.standoff = None;
                             a.parked = true;
@@ -3391,6 +3392,9 @@ pub(crate) fn housekeeping_loop(
                                 if a.releasing
                                     && !gate.lock().unwrap().inside_world(&snap.q).unwrap_or(true)
                                 {
+                                    log::debug!(
+                                        "braking: let go of outside the clearance; parking"
+                                    );
                                     a.standoff = None;
                                     a.parked = true;
                                     a.servo_target = Some(snap.q);
@@ -3453,6 +3457,14 @@ pub(crate) fn housekeeping_loop(
                                 // on. A released jog rests in EXEC's hold,
                                 // though, and a working mode leaves only for
                                 // IDLE, so that one does pass through it.
+                                log::debug!(
+                                    "braking: rested in {:?}, releasing {}; placing from {:.5} rad out",
+                                    snap.mode,
+                                    a.releasing,
+                                    (0..par6_kin::NQ)
+                                        .map(|j| (stop[j] - snap.q[j]).abs())
+                                        .fold(0.0, f64::max)
+                                );
                                 if !matches!(snap.mode, Mode::Stream | Mode::Idle) {
                                     link.send(RtCommand::SetMode(Mode::Idle));
                                 }
@@ -3494,6 +3506,12 @@ pub(crate) fn housekeeping_loop(
                                     .map(|j| (stop[j] - snap.q[j]).abs())
                                     .fold(0.0, f64::max);
                                 let expired = if span + STANDOFF_HEADWAY_RAD < best {
+                                    log::debug!(
+                                        "placing: headway, {span:.5} rad to go (was {best:.5}), \
+                                         try {tries}, mode {:?}, releasing {}",
+                                        snap.mode,
+                                        a.releasing
+                                    );
                                     a.standoff = Some(Standoff::Placing {
                                         stop,
                                         tries,
@@ -3532,6 +3550,7 @@ pub(crate) fn housekeeping_loop(
                                         .all(|v| v.abs() <= STREAM_MOVING_RAD_S)
                                     && !gate.lock().unwrap().inside_world(&snap.q).unwrap_or(true);
                                 if arrived {
+                                    log::debug!("placing: arrived on try {tries}; settling");
                                     // Let go, then look. The hold is what was
                                     // keeping the arm here, and dropping it
                                     // hands the arm back whatever the drive

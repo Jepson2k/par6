@@ -1408,12 +1408,30 @@ fn streaming_gated_by_the_collision_world_at(dt: f64) {
         let mut brake_rest = None;
         let mut first_ns: Option<u64> = None;
         let deadline = Instant::now() + 2 * BUDGET;
+        // Every change of mode or of moving-or-not, with its time \[ms\]:
+        // what a rest that never lasts looked like.
+        let mut trail: Vec<(u64, ControllerMode, bool, bool, f64)> = Vec::new();
         let s = loop {
             assert!(
                 Instant::now() < deadline,
-                "{what}: never came to rest on the clearance"
+                "{what}: never came to rest on the clearance: latched {}, {} changes, \
+                 first {:?}, last {:?}",
+                latched.is_some(),
+                trail.len(),
+                &trail[..trail.len().min(12)],
+                &trail[trail.len().saturating_sub(12)..]
             );
             let Some(s) = rig.recv_status() else { continue };
+            let seen = (
+                s.mode,
+                s.speeds.iter().any(|v| v.abs() >= 0.01),
+                s.collision_active,
+            );
+            if trail.last().map(|t| (t.1, t.2, t.3)) != Some(seen) {
+                let since = first_ns.map_or(0, |t0| (s.mono_time_ns - t0) / 1_000_000);
+                let gap_um = (world_gap_m(&mut world, s.angles) * 1e6).round();
+                trail.push((since, seen.0, seen.1, seen.2, gap_um));
+            }
             assert_ne!(
                 s.mode,
                 ControllerMode::ActiveError,
