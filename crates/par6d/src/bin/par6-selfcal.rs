@@ -39,7 +39,9 @@
 //! justification still gets written down; it costs one comment instead of a
 //! flag, a parser, a struct field and a log line to keep in sync.
 
-use par6_bus::spectral::codec::{CAPTURE_LEN, CAPTURE_STATUS_CHANNEL, CAPTURE_VEL_SCALE};
+use par6_bus::spectral::codec::{
+    DriveRun, Param, CAPTURE_LEN, CAPTURE_VEL_SCALE, COGCAL_RUN_TRIMMED, ENCAL_RUN,
+};
 use par6_bus::{
     hw::SocketCanBus,
     sim::{
@@ -219,17 +221,17 @@ const GAINS_ROOM_SHARE: f64 = 0.6;
 const GAINS_CAPTURE_DIVISOR: u8 = 3;
 /// Status requests before a drive counts as recording no capture.
 const GAINS_STATUS_TRIES: u32 = 3;
-/// Read passes over the chunks a lossy bus did not answer.
+/// Read passes over the samples a lossy bus did not deliver.
 const GAINS_READ_PASSES: u32 = 3;
+/// Capture samples asked for per tick. The drive sends a run as fast as the
+/// bus takes it, and the joints' own replies share that bus: twelve a tick
+/// is a frame every 320 µs at the shipped rate, which left them on time.
+const CAPTURE_READ_PER_TICK: u16 = 12;
 /// How close to an endstop a sample stops counting as tracking. User
 /// requirement, 2026-09-21: within this much of a stop a joint is nudging
 /// into, or breaking away from, a mechanical limit, and what it does there
 /// says nothing about its gains.
 const ENDSTOP_EXCLUSION_RAD: f64 = 5.0 * std::f64::consts::PI / 180.0;
-/// How long a streamed capture is given to land: 1536 frames at the drive's
-/// 320 µs pace is half a second, and the host's own traffic shares the bus.
-/// Pairs still missing after it are read one at a time.
-const CAPTURE_STREAM_WAIT_S: f64 = 1.0;
 /// The arm may not stand still longer than this between motions, anywhere in
 /// a run: every second of it is the operator's. A longer stop is reported
 /// when motion resumes, with what the run was doing, and the run's total is
@@ -265,6 +267,26 @@ const RIPPLE_MIN_IMPROVEMENT: f64 = 0.2;
 /// The refinement step extrapolates from two captures; no harmonic of it
 /// may exceed the current limit over this.
 const RIPPLE_REFINE_ILIM_SHARE: f64 = 8.0;
+/// A drive's own calibration run carries its motor 1.04 to 1.07 turns from
+/// where it began and back (firmware 109); one that has carried it this
+/// far \[motor turns\] is stopped.
+const DRIVE_RUN_TURNS: f64 = 1.15;
+/// A drive answers nothing while it fits what a pass recorded; one quiet
+/// for longer than this \[s\] has stopped.
+const DRIVE_QUIET_S: f64 = 2.0;
+/// The share of its current limit a drive pulls the rotor along with while
+/// it measures its encoder table (firmware 109).
+const DRIVE_ENCAL_CURRENT_SHARE: f64 = 0.8;
+/// The most a joint's gravity load may turn the rotor off that field
+/// \[rad electrical\] for its drive's runs to be tried there.
+const DRIVE_ENCAL_BIAS_RAD: f64 = 1.0 * std::f64::consts::PI / 180.0;
+/// The longest the encoder-table run and the anti-cogging run may take \[s\]:
+/// 17 s, and three identifications of 23 s where the zero trim is tried and
+/// taken back.
+const DRIVE_ENCAL_S: f64 = 40.0;
+const DRIVE_COGCAL_S: f64 = 100.0;
+/// How long a drive is left to write its configuration.
+const DRIVE_SAVE: Duration = Duration::from_millis(500);
 /// A speed error this large for `RUNAWAY_TICKS` in a row is a loop that
 /// has gone unstable, not a rough joint: J2's backlash chatter spikes to
 /// 77 deg/s for single samples, the J1 buzz sat at +-240 deg/s.
@@ -1050,6 +1072,29 @@ enum Stage {
     Mechanics,
     /// Each joint's EXEC limits (opt-in with `--limits` in a full run).
     Limits,
+    /// The drive's own calibration runs (firmware 109), with the motors in
+    /// place, on the joints gravity does not load at the ready pose: its
+    /// encoder table, then its anti-cogging with the current-sense zero
+    /// trim. Never part of a full run. With `--apply` each drive saves what
+    /// it kept.
+    Drive,
+}
+
+/// What a drive's own calibration runs found on one joint.
+#[derive(Clone, Copy, Debug)]
+struct DriveFound {
+    /// The encoder table's error peak to peak and once per turn \[deg of the
+    /// motor shaft\], and how far the run moved the electrical offset \[deg
+    /// electrical\]; `None` where it was not measured.
+    encoder: Option<(f64, f64, f64)>,
+    /// The cogging current \[mA rms\], its first harmonic before and after
+    /// the zero trim \[mA\], and the two trims \[ADC counts\]; `None` where the
+    /// identification did not finish.
+    cogging: Option<(f64, f64, f64, i32, i32)>,
+    /// The speed ripple on the gains step before and after \[ticks/s\].
+    ripple: (f64, f64),
+    /// The anti-cogging stayed on.
+    kept: bool,
 }
 
 // ---------------------------------------------------------------- events
@@ -1114,6 +1159,19 @@ enum Event {
     RippleCheck(u64, usize, f64, f64, bool),
     /// Why a joint gets no ripple feedforward.
     RippleNote(u64, usize, &'static str),
+    /// The drive's encoder table: its error peak to peak and once per turn
+    /// \[deg of the motor shaft\], and how far the run moved the electrical
+    /// offset \[deg electrical\].
+    DriveEncoder(u64, usize, f64, f64, f64),
+    /// The drive's anti-cogging: the cogging current \[mA rms\], its first
+    /// harmonic before and after the current-sense zero trim \[mA\], and the
+    /// two trims \[ADC counts\].
+    DriveCogging(u64, usize, f64, f64, f64, i32, i32),
+    /// The speed ripple on the gains step before and after the drive's
+    /// runs \[ticks/s\], and whether its anti-cogging stayed on.
+    DriveCheck(u64, usize, f64, f64, bool),
+    /// What a drive's run did not do, and why.
+    DriveNote(u64, usize, &'static str),
     IdentPose(usize, usize, [f64; N]),
     IdentTorque(usize, [f64; N]),
     ArmFit(f64, f64),
@@ -1259,6 +1317,20 @@ fn describe(event: &Event) -> Option<String> {
             j + 1
         ),
         Event::RippleNote(tick, j, note) => format!("tick={tick} J{} RIPPLE {note}", j + 1),
+        Event::DriveEncoder(tick, j, peak, once, moved) => format!(
+            "tick={tick} J{} DRIVE encoder table {peak:.2}deg peak to peak, {once:.2}deg once per turn (motor shaft); electrical offset moved {moved:.1}deg",
+            j + 1
+        ),
+        Event::DriveCogging(tick, j, rms, before, after, trim1, trim2) => format!(
+            "tick={tick} J{} DRIVE anti-cogging {rms:.1}mA rms; first harmonic {before:.1}->{after:.1}mA with zero trims {trim1}/{trim2} counts",
+            j + 1
+        ),
+        Event::DriveCheck(tick, j, before, after, kept) => format!(
+            "tick={tick} J{} DRIVE speed ripple about the 20 deg/s step {before:.0}->{after:.0}ticks/s {}",
+            j + 1,
+            if kept { "kept" } else { "no better; anti-cogging off" }
+        ),
+        Event::DriveNote(tick, j, note) => format!("tick={tick} J{} DRIVE {note}", j + 1),
         Event::Gains(tick, j, t) => format!(
             "tick={tick} J{} GAINS StepFOC kpv={:.6}->{:.6} kiv={:.8}->{:.8} kpp={:.5}->{:.5} observations={}",
             j + 1, t.before.kpv, t.after.kpv, t.before.kiv, t.after.kiv,
@@ -1626,6 +1698,9 @@ struct Arm {
     /// The joint that guard last fired on, so the posture qualification can
     /// tell a candidate's fault from a bus fault.
     runaway_joint: Option<usize>,
+    /// The joint whose drive is moving it through one of its own
+    /// calibration runs.
+    self_driven: Option<usize>,
     /// Consecutive ticks the CAN transmit queue refused the frames.
     tx_full: u64,
     /// The gripper slot's frame every tick: a fitted CAN gripper's drive
@@ -1764,6 +1839,7 @@ impl Arm {
             fitter: None,
             tracking_runaway: [0; N],
             runaway_joint: None,
+            self_driven: None,
             activity: std::cell::Cell::new(("startup", 0)),
             idle_spans: Vec::new(),
             rest: [None; N],
@@ -1926,9 +2002,11 @@ impl Arm {
                     faulted = Some((j, node.error_flags));
                     break;
                 }
-                if silent.is_none()
-                    && (node.live_error_bit || self.tick.saturating_sub(self.seen[j]) > timeout)
-                {
+                // A drive running its own calibration answers nothing while it
+                // fits a pass, and a hold sent to wake it would end the run.
+                let quiet =
+                    self.self_driven != Some(j) && self.tick.saturating_sub(self.seen[j]) > timeout;
+                if silent.is_none() && (node.live_error_bit || quiet) {
                     silent = Some(j);
                 }
             }
@@ -4062,6 +4140,281 @@ impl Arm {
         Ok(Some(chosen))
     }
 
+    // ------------------------------------------------------- drive runs
+
+    /// Have each chosen joint's drive run its own calibration with the
+    /// motor in place (firmware 109): the encoder table, then the
+    /// anti-cogging with the current-sense zero trim. The speed ripple on
+    /// the gains step is captured before and after, and the anti-cogging
+    /// stays on only if it falls by `RIPPLE_MIN_IMPROVEMENT`.
+    fn drive(
+        &mut self,
+        ready: [f64; N],
+        spans: &[(f64, f64); N],
+        chosen: [bool; N],
+    ) -> Result<[Option<DriveFound>; N]> {
+        let mut found = [None; N];
+        for (j, slot) in found.iter_mut().enumerate() {
+            if !chosen[j] {
+                continue;
+            }
+            self.pose(ready)?;
+            self.emit(Event::Phase("drive runs", j));
+            *slot = self.joint_drive(j, ready[j], spans[j])?;
+        }
+        self.pose(ready)?;
+        Ok(found)
+    }
+
+    fn joint_drive(&mut self, j: usize, home: f64, span: (f64, f64)) -> Result<Option<DriveFound>> {
+        let node = self.bundle.robot.joints[j].node_id;
+        let ilim = self.bundle.robot.joints[j].ilim_ma;
+        let per_tick = self.per_tick(j);
+        let (up, down) = (span.1 - home, home - span.0);
+        let reach = DRIVE_RUN_TURNS * 16384.0 * per_tick.abs();
+        // The nearest place to ready with the room the runs take: both carry
+        // the motor toward rising drive ticks and bring it back.
+        let rising = if per_tick > 0.0 {
+            home.min(span.1 - reach)
+        } else {
+            home.max(span.0 + reach)
+        };
+        if !(span.0..=span.1).contains(&rising) {
+            self.emit(Event::DriveNote(
+                self.tick,
+                j,
+                "the joint's travel is shorter than the motor turn the runs take",
+            ));
+            return Ok(None);
+        }
+        if self.drive_param(j, Param::Cogcal, false)?.is_none() {
+            self.emit(Event::DriveNote(
+                self.tick,
+                j,
+                "the drive answers no run state (firmware before 109)",
+            ));
+            return Ok(None);
+        }
+        // A drive holds its joint through these runs without the gravity
+        // feedforward, and takes a steady load on the encoder-table run for an
+        // error of its electrical offset, which forward and back do not
+        // cancel.
+        let gravity = f64::from(self.feedforward(j)).abs();
+        if gravity > DRIVE_ENCAL_CURRENT_SHARE * ilim * DRIVE_ENCAL_BIAS_RAD.sin() {
+            self.emit(Event::DriveNote(
+                self.tick,
+                j,
+                "gravity loads the joint at the ready pose; its drive's runs are left alone",
+            ));
+            return Ok(None);
+        }
+        // The motor as it is: nothing the file sends stays on under the runs.
+        self.bus.set_ripple(node, &[])?;
+        let start = self.pos(j)?;
+        let window = f64::from(CAPTURE_LEN) * f64::from(GAINS_CAPTURE_DIVISOR) / LOOP_HZ;
+        let speed = GAINS_STEP_RAD_S.min(GAINS_ROOM_SHARE * up.max(down) / window);
+        let direction = if up >= down { 1.0 } else { -1.0 };
+        let step = direction * speed / per_tick;
+        let skip = (RIPPLE_STEP_SKIP_S * LOOP_HZ / f64::from(GAINS_CAPTURE_DIVISOR)) as usize;
+        let speed_ripple = |c: &Captured| {
+            ripple::fit(&c.speed, &c.phase, skip, &RIPPLE_HARMONICS).map(|v| ripple::total(&v))
+        };
+        let before = self
+            .capture_step(j, step, GAINS_CAPTURE_DIVISOR, span)?
+            .as_ref()
+            .and_then(speed_ripple)
+            .ok_or_else(|| format!("J{} gave no speed ripple before its drive's runs", j + 1))?;
+
+        self.move_joint(j, rising, RETURN_S)?;
+        self.emit(Event::Phase("drive: encoder table", j));
+        let run = self.drive_run(
+            j,
+            Param::Encal,
+            ENCAL_RUN,
+            DriveRun::of_encal,
+            DRIVE_ENCAL_S,
+            span,
+        )?;
+        let encoder = if run == DriveRun::Done {
+            let read = |arm: &mut Self, param| -> Result<f64> {
+                arm.drive_param(j, param, false)?
+                    .map(f64::from)
+                    .ok_or_else(|| format!("J{} drive stopped answering", j + 1).into())
+            };
+            let peak = read(self, Param::EncalPeakToPeakX100)? / 100.0;
+            let once = read(self, Param::EncalOncePerTurnX100)? / 100.0;
+            let moved = read(self, Param::EncalOffsetMoveX10)? / 10.0;
+            self.emit(Event::DriveEncoder(self.tick, j, peak, once, moved));
+            Some((peak, once, moved))
+        } else {
+            self.emit(Event::DriveNote(
+                self.tick,
+                j,
+                run.failure().unwrap_or("the encoder table did not run"),
+            ));
+            None
+        };
+        self.adopt(j)?;
+        self.move_joint(j, rising, RETURN_S)?;
+
+        self.emit(Event::Phase("drive: anti-cogging", j));
+        let trims = (
+            self.drive_param(j, Param::ZeroTrim1, false)?,
+            self.drive_param(j, Param::ZeroTrim2, false)?,
+        );
+        let (Some(trim1), Some(trim2)) = trims else {
+            return Err(format!("J{} drive stopped answering", j + 1).into());
+        };
+        let run = self.drive_run(
+            j,
+            Param::Cogcal,
+            COGCAL_RUN_TRIMMED,
+            DriveRun::of_cogcal,
+            DRIVE_COGCAL_S,
+            span,
+        );
+        // A run that ends between its trim and the pass that checks it
+        // leaves the zeros moved and unproven.
+        if !matches!(run, Ok(DriveRun::Done | DriveRun::DoneUntrimmed)) {
+            self.bus.set_param(node, Param::ZeroTrim1, trim1)?;
+            self.bus.set_param(node, Param::ZeroTrim2, trim2)?;
+        }
+        let run = run?;
+        let cogging = if matches!(run, DriveRun::Done | DriveRun::DoneUntrimmed) {
+            let read = |arm: &mut Self, param| -> Result<i32> {
+                arm.drive_param(j, param, false)?
+                    .ok_or_else(|| format!("J{} drive stopped answering", j + 1).into())
+            };
+            let rms = f64::from(read(self, Param::CogcalRippleX10)?) / 10.0;
+            let first = f64::from(read(self, Param::TrimFirstHarmonicBeforeX10)?) / 10.0;
+            let trimmed = f64::from(read(self, Param::TrimFirstHarmonicAfterX10)?) / 10.0;
+            let trims = (read(self, Param::ZeroTrim1)?, read(self, Param::ZeroTrim2)?);
+            self.emit(Event::DriveCogging(
+                self.tick, j, rms, first, trimmed, trims.0, trims.1,
+            ));
+            Some((rms, first, trimmed, trims.0, trims.1))
+        } else {
+            self.emit(Event::DriveNote(
+                self.tick,
+                j,
+                run.failure().unwrap_or("the anti-cogging did not run"),
+            ));
+            None
+        };
+        self.return_to(j, start)?;
+
+        let after = self
+            .capture_step(j, step, GAINS_CAPTURE_DIVISOR, span)?
+            .as_ref()
+            .and_then(speed_ripple)
+            .ok_or_else(|| format!("J{} gave no speed ripple after its drive's runs", j + 1))?;
+        let kept = cogging.is_some() && after < before * (1.0 - RIPPLE_MIN_IMPROVEMENT);
+        self.emit(Event::DriveCheck(self.tick, j, before, after, kept));
+        if !kept {
+            self.bus.set_param(node, Param::CoggingMode, 0)?;
+        }
+        Ok(Some(DriveFound {
+            encoder,
+            cogging,
+            ripple: (before, after),
+            kept,
+        }))
+    }
+
+    /// One answer to a read of `param` on joint `j`'s drive; `None` when it
+    /// gives none. While its drive `running` its own motion the joint is
+    /// only watched, and held where it is the moment anything stops.
+    fn drive_param(&mut self, j: usize, param: Param, running: bool) -> Result<Option<i32>> {
+        let node = self.bundle.robot.joints[j].node_id;
+        self.state.nodes[usize::from(node)].forget_param(param);
+        for _ in 0..GAINS_STATUS_TRIES {
+            self.bus
+                .queue_poll_override(PollAction::ParamRead { node, param }, 1);
+            for _ in 0..2 {
+                if running {
+                    self.frame(Some((j, JointCommand::encoder_poll())))?;
+                    self.adopt(j)?;
+                } else {
+                    self.frame(None)?;
+                }
+            }
+            if let Some(value) = self.state.nodes[usize::from(node)].param(param) {
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Start one of the drive's own runs on joint `j` and follow it to its
+    /// end: the drive moves the motor itself, every other joint is held, and
+    /// a run that leaves `span`, carries the motor past `DRIVE_RUN_TURNS` or
+    /// outlasts `budget_s` is aborted, which has the drive hold where it is.
+    fn drive_run(
+        &mut self,
+        j: usize,
+        param: Param,
+        start: i32,
+        state: fn(i32) -> DriveRun,
+        budget_s: f64,
+        span: (f64, f64),
+    ) -> Result<DriveRun> {
+        let node = self.bundle.robot.joints[j].node_id;
+        let from = self.pos(j)?;
+        let reach = (DRIVE_RUN_TURNS * 16384.0) as i64;
+        let deadline = self.tick + self.ticks(budget_s);
+        let quiet = self.ticks(DRIVE_QUIET_S);
+        self.bus.set_param(node, param, start)?;
+        self.self_driven = Some(j);
+        let mut ran = false;
+        let mut answered = self.tick;
+        let outcome = loop {
+            let now = match self.drive_param(j, param, true) {
+                Err(e) => break Err(e),
+                Ok(Some(value)) => {
+                    answered = self.tick;
+                    state(value)
+                }
+                Ok(None) if self.tick - answered > quiet => {
+                    break Ok(Err("the drive stopped answering its run state"));
+                }
+                Ok(None) => continue,
+            };
+            let at = match self.pos(j) {
+                Ok(at) => at,
+                Err(e) => break Err(e),
+            };
+            if (i64::from(at) - i64::from(from)).abs() > reach {
+                break Ok(Err("the run carried the motor further than it should"));
+            }
+            if !(span.0..=span.1).contains(&self.conv[j].joint_rad(at)) {
+                break Ok(Err("the run reached the joint's travel bound"));
+            }
+            if self.tick > deadline {
+                break Ok(Err("the run outlasted its time"));
+            }
+            match now {
+                DriveRun::Running => ran = true,
+                DriveRun::Idle if !ran => {}
+                DriveRun::Done | DriveRun::DoneUntrimmed if !ran => {
+                    break Ok(Err("the drive reports an earlier run and started none"));
+                }
+                ended => break Ok(Ok(ended)),
+            }
+        };
+        self.self_driven = None;
+        let stopped = match outcome? {
+            Ok(ended) => {
+                self.adopt(j)?;
+                return Ok(ended);
+            }
+            Err(why) => why,
+        };
+        self.bus.set_param(node, param, 0)?;
+        self.adopt(j)?;
+        self.settle(RIPPLE_SETTLE_S)?;
+        Err(format!("J{} drive run stopped: {stopped}", j + 1).into())
+    }
+
     // ------------------------------------------------------------ gains
 
     /// Tune every chosen joint in turn at the ready pose and leave each
@@ -4908,8 +5261,7 @@ impl Arm {
         let node = self.bundle.robot.joints[j].node_id;
         let divisor = command.divisor();
         let phase_capture = !matches!(command, GainCommand::Position(_));
-        let channels: &[u8] = if phase_capture { &[0, 1, 2] } else { &[0, 1] };
-        if !self.fetch_capture(j, channels, divisor)? {
+        if !self.fetch_capture(j)? {
             return Err(format!("J{} did not supply encoder capture", j + 1).into());
         }
         let record = self
@@ -5048,7 +5400,7 @@ impl Arm {
         let direction = (i64::from(target) - i64::from(start)).signum() as f64;
         let divisor = command.divisor();
         let duration = f64::from(CAPTURE_LEN) * f64::from(divisor) / LOOP_HZ;
-        self.bus.capture_start(node, divisor, CAPTURE_LEN)?;
+        self.bus.capture_start(node, u16::from(divisor))?;
         let mut overshoot: f64 = 0.0;
         let mut runaway = 0;
         let mut generation = self.generation[j];
@@ -5254,7 +5606,7 @@ impl Arm {
         let result = (|| {
             let start = self.pos(j)?;
             let window = f64::from(CAPTURE_LEN) * f64::from(divisor) / LOOP_HZ;
-            self.bus.capture_start(node, divisor, CAPTURE_LEN)?;
+            self.bus.capture_start(node, u16::from(divisor))?;
             let mut runaway_ticks = 0u32;
             let mut generation = self.generation[j];
             let stepping = self.ticks(window) + 2;
@@ -5287,7 +5639,7 @@ impl Arm {
                 }
             }
             self.adopt(j)?;
-            if !self.fetch_capture(j, &[0, 1, 2], divisor)? {
+            if !self.fetch_capture(j)? {
                 self.return_to(j, start)?;
                 return Ok(None);
             }
@@ -5320,17 +5672,19 @@ impl Arm {
         result
     }
 
-    /// Read joint `j`'s capture back over the poll slot: its status until it
-    /// answers, then every chunk of `channels`, again for any a lossy bus
-    /// dropped. `false` when the drive answers no status.
-    fn fetch_capture(&mut self, j: usize, channels: &[u8], divisor: u8) -> Result<bool> {
+    /// Read joint `j`'s capture back over the poll slot: its status until
+    /// the drive answers, then every sample a run a tick, again for any a
+    /// lossy bus dropped. `false` when the drive answers no status.
+    fn fetch_capture(&mut self, j: usize) -> Result<bool> {
         let node = self.bundle.robot.joints[j].node_id;
         self.emit(Event::Phase("capture download", j));
         let mut answered = false;
         for _ in 0..GAINS_STATUS_TRIES {
-            self.read_capture(node, CAPTURE_STATUS_CHANNEL, 0)?;
+            self.bus
+                .queue_poll_override(PollAction::CaptureStatus { node }, 1);
+            self.frame(None)?;
             self.settle(self.dt)?;
-            if self.bus.capture(node).is_some_and(|c| c.wanted > 0) {
+            if self.bus.capture(node).is_some_and(|c| c.recorded > 0) {
                 answered = true;
                 break;
             }
@@ -5339,60 +5693,28 @@ impl Arm {
             return Ok(false);
         }
         let capture = self.bus.capture(node).ok_or("capture status disappeared")?;
-        if capture.recorded != CAPTURE_LEN
-            || capture.wanted != CAPTURE_LEN
-            || capture.divisor != u16::from(divisor)
-        {
-            return Err(format!("J{} capture has the wrong length or sample rate", j + 1).into());
+        if capture.recorded != CAPTURE_LEN {
+            return Err(format!(
+                "J{} capture holds {} of {CAPTURE_LEN} samples",
+                j + 1,
+                capture.recorded
+            )
+            .into());
         }
-        // The whole buffer on one request, paced by the drive; the reads
-        // below then fill only what the bus dropped. A drive without the
-        // stream command sends nothing and the reads fetch everything.
-        self.bus.capture_stream(node)?;
-        for _ in 0..self.ticks(CAPTURE_STREAM_WAIT_S) {
-            self.frame(None)?;
-            let complete = self.bus.capture(node).is_some_and(|capture| {
-                channels
-                    .iter()
-                    .all(|channel| capture.missing(*channel).next().is_none())
-            });
-            if complete {
+        let mut span = Some((0, CAPTURE_LEN));
+        for _ in 0..=GAINS_READ_PASSES {
+            let Some((first, count)) = span else {
                 break;
-            }
-        }
-        for _ in 0..GAINS_READ_PASSES {
-            let missing: Vec<(u8, u16)> = channels
-                .iter()
-                .copied()
-                .flat_map(|channel| {
-                    let capture = self.bus.capture(node);
-                    capture
-                        .map(|c| {
-                            c.missing(channel)
-                                .map(|chunk| (channel, chunk))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect();
-            if missing.is_empty() {
-                break;
-            }
-            for (channel, chunk) in missing {
-                self.read_capture(node, channel, chunk)?;
+            };
+            for at in (first..first + count).step_by(usize::from(CAPTURE_READ_PER_TICK)) {
+                self.read_capture(node, at, CAPTURE_READ_PER_TICK.min(first + count - at))?;
             }
             self.settle(2.0 * self.dt)?;
+            span = self.bus.capture(node).and_then(|c| c.missing());
         }
-        let capture = self
-            .bus
-            .capture(node)
-            .ok_or_else(|| format!("J{} has no capture buffer", j + 1))?;
-        if channels
-            .iter()
-            .any(|c| capture.missing(*c).next().is_some())
-        {
+        if span.is_some() {
             return Err(format!(
-                "J{} capture incomplete after {GAINS_READ_PASSES} reads",
+                "J{} capture incomplete after {GAINS_READ_PASSES} more reads",
                 j + 1
             )
             .into());
@@ -5428,15 +5750,9 @@ impl Arm {
     }
 
     /// One capture read in this tick's poll slot.
-    fn read_capture(&mut self, node: u8, channel: u8, chunk: u16) -> Result<()> {
-        self.bus.queue_poll_override(
-            PollAction::CaptureRead {
-                node,
-                channel,
-                chunk,
-            },
-            1,
-        );
+    fn read_capture(&mut self, node: u8, first: u16, count: u16) -> Result<()> {
+        self.bus
+            .queue_poll_override(PollAction::CaptureRead { node, first, count }, 1);
         self.frame(None)
     }
 
@@ -7799,17 +8115,20 @@ fn run(args: Args) -> Result<()> {
         return Err("--verify-gains requires --only gains".into());
     }
     if !args.joints.is_empty()
-        && !args
-            .only
-            .iter()
-            .any(|s| matches!(s, Stage::Ripple | Stage::Gains | Stage::Limits))
+        && !args.only.iter().any(|s| {
+            matches!(
+                s,
+                Stage::Ripple | Stage::Gains | Stage::Limits | Stage::Drive
+            )
+        })
     {
-        return Err("--joint needs --only ripple, gains or limits".into());
+        return Err("--joint needs --only ripple, gains, limits or drive".into());
     }
     let chosen: [bool; N] =
         std::array::from_fn(|j| args.joints.is_empty() || args.joints.contains(&(j as u8 + 1)));
     let limits_stage = args.limits && args.only.is_empty() || args.only.contains(&Stage::Limits);
     let ripple_stage = runs(Stage::Ripple);
+    let drive_stage = args.only.contains(&Stage::Drive);
     let gains_stage = runs(Stage::Gains);
     let stiction_stage = runs(Stage::Stiction);
     let belt_stage = runs(Stage::Belt);
@@ -8020,6 +8339,7 @@ fn run(args: Args) -> Result<()> {
         || belt_stage
         || vibration_stage
         || ripple_stage
+        || drive_stage
         || mechanics_stage
     {
         Some(limit_spans(&bundle, &assets, ready)?)
@@ -8080,6 +8400,7 @@ fn run(args: Args) -> Result<()> {
     let mut fit = None;
     let mut friction = None;
     let mut ripples = None;
+    let mut drives = None;
     let mut tuned = None;
     let mut limits = None;
     let mut vibration = None;
@@ -8115,6 +8436,9 @@ fn run(args: Args) -> Result<()> {
         if ripple_stage && *selected {
             statuses.push(("ripple", Some(j), "not reached"));
         }
+        if drive_stage && *selected {
+            statuses.push(("drive", Some(j), "not reached"));
+        }
         if gains_stage && *selected {
             statuses.push(("gains", Some(j), "not reached"));
         }
@@ -8147,6 +8471,23 @@ fn run(args: Args) -> Result<()> {
                             "passed"
                         } else {
                             "passed: no compensation improved the ripple"
+                        },
+                    );
+                }
+            }
+        }
+        if let (true, Some(spans)) = (drive_stage, &spans) {
+            drives = Some(arm.drive(ready, spans, chosen)?);
+            for (j, found) in drives.as_ref().unwrap().iter().enumerate() {
+                if chosen[j] {
+                    stage_status(
+                        &mut statuses,
+                        "drive",
+                        Some(j),
+                        match found {
+                            Some(f) if f.kept => "passed",
+                            Some(_) => "passed: its anti-cogging did not lower the ripple",
+                            None => "passed: nothing could run on this joint",
                         },
                     );
                 }
@@ -8510,6 +8851,23 @@ fn run(args: Args) -> Result<()> {
         None,
         if parked.is_ok() { "passed" } else { "failed" },
     );
+    // Saved with the arm lying parked and released: a drive answers nothing
+    // while it writes. Its anti-cogging then replaces the file's harmonics
+    // for that joint, which a start-up would otherwise send over it.
+    let mut saved: Result<()> = Ok(());
+    if let (true, true, Some(found)) = (args.apply && outcome.is_ok(), parked.is_ok(), &drives) {
+        for (j, f) in found.iter().enumerate() {
+            if f.is_none() {
+                continue;
+            }
+            let node = arm.bundle.robot.joints[j].node_id;
+            saved = saved.and(arm.bus.save_config(node).map_err(Into::into));
+            std::thread::sleep(DRIVE_SAVE);
+            if f.is_some_and(|f| f.kept) {
+                ripples.get_or_insert_with(Default::default)[j] = Some(Vec::new());
+            }
+        }
+    }
     let gain_used = arm.gain_used;
     let idle = (arm.idle_stops, arm.idle_total_s, arm.idle_longest);
     // `fit_arm` solves for a correction ON TOP OF everything the model
@@ -8548,6 +8906,7 @@ fn run(args: Args) -> Result<()> {
     let result = outcome
         .and(restored_gains)
         .and(restored_ripple)
+        .and(saved)
         .and(restored_gravity)
         .and(parked)
         .and(recorded.map_err(Into::into));
@@ -8723,6 +9082,41 @@ fn run(args: Args) -> Result<()> {
                     "none".to_owned()
                 } else {
                     harmonics.join(", ")
+                }
+            );
+        }
+    }
+    if let Some(drives) = &drives {
+        for (j, f) in drives.iter().enumerate() {
+            let Some(f) = f else {
+                continue;
+            };
+            let encoder = f.encoder.map_or_else(
+                || "encoder table not measured".to_owned(),
+                |(peak, once, moved)| {
+                    format!(
+                        "encoder table {peak:.2} deg peak to peak, {once:.2} deg once per turn, offset moved {moved:.1} deg electrical"
+                    )
+                },
+            );
+            let cogging = f.cogging.map_or_else(
+                || "anti-cogging not identified".to_owned(),
+                |(rms, before, after, trim1, trim2)| {
+                    format!(
+                        "anti-cogging {rms:.1} mA rms, first harmonic {before:.1} -> {after:.1} mA (zero trims {trim1}/{trim2})"
+                    )
+                },
+            );
+            say!(
+                "drive J{}: {encoder}; {cogging}; speed ripple {:.0} -> {:.0} ticks/s, {}; {}",
+                j + 1,
+                f.ripple.0,
+                f.ripple.1,
+                if f.kept { "kept" } else { "anti-cogging off" },
+                if args.apply {
+                    "saved in the drive"
+                } else {
+                    "not saved: the drive keeps it until it restarts"
                 }
             );
         }

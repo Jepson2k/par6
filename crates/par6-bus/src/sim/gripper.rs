@@ -115,8 +115,8 @@ impl GripperSim {
             None,
         );
         // The drive says which tool it is built into, as a provisioned
-        // gripper drive does over cmd 36.
-        driver.device.tool_id = cfg.can_tool_id.unwrap_or(0);
+        // gripper drive does in its identity.
+        driver.identity.tool_id = cfg.can_tool_id.unwrap_or(0);
         Self {
             driver,
             joint: JawJoint::new(

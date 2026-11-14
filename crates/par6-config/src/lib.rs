@@ -47,8 +47,10 @@ pub use robot::{
     BusConfig, CollisionConfig, CollisionMode, ControlMode, DriverType, Gains, JogDefaults,
     JogProfile, JointConfig, JointLimits, KtFetchConfig, KtSource, LimitMode, ModeLimits,
     MotionConfig, ProtocolConfig, ResolvedLimits, RippleHarmonic, RobotConfig, RobotSection,
-    ScanConfig, SelfcalConfig, SimConfig, StreamDefaults, ThermalConfig, TimingConfig,
-    VibrationConfig, WatchdogAction, MAX_OPEN_RETRY_S, MAX_RIPPLE_HARMONICS, WATCHDOG_TIMEOUT_MS,
+    ScanConfig, SelfcalConfig, SimConfig, SoundConfig, SpeedEstimator, StreamDefaults,
+    ThermalConfig, TimingConfig, VibrationConfig, WatchdogAction, WatchdogAfter, WatchdogFallback,
+    MAX_OPEN_RETRY_S, MAX_RIPPLE_HARMONICS, SPEED_PLL_BANDWIDTH_HZ, WATCHDOG_FALLBACK_MAX_S,
+    WATCHDOG_TIMEOUT_MS,
 };
 
 use std::path::Path;

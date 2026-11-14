@@ -68,7 +68,7 @@ fn steady_state_ticks_allocate_nothing() {
             a_ma: 40,
             b_ma: -25,
         }];
-        j.velocity_window = Some(16);
+        j.speed_estimator = Some(par6_config::SpeedEstimator::Average);
     }
     let robot = &bundle.robot;
     let dt = robot.robot.tick_dt_s;

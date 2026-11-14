@@ -6,10 +6,11 @@
 //! err bit and the telemetry values the RTR polls report.
 
 use crate::spectral::codec::{
-    unpack_f32, unpack_i16, unpack_i24, unpack_u32, CommandId, CAPTURE_LEN, CAPTURE_STATUS_CHANNEL,
-    CAPTURE_VEL_SCALE, RIPPLE_SLOTS,
+    readback_params, unpack_f32, unpack_i16, unpack_i24, unpack_u32, CommandId, Param,
+    BUFFER_HARMONICS, CAPTURE_LEN, CAPTURE_TRIGGER_NOW, CAPTURE_VEL_SCALE, COGGING_MODE_HARMONICS,
+    RIPPLE_MAX_HARMONIC, RIPPLE_SLOTS, SOUND_PLAY, SOUND_QUEUE, SOUND_STATE_PLAYING, SOUND_STOP,
 };
-use crate::types::{DeviceInfo, DriveRange, ErrorFlags, NodeId};
+use crate::types::{DeviceInfo, DriveRange, ErrorFlags, Identity, NodeId};
 
 /// Firmware cascade frequency [Hz], from STEPFOC constants.h at 32fb5b5.
 /// The physics integrates between loop evaluations; scaling the integral
@@ -26,8 +27,6 @@ pub(crate) const FW_LOOP_DT: f64 = 1.0 / FW_LOOP_HZ;
 /// better here than it is: on the arm's base 8 samples hunted after every
 /// move where 20 hold still.
 const VELOCITY_WINDOW: usize = 20;
-/// The longest speed filter the firmware takes (cmd 41).
-const VELOCITY_WINDOW_MAX: usize = 64;
 /// The firmware's outward speed past an armed range that trips it
 /// \[ticks/s\].
 const RANGE_OUTWARD_TICKS_S: f64 = 1000.0;
@@ -173,8 +172,10 @@ pub(crate) struct VirtualDriver {
     integral_ma: f64,
     loop_phase: f64,
     last_drive: PlantCmd,
-    velocity_history: [f64; VELOCITY_WINDOW_MAX],
-    /// The speed filter's length in loops (cmd 41).
+    velocity_history: [f64; VELOCITY_WINDOW],
+    /// The speed filter's length in loops: the firmware's moving average,
+    /// or the shortest this model has for its PLL estimates, which do not
+    /// lag the way an average does.
     velocity_window: usize,
     velocity_samples: usize,
     previous_encoder: Option<f64>,
@@ -197,15 +198,28 @@ pub(crate) struct VirtualDriver {
     capture_vel: Vec<i16>,
     capture_iq: Vec<i16>,
     capture_phase: Vec<i16>,
-    /// Ripple feedforward slots (cmd 40): (harmonic, cosine mA, sine mA).
+    /// What the watchdog does at a trip (cmd 15's action byte), how long a
+    /// hold may run, and where and for how much longer one is running.
+    watchdog_action: u8,
+    fallback_ticks: u64,
+    hold_pos: Option<f64>,
+    hold_ticks_left: u64,
+    /// The tune queued and not yet started, and how much of the one
+    /// playing is left \[ticks\].
+    sound_queued_ticks: u64,
+    sound_ticks_left: u64,
+    /// The anti-cogging harmonics are switched on (parameter 37).
+    ripple_on: bool,
+    /// Ripple feedforward slots (the anti-cogging harmonics): (harmonic,
+    /// cosine mA, sine mA).
     ripple: [(u8, i16, i16); RIPPLE_SLOTS as usize],
-    /// The joint range it enforces (cmd 44).
+    /// The joint range it enforces (cmd 46).
     range: DriveRange,
     /// The rotor's electrical phase this loop, 0..16383 per cycle, as the
     /// firmware derives it from the raw count.
     phase: u32,
-    /// Each configuration frame as last written, echoed to a read request
-    /// the way the firmware reports the values in force.
+    /// Each configuration frame as last written: what its parameters read
+    /// back as, the way the firmware reports the values in force.
     written: [Option<([u8; 8], usize)>; 7],
     // -- faults --
     flags: ErrorFlags,
@@ -219,7 +233,15 @@ pub(crate) struct VirtualDriver {
     pub temperature_c: i16,
     pub voltage_mv: i16,
     pub device: DeviceInfo,
+    pub identity: Identity,
 }
+
+/// The watchdog action byte that holds position at a trip.
+const WATCHDOG_HOLD: u8 = 1;
+/// The speed estimate the firmware's parameter 50 calls the moving average.
+const SPEED_ESTIMATOR_AVERAGE: i32 = 0;
+/// The shortest speed filter this model runs, standing in for the PLLs.
+const VELOCITY_WINDOW_MIN: usize = 4;
 
 impl VirtualDriver {
     pub fn new(
@@ -253,7 +275,7 @@ impl VirtualDriver {
                 vel_limit_ticks_s: vel_limit,
                 idle: true,
             },
-            velocity_history: [0.0; VELOCITY_WINDOW_MAX],
+            velocity_history: [0.0; VELOCITY_WINDOW],
             velocity_window: VELOCITY_WINDOW,
             velocity_samples: 0,
             previous_encoder: None,
@@ -271,6 +293,13 @@ impl VirtualDriver {
             capture_vel: vec![0; usize::from(CAPTURE_LEN)],
             capture_iq: vec![0; usize::from(CAPTURE_LEN)],
             capture_phase: vec![0; usize::from(CAPTURE_LEN)],
+            watchdog_action: 0,
+            fallback_ticks: 0,
+            sound_queued_ticks: 0,
+            sound_ticks_left: 0,
+            hold_pos: None,
+            hold_ticks_left: 0,
+            ripple_on: false,
             ripple: [(0, 0, 0); RIPPLE_SLOTS as usize],
             range: DriveRange::Disarmed,
             phase: 0,
@@ -290,67 +319,110 @@ impl VirtualDriver {
             device: DeviceInfo {
                 hw_ver: 1,
                 batch: 1,
-                sw_ver: 3,
+                sw_ver: 109,
                 serial: 1_000 + i32::from(node),
+            },
+            identity: Identity {
+                product: 1,
                 tool_id: 0,
+                firmware: 109,
+                hw_ver: 1,
+                pole_pairs: POLE_PAIRS as u8,
+                calibrated: true,
+                flags: 0,
             },
         }
     }
 
-    /// cmd 38: record `wanted` samples, one every `divisor` loops, from
-    /// the next loop; the firmware caps at its buffer and floors the
-    /// divisor at one.
-    pub fn capture_start(&mut self, divisor: u8, wanted: u16) {
-        self.capture_wanted = wanted.min(CAPTURE_LEN);
-        self.capture_div = u16::from(divisor.max(1));
+    /// Record a full capture, one sample every `divisor` loops, from the
+    /// next loop; the firmware floors the divisor at one.
+    fn capture_start(&mut self, divisor: u16) {
+        self.capture_wanted = CAPTURE_LEN;
+        self.capture_div = divisor.max(1);
         self.capture_tick = 0;
         self.capture_pos = 0;
     }
 
-    /// A read request on a configuration frame: what was last written, the
-    /// firmware's answer; nothing if it was never written.
-    pub fn config_readback(&self, kind: crate::ConfigKind) -> Option<([u8; 8], usize)> {
-        self.written[kind.index()]
-    }
-
-    /// Pairs recorded so far: what a stream sends per channel.
-    pub fn capture_pairs(&self) -> u16 {
-        self.capture_pos.div_ceil(2)
-    }
-
-    /// cmd 39 reply payload: pair `chunk` of `channel`, zero past what
-    /// was recorded; the status for `CAPTURE_STATUS_CHANNEL`.
-    pub fn capture_reply(&self, channel: u8, chunk: u16) -> [u8; 7] {
-        let mut p = [0u8; 7];
-        p[0] = channel;
-        let words: [i16; 3] = if channel == CAPTURE_STATUS_CHANNEL {
-            [
-                self.capture_pos as i16,
-                self.capture_wanted as i16,
-                self.capture_div as i16,
-            ]
-        } else {
-            let rows = match channel {
-                0 => &self.capture_vel,
-                1 => &self.capture_iq,
-                _ => &self.capture_phase,
-            };
-            let at = usize::from(chunk) * 2;
-            let sample = |k: usize| {
-                let i = at + k;
-                if i < usize::from(self.capture_pos) {
-                    rows[i]
-                } else {
-                    0
-                }
-            };
-            [chunk as i16, sample(0), sample(1)]
-        };
-        for (k, w) in words.iter().enumerate() {
-            p[1 + 2 * k..3 + 2 * k].copy_from_slice(&w.to_be_bytes());
+    /// A parameter's value in force (the answer to cmd 37), for the
+    /// parameters this model carries; a configuration frame's read back as
+    /// last written, nothing if it never was.
+    pub fn param_value(&self, param: u8) -> Option<[u8; 4]> {
+        if param == Param::ToolId.raw() {
+            return Some(i32::from(self.identity.tool_id).to_be_bytes());
         }
+        if param == Param::CaptureCount.raw() {
+            return Some(i32::from(self.capture_pos).to_be_bytes());
+        }
+        if param == Param::SoundState.raw() {
+            let playing = if self.sound_ticks_left > 0 {
+                SOUND_STATE_PLAYING
+            } else {
+                0
+            };
+            return Some(playing.to_be_bytes());
+        }
+        for kind in crate::ConfigKind::ALL {
+            let Some(i) = readback_params(kind).iter().position(|p| p.raw() == param) else {
+                continue;
+            };
+            let (bytes, _) = self.written[kind.index()]?;
+            return Some(match (kind, i) {
+                // The action is the frame's fifth byte, read back as an i32.
+                (crate::ConfigKind::Watchdog, 1) => [0, 0, 0, bytes[4]],
+                _ => [
+                    bytes[4 * i],
+                    bytes[4 * i + 1],
+                    bytes[4 * i + 2],
+                    bytes[4 * i + 3],
+                ],
+            });
+        }
+        None
+    }
+
+    /// Samples a capture read-out holds.
+    pub fn capture_held(&self) -> u16 {
+        self.capture_pos
+    }
+
+    /// cmd 42 payload for capture sample `index`: the header, then the
+    /// velocity, Iq and electrical angle.
+    pub fn capture_frame(&self, index: u16) -> [u8; 8] {
+        let i = usize::from(index);
+        let mut p = [0u8; 8];
+        p[0..2].copy_from_slice(&index.to_be_bytes());
+        p[2..4].copy_from_slice(&self.capture_vel[i].to_be_bytes());
+        p[4..6].copy_from_slice(&self.capture_iq[i].to_be_bytes());
+        p[6..8].copy_from_slice(&self.capture_phase[i].to_be_bytes());
         p
     }
+
+    fn set_param(&mut self, param: u8, value: i32) {
+        let is = |p: Param| p.raw() == param;
+        if is(Param::ToolId) {
+            self.identity.tool_id = u8::try_from(value).unwrap_or(0);
+        } else if is(Param::WatchdogFallbackMs) {
+            self.fallback_ticks =
+                (f64::from(value.clamp(0, 60_000)) / 1000.0 / self.dt).round() as u64;
+        } else if is(Param::CaptureDivider) {
+            self.capture_div = value.clamp(1, 65_535) as u16;
+        } else if is(Param::CaptureTrigger) && value == CAPTURE_TRIGGER_NOW {
+            self.capture_start(self.capture_div);
+        } else if is(Param::CoggingMode) {
+            self.ripple_on = value == COGGING_MODE_HARMONICS;
+        } else if is(Param::SpeedEstimator) {
+            let window = if value == SPEED_ESTIMATOR_AVERAGE {
+                VELOCITY_WINDOW
+            } else {
+                VELOCITY_WINDOW_MIN
+            };
+            if window != self.velocity_window {
+                self.velocity_window = window;
+                self.velocity_samples = 0;
+            }
+        }
+    }
+
     /// Handle one host→driver DATA frame. Feeds the watchdog (any valid
     /// data frame counts as command traffic; RTR polls do not), updates
     /// config/mode, and names the reply the bus owes. Wrong-DLC frames are
@@ -373,17 +445,8 @@ impl VirtualDriver {
         );
         let was_cascade = self.mode.is_cascade();
         let reply = match (cmd, d.len()) {
-            (SetGripperId, 1) => {
-                self.device.tool_id = d[0];
-                ReplyKind::None
-            }
-            (VelocityWindow, 1) => {
-                // The firmware clamps, and restarts the average on a change.
-                let window = usize::from(d[0]).clamp(4, VELOCITY_WINDOW_MAX);
-                if window != self.velocity_window {
-                    self.velocity_window = window;
-                    self.velocity_samples = 0;
-                }
+            (ParamSet, 5) => {
+                self.set_param(d[0], i32::from_be_bytes([d[1], d[2], d[3], d[4]]));
                 ReplyKind::None
             }
             (Range, 8) => {
@@ -401,12 +464,36 @@ impl VirtualDriver {
                 self.range = DriveRange::Disarmed;
                 ReplyKind::None
             }
-            (Ripple, 6) if d[0] < RIPPLE_SLOTS => {
-                self.ripple[usize::from(d[0])] = (
-                    d[1],
-                    i16::from_be_bytes([d[2], d[3]]),
-                    i16::from_be_bytes([d[4], d[5]]),
-                );
+            (Sound, 8) => {
+                let ms = u16::from_be_bytes([d[6], d[7]]);
+                match d[0] {
+                    SOUND_STOP => (self.sound_queued_ticks, self.sound_ticks_left) = (0, 0),
+                    SOUND_QUEUE => {
+                        self.sound_queued_ticks += (f64::from(ms) / 1000.0 / self.dt).round() as u64
+                    }
+                    SOUND_PLAY => {
+                        self.sound_ticks_left = std::mem::take(&mut self.sound_queued_ticks)
+                    }
+                    _ => {}
+                }
+                ReplyKind::None
+            }
+            (BufferWrite, 8) => {
+                let header = u16::from_be_bytes([d[0], d[1]]);
+                let (kind, slot) = ((header >> 13) as u8, header & 0x1FFF);
+                if kind == BUFFER_HARMONICS && slot < u16::from(RIPPLE_SLOTS) {
+                    let harmonic = u16::from_be_bytes([d[2], d[3]]);
+                    self.ripple[usize::from(slot)] = (
+                        // The firmware takes a harmonic past its highest as
+                        // an unused slot.
+                        u8::try_from(harmonic)
+                            .ok()
+                            .filter(|h| *h <= RIPPLE_MAX_HARMONIC)
+                            .unwrap_or(0),
+                        i16::from_be_bytes([d[4], d[5]]),
+                        i16::from_be_bytes([d[6], d[7]]),
+                    );
+                }
                 ReplyKind::None
             }
             (DataPack1, 8) => {
@@ -459,6 +546,7 @@ impl VirtualDriver {
             (Watchdog, 5) => {
                 let ms = unpack_u32([d[0], d[1], d[2], d[3]]);
                 self.watchdog_ticks = (f64::from(ms) / 1000.0 / self.dt).round() as u64;
+                self.watchdog_action = d[4];
                 ReplyKind::None
             }
             (Limits, 8) => {
@@ -606,9 +694,9 @@ impl VirtualDriver {
         self.previous_encoder = Some(pos_ticks);
         let window = self.velocity_window;
         self.velocity_history.rotate_left(1);
-        self.velocity_history[VELOCITY_WINDOW_MAX - 1] = vel_ticks_s;
+        self.velocity_history[VELOCITY_WINDOW - 1] = vel_ticks_s;
         self.velocity_samples = (self.velocity_samples + 1).min(window);
-        let vel_ticks_s = (self.velocity_history[VELOCITY_WINDOW_MAX - self.velocity_samples..]
+        let vel_ticks_s = (self.velocity_history[VELOCITY_WINDOW - self.velocity_samples..]
             .iter()
             .sum::<f64>()
             / self.velocity_samples as f64)
@@ -632,9 +720,9 @@ impl VirtualDriver {
         out
     }
 
-    /// Loop-rate capture (cmd 38), after the loop the way the firmware takes
-    /// it: this loop's filtered velocity, the current the last loop drove,
-    /// and the electrical phase.
+    /// Loop-rate capture, after the loop the way the firmware takes it: this
+    /// loop's filtered velocity, the current the last loop drove, and the
+    /// electrical phase.
     fn record_capture(&mut self, vel_ticks_s: f64, driven: f64) {
         if self.capture_pos >= self.capture_wanted {
             return;
@@ -652,9 +740,12 @@ impl VirtualDriver {
 
     fn control_law(&mut self, pos_ticks: f64, vel_ticks_s: f64, shaft_ticks_s: f64) -> PlantCmd {
         let fw_steps = 1.0;
+        let hold = self
+            .hold_pos
+            .filter(|_| self.hold_ticks_left > 0 && self.only_watchdog());
         // Without this a test could fault a joint, keep commanding it, and
         // pass — against hardware where the arm simply freewheels.
-        if self.flags.error {
+        if self.flags.error && hold.is_none() {
             self.mode = Mode::Idle;
             self.integral_ma = 0.0;
             self.iq_ma = 0.0;
@@ -667,14 +758,24 @@ impl VirtualDriver {
                 idle: true,
             };
         }
+        // A watchdog hold is the position loop on the trip position, with
+        // none of the feedforward the host was sending.
+        let mode = match hold {
+            Some(pos) => Mode::Position {
+                pos,
+                speed: 0.0,
+                cur_ff: 0.0,
+            },
+            None => self.mode,
+        };
         let ilim = self.ilim_ma;
-        let ff = match self.mode {
+        let ff = match mode {
             Mode::Position { cur_ff, .. }
             | Mode::Velocity { cur_ff, .. }
             | Mode::Pd { cur_ff, .. } => cur_ff,
             _ => 0.0,
         };
-        let cur = match self.mode {
+        let cur = match mode {
             Mode::Idle => {
                 self.iq_ma = 0.0;
                 self.iq_err_sum = 0.0;
@@ -775,6 +876,21 @@ impl VirtualDriver {
         self.ticks_since_data = 0;
     }
 
+    /// A tune is playing.
+    pub fn sounding(&self) -> bool {
+        self.sound_ticks_left > 0
+    }
+
+    /// One tick of the tune: the firmware plays only while a loop runs
+    /// with nothing wrong, and an idle or faulted drive drops it whole.
+    pub fn age_sound(&mut self) {
+        if matches!(self.mode, Mode::Idle) || self.flags.error {
+            (self.sound_queued_ticks, self.sound_ticks_left) = (0, 0);
+        } else {
+            self.sound_ticks_left = self.sound_ticks_left.saturating_sub(1);
+        }
+    }
+
     /// Watchdog aging without a control law — the firmware-mode gripper
     /// path, where the cascade is bypassed but the CAN watchdog still runs.
     pub fn age_watchdog(&mut self) {
@@ -783,10 +899,35 @@ impl VirtualDriver {
         }
         self.ticks_since_data = self.ticks_since_data.saturating_add(1);
         if self.ticks_since_data == self.watchdog_ticks {
+            // A hold starts only on a drive that was running a loop with
+            // nothing else wrong; otherwise the trip is what it always was.
+            let running = !matches!(self.mode, Mode::Idle) && !self.flags.error;
+            if self.watchdog_action == WATCHDOG_HOLD && running {
+                self.hold_pos = self.previous_encoder;
+                self.hold_ticks_left = self.fallback_ticks;
+            }
             self.mode = Mode::Idle;
             self.flags.watchdog = true;
             self.flags.error = true;
+        } else {
+            self.hold_ticks_left = self.hold_ticks_left.saturating_sub(1);
         }
+    }
+
+    /// The watchdog is the only fault: any other gets the full response,
+    /// whatever the watchdog's action says.
+    fn only_watchdog(&self) -> bool {
+        let f = &self.flags;
+        f.watchdog
+            && !(f.temperature
+                || f.encoder
+                || f.vbus
+                || f.driver
+                || f.velocity
+                || f.current
+                || f.estop
+                || f.range
+                || f.wrong_product)
     }
 
     /// Whether the watchdog has dropped the driver to Idle (used by the
@@ -846,6 +987,9 @@ impl VirtualDriver {
 
     /// The firmware's ripple feedforward at this loop's phase \[mA\].
     fn ripple_ff(&self) -> f64 {
+        if !self.ripple_on {
+            return 0.0;
+        }
         let phase = std::f64::consts::TAU * f64::from(self.phase) / 16384.0;
         self.ripple
             .iter()
@@ -876,6 +1020,8 @@ impl VirtualDriver {
 
     pub fn clear_faults(&mut self) {
         self.mode = Mode::Idle;
+        self.hold_pos = None;
+        self.hold_ticks_left = 0;
         let (calibrated, activated) = (self.flags.calibrated, self.flags.activated);
         self.flags = ErrorFlags {
             calibrated,
@@ -900,7 +1046,7 @@ impl VirtualDriver {
             || f.range
     }
 
-    /// The joint range it enforces (cmd 44).
+    /// The joint range it enforces (cmd 46).
     pub fn range(&self) -> DriveRange {
         self.range
     }

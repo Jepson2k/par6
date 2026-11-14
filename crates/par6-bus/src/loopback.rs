@@ -18,7 +18,7 @@ use crate::hw::sched::FreshnessClock;
 use crate::types::CaptureBuffer;
 use crate::types::{
     BusError, BusState, DeviceInfo, DriveTune, ErrorFlags, Freshness, GripperCommand, GripperReply,
-    HallState, JointCommand, LinkHealth, NodeId, PollAction, PollKind, MAX_NODES,
+    HallState, Identity, JointCommand, LinkHealth, NodeId, PollAction, PollKind, MAX_NODES,
 };
 
 /// A decoded reply a test injects into the loopback RX queue.
@@ -76,8 +76,15 @@ pub enum Reply {
     DeviceInfo {
         /// Source node.
         node: NodeId,
-        /// Identity payload.
+        /// Device information payload.
         info: DeviceInfo,
+    },
+    /// cmd 39 reply.
+    Identity {
+        /// Source node.
+        node: NodeId,
+        /// Identity payload.
+        identity: Identity,
     },
     /// cmd 60 reply (firmware gripper).
     Gripper {
@@ -95,7 +102,8 @@ impl Reply {
             | Reply::Errors { node, .. }
             | Reply::Hall { node, .. }
             | Reply::Kt { node, .. }
-            | Reply::DeviceInfo { node, .. } => node,
+            | Reply::DeviceInfo { node, .. }
+            | Reply::Identity { node, .. } => node,
             Reply::Gripper { .. } => gripper_node,
         }
     }
@@ -140,12 +148,30 @@ pub enum TxRecord {
         /// Target node.
         node: NodeId,
     },
-    /// Gripper_ID (cmd 36).
+    /// The tool id (parameter 1).
     SetToolId {
         /// Target node.
         node: NodeId,
         /// The tool id it was told it is built into.
         tool_id: u8,
+    },
+    /// One parameter (cmd 36).
+    SetParam {
+        /// Target node.
+        node: NodeId,
+        /// The parameter.
+        param: crate::spectral::codec::Param,
+        /// What it was set to.
+        value: i32,
+    },
+    /// A tune (cmd 44).
+    Tune {
+        /// Target node.
+        node: NodeId,
+        /// How many notes.
+        notes: usize,
+        /// How loud \[mA\].
+        loudness_ma: u16,
     },
     /// Limits frame (cmd 20).
     Limits {
@@ -238,9 +264,9 @@ impl LoopbackBus {
     pub fn report_tool(&mut self, gripper_node: NodeId, tool_id: u8) {
         self.inject(
             false,
-            Reply::DeviceInfo {
+            Reply::Identity {
                 node: gripper_node,
-                info: DeviceInfo {
+                identity: Identity {
                     tool_id,
                     ..Default::default()
                 },
@@ -303,6 +329,7 @@ impl LoopbackBus {
             }
             Reply::Kt { kt_nm_a, .. } => state.nodes[node].kt_nm_a = Some(kt_nm_a),
             Reply::DeviceInfo { info, .. } => state.nodes[node].device_info = Some(info),
+            Reply::Identity { identity, .. } => state.nodes[node].identity = Some(identity),
             Reply::Gripper { reply } => {
                 state.gripper.reply = Some(reply);
                 state.gripper.live_error_bit = err_bit;
@@ -430,7 +457,9 @@ impl DriverBus for LoopbackBus {
                 }
                 PollAction::ResendConfig { node } => self.record_config_pass(node),
                 // Nothing answers on the loopback; the slot is consumed like a poll.
-                PollAction::CaptureRead { .. } => {}
+                PollAction::CaptureRead { .. }
+                | PollAction::CaptureStatus { .. }
+                | PollAction::ParamRead { .. } => {}
                 PollAction::ConfigRead { .. } => {}
                 PollAction::ConfigFrame { node, kind } => {
                     if !self.joint_nodes.contains(&node) && node != self.gripper_node {
@@ -549,9 +578,37 @@ impl DriverBus for LoopbackBus {
         Ok(())
     }
 
-    /// Nothing on the loopback applies it; the request is accepted.
-    fn set_velocity_window(&mut self, _node: NodeId, _window: u8) -> Result<(), BusError> {
-        self.ensure_ready()
+    fn set_param(
+        &mut self,
+        node: NodeId,
+        param: crate::spectral::codec::Param,
+        value: i32,
+    ) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        let tick = self.tick;
+        self.tx_log
+            .push((tick, TxRecord::SetParam { node, param, value }));
+        Ok(())
+    }
+
+    fn play_tune(
+        &mut self,
+        node: NodeId,
+        notes: &[crate::spectral::codec::Note],
+        loudness_ma: u16,
+    ) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        crate::spectral::codec::check_tune(notes)?;
+        let tick = self.tick;
+        self.tx_log.push((
+            tick,
+            TxRecord::Tune {
+                node,
+                notes: notes.len(),
+                loudness_ma,
+            },
+        ));
+        Ok(())
     }
 
     /// Nothing on the loopback enforces it; the request is accepted.
@@ -568,15 +625,9 @@ impl DriverBus for LoopbackBus {
         self.ensure_ready()
     }
 
-    /// Nothing on the loopback records, so nothing streams; the request is
-    /// accepted.
-    fn capture_stream(&mut self, _node: NodeId) -> Result<(), BusError> {
-        self.ensure_ready()
-    }
-
     /// The loopback has no drive to record anything; the request is
     /// accepted and nothing is ever read back.
-    fn capture_start(&mut self, _node: NodeId, _divisor: u8, _wanted: u16) -> Result<(), BusError> {
+    fn capture_start(&mut self, _node: NodeId, _divisor: u16) -> Result<(), BusError> {
         self.ensure_ready()
     }
 

@@ -18,10 +18,12 @@ use crate::spectral::codec::{
 };
 use crate::types::{Freshness, NodeId, PollAction, PollKind, MAX_NODES};
 
-/// Poll slots between device-info sweeps.
+/// Poll slots between identity sweeps: every node's identity (cmd 39: what
+/// it is and the tool it carries), then every node's device information
+/// (cmd 25: its serial number).
 ///
 /// One slot goes out per RT tick, so the sweep period is
-/// `DEVICE_INFO_PERIOD_SLOTS · dt` — ~4 s at the shipped 250 Hz and
+/// `IDENTITY_PERIOD_SLOTS · dt` — ~4 s at the shipped 250 Hz and
 /// proportionally longer at a slower one. Left a count deliberately:
 /// this is identity/telemetry refresh cadence with no deadline riding
 /// on it, unlike the freshness windows above.
@@ -29,9 +31,9 @@ use crate::types::{Freshness, NodeId, PollAction, PollKind, MAX_NODES};
 /// Shared with [`crate::sim`], which schedules its polls on the same
 /// rhythm — the same reason [`FreshnessClock`] lives here rather than in
 /// each backend.
-pub const DEVICE_INFO_PERIOD_SLOTS: u64 = 1006;
+pub const IDENTITY_PERIOD_SLOTS: u64 = 1006;
 
-/// Poll slots between range sweeps (cmd 44 read-backs), ~0.5 s at the
+/// Poll slots between range sweeps (cmd 46 read-backs), ~0.5 s at the
 /// shipped 250 Hz: a drive that restarted has dropped the range the
 /// runtime armed, and its reference with it, and this is how soon the
 /// runtime learns of it.
@@ -55,7 +57,7 @@ pub(super) enum PollStep {
 /// telemetry poll per cycle, or temperature / voltage / errors in three
 /// slots when it runs a firmware without the combined reply; a
 /// device-info sweep replaces the round robin for `targets` slots every
-/// [`DEVICE_INFO_PERIOD_SLOTS`], and a single-slot override queue
+/// [`IDENTITY_PERIOD_SLOTS`], and a single-slot override queue
 /// preempts everything.
 ///
 /// One slot per RT tick keeps the steady-state TX budget at joints +
@@ -69,7 +71,7 @@ pub(super) struct PollScheduler {
     cycle: Vec<(usize, PollKind)>,
     cursor: u64,
     slot: u64,
-    device_info_remaining: usize,
+    identity_remaining: usize,
     range_remaining: usize,
     override_slot: Option<(PollAction, u16)>,
 }
@@ -86,7 +88,7 @@ impl PollScheduler {
         self.cycle = Vec::with_capacity(3 * targets);
         self.cursor = 0;
         self.slot = 0;
-        self.device_info_remaining = 0;
+        self.identity_remaining = 0;
         self.range_remaining = 0;
         self.override_slot = None;
         self.rebuild_cycle();
@@ -138,16 +140,20 @@ impl PollScheduler {
             return Some(PollStep::Override(action));
         }
         self.slot += 1;
-        if self.device_info_remaining > 0 {
-            let target = self.targets - self.device_info_remaining;
-            self.device_info_remaining -= 1;
+        if self.identity_remaining > 0 {
+            let done = 2 * self.targets - self.identity_remaining;
+            self.identity_remaining -= 1;
             return Some(PollStep::Poll {
-                target,
-                kind: PollKind::DeviceInfo,
+                target: done % self.targets,
+                kind: if done < self.targets {
+                    PollKind::Identity
+                } else {
+                    PollKind::DeviceInfo
+                },
             });
         }
-        if self.slot.is_multiple_of(DEVICE_INFO_PERIOD_SLOTS) {
-            self.device_info_remaining = self.targets;
+        if self.slot.is_multiple_of(IDENTITY_PERIOD_SLOTS) {
+            self.identity_remaining = 2 * self.targets;
         }
         if self.range_remaining > 0 {
             let target = self.targets - self.range_remaining;
@@ -411,9 +417,17 @@ pub(super) fn boot_config_plan(configs: &[NodeConfig], repeats: u8, out: &mut Ve
             }
             out.push(BootStep::Pace);
         }
-        let extra: Vec<CanFrame> = configs.iter().flat_map(NodeConfig::extra_frames).collect();
-        if !extra.is_empty() {
-            out.extend(extra.into_iter().map(BootStep::Frame));
+        // The parameter frames, a batch per parameter the way the seven
+        // above go: a node's k-th with every other node's k-th.
+        let extra: Vec<Vec<CanFrame>> =
+            configs.iter().map(|c| c.extra_frames().collect()).collect();
+        for k in 0..extra.iter().map(Vec::len).max().unwrap_or(0) {
+            out.extend(
+                extra
+                    .iter()
+                    .filter_map(|frames| frames.get(k))
+                    .map(|f| BootStep::Frame(*f)),
+            );
             out.push(BootStep::Pace);
         }
     }
@@ -422,14 +436,23 @@ pub(super) fn boot_config_plan(configs: &[NodeConfig], repeats: u8, out: &mut Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::node_config::Watchdog;
     use crate::spectral::codec::{unpack_can_id, CommandId};
-    use par6_config::{Gains, WatchdogAction};
+    use par6_config::{Gains, WatchdogAction, WatchdogAfter, WatchdogFallback};
+
+    const FALLBACK: WatchdogFallback = WatchdogFallback {
+        time_s: 5.0,
+        current_ma: 0,
+        speed_ticks_s: 1000,
+        after: WatchdogAfter::Brake,
+    };
 
     fn node_config(node: NodeId) -> NodeConfig {
         NodeConfig {
             node,
             watchdog_ms: 5000,
             watchdog_action: WatchdogAction::Idle,
+            watchdog_fallback: FALLBACK,
             velocity_limit_ticks_s: 80000.0,
             ilim_ma: 1200.0,
             voltage_limit_mv: 6000,
@@ -443,7 +466,8 @@ mod tests {
                 kpp: 7.0,
             },
             ripple: [(0, 0, 0); 8],
-            velocity_window: None,
+            speed_estimator: None,
+            speed_pll_bandwidth_hz: None,
         }
     }
 
@@ -458,8 +482,12 @@ mod tests {
 
         let paces = plan.iter().filter(|s| **s == BootStep::Pace).count();
         let frames = plan.len() - paces;
-        assert_eq!(frames, 3 * 7 * 7, "repeats × message types × nodes");
-        assert_eq!(paces, 3 * 7, "one pace per message-type batch");
+        assert_eq!(
+            frames,
+            3 * (7 + 4) * 7,
+            "repeats × (message types + watchdog fallback parameters) × nodes"
+        );
+        assert_eq!(paces, 3 * (7 + 4), "one pace per message-type batch");
 
         // Each batch: one frame per node, same command, nodes in order.
         let want = [
@@ -470,6 +498,10 @@ mod tests {
             CommandId::CurrentGains,
             CommandId::VelocityGains,
             CommandId::PositionGains,
+            CommandId::ParamSet,
+            CommandId::ParamSet,
+            CommandId::ParamSet,
+            CommandId::ParamSet,
         ];
         let mut batch = 0usize;
         let mut in_batch: Vec<(NodeId, u8)> = Vec::new();
@@ -509,13 +541,33 @@ mod tests {
         let be = |v: f64| (v as f32).to_be_bytes();
         let pair = |a: f64, b: f64| [be(a), be(b)].concat();
         for j in &robot.joints {
-            let c = NodeConfig::arm(j, WatchdogAction::Idle);
+            let c = NodeConfig::arm(
+                j,
+                Watchdog {
+                    action: WatchdogAction::Hold,
+                    fallback: FALLBACK,
+                },
+            );
             let payload = |kind| config_frame(kind, &c).payload().to_vec();
             let g = &j.gains;
             assert_eq!(
                 payload(ConfigKind::Watchdog),
-                [j.watchdog_timeout_ms.to_be_bytes().as_slice(), &[0]].concat(),
-                "{}: watchdog ms then the Idle action",
+                [j.watchdog_timeout_ms.to_be_bytes().as_slice(), &[1]].concat(),
+                "{}: watchdog ms then the Hold action",
+                j.name
+            );
+            // How the hold runs travels as parameters 2..=5: 5 s, no
+            // descend current, the descend speed cap, then brake.
+            let extra: Vec<Vec<u8>> = c.extra_frames().map(|f| f.payload().to_vec()).collect();
+            assert_eq!(
+                extra[..4],
+                [
+                    vec![2, 0, 0, 0x13, 0x88],
+                    vec![3, 0, 0, 0, 0],
+                    vec![4, 0, 0, 0x03, 0xE8],
+                    vec![5, 0, 0, 0, 2]
+                ],
+                "{}",
                 j.name
             );
             assert_eq!(

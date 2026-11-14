@@ -14,15 +14,13 @@ use std::path::PathBuf;
 
 use par6_bus::sim::scene::{Scene, Tool};
 use par6_bus::sim::{FaultKind, SimBus};
-use par6_bus::spectral::codec::{
-    pack_can_id, CanFrame, CommandId, CAPTURE_STATUS_CHANNEL, CAPTURE_VEL_SCALE,
-};
+use par6_bus::spectral::codec::{pack_can_id, CanFrame, CommandId, CAPTURE_LEN, CAPTURE_VEL_SCALE};
 use par6_bus::spectral::convert::{ticks_per_radian, JointConversion};
 use par6_bus::{
     BusState, DriveRange, DriverBus, FirmwareGripperCommand, Freshness, GripperCommand,
     JointCommand, ObjectDetection, PollAction, PollKind,
 };
-use par6_config::{HomingStrategy, RobotConfig, ToolConfig};
+use par6_config::{HomingStrategy, RobotConfig, ToolConfig, WatchdogAction};
 use par6_proto::{Layer, Physical, Shape};
 
 fn par6() -> RobotConfig {
@@ -562,7 +560,7 @@ fn hall_joint_trigger_edge_and_latched_position() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Driver watchdog: command silence → Idle (configured WatchdogAction)
+// 3. Driver watchdog: command silence → the configured WatchdogAction
 // ---------------------------------------------------------------------------
 
 /// A Hall reference is periodic; choosing the adjacent turn at boot must not
@@ -624,9 +622,169 @@ fn hall_referenced_wrist_can_traverse_its_working_range_from_either_boot_turn() 
     }
 }
 
+/// A drive told to hold on a watchdog trip keeps its joint where it was when
+/// the host went quiet, carrying the load without the host's feedforward,
+/// for the fallback time and no longer; one that was idle when it tripped
+/// stays idle.
+#[test]
+fn a_drive_that_loses_the_host_holds_its_joint_for_the_fallback_time_then_lets_go() {
+    let mut robot = par6();
+    assert_eq!(
+        robot.bus.watchdog_action,
+        WatchdogAction::Hold,
+        "what the arm ships with"
+    );
+    robot.bus.watchdog_fallback.time_s = 1.0;
+    let q = robot.homing.ready_pose_rad(6).expect("ready pose");
+    let watchdog = robot.ticks(f64::from(robot.joints[0].watchdog_timeout_ms) / 1000.0);
+    // One poll and nothing else: an answered poll is traffic to the drive,
+    // but a tripped watchdog stays tripped.
+    let read = |rig: &mut Rig, node: u8| {
+        rig.bus.queue_poll_override(
+            PollAction::Poll {
+                node,
+                kind: PollKind::Telemetry,
+            },
+            1,
+        );
+        rig.step_poll_only();
+        rig.step_silent();
+        rig.state.nodes[usize::from(node)]
+    };
+
+    let mut rig = flange_rig(&robot, &q);
+    let cmds = gravity_hold(&mut rig.bus, &robot, &q);
+    for _ in 0..robot.ticks(1.0) {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+    // The joint the arm's weight loads most at this pose.
+    let j = (0..6)
+        .max_by_key(|&j| cmds[j].cur_ma.map_or(0, |c| c.unsigned_abs()))
+        .expect("six joints");
+    let node = robot.joints[j].node_id;
+    let load_ma = i32::from(cmds[j].cur_ma.expect("a feedforward")).abs();
+    assert!(load_ma > 200, "J{} carries {load_ma} mA here", j + 1);
+    let held = rig.bus.true_joint_rad()[j];
+
+    // The host goes quiet: no frames and no polls.
+    for _ in 0..watchdog + robot.ticks(0.5) {
+        rig.step_silent();
+    }
+    let holding = rig.bus.true_joint_rad()[j];
+    assert!(
+        (holding - held).abs() < 0.01,
+        "J{} moved {:.4} rad while its drive held it",
+        j + 1,
+        holding - held
+    );
+    let state = read(&mut rig, node);
+    let flags = state.error_flags.expect("error flags");
+    assert!(flags.watchdog && flags.error, "{flags:?}");
+    assert!(
+        i32::from(state.current_ma.expect("a current")).abs() > load_ma / 2,
+        "the drive carries the load itself: {:?} mA against {load_ma}",
+        state.current_ma
+    );
+
+    // Past the fallback time the drive lets go, and stays tripped.
+    for _ in 0..robot.ticks(1.0) {
+        rig.step_silent();
+    }
+    let state = read(&mut rig, node);
+    assert_eq!(state.current_ma, Some(0), "a drive past its fallback time");
+    assert!(state.error_flags.is_some_and(|f| f.watchdog));
+
+    // A drive that was idle when the host went quiet is not picked up.
+    let mut rig = flange_rig(&robot, &q);
+    for _ in 0..robot.ticks(0.5) {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+    let limp = vec![JointCommand::drop_to_idle(); 6];
+    for _ in 0..3 {
+        rig.step(&limp, &GripperCommand::NoGripper);
+    }
+    for _ in 0..watchdog + robot.ticks(0.2) {
+        rig.step_silent();
+    }
+    let state = read(&mut rig, node);
+    assert!(state.error_flags.is_some_and(|f| f.watchdog));
+    assert_eq!(state.current_ma, Some(0), "an idle drive stays idle");
+}
+
+/// A tune sounds through the motor of a drive that is running a loop, for
+/// as long as its notes last, and a drive that idles drops it; a tune no
+/// drive could play is refused before a frame is sent.
+#[test]
+fn a_tune_plays_through_a_holding_drive_for_its_length_and_not_through_an_idle_one() {
+    use par6_bus::spectral::codec::{Note, Param, SOUND_NOTES, SOUND_STATE_PLAYING};
+    let robot = par6();
+    let q = robot.homing.ready_pose_rad(6).expect("ready pose");
+    let node = robot.joints[0].node_id;
+    let tune = [
+        Note { hz: 880, ms: 120 },
+        Note { hz: 0, ms: 40 },
+        Note { hz: 1320, ms: 120 },
+    ];
+    let playing = |rig: &mut Rig, cmds: &[JointCommand]| {
+        rig.state.nodes[usize::from(node)].forget_param(Param::SoundState);
+        rig.bus.queue_poll_override(
+            PollAction::ParamRead {
+                node,
+                param: Param::SoundState,
+            },
+            1,
+        );
+        for _ in 0..2 {
+            rig.step(cmds, &GripperCommand::NoGripper);
+        }
+        rig.state.nodes[usize::from(node)]
+            .param(Param::SoundState)
+            .expect("the sound state")
+            & SOUND_STATE_PLAYING
+            != 0
+    };
+
+    let mut rig = flange_rig(&robot, &q);
+    let hold = gravity_hold(&mut rig.bus, &robot, &q);
+    for _ in 0..robot.ticks(0.3) {
+        rig.step(&hold, &GripperCommand::NoGripper);
+    }
+    assert!(!playing(&mut rig, &hold), "nothing was asked for yet");
+    rig.bus
+        .play_tune(node, &tune, 200)
+        .expect("a playable tune");
+    assert!(playing(&mut rig, &hold), "a holding drive plays");
+    for _ in 0..robot.ticks(0.2) {
+        rig.step(&hold, &GripperCommand::NoGripper);
+    }
+    assert!(
+        playing(&mut rig, &hold),
+        "0.28 s of notes are not over at 0.2 s"
+    );
+    for _ in 0..robot.ticks(0.15) {
+        rig.step(&hold, &GripperCommand::NoGripper);
+    }
+    assert!(!playing(&mut rig, &hold), "the tune ends by itself");
+
+    let limp = vec![JointCommand::drop_to_idle(); 6];
+    for _ in 0..3 {
+        rig.step(&limp, &GripperCommand::NoGripper);
+    }
+    rig.bus
+        .play_tune(node, &tune, 200)
+        .expect("a playable tune");
+    assert!(!playing(&mut rig, &limp), "an idle drive stays silent");
+
+    let too_high = [Note { hz: 5000, ms: 100 }];
+    assert!(rig.bus.play_tune(node, &too_high, 200).is_err());
+    let too_long = [Note { hz: 440, ms: 10 }; SOUND_NOTES + 1];
+    assert!(rig.bus.play_tune(node, &too_long, 200).is_err());
+}
+
 #[test]
 fn watchdog_silence_drops_driver_to_idle() {
     let mut robot = par6();
+    robot.bus.watchdog_action = WatchdogAction::Idle;
     robot.joints[0].watchdog_timeout_ms = 200; // 50 ticks at 250 Hz
     let wd_ticks = u64::from(robot.ticks(f64::from(robot.joints[0].watchdog_timeout_ms) / 1000.0));
     let mut rig = Rig::boot(&robot, None, None);
@@ -981,16 +1139,17 @@ fn wrong_dlc_frames_discarded_whole() {
     rig.bus.queue_poll_override(
         PollAction::Poll {
             node: 3,
-            kind: PollKind::Encoder,
+            kind: PollKind::Errors,
         },
         1,
     );
     rig.step(&cmds, &GripperCommand::FirmwarePoll);
     rig.step(&cmds, &GripperCommand::FirmwarePoll);
-    assert_eq!(
-        rig.state.nodes[node].current_ma,
-        Some(0),
-        "a watchdog-released driver must stop supplying current; gravity may still move it"
+    assert!(
+        rig.state.nodes[node]
+            .error_flags
+            .is_some_and(|f| f.watchdog),
+        "frames discarded for their length must not keep the watchdog fed"
     );
     rig.bus.queue_poll_override(
         PollAction::Poll {
@@ -1108,15 +1267,19 @@ fn boot_wrap_sector_semantics_and_position_mode_in_wire_coords() {
         "still moving at the end ({settle_band} ticks)"
     );
 
-    // The periodic device-info sweep has covered every node by now
-    // (~1006 poll slots into the run), each telling itself apart.
-    let mut serials = std::collections::BTreeSet::new();
+    // The periodic identity sweep has covered every node by now (~1006
+    // poll slots into the run): each says what it is and that it carries
+    // no tool.
     for joint in &robot.joints {
         let n = usize::from(joint.node_id);
-        let info = rig.state.nodes[n]
-            .device_info
-            .unwrap_or_else(|| panic!("no device info for node {n} after the sweep"));
-        assert!(serials.insert(info.serial), "node {n} repeats a serial");
+        let identity = rig.state.nodes[n]
+            .identity
+            .unwrap_or_else(|| panic!("no identity for node {n} after the sweep"));
+        assert_eq!(
+            (identity.product, identity.firmware, identity.tool_id),
+            (1, 109, 0),
+            "node {n}"
+        );
     }
 
     // The vendor runtime's hold is a position frame with Speed=0 (last
@@ -2619,26 +2782,26 @@ fn one_telemetry_poll_refreshes_the_node_and_the_gripper_names_its_tool() {
     assert!(n.error_flags.is_some_and(|f| f.calibrated), "{n:?}");
     assert!(n.current_ma.is_some(), "{n:?}");
 
-    let device_info = |rig: &mut Rig| {
+    let identity = |rig: &mut Rig| {
         rig.bus.queue_poll_override(
             PollAction::Poll {
                 node: gnode,
-                kind: PollKind::DeviceInfo,
+                kind: PollKind::Identity,
             },
             1,
         );
         rig.step(&cmds, &GripperCommand::FirmwarePoll);
         rig.step(&cmds, &GripperCommand::FirmwarePoll);
         rig.state.nodes[usize::from(gnode)]
-            .device_info
-            .expect("device info")
+            .identity
+            .expect("an identity")
     };
     assert_eq!(
-        device_info(&mut rig).tool_id,
+        identity(&mut rig).tool_id,
         gripper.can_tool_id.expect("the MSG rail carries an id")
     );
     rig.bus.set_tool_id(gnode, 33).expect("set_tool_id");
-    assert_eq!(device_info(&mut rig).tool_id, 33);
+    assert_eq!(identity(&mut rig).tool_id, 33);
 
     let mut bare = Rig::boot(&robot, None, None);
     let cmds = bare.idle_cmds();
@@ -2652,18 +2815,18 @@ fn one_telemetry_poll_refreshes_the_node_and_the_gripper_names_its_tool() {
     );
 }
 
-/// The loop-rate capture (cmd 38/39) is what host-side tuning fits: the
-/// velocity the drive's loop acted on and the current it drove, sample by
-/// sample through a velocity step, read back one pair per poll slot.
+/// The loop-rate capture is what host-side tuning fits: the velocity the
+/// drive's loop acted on and the current it drove, sample by sample through
+/// a velocity step, read back a frame a sample as the drive paces them out.
 #[test]
 fn capture_records_a_velocity_step_at_the_loop_rate_and_reads_back() {
     let robot = par6();
     let j = 0usize;
     let node = robot.joints[j].node_id;
     let step = 6000;
-    // A velocity step captured at `divisor` loops a sample: the velocity
-    // and current records, read back chunk by chunk through the poll slot.
-    let capture = |divisor: u8, wanted: u16| -> (Rig, Vec<i32>, Vec<i16>) {
+    // A velocity step captured at `divisor` loops a sample: the first
+    // `wanted` samples of the velocity and current records.
+    let capture = |divisor: u16, wanted: u16| -> (Rig, Vec<i32>, Vec<i16>) {
         let mut rig = Rig::boot(&robot, None, Some(&calibration_pose(&robot)));
         let mut cmds = rig.idle_cmds();
         cmds[j] = JointCommand::velocity(0, 0);
@@ -2719,7 +2882,7 @@ fn capture_records_a_velocity_step_at_the_loop_rate_and_reads_back() {
         rise_at(&every_loop)
     );
 
-    rig.bus.capture_start(node, 1, 10).expect("second capture");
+    rig.bus.capture_start(node, 1).expect("second capture");
     assert_eq!(
         rig.bus.capture(node).expect("a capture buffer").recorded,
         0,
@@ -2769,8 +2932,9 @@ fn the_send_contracts_and_the_rx_cap_hold() {
 
 /// Step joint `j` to `step` ticks/s from whatever `cmds` left it doing, with
 /// the drive capturing every `divisor` loops from the same tick, hold the
-/// step for `step_s`, stop, and read the record back through the poll slot:
-/// its velocity \[ticks/s\] and current \[mA\]. `cmds` keeps the other joints.
+/// step for `step_s`, stop, and read the record's first `wanted` samples
+/// back: its velocity \[ticks/s\] and current \[mA\]. `cmds` keeps the other
+/// joints.
 #[allow(clippy::too_many_arguments)]
 fn capture_step(
     rig: &mut Rig,
@@ -2778,46 +2942,50 @@ fn capture_step(
     cmds: &mut [JointCommand],
     j: usize,
     step: i32,
-    divisor: u8,
+    divisor: u16,
     wanted: u16,
     step_s: f64,
 ) -> (Vec<i32>, Vec<i16>) {
     let node = robot.joints[j].node_id;
-    rig.bus
-        .capture_start(node, divisor, wanted)
-        .expect("capture_start");
+    rig.bus.capture_start(node, divisor).expect("capture_start");
     cmds[j] = JointCommand::velocity(step, 0);
     for _ in 0..robot.ticks(step_s) {
         rig.step(cmds, &GripperCommand::NoGripper);
     }
     cmds[j] = JointCommand::velocity(0, 0);
-    let read = |rig: &mut Rig, cmds: &[JointCommand], channel: u8, chunk: u16| {
+    // A capture is always the drive's whole buffer: it is done once the
+    // drive says it holds that many.
+    let full = robot.ticks(f64::from(CAPTURE_LEN) * f64::from(divisor) / 6250.0) + 4;
+    for _ in 0..full {
+        rig.bus
+            .queue_poll_override(PollAction::CaptureStatus { node }, 1);
+        rig.step(cmds, &GripperCommand::NoGripper);
+        if rig.bus.capture(node).expect("a capture buffer").recorded == CAPTURE_LEN {
+            break;
+        }
+    }
+    let status = rig.bus.capture(node).expect("a capture buffer");
+    assert_eq!(
+        (status.recorded, status.divisor),
+        (CAPTURE_LEN, divisor),
+        "the drive stops by itself once its buffer is full"
+    );
+    // Read back a run a tick: the drive sends a run as fast as the bus
+    // takes it, so the run's length is the pace.
+    for first in (0..CAPTURE_LEN).step_by(12) {
         rig.bus.queue_poll_override(
             PollAction::CaptureRead {
                 node,
-                channel,
-                chunk,
+                first,
+                count: 12,
             },
             1,
         );
         rig.step(cmds, &GripperCommand::NoGripper);
-    };
-    read(rig, cmds, CAPTURE_STATUS_CHANNEL, 0);
-    rig.step(cmds, &GripperCommand::NoGripper);
-    let status = rig.bus.capture(node).expect("a capture buffer");
-    assert_eq!(
-        (status.recorded, status.wanted, status.divisor),
-        (wanted, wanted, u16::from(divisor)),
-        "the drive stops by itself at the length asked for"
-    );
-    let chunks = status.chunks();
-    for channel in [0u8, 1] {
-        for chunk in 0..chunks {
-            read(rig, cmds, channel, chunk);
-        }
     }
     rig.step(cmds, &GripperCommand::NoGripper);
     let cap = rig.bus.capture(node).expect("a capture buffer");
+    assert_eq!(cap.missing(), None, "every sample the drive holds arrived");
     let n = usize::from(wanted);
     let velocity = cap.velocity[..n]
         .iter()

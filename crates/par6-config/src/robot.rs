@@ -46,14 +46,89 @@ pub const MAX_CLIENT_TIMEOUT_S: f64 = 10.0;
 /// command that long.
 pub const WATCHDOG_TIMEOUT_MS: std::ops::RangeInclusive<u32> = 80..=1000;
 
-/// The action byte sent with the drive watchdog timeout.
+/// What a drive does when its watchdog trips (firmware 109): the action
+/// byte sent with the timeout. Whatever it says, a trip latches Watchdog,
+/// and any other fault at the same time gets [`Self::Idle`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WatchdogAction {
-    /// The vendor setting. The firmware stores the byte and acts on none:
-    /// a trip latches Watchdog and brakes the motor whatever it says.
+    /// What the firmware did before it had a choice: the motor is braked.
     Idle,
+    /// Keep the position the joint had at the trip for the fallback time,
+    /// then the after-action. A drive that was idle at the trip stays idle.
+    Hold,
+    /// Short the motor's phases.
+    Brake,
+    /// Leave the phases open.
+    Coast,
+    /// Apply the fallback current with the speed capped at the fallback
+    /// speed for the fallback time, then the after-action.
+    Descend,
 }
+
+/// What follows a watchdog hold or descend once its time is up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchdogAfter {
+    /// As [`WatchdogAction::Idle`].
+    Idle,
+    /// Short the motor's phases.
+    Brake,
+    /// Leave the phases open.
+    Coast,
+}
+
+/// The longest a drive lets a watchdog hold or descend run \[s\].
+pub const WATCHDOG_FALLBACK_MAX_S: f64 = 60.0;
+
+/// How [`WatchdogAction::Hold`] and [`WatchdogAction::Descend`] run on a
+/// drive (firmware 109 parameters 2–5), pushed at boot with the action.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchdogFallback {
+    /// How long the hold or descend may run before the after-action \[s\]:
+    /// the bound on how long a drive powers its motor with no host.
+    pub time_s: f64,
+    /// The current a descend applies \[mA\], signed in the drive's sense.
+    pub current_ma: i16,
+    /// The speed a descend is capped at, either way \[ticks/s\].
+    pub speed_ticks_s: u16,
+    /// What follows.
+    pub after: WatchdogAfter,
+}
+
+/// The loudest a cue may be \[mA\]: the tone's current is added to what
+/// holds the joint, and heats the motor with it.
+pub const SOUND_LOUDNESS_MAX_MA: u16 = 500;
+
+/// The cues the arm plays through one joint's motor (firmware 109): a
+/// rising chime when it becomes homed, two falling notes when a fault
+/// latches. Only a drive in closed loop sounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SoundConfig {
+    /// The joint whose drive plays, counted from 0.
+    pub joint: usize,
+    /// How loud \[mA\], 1..=[`SOUND_LOUDNESS_MAX_MA`].
+    pub loudness_ma: u16,
+}
+
+/// The speed a drive's velocity and position loops act on (firmware 109
+/// parameter 50).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpeedEstimator {
+    /// The 20-loop moving average of the encoder's count difference.
+    Average,
+    /// A phase-locked loop's integrator: smooth, and it lags.
+    Pll,
+    /// The same loop's integrator plus its proportional term: no lag,
+    /// more encoder noise.
+    PllDirect,
+}
+
+/// The band a drive accepts for its speed PLL's natural frequency \[Hz\].
+pub const SPEED_PLL_BANDWIDTH_HZ: std::ops::RangeInclusive<u16> = 10..=312;
 
 /// Cascade-PID and impedance-PD gains pushed to a driver at boot.
 ///
@@ -305,16 +380,22 @@ pub struct JointConfig {
     pub sector_home_offset_rad: f64,
     /// Controller gains pushed at boot.
     pub gains: Gains,
-    /// Ripple feedforward pushed at boot (cmd 40, par6 firmware): the current
-    /// that cancels this joint's cogging and commutation ripple, as harmonics
-    /// of the rotor's electrical angle. Measured by `par6-selfcal`; empty
-    /// sends nothing.
+    /// Ripple feedforward pushed at boot (the drive's anti-cogging
+    /// harmonics, firmware 109): the current that cancels this joint's
+    /// cogging and commutation ripple, as harmonics of the electrical angle
+    /// the encoder alone gives (motor position times pole pairs, without
+    /// the calibration's offset). Measured by `par6-selfcal`; empty sends
+    /// nothing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ripple: Vec<RippleHarmonic>,
-    /// The drive's speed filter length in control loops (cmd 41, par6
-    /// firmware), pushed at boot; omitted keeps the drive's own (20).
+    /// The speed the drive's loops act on, pushed at boot; omitted keeps
+    /// the drive's own (the direct PLL).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub velocity_window: Option<u8>,
+    pub speed_estimator: Option<SpeedEstimator>,
+    /// The speed PLL's natural frequency \[Hz\], pushed at boot; omitted
+    /// keeps the drive's own (60).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub speed_pll_bandwidth_hz: Option<u16>,
     /// Position limits + kinodynamic ceiling + per-mode blocks.
     pub limits: JointLimits,
 }
@@ -416,6 +497,8 @@ pub struct BusConfig {
     pub config_pace_s: f64,
     /// What the driver watchdog does when it fires.
     pub watchdog_action: WatchdogAction,
+    /// How a watchdog hold or descend runs.
+    pub watchdog_fallback: WatchdogFallback,
     /// Boot kt fetch parameters.
     pub kt_fetch: KtFetchConfig,
     /// Boot bus scan parameters.
@@ -1064,6 +1147,9 @@ pub struct RobotConfig {
     /// Collision detection. Omitted = off.
     #[serde(default)]
     pub collision: CollisionConfig,
+    /// Cues played through a motor. Omitted = a silent arm.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound: Option<SoundConfig>,
     /// Shutdown retreat. Omitted = the retreat to the park pose.
     #[serde(default)]
     pub shutdown: ShutdownConfig,
@@ -1338,8 +1424,10 @@ impl RobotConfig {
         if j.velocity_limit_ticks_s <= 0.0 {
             return Err(invalid(f("velocity_limit_ticks_s"), "must be > 0"));
         }
-        if j.velocity_window.is_some_and(|w| !(4..=64).contains(&w)) {
-            return Err(invalid(f("velocity_window"), "must be 4..=64"));
+        if j.speed_pll_bandwidth_hz
+            .is_some_and(|hz| !SPEED_PLL_BANDWIDTH_HZ.contains(&hz))
+        {
+            return Err(invalid(f("speed_pll_bandwidth_hz"), "must be 10..=312"));
         }
         if j.ripple.len() > MAX_RIPPLE_HARMONICS {
             return Err(invalid(f("ripple"), "at most 8 harmonics"));
@@ -1506,6 +1594,18 @@ impl RobotConfig {
         }
         if b.config_pace_s < 0.0 {
             return Err(invalid("bus.config_pace_s", "must be >= 0"));
+        }
+        let fallback_s = b.watchdog_fallback.time_s;
+        if !(0.0..=WATCHDOG_FALLBACK_MAX_S).contains(&fallback_s) {
+            return Err(invalid("bus.watchdog_fallback.time_s", "must be 0..=60"));
+        }
+        if let Some(sound) = self.sound {
+            if sound.joint >= self.joints.len() {
+                return Err(invalid("sound.joint", "must name one of the arm's joints"));
+            }
+            if !(1..=SOUND_LOUDNESS_MAX_MA).contains(&sound.loudness_ma) {
+                return Err(invalid("sound.loudness_ma", "must be 1..=500"));
+            }
         }
         Ok(())
     }

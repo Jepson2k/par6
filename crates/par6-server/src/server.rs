@@ -885,7 +885,7 @@ impl<R: RtCommands> Core<R> {
         let nodes = (0..16u8)
             .map(|id| {
                 let slot = self.cfg.tunable_nodes.iter().position(|n| n.node == id);
-                let (freshness, info) = match slot {
+                let (freshness, info, identity) = match slot {
                     Some(i) if i < self.snap.nodes.len() => (
                         match self.snap.node_freshness[i] {
                             par6_rt::Freshness::Unknown => 0,
@@ -894,8 +894,9 @@ impl<R: RtCommands> Core<R> {
                             par6_rt::Freshness::Lost => 3,
                         },
                         self.snap.nodes[i].device_info,
+                        self.snap.nodes[i].identity,
                     ),
-                    _ => (0, None),
+                    _ => (0, None, None),
                 };
                 par6_proto::BusNode {
                     node: id,
@@ -905,7 +906,7 @@ impl<R: RtCommands> Core<R> {
                     hw_ver: info.map_or(0, |d| d.hw_ver),
                     sw_ver: info.map_or(0, |d| d.sw_ver),
                     serial: info.map_or(0, |d| d.serial),
-                    tool_id: info.map_or(0, |d| d.tool_id),
+                    tool_id: identity.map_or(0, |d| d.tool_id),
                 }
             })
             .collect();

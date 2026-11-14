@@ -54,6 +54,10 @@ velocity_limit_ticks_s = 80000.0
 # A drive that hears nothing for this long latches Watchdog and brakes
 # (vendor drive_watchdog_ms).
 watchdog_timeout_ms = 100
+# The gains below were found on the 20-loop average. Firmware 109's own
+# default is its direct PLL, which lags less and lets more encoder noise
+# through: switching is a retune, joint by joint, on the arm.
+speed_estimator = "average"
 encoder_bits = 14
 gear_ratio = 6.4
 gear_efficiency = 0.98
@@ -123,6 +127,7 @@ phase_resistance_ohm = 1.6
 phase_inductance_mh = 3.0
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 100
+speed_estimator = "average"
 encoder_bits = 14
 gear_ratio = 25.0
 gear_efficiency = 0.90
@@ -179,6 +184,7 @@ phase_resistance_ohm = 1.6
 phase_inductance_mh = 3.0
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 100
+speed_estimator = "average"
 encoder_bits = 14
 gear_ratio = 18.0952381
 gear_efficiency = 0.95
@@ -236,6 +242,7 @@ phase_resistance_ohm = 1.3
 phase_inductance_mh = 2.6
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 100
+speed_estimator = "average"
 encoder_bits = 14
 gear_ratio = 4.0
 gear_efficiency = 0.98
@@ -289,6 +296,7 @@ phase_resistance_ohm = 1.3
 phase_inductance_mh = 2.6
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 100
+speed_estimator = "average"
 encoder_bits = 14
 gear_ratio = 4.0
 gear_efficiency = 0.98
@@ -342,6 +350,7 @@ phase_resistance_ohm = 3.7
 phase_inductance_mh = 4.5
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 100
+speed_estimator = "average"
 encoder_bits = 14
 gear_ratio = 10.0
 gear_efficiency = 0.95
@@ -571,7 +580,27 @@ boot_config_repeats = 3
 config_resend_offsets_s = [0.2, 0.6, 1.2]  # full stored-config shots after the bus arms (vendor boot workaround)
 open_retry_s = 10.0  # startup keeps retrying a failed can0 open this long (boot race with the driver)
 config_pace_s = 0.0005 # ~0.5 ms per message-type batch (TX queue drops on overflow)
-watchdog_action = "idle"
+# A drive that loses the host holds where it is for the fallback time, then
+# brakes: par6d stopping, crashing or stalling no longer lets the arm sink at
+# once (firmware 109; a drive that was idle at the trip stays idle).
+watchdog_action = "hold"
+
+[bus.watchdog_fallback]
+# Longer than a crashed par6d takes to come back and hold again: 18 s on the
+# control box (systemd's 10 s RestartSec, then the boot), measured 2026-11-11.
+# At 5 s the arm fell from the ready pose in the 13 s that were left.
+time_s = 30.0
+current_ma = 0          # descend only
+speed_ticks_s = 1000    # descend only
+after = "brake"
+
+# The arm speaks through a motor (firmware 109): the drive adds a tone's
+# current to what holds its joint, on the axis that makes no torque. A rising
+# chime when homing completes, two
+# falling notes when a fault latches. Without this section the arm is silent.
+[sound]
+joint = 0          # the base: gravity does not load it
+loudness_ma = 200  # the firmware's own default for a tone
 
 [bus.kt_fetch]
 timeout_s = 0.35

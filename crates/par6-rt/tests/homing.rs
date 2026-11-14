@@ -228,6 +228,53 @@ fn the_arm_is_homed_only_with_every_drive_guarding_its_range() {
     );
 }
 
+/// The arm chimes through its base motor as it becomes homed and sounds
+/// once as a fault latches; in between and after, the motor is quiet.
+#[test]
+fn the_arm_chimes_when_it_is_homed_and_sounds_once_when_a_fault_latches() {
+    let bundle = common::bundle();
+    let sound = bundle.robot.sound.expect("the shipped arm speaks");
+    let speaker = bundle.robot.joints[sound.joint].node_id;
+    let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&bundle);
+    let dt = core.tick_dt_s();
+    start_homing(&mut core, &mut handles, &tx);
+    let mut sounded_early = false;
+    for _ in 0..(200.0 / dt) as usize {
+        core.tick(dt, false);
+        if handles.snapshots.latest().homed {
+            break;
+        }
+        sounded_early |= core.bus_mut().sounding(speaker);
+    }
+    assert!(handles.snapshots.latest().homed, "the home never finished");
+    assert!(!sounded_early, "a sound before the arm was homed");
+    assert!(
+        core.bus_mut().sounding(speaker),
+        "no chime as the arm became homed"
+    );
+    for _ in 0..(1.0 / dt) as usize {
+        core.tick(dt, false);
+    }
+    assert!(
+        !core.bus_mut().sounding(speaker),
+        "the chime ends by itself"
+    );
+
+    // J3's drive loses its range: a fault latches.
+    let node = bundle.robot.joints[2].node_id;
+    par6_bus::DriverBus::set_range(core.bus_mut(), node, None).unwrap();
+    let (mut starts, mut was) = (0, false);
+    for _ in 0..(4.0 / dt) as usize {
+        core.tick(dt, false);
+        let is = core.bus_mut().sounding(speaker);
+        starts += usize::from(is && !was);
+        was = is;
+    }
+    assert!(handles.snapshots.latest().error_active, "no fault latched");
+    assert_eq!(starts, 1, "the fault sounds once");
+    assert!(!was, "and is over within its notes");
+}
+
 /// A driven tool taken off leaves nothing reading on its node, whichever
 /// tick the change lands on: a reply in flight as the jaw came off is not
 /// a reading of anything on the arm, and with no poll after it would read

@@ -133,43 +133,60 @@ pub trait DriverBus {
     /// NVM (cmd 13), one frame.
     fn save_config(&mut self, node: NodeId) -> Result<(), BusError>;
 
-    /// Commissioning: tell `node` which tool it is built into (cmd 36,
+    /// Commissioning: tell `node` which tool it is built into (parameter 1,
     /// `ToolConfig::can_tool_id`), one frame; it reads back in the
-    /// node's device info at once and survives a power cycle after a
+    /// node's identity at once and survives a power cycle after a
     /// [`save_config`](Self::save_config).
     fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError>;
 
-    /// Set `node`'s ripple feedforward (cmd 40): the harmonics fill its slots
-    /// in order and the rest are cleared, sent now and kept for the node's
-    /// reconnect resend. At most `RIPPLE_SLOTS` harmonics.
+    /// Set one parameter in `node`'s RAM (cmd 36), one frame. For what has
+    /// no call of its own here: the drive's own calibration runs, and what
+    /// a measurement switches for its duration.
+    fn set_param(
+        &mut self,
+        node: NodeId,
+        param: crate::spectral::codec::Param,
+        value: i32,
+    ) -> Result<(), BusError>;
+
+    /// Have `node` play `notes` through its motor at `loudness_ma`, in place
+    /// of whatever it was playing (cmd 44), one frame a note and three more,
+    /// on the axis that puts no torque on the joint.
+    /// Only a drive in closed loop sounds; an idle or faulted one stays
+    /// silent. At most `SOUND_NOTES`, each a rest or within `SOUND_HZ`.
+    fn play_tune(
+        &mut self,
+        node: NodeId,
+        notes: &[crate::spectral::codec::Note],
+        loudness_ma: u16,
+    ) -> Result<(), BusError>;
+
+    /// Set `node`'s ripple feedforward (its anti-cogging harmonics): the
+    /// harmonics fill its slots in order, the rest are cleared, and the
+    /// drive applies them from then on (none switches them off). Sent now
+    /// and kept for the node's reconnect resend. At most `RIPPLE_SLOTS`
+    /// harmonics.
     fn set_ripple(
         &mut self,
         node: NodeId,
         ripple: &[par6_config::RippleHarmonic],
     ) -> Result<(), BusError>;
 
-    /// Set `node`'s speed filter window (cmd 41), sent now and kept for the
-    /// node's reconnect resend.
-    fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError>;
-
     /// Arm `node`'s joint range over drive positions `[min, max]` \[ticks\]
-    /// (cmd 44), or disarm it with `None`, and read it back at once into
+    /// (cmd 46), or disarm it with `None`, and read it back at once into
     /// `NodeState::range`. Sent now and never kept for a resend: a drive
     /// that restarted counts from its single-turn angle again, and a range
     /// in the count it had would guard the wrong span.
     fn set_range(&mut self, node: NodeId, range: Option<(i32, i32)>) -> Result<(), BusError>;
 
-    /// Have `node` send its whole capture (cmd 42) as the same replies a
-    /// [`PollAction::CaptureRead`] gets, paced by the drive; they land in
-    /// [`DriverBus::capture`] as they arrive. Pairs the bus drops are read
-    /// back one at a time afterwards.
-    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError>;
-
-    /// Start a loop-rate capture on `node` (cmd 38): `wanted` samples of the
-    /// velocity its loop acts on and Iq, one every `divisor` control loops,
-    /// from the next loop. Read back with [`PollAction::CaptureRead`]
-    /// overrides into [`capture`](Self::capture).
-    fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError>;
+    /// Start a loop-rate capture on `node`: `CAPTURE_LEN` samples of the
+    /// velocity its loop acts on, Iq and the electrical angle, one every
+    /// `divisor` control loops, from the next loop. A
+    /// [`PollAction::CaptureStatus`] says how far it got; read it back a
+    /// run at a time with [`PollAction::CaptureRead`] into
+    /// [`capture`](Self::capture). The drive sends a run as fast as the bus
+    /// takes it, so the run's length is what paces the read-out.
+    fn capture_start(&mut self, node: NodeId, divisor: u16) -> Result<(), BusError>;
 
     /// What the capture reads have assembled for `node` so far.
     fn capture(&self, node: NodeId) -> Option<&CaptureBuffer>;

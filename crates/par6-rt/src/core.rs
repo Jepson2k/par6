@@ -30,6 +30,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
+use par6_bus::spectral::codec::Note;
 use par6_bus::spectral::{torque_to_ma_factor, JointConversion};
 use par6_bus::{
     BusError, BusState, DriverBus, Fault, Freshness, GripperCommand, JointCommand, NodeId, Pack,
@@ -81,6 +82,19 @@ struct BootConfig {
 /// equality test there leaves STREAM open forever on an arm that has
 /// visibly stopped.
 const STREAM_REST_RAD_S: f64 = 1e-9;
+/// The arm became homed: a rising chord, G5 B5 D6 G6.
+const TUNE_HOMED: [Note; 4] = [
+    Note { hz: 784, ms: 90 },
+    Note { hz: 988, ms: 90 },
+    Note { hz: 1175, ms: 90 },
+    Note { hz: 1568, ms: 220 },
+];
+/// A fault latched: A4, a breath, then a longer E4.
+const TUNE_FAULT: [Note; 3] = [
+    Note { hz: 440, ms: 180 },
+    Note { hz: 0, ms: 60 },
+    Note { hz: 330, ms: 360 },
+];
 /// How far a joint may wander and still count as stopped for a released
 /// JOG or STREAM to hand over to IDLE \[rad\], and how long it must stay
 /// inside that band \[s\].
@@ -339,6 +353,9 @@ fn latch_key(fault: Fault) -> ErrorCode {
         Fault::EstopMotor => ErrorCode::EstopMotor,
         Fault::Watchdog => ErrorCode::Watchdog,
         Fault::Range => ErrorCode::JointRange,
+        // A drive on the other product's firmware drives nothing: to the
+        // arm, a drive that does not work.
+        Fault::WrongProduct => ErrorCode::Driver,
     }
 }
 
@@ -740,6 +757,11 @@ pub struct RtCore<B: DriverBus> {
     state: ArmState,
     enable_seq: u64,
     homed: bool,
+    /// The drive that plays the cues and how loud \[mA\], and whether the
+    /// arm was homed and faulted when they were last judged: nothing
+    /// before the first judgement, so an arm taken over homed says nothing.
+    sound: Option<(NodeId, u16)>,
+    cued: Option<(bool, bool)>,
     soft_estop: bool,
     hw_estop: bool,
     /// Whether an e-stop stood on the previous tick, so the jaws are
@@ -1024,6 +1046,10 @@ impl<B: DriverBus> RtCore<B> {
             state: ArmState::Disabled,
             enable_seq: 0,
             homed: false,
+            sound: robot
+                .sound
+                .map(|s| (robot.joints[s.joint].node_id, s.loudness_ma)),
+            cued: None,
             ranges: DriveRanges::new(robot),
             ranges_due: None,
             soft_estop: false,
@@ -1913,7 +1939,7 @@ impl<B: DriverBus> RtCore<B> {
             return None;
         }
         let reported = self.bus_state.nodes[usize::from(self.gripper_node)]
-            .device_info
+            .identity
             .map(|d| d.tool_id)
             .filter(|id| *id != 0)?;
         let fitted = self.boot.tool.as_ref().and_then(|t| t.can_tool_id);
@@ -1934,7 +1960,7 @@ impl<B: DriverBus> RtCore<B> {
         let unheard = !self.bus.simulated()
             && self.gripper_present()
             && self.bus_state.nodes[usize::from(self.gripper_node)]
-                .device_info
+                .identity
                 .is_none();
         if unheard && self.tick < self.tool_hold_until {
             return;
@@ -2022,7 +2048,7 @@ impl<B: DriverBus> RtCore<B> {
                     self.bus.queue_poll_override(
                         PollAction::Poll {
                             node: self.gripper_node,
-                            kind: par6_bus::PollKind::DeviceInfo,
+                            kind: par6_bus::PollKind::Identity,
                         },
                         1,
                     );
@@ -2677,6 +2703,7 @@ impl<B: DriverBus> RtCore<B> {
             let node = &mut self.bus_state.nodes[usize::from(self.gripper_node)];
             *node = par6_bus::NodeState {
                 device_info: node.device_info,
+                identity: node.identity,
                 ..Default::default()
             };
             self.bus_state.gripper = par6_bus::GripperState::default();
@@ -3505,7 +3532,33 @@ impl<B: DriverBus> RtCore<B> {
 
     // ------------------------------------------------------------ snapshot
 
+    /// What the arm says through a motor: once as it becomes homed, once as
+    /// a fault latches. A fault speaks first, and a drive that cannot play
+    /// stays silent.
+    fn sound_cues(&mut self) {
+        let Some((node, loudness_ma)) = self.sound else {
+            return;
+        };
+        let now = (self.homed, self.errors.any_hard());
+        let Some(before) = self.cued.replace(now) else {
+            return;
+        };
+        let tune: Option<&[Note]> = if now.1 && !before.1 {
+            Some(&TUNE_FAULT)
+        } else if now.0 && !before.0 {
+            Some(&TUNE_HOMED)
+        } else {
+            None
+        };
+        if let Some(notes) = tune {
+            if let Err(e) = self.bus.play_tune(node, notes, loudness_ma) {
+                log::warn!("sound cue not sent: {e}");
+            }
+        }
+    }
+
     fn publish(&mut self) {
+        self.sound_cues();
         let gravity_applied = self.gravity_applied();
         let s = &mut self.snap;
         s.tick = self.tick;

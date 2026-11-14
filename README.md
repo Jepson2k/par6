@@ -721,6 +721,15 @@ GPIO and RT-priority permissions, cores, disk, devices and imports, each
 required or advisory, re-executed inside the package's virtualenv so it
 reflects the runtime environment.
 
+### Sound
+
+With a `[sound]` section the arm speaks through one joint's motor (STEPFOC
+firmware 109): the drive adds a tone's current to what holds its joint, on the axis
+that makes no torque, so only a drive in closed loop sounds and the collision
+monitor reads nothing of it. `par6d` plays a rising chime as the arm becomes homed
+and two falling notes as a fault latches, through `joint` (the base, as shipped) at
+`loudness_ma`. Without the section the arm is silent.
+
 ### Commissioning a drive
 
 A fresh Spectral drive sits at its factory node id, which the config does not
@@ -875,8 +884,23 @@ limited by is only a lower bound, so it is reported and left as configured.
 The base's chirp (2 to 60 Hz) is recorded for estimating the arm's effective
 compliance outside selfcal. `--only <stage>` (repeatable) runs
 homing and just those stages, for development, and `--joint N` narrows the
-ripple and gains stages to some joints. Hardware runs need `sudo`; the ripple and gains stages need the par6
-STEPFOC firmware.
+ripple, gains, limits and drive stages to some joints. Hardware runs need `sudo`; the ripple and gains stages need STEPFOC
+firmware 109 (its capture and its anti-cogging harmonics).
+
+`--only drive` is never part of a full run. It has each chosen joint's drive run its
+own calibration with the motor in place (firmware 109): the encoder table, then the
+anti-cogging identification with the current-sense zero trim. The drive turns its
+motor a little over one turn toward rising ticks and back for each, so the joint is
+first moved to where its travel has that room. A joint gravity loads at the ready
+pose is left alone: its drive would hold it through the runs without the gravity
+feedforward, and would take the steady load on the encoder-table run for an error
+of its electrical offset. The speed ripple on the gains step is captured before
+and after, and the drive's anti-cogging stays on only if it fell by a fifth. With
+`--apply` each drive saves what it kept (the encoder table and the offset it moved,
+the zero trim, the anti-cogging set), and the overlay's `ripple` for a joint whose
+drive now carries its own set is cleared, since a start-up would send it over the
+drive's. Run it before the ripple stage: the harmonics are fitted on the encoder
+the drive corrects.
 
 The simulator is meant to be useful, not exact: collisions, picking up and
 carrying objects, payload, and the arm's give under load, with the arm's
@@ -1235,9 +1259,15 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
   purpose leaves what it queued to run.
 - **A normal shutdown puts the arm down**: `par6d` retreats to its safe park, the shoulder
   and elbow onto their homing endstops, then goes limp (`[shutdown] safe_park`).
-- **A dead daemon or CAN link drops the arm.** Each drive's own watchdog trips 100 ms
-  after its last command and brakes it by shorting its phases, so the arm sinks; the
-  firmware has no hold action. This is the accepted exception.
+- **A dead daemon or CAN link leaves the arm to its drives.** Each drive's own watchdog
+  trips 100 ms after its last command. With `[bus] watchdog_action = "hold"` (firmware
+  109) a drive that was running a loop then holds its joint where it was, without the
+  host's gravity feedforward, for `[bus.watchdog_fallback] time_s`, and after that
+  brakes it by shorting its phases, so the arm sinks then rather than at once. The
+  shipped 30 s outlasts a crashed `par6d` coming back to hold the arm again, 18 s on
+  the control box with the unit's 10 s `RestartSec`. A drive
+  that was idle when it tripped stays idle, and any other fault on a drive gets the
+  brake whatever the action says. `watchdog_action = "idle"` is the brake at once.
 - **`par6-selfcal` parks and releases** on a failure and at the end of a run: the area is
   known clear and nothing is held, and a run may be on a bad tune that oscillates loudly
   under a hold. Parking runs with its motion guards on.

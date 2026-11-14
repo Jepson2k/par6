@@ -78,6 +78,22 @@ impl DriverBus for Hardware {
     fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError> {
         self.plant.set_tool_id(node, tool_id)
     }
+    fn set_param(
+        &mut self,
+        node: NodeId,
+        param: par6_bus::spectral::codec::Param,
+        value: i32,
+    ) -> Result<(), BusError> {
+        self.plant.set_param(node, param, value)
+    }
+    fn play_tune(
+        &mut self,
+        node: NodeId,
+        notes: &[par6_bus::spectral::codec::Note],
+        loudness_ma: u16,
+    ) -> Result<(), BusError> {
+        self.plant.play_tune(node, notes, loudness_ma)
+    }
     fn set_ripple(
         &mut self,
         node: NodeId,
@@ -85,17 +101,11 @@ impl DriverBus for Hardware {
     ) -> Result<(), BusError> {
         self.plant.set_ripple(node, ripple)
     }
-    fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError> {
-        self.plant.set_velocity_window(node, window)
-    }
     fn set_range(&mut self, node: NodeId, range: Option<(i32, i32)>) -> Result<(), BusError> {
         self.plant.set_range(node, range)
     }
-    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
-        self.plant.capture_stream(node)
-    }
-    fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {
-        self.plant.capture_start(node, divisor, wanted)
+    fn capture_start(&mut self, node: NodeId, divisor: u16) -> Result<(), BusError> {
+        self.plant.capture_start(node, divisor)
     }
     fn capture(&self, node: NodeId) -> Option<&CaptureBuffer> {
         self.plant.capture(node)

@@ -347,15 +347,11 @@ fn boot_config_load_is_paced_and_ordered_on_the_wire() {
     });
     let _ = wire.drain();
     let seen: Vec<Seen> = stamped.iter().map(|(_, s)| s.clone()).collect();
-    let batches = usize::from(repeats) * 7;
-    // The encoder seed sweep follows the config load.
-    let config_frames = batches * nodes.len();
-    assert!(
-        seen.len() >= config_frames,
-        "expected at least {config_frames} config frames, saw {}",
-        seen.len()
-    );
-    let order = [
+    // A pass: the seven configuration frames and the four watchdog fallback
+    // parameters to every node, then the speed estimator to the joints,
+    // which name one; each a batch of its own.
+    let joints = &nodes[..robot.joints.len()];
+    let pass: Vec<(CommandId, &[NodeId])> = [
         CommandId::Watchdog,
         CommandId::Limits,
         CommandId::VoltageLimit,
@@ -363,31 +359,48 @@ fn boot_config_load_is_paced_and_ordered_on_the_wire() {
         CommandId::CurrentGains,
         CommandId::VelocityGains,
         CommandId::PositionGains,
-    ];
-    for (b, chunk) in seen[..config_frames].chunks(nodes.len()).enumerate() {
-        let want = order[b % order.len()];
-        assert_eq!(
-            chunk.iter().map(|s| (s.node, s.cmd)).collect::<Vec<_>>(),
-            nodes.iter().map(|n| (*n, want.raw())).collect::<Vec<_>>(),
-            "batch {b} must carry {want:?} to every node in configuration order"
-        );
-        assert!(chunk.iter().all(|s| !s.rtr && !s.err));
-    }
-
+        CommandId::ParamSet,
+        CommandId::ParamSet,
+        CommandId::ParamSet,
+        CommandId::ParamSet,
+    ]
+    .into_iter()
+    .map(|cmd| (cmd, nodes.as_slice()))
+    .chain(std::iter::once((CommandId::ParamSet, joints)))
+    .collect();
+    let batches: Vec<&(CommandId, &[NodeId])> = (0..repeats).flat_map(|_| pass.iter()).collect();
+    // The encoder seed sweep follows the config load.
+    let config_frames: usize = batches.iter().map(|(_, to)| to.len()).sum();
+    assert!(
+        seen.len() >= config_frames,
+        "expected at least {config_frames} config frames, saw {}",
+        seen.len()
+    );
     // Pacing is real time on the wire, not a comment: every batch waits
     // for the pause after the one before it, so the whole load cannot
     // outrun the TX queue. Half the pause is the bound — scheduling only
     // ever lengthens the gap the reader sees.
     let pace = Duration::from_secs_f64(robot.bus.config_pace_s);
-    for b in 1..batches {
-        let gap = stamped[b * nodes.len()].0 - stamped[b * nodes.len() - 1].0;
-        assert!(
-            gap >= pace / 2,
-            "batch {b} followed the one before it after {gap:?}; the pace is {pace:?}"
+    let mut at = 0;
+    for (b, (want, to)) in batches.iter().enumerate() {
+        let chunk = &seen[at..at + to.len()];
+        assert_eq!(
+            chunk.iter().map(|s| (s.node, s.cmd)).collect::<Vec<_>>(),
+            to.iter().map(|n| (*n, want.raw())).collect::<Vec<_>>(),
+            "batch {b} must carry {want:?} to its nodes in configuration order"
         );
+        assert!(chunk.iter().all(|s| !s.rtr && !s.err));
+        if at > 0 {
+            let gap = stamped[at].0 - stamped[at - 1].0;
+            assert!(
+                gap >= pace / 2,
+                "batch {b} followed the one before it after {gap:?}; the pace is {pace:?}"
+            );
+        }
+        at += to.len();
     }
 
-    // The telemetry probe asks every node for the combined reply (cmd 37)
+    // The telemetry probe asks every node for the combined reply (cmd 40)
     // — `retries` times here, since nothing on a vcan answers; a drive
     // answers the first — and the ones that stay silent are polled the
     // vendor way from then on.
@@ -821,7 +834,7 @@ fn steady_state_ticks_allocate_nothing() {
             a_ma: 40,
             b_ma: -25,
         }];
-        j.velocity_window = Some(16);
+        j.speed_estimator = Some(par6_config::SpeedEstimator::Average);
     }
     let mut bus = SocketCanBus::open(&robot.bus).expect("open SocketCanBus");
     bus.boot_configure(&robot, Some(&gripper), 0)
@@ -1000,16 +1013,17 @@ fn polls_reach_every_node_in_its_dialect_and_overrides_take_their_slots() {
     assert_eq!(rtrs(&replaced), vec![polled[2]]);
     let round_robin_before = cycle + 3;
 
-    // The device-info sweep: it replaces the round robin once every
-    // DEVICE_INFO_PERIOD_SLOTS of its slots, one RTR per node in one
-    // contiguous run, and the round robin then carries on where it was.
+    // The identity sweep: it replaces the round robin once every
+    // IDENTITY_PERIOD_SLOTS of its slots, one identity RTR per node and
+    // then one device-info RTR per node in one contiguous run, and the
+    // round robin then carries on where it was.
     let long = rtrs(&step(
         &mut bus,
-        par6_bus::DEVICE_INFO_PERIOD_SLOTS as usize + 20,
+        par6_bus::IDENTITY_PERIOD_SLOTS as usize + 20,
     ));
-    // The range sweep (cmd 44 read-backs) cuts in every RANGE_PERIOD_SLOTS,
+    // The range sweep (cmd 46 read-backs) cuts in every RANGE_PERIOD_SLOTS,
     // one read-back per node each time.
-    let sweeps = par6_bus::DEVICE_INFO_PERIOD_SLOTS / par6_bus::RANGE_PERIOD_SLOTS - 1;
+    let sweeps = par6_bus::IDENTITY_PERIOD_SLOTS / par6_bus::RANGE_PERIOD_SLOTS - 1;
     for &node in &nodes {
         let read = long
             .iter()
@@ -1020,17 +1034,25 @@ fn polls_reach_every_node_in_its_dialect_and_overrides_take_their_slots() {
     let sweep: Vec<usize> = long
         .iter()
         .enumerate()
-        .filter(|(_, (_, c))| *c == CommandId::DeviceInfo.raw())
+        .filter(|(_, (_, c))| *c == CommandId::Identity.raw())
         .map(|(i, _)| i)
         .collect();
-    assert_eq!(sweep.len(), nodes.len(), "one device-info RTR per node");
+    assert_eq!(sweep.len(), nodes.len(), "one identity RTR per node");
     assert!(
         sweep.windows(2).all(|w| w[1] == w[0] + 1),
         "one contiguous sweep"
     );
+    let info: Vec<NodeId> = long[sweep[sweep.len() - 1] + 1..][..nodes.len()]
+        .iter()
+        .map(|(n, c)| {
+            assert_eq!(*c, CommandId::DeviceInfo.raw(), "device info follows");
+            *n
+        })
+        .collect();
+    assert_eq!(info, sweep.iter().map(|&i| long[i].0).collect::<Vec<_>>());
     assert_eq!(
         round_robin_before + sweep[0],
-        par6_bus::DEVICE_INFO_PERIOD_SLOTS as usize,
+        par6_bus::IDENTITY_PERIOD_SLOTS as usize,
         "the sweep follows the period's last round-robin slot"
     );
     let mut swept: Vec<NodeId> = sweep.iter().map(|&i| long[i].0).collect();
@@ -1042,7 +1064,11 @@ fn polls_reach_every_node_in_its_dialect_and_overrides_take_their_slots() {
         slots
             .iter()
             .copied()
-            .filter(|(_, c)| *c != CommandId::Range.raw() && *c != CommandId::DeviceInfo.raw())
+            .filter(|(_, c)| {
+                ![CommandId::Range, CommandId::DeviceInfo, CommandId::Identity]
+                    .map(CommandId::raw)
+                    .contains(c)
+            })
             .collect()
     };
     let before = *robin(&long[..sweep[0]]).last().expect("a round-robin poll");

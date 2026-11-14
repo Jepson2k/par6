@@ -442,7 +442,7 @@ impl Par6Planner {
             par6_rt::Freshness::Fresh | par6_rt::Freshness::Stale
         );
         if !snap.bus_simulated && heard {
-            let info = snap.nodes[MAX_JOINTS].device_info;
+            let info = snap.nodes[MAX_JOINTS].identity;
             // A drive answering on the gripper node that has not said which
             // tool it is yet — just after the last change — is asked again
             // before another is fitted on its word.
@@ -550,7 +550,7 @@ impl Par6Planner {
             return;
         }
         let Some(id) = snap.nodes[MAX_JOINTS]
-            .device_info
+            .identity
             .map(|d| d.tool_id)
             .filter(|id| *id != 0)
         else {
@@ -3362,7 +3362,7 @@ mod tests {
             bus_simulated: simulated,
             ..Default::default()
         };
-        snap.nodes[MAX_JOINTS].device_info = Some(par6_bus::DeviceInfo {
+        snap.nodes[MAX_JOINTS].identity = Some(par6_bus::Identity {
             tool_id,
             ..Default::default()
         });

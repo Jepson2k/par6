@@ -121,6 +121,24 @@ impl DriverBus for RuntimeBus {
         dispatch!(self, set_tool_id(node, tool_id))
     }
 
+    fn set_param(
+        &mut self,
+        node: NodeId,
+        param: crate::spectral::codec::Param,
+        value: i32,
+    ) -> Result<(), BusError> {
+        dispatch!(self, set_param(node, param, value))
+    }
+
+    fn play_tune(
+        &mut self,
+        node: NodeId,
+        notes: &[crate::spectral::codec::Note],
+        loudness_ma: u16,
+    ) -> Result<(), BusError> {
+        dispatch!(self, play_tune(node, notes, loudness_ma))
+    }
+
     fn set_ripple(
         &mut self,
         node: NodeId,
@@ -129,20 +147,12 @@ impl DriverBus for RuntimeBus {
         dispatch!(self, set_ripple(node, ripple))
     }
 
-    fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError> {
-        dispatch!(self, set_velocity_window(node, window))
-    }
-
     fn set_range(&mut self, node: NodeId, range: Option<(i32, i32)>) -> Result<(), BusError> {
         dispatch!(self, set_range(node, range))
     }
 
-    fn capture_stream(&mut self, node: NodeId) -> Result<(), BusError> {
-        dispatch!(self, capture_stream(node))
-    }
-
-    fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {
-        dispatch!(self, capture_start(node, divisor, wanted))
+    fn capture_start(&mut self, node: NodeId, divisor: u16) -> Result<(), BusError> {
+        dispatch!(self, capture_start(node, divisor))
     }
 
     fn capture(&self, node: NodeId) -> Option<&CaptureBuffer> {
